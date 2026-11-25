@@ -68,7 +68,9 @@ impl Config {
     /// 1. The directory is inspected without following links; a link (any
     ///    reparse point on Windows) or a non-directory is refused.
     /// 2. `config.json` is looked up by name in it, inspected the same way,
-    ///    opened, and read through a handle that must be the file inspected.
+    ///    opened, and read through that handle. The opened file's metadata
+    ///    must match the inspection: device and inode on Unix, size and
+    ///    modification time on Windows.
     /// 3. The directory is inspected again. On Unix its device and inode
     ///    must match step 1; on Windows only its kind is checked again.
     ///
@@ -340,8 +342,10 @@ fn check_dir_kind(path: &Path) -> Result<Option<fs::Metadata>> {
 /// Its identity is checked again after the read (see `Config::load`).
 /// When its mode must be tightened on Unix, it is opened, checked to be the
 /// directory inspected, and changed through that handle, which is held
-/// until the final check. Otherwise it is not opened, so a directory the
-/// owner may search but not list (mode 0100) still works.
+/// until the final check. If it cannot be opened (`PermissionDenied`, as
+/// with mode 0310), no handle is kept: the mode is set by path after a
+/// fresh inspection. A directory that needs no change is not opened, so
+/// one the owner may search but not list (mode 0100) still works.
 struct CheckedDir {
     path: PathBuf,
     metadata: fs::Metadata,
@@ -736,10 +740,31 @@ mod tests {
         assert_eq!(names, ["bare.json"]);
     }
 
+    /// An existing `bare.json` stops the child before it writes.
+    #[test]
+    fn the_bare_name_child_leaves_an_existing_file_alone() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("bare.json"), b"sentinel").unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "config::tests::bare_name_child_writes_in_its_working_directory",
+                "--test-threads=1",
+            ])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(fs::read(dir.path().join("bare.json")).unwrap(), b"sentinel");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
     /// The child half of the test above. It writes only when its working
     /// directory lies under the system temporary directory, so a plain
     /// `cargo test -- --ignored` from the repository writes nothing and
-    /// passes.
+    /// passes. It first reserves `bare.json` with `create_new`; if a file of
+    /// that name already exists, it stops without writing.
     #[test]
     #[ignore = "run by a_bare_file_name_writes_in_the_current_directory"]
     fn bare_name_child_writes_in_its_working_directory() {
@@ -747,6 +772,15 @@ mod tests {
         let temporary = std::env::temp_dir().canonicalize().unwrap();
         if !cwd.starts_with(&temporary) {
             return; // not started by the parent test: write nothing
+        }
+        let reserved = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open("bare.json");
+        match reserved {
+            Ok(file) => drop(file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return,
+            Err(error) => panic!("could not reserve bare.json: {error}"),
         }
         atomic_write(Path::new("bare.json"), br#"{"ok":true}"#).unwrap();
     }

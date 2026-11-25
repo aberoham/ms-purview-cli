@@ -63,15 +63,26 @@ impl Config {
     /// readable by others are tightened, with a warning written to
     /// `warnings` (the command's redacted stderr).
     ///
-    /// This is the only way to load: the directory is checked first, and
-    /// checked again after the read, so a file under a linked or replaced
-    /// directory is never accepted.
+    /// This is the only way to load. The checks, in order:
+    ///
+    /// 1. The directory is inspected without following links; a link (any
+    ///    reparse point on Windows) or a non-directory is refused.
+    /// 2. `config.json` is looked up by name in it, inspected the same way,
+    ///    opened, and read through a handle that must be the file inspected.
+    /// 3. The directory is inspected again. On Unix its device and inode
+    ///    must match step 1; on Windows only its kind is checked again.
+    ///
+    /// A directory replaced and put back between steps 1 and 3 is not
+    /// detected: standard Rust cannot open a file relative to a directory
+    /// handle, so this race is accepted.
     pub fn load(dir: &Path, warnings: &mut dyn Write) -> Result<Self> {
         let dir = normalise(dir);
         let Some(checked) = check_existing_dir(&dir, warnings)? else {
             return Ok(Self::default());
         };
         let config = Self::load_file(&dir.join(CONFIG_FILE), warnings)?;
+        #[cfg(test)]
+        tests::run_between_reads_hook();
         checked.still_the_same()?;
         Ok(config)
     }
@@ -326,13 +337,16 @@ fn check_dir_kind(path: &Path) -> Result<Option<fs::Metadata>> {
 }
 
 /// An existing configuration directory, inspected without following links.
-/// On Unix it is also held open: its mode is tightened through that handle,
-/// and its identity is checked again after the read. Standard Rust has no
-/// way to open a file relative to a directory handle, so `config.json`
-/// itself is still looked up by path between those two checks.
+/// Its identity is checked again after the read (see `Config::load`).
+/// When its mode must be tightened on Unix, it is opened, checked to be the
+/// directory inspected, and changed through that handle, which is held
+/// until the final check. Otherwise it is not opened, so a directory the
+/// owner may search but not list (mode 0100) still works.
 struct CheckedDir {
     path: PathBuf,
     metadata: fs::Metadata,
+    #[cfg(unix)]
+    _handle: Option<File>,
 }
 
 impl CheckedDir {
@@ -358,12 +372,8 @@ fn check_existing_dir(dir: &Path, warnings: &mut dyn Write) -> Result<Option<Che
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let handle = File::open(dir)?;
-        let opened = handle.metadata()?;
-        if !opened.is_dir() || !same_file(&metadata, &opened) {
-            return Err(refusal(dir, "changed while it was being opened"));
-        }
-        let mode = opened.permissions().mode() & 0o777;
+        let mode = metadata.permissions().mode() & 0o777;
+        let mut handle = None;
         if mode & 0o077 != 0 {
             writeln!(
                 warnings,
@@ -371,15 +381,51 @@ fn check_existing_dir(dir: &Path, warnings: &mut dyn Write) -> Result<Option<Che
                 shown(dir),
                 mode
             )?;
-            handle.set_permissions(fs::Permissions::from_mode(0o700))?;
+            handle = tighten_dir(dir, &metadata)?;
         }
+        Ok(Some(CheckedDir {
+            path: dir.to_path_buf(),
+            metadata,
+            _handle: handle,
+        }))
     }
     #[cfg(not(unix))]
-    let _ = warnings;
-    Ok(Some(CheckedDir {
-        path: dir.to_path_buf(),
-        metadata,
-    }))
+    {
+        let _ = warnings;
+        Ok(Some(CheckedDir {
+            path: dir.to_path_buf(),
+            metadata,
+        }))
+    }
+}
+
+/// Sets mode 0700 on the inspected directory. Through a verified handle
+/// when the directory can be opened; when it cannot (the owner may not list
+/// it, as with mode 0310), by path after inspecting it again, which leaves
+/// a short race between that inspection and the change.
+#[cfg(unix)]
+fn tighten_dir(dir: &Path, expected: &fs::Metadata) -> Result<Option<File>> {
+    use std::os::unix::fs::PermissionsExt;
+    match File::open(dir) {
+        Ok(handle) => {
+            let opened = handle.metadata()?;
+            if !opened.is_dir() || !same_file(expected, &opened) {
+                return Err(refusal(dir, "changed while it was being opened"));
+            }
+            handle.set_permissions(fs::Permissions::from_mode(0o700))?;
+            Ok(Some(handle))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            let now = check_dir_kind(dir)?
+                .ok_or_else(|| refusal(dir, "disappeared while it was being opened"))?;
+            if !same_file(expected, &now) {
+                return Err(refusal(dir, "changed while it was being opened"));
+            }
+            set_mode(dir, 0o700)?;
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Opens `path`, checks that the opened file is the one `expected`
@@ -656,25 +702,21 @@ mod tests {
         assert!(first[0].starts_with(".config.json.tmp-"));
     }
 
-    /// Runs the write in a child test process whose working directory is a
-    /// fresh temporary directory, so the test never changes this process's
-    /// directory or writes into the repository.
+    /// Runs the ignored child test below in a fresh temporary working
+    /// directory, so this process's directory never changes and nothing is
+    /// written into the repository.
     #[test]
     fn a_bare_file_name_writes_in_the_current_directory() {
         assert_eq!(parent_dir(Path::new("config.json")), PathBuf::from("."));
         assert_eq!(parent_dir(Path::new("a/config.json")), PathBuf::from("a"));
-        if std::env::var_os("PURVIEW_TEST_BARE_NAME_CHILD").is_some() {
-            atomic_write(Path::new("bare.json"), br#"{"ok":true}"#).unwrap();
-            return;
-        }
         let dir = tempdir().unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
+                "--ignored",
                 "--exact",
-                "config::tests::a_bare_file_name_writes_in_the_current_directory",
+                "config::tests::bare_name_child_writes_in_its_working_directory",
                 "--test-threads=1",
             ])
-            .env("PURVIEW_TEST_BARE_NAME_CHILD", "1")
             .current_dir(dir.path())
             .output()
             .unwrap();
@@ -692,6 +734,21 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, ["bare.json"]);
+    }
+
+    /// The child half of the test above. It writes only when its working
+    /// directory lies under the system temporary directory, so a plain
+    /// `cargo test -- --ignored` from the repository writes nothing and
+    /// passes.
+    #[test]
+    #[ignore = "run by a_bare_file_name_writes_in_the_current_directory"]
+    fn bare_name_child_writes_in_its_working_directory() {
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let temporary = std::env::temp_dir().canonicalize().unwrap();
+        if !cwd.starts_with(&temporary) {
+            return; // not started by the parent test: write nothing
+        }
+        atomic_write(Path::new("bare.json"), br#"{"ok":true}"#).unwrap();
     }
 
     #[test]
@@ -730,20 +787,67 @@ mod tests {
         }
     }
 
+    thread_local! {
+        static BETWEEN_READS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            std::cell::RefCell::new(None);
+    }
+
+    /// Called by `Config::load` between reading the file and checking the
+    /// directory again; runs the hook a test installed on this thread.
+    pub(super) fn run_between_reads_hook() {
+        if let Some(hook) = BETWEEN_READS.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
+    }
+
     #[cfg(unix)]
     #[test]
-    fn a_directory_replaced_during_the_read_is_refused() {
+    fn a_directory_replaced_during_a_load_is_refused() {
         let dir = tempdir().unwrap();
         let root = dir.path().join("purview");
         fs::create_dir(&root).unwrap();
-        let checked = check_existing_dir(&root, &mut no_warnings())
-            .unwrap()
-            .unwrap();
-        checked.still_the_same().unwrap();
-        fs::rename(&root, dir.path().join("moved")).unwrap();
-        fs::create_dir(&root).unwrap();
-        let error = checked.still_the_same().unwrap_err().to_string();
+        fs::write(root.join("config.json"), b"{}").unwrap();
+        assert!(Config::load(&root, &mut no_warnings()).is_ok());
+        let (moved, again) = (dir.path().join("moved"), root.clone());
+        BETWEEN_READS.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                fs::rename(&again, &moved).unwrap();
+                fs::create_dir(&again).unwrap();
+            }));
+        });
+        let error = Config::load(&root, &mut no_warnings())
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("changed while it was being read"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_the_owner_cannot_list_still_loads() {
+        use std::os::unix::fs::PermissionsExt;
+        for mode in [0o100, 0o310] {
+            let dir = tempdir().unwrap();
+            let root = dir.path().join("purview");
+            fs::create_dir(&root).unwrap();
+            fs::write(
+                root.join("config.json"),
+                br#"{"default_account":"alex@contoso.example"}"#,
+            )
+            .unwrap();
+            fs::set_permissions(root.join("config.json"), fs::Permissions::from_mode(0o600))
+                .unwrap();
+            fs::set_permissions(&root, fs::Permissions::from_mode(mode)).unwrap();
+            let result = Config::load(&root, &mut no_warnings());
+            let after = fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(
+                result.unwrap().default_account,
+                "alex@contoso.example",
+                "{mode:o}"
+            );
+            let expected = if mode & 0o077 == 0 { mode } else { 0o700 };
+            assert_eq!(after, expected, "{mode:o}");
+        }
     }
 
     #[cfg(unix)]

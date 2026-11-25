@@ -1849,7 +1849,7 @@ pub fn parse_msg(bytes: &[u8]) -> Result<MsgItem, MsgError>; // pure, no I/O
     | `learn.microsoft.com` | any |
     | `aka.ms` | any |
     | `github.com` | `/aberoham/…` only |
-    | `img.shields.io` | `/github/…/aberoham/…` only |
+    | `img.shields.io` | `/github/…` only, with the exact owner/repository pair `aberoham/ms-purview-cli` or `aberoham/ms-entra-cli` as consecutive path segments |
     | `*.example`, `localhost`, `127.0.0.1` | any |
 
   - **the presence of `docs/reviews/`**, or of any file that names the maintainer's private

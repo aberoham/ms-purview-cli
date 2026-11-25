@@ -96,25 +96,32 @@ fn public_files_hold_only_synthetic_data() {
         "the lint found none of the files it should scan"
     );
     let denylist = load_denylist();
+    let findings = lint_files(root, &files, &denylist);
+    assert!(findings.is_empty(), "{}", render(&findings, &denylist));
+}
+
+/// The production scan: the `docs/reviews/` check, then for each file its
+/// path and its contents.
+fn lint_files(root: &Path, files: &[String], denylist: &[DenyTerm]) -> Vec<Finding> {
     let mut findings = Vec::new();
     if root.join("docs/reviews").exists() {
         findings.push(file_finding("docs/reviews/", RULE_REVIEWS));
     }
-    for file in &files {
+    for file in files {
         if file.starts_with("docs/reviews/") {
             findings.push(file_finding(file, RULE_REVIEWS));
             continue;
         }
-        if path_is_private(file, &denylist) {
+        if path_is_private(file, denylist) {
             findings.push(file_finding(file, RULE_PRIVATE_PATH));
         }
         match read_for_scan(&root.join(file)) {
-            Ok(Some(text)) => findings.extend(scan_text(file, &text, &denylist)),
+            Ok(Some(text)) => findings.extend(scan_text(file, &text, denylist)),
             Ok(None) => {} // listed by git but deleted in the working tree
             Err(rule) => findings.push(file_finding(file, rule)),
         }
     }
-    assert!(findings.is_empty(), "{}", render(&findings, &denylist));
+    findings
 }
 
 fn file_finding(file: &str, rule: &'static str) -> Finding {
@@ -622,47 +629,21 @@ fn is_scope_segment(scope: &str) -> bool {
             }))
 }
 
-/// Shields route words that may come between `/github/` and the owner,
-/// such as `actions/workflow/status` or `v/release`.
-const SHIELDS_ROUTE_WORDS: &[&str] = &[
-    "actions",
-    "workflow",
-    "status",
-    "v",
-    "release",
-    "release-date",
-    "tag",
-    "license",
-    "stars",
-    "forks",
-    "watchers",
-    "issues",
-    "issues-pr",
-    "last-commit",
-    "commit-activity",
-    "downloads",
-    "contributors",
-    "languages",
-    "top",
-    "code-size",
-    "repo-size",
-    "check-runs",
-    "checks-status",
-];
+/// The repositories whose Shields badges may appear, as exact
+/// (owner, repository) pairs.
+const SHIELDS_REPOSITORIES: &[(&str, &str)] =
+    &[("aberoham", "ms-purview-cli"), ("aberoham", "ms-entra-cli")];
 
-/// `/github/<route words>/aberoham/<repository>/…`: the owner sits right
-/// after the route words and is followed by a repository.
+/// A Shields `/github/…` badge passes only when an allowed owner and its
+/// repository appear as consecutive path segments. Route words are not
+/// parsed; any other badge is refused.
 fn is_own_shields_badge(segments: &[String]) -> bool {
-    if segments.first().map(String::as_str) != Some("github") {
-        return false;
-    }
-    let owner = segments[1..]
-        .iter()
-        .position(|segment| !SHIELDS_ROUTE_WORDS.contains(&segment.to_ascii_lowercase().as_str()))
-        .map(|offset| offset + 1);
-    owner.is_some_and(|index| {
-        index >= 2 && segments[index].eq_ignore_ascii_case("aberoham") && index + 1 < segments.len()
-    })
+    segments.first().map(String::as_str) == Some("github")
+        && segments[1..].windows(2).any(|pair| {
+            SHIELDS_REPOSITORIES.iter().any(|(owner, repository)| {
+                pair[0].eq_ignore_ascii_case(owner) && pair[1].eq_ignore_ascii_case(repository)
+            })
+        })
 }
 
 fn url_allowed(url: &str) -> bool {
@@ -882,6 +863,8 @@ fn urls_pass_only_on_allowed_host_and_path_pairs() {
     for allowed in [
         "img.shields.io/github/v/release/aberoham/ms-purview-cli",
         "img.shields.io/github/license/aberoham/ms-purview-cli",
+        "img.shields.io/github/commit-activity/m/aberoham/ms-purview-cli",
+        "img.shields.io/github/actions/workflow/status/aberoham/ms-entra-cli/ci.yml",
     ] {
         assert!(url_allowed(&url(allowed)), "{allowed}");
     }
@@ -897,8 +880,11 @@ fn urls_pass_only_on_allowed_host_and_path_pairs() {
         "github.com/aberoham/../someone-else",
         "img.shields.io/badge/x",
         "img.shields.io/github/stars/other-owner/aberoham",
-        "img.shields.io/github/aberoham/ms-purview-cli",
+        "img.shields.io/github/actions/workflow/status/status/aberoham/ci.yml",
+        "img.shields.io/github/downloads/actions/aberoham/total",
         "img.shields.io/github/license/aberoham",
+        "img.shields.io/github/license/aberoham/other-repository",
+        "img.shields.io/badge/aberoham/ms-purview-cli",
         "[::1]/x",
         "[2001:db8::1]:8443/x",
         "eur.proxyservice.ediscovery.svc.cloud.microsoft/other",
@@ -1013,6 +999,21 @@ fn multibyte_text_after_a_drive_letter_does_not_panic() {
     }
     let named = join(&["D", ":/", "Users", "/", "zoë"]);
     assert!(!home_paths(&named).is_empty());
+}
+
+/// A file whose name holds refused data and whose contents are clean is
+/// still a finding, through the production scan loop.
+#[test]
+fn a_refused_file_name_with_clean_contents_fails_the_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let guid = join(&["3f2a9c1e", "-7b4d-4e0a-9c8f-", "1a2b3c4d5e6f"]);
+    let name = join(&["fixture-", &guid, ".json"]);
+    std::fs::write(dir.path().join(&name), "{}").unwrap();
+    std::fs::write(dir.path().join("clean.json"), "{}").unwrap();
+    let findings = lint_files(dir.path(), &[name, "clean.json".to_owned()], &[]);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].rule, RULE_PRIVATE_PATH);
+    assert!(!render(&findings, &[]).contains(&guid));
 }
 
 /// With no deny list, a file whose name holds a value a built-in rule

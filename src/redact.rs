@@ -10,6 +10,8 @@ use std::fmt;
 use std::io::{self, Write};
 use std::sync::{Arc, RwLock};
 
+use serde_json::Value;
+
 /// What every redacted value becomes.
 pub const REDACTED: &str = "[redacted]";
 
@@ -54,10 +56,7 @@ impl Redactor {
     }
 
     pub fn secret_count(&self) -> usize {
-        self.secrets
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .len()
+        self.read_secrets().len()
     }
 
     pub fn redact(&self, text: &str) -> String {
@@ -66,40 +65,106 @@ impl Redactor {
         String::from_utf8_lossy(&self.redact_bytes(text.as_bytes())).into_owned()
     }
 
+    /// Whether `text` holds a registered secret or a JWT-shaped run.
+    pub fn recognises(&self, text: &str) -> bool {
+        !self.spans(text.as_bytes()).is_empty()
+    }
+
+    /// Redacts every string in a JSON value, object keys included, before
+    /// it is serialised. Redacting serialised JSON would miss a secret that
+    /// JSON escaping changed, and could break the document's syntax.
+    pub fn redact_value(&self, value: &Value) -> Value {
+        match value {
+            Value::String(text) => Value::String(self.redact(text)),
+            Value::Array(items) => {
+                Value::Array(items.iter().map(|item| self.redact_value(item)).collect())
+            }
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .map(|(key, item)| (self.redact(key), self.redact_value(item)))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+
+    /// Whether any string in a JSON value, object keys included, holds a
+    /// registered secret or a JWT-shaped run.
+    pub fn recognises_value(&self, value: &Value) -> bool {
+        match value {
+            Value::String(text) => self.recognises(text),
+            Value::Array(items) => items.iter().any(|item| self.recognises_value(item)),
+            Value::Object(map) => map
+                .iter()
+                .any(|(key, item)| self.recognises(key) || self.recognises_value(item)),
+            _ => false,
+        }
+    }
+
     /// Replaces every registered secret and every JWT-shaped run. Matches
     /// are found on the original bytes and overlapping or adjacent matches
     /// are merged, so two secrets that share bytes are both removed whole.
     pub fn redact_bytes(&self, bytes: &[u8]) -> Vec<u8> {
-        let mut spans = jwt_spans(bytes);
-        {
-            let secrets = self
-                .secrets
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for secret in secrets.iter() {
-                spans.extend(occurrences(bytes, secret));
-            }
-        }
+        let spans = self.spans(bytes);
         if spans.is_empty() {
             return bytes.to_vec();
         }
-        spans.sort_unstable();
         let mut output = Vec::with_capacity(bytes.len());
         let mut position = 0;
-        let mut index = 0;
-        while index < spans.len() {
-            let (start, mut end) = spans[index];
-            index += 1;
-            while index < spans.len() && spans[index].0 <= end {
-                end = end.max(spans[index].1);
-                index += 1;
-            }
+        for (start, end) in spans {
             output.extend_from_slice(&bytes[position..start]);
             output.extend_from_slice(REDACTED.as_bytes());
             position = end;
         }
         output.extend_from_slice(&bytes[position..]);
         output
+    }
+
+    /// Every match, sorted, with overlapping and adjacent spans merged.
+    fn spans(&self, bytes: &[u8]) -> Vec<(usize, usize)> {
+        let mut spans = jwt_spans(bytes);
+        for secret in self.read_secrets().iter() {
+            spans.extend(occurrences(bytes, secret));
+        }
+        spans.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+        for (start, end) in spans {
+            match merged.last_mut() {
+                Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                _ => merged.push((start, end)),
+            }
+        }
+        merged
+    }
+
+    /// Where the undecided tail of `bytes` begins: the earliest position
+    /// from which the text could still become a match once more bytes
+    /// arrive. That is the start of a registered secret's prefix or of a
+    /// JWT that reaches the end, pulled back to the start of any match
+    /// that runs into it. Text before this point can be written safely.
+    fn hold_point(&self, bytes: &[u8]) -> usize {
+        let length = bytes.len();
+        let mut hold = jwt_open_start(bytes);
+        for secret in self.read_secrets().iter() {
+            for prefix in (1..secret.len().min(length + 1)).rev() {
+                if bytes.ends_with(&secret[..prefix]) {
+                    hold = hold.min(length - prefix);
+                    break;
+                }
+            }
+        }
+        for (start, end) in self.spans(bytes).into_iter().rev() {
+            if start < hold && end > hold {
+                hold = start;
+            }
+        }
+        hold
+    }
+
+    fn read_secrets(&self) -> std::sync::RwLockReadGuard<'_, Vec<Box<[u8]>>> {
+        self.secrets
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -163,10 +228,54 @@ fn jwt_end(bytes: &[u8], after_prefix: usize) -> Option<usize> {
     Some(skip_jwt_bytes(bytes, payload_end + 1))
 }
 
+/// The start of a JWT that reaches the end of `bytes` and could still
+/// grow, or of a partial `eyJ` prefix at the end; `bytes.len()` when there
+/// is none.
+fn jwt_open_start(bytes: &[u8]) -> usize {
+    let tail = bytes
+        .iter()
+        .rposition(|byte| !(is_jwt_byte(*byte) || *byte == b'.'))
+        .map_or(0, |position| position + 1);
+    (tail..bytes.len())
+        .find(|start| is_open_jwt(&bytes[*start..]))
+        .unwrap_or(bytes.len())
+}
+
+/// Whether `text` is a prefix of some JWT match that could continue.
+fn is_open_jwt(text: &[u8]) -> bool {
+    if text.len() < 3 {
+        return !text.is_empty() && b"eyJ".starts_with(text);
+    }
+    if &text[..3] != b"eyJ" {
+        return false;
+    }
+    let mut dots = 0;
+    let mut since_dot = 0;
+    for byte in &text[3..] {
+        if *byte == b'.' {
+            // Each of the first two parts needs at least one character.
+            if dots == 2 || since_dot == 0 {
+                return false;
+            }
+            dots += 1;
+            since_dot = 0;
+        } else {
+            since_dot += 1;
+        }
+    }
+    true
+}
+
 /// A writer that redacts everything written through it before passing it
 /// on. It holds bytes back until a line ends, so a secret split across two
-/// `write` calls is still found; `flush` redacts and writes a partial line.
-/// Neither secrets nor the JWT pattern span a line break.
+/// `write` calls is still found. Neither secrets nor the JWT pattern span a
+/// line break; a multi-line secret is registered line by line.
+///
+/// `flush` writes a partial line only up to the point where a match could
+/// still begin, and keeps that tail for the next write. `finish` ends the
+/// stream: it redacts and writes everything held. Call `finish` once at the
+/// end and check its result; dropping the writer finishes it but discards
+/// any error.
 pub struct RedactingWriter {
     inner: Box<dyn Write + Send>,
     redactor: Arc<Redactor>,
@@ -209,10 +318,22 @@ impl Write for RedactingWriter {
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        let hold = self.redactor.hold_point(&self.pending);
+        if hold > 0 {
+            let tail = self.pending.split_off(hold);
+            let ready = std::mem::replace(&mut self.pending, tail);
+            self.inner.write_all(&self.redactor.redact_bytes(&ready))?;
+        }
+        self.inner.flush()
+    }
+}
+
+impl RedactingWriter {
+    /// Ends the stream: redacts and writes every held byte, then flushes.
+    pub fn finish(&mut self) -> io::Result<()> {
         if !self.pending.is_empty() {
-            let partial = std::mem::take(&mut self.pending);
-            self.inner
-                .write_all(&self.redactor.redact_bytes(&partial))?;
+            let rest = std::mem::take(&mut self.pending);
+            self.inner.write_all(&self.redactor.redact_bytes(&rest))?;
         }
         self.inner.flush()
     }
@@ -220,7 +341,7 @@ impl Write for RedactingWriter {
 
 impl Drop for RedactingWriter {
     fn drop(&mut self) {
-        let _ = self.flush();
+        let _ = self.finish();
     }
 }
 
@@ -391,8 +512,98 @@ mod tests {
         writer.write_all(b"load-0001 end\nnext ").unwrap();
         assert_eq!(sink.text(), "token [redacted] end\n");
         writer.write_all(b"canary-download-0001").unwrap();
-        writer.flush().unwrap();
+        writer.finish().unwrap();
         assert_eq!(sink.text(), "token [redacted] end\nnext [redacted]");
+    }
+
+    fn writer_with(secrets: &[&str]) -> (RedactingWriter, Shared) {
+        let redactor = Arc::new(Redactor::new());
+        for secret in secrets {
+            redactor.register(secret);
+        }
+        let sink = Shared::default();
+        (RedactingWriter::new(Box::new(sink.clone()), redactor), sink)
+    }
+
+    #[test]
+    fn a_flush_inside_a_secret_holds_back_its_start() {
+        let (mut writer, sink) = writer_with(&["canary-download-0001"]);
+        writer.write_all(b"a canary-dow").unwrap();
+        writer.flush().unwrap();
+        assert_eq!(sink.text(), "a ");
+        writer.write_all(b"nload-0001 z").unwrap();
+        writer.flush().unwrap();
+        writer.finish().unwrap();
+        assert_eq!(sink.text(), "a [redacted] z");
+    }
+
+    #[test]
+    fn a_flush_inside_a_jwt_holds_back_its_start() {
+        let token = jwt();
+        for split in [
+            1,
+            2,
+            3,
+            8,
+            token.find('.').unwrap() + 1,
+            token.len() - 2,
+            token.len(),
+        ] {
+            let (mut writer, sink) = writer_with(&[]);
+            write!(writer, "x {}", &token[..split]).unwrap();
+            writer.flush().unwrap();
+            assert_eq!(sink.text(), "x ", "split at {split}");
+            write!(writer, "{} y", &token[split..]).unwrap();
+            writer.flush().unwrap();
+            writer.finish().unwrap();
+            assert_eq!(sink.text(), "x [redacted] y", "split at {split}");
+        }
+    }
+
+    #[test]
+    fn a_flush_across_the_lines_of_a_multi_line_secret_still_redacts() {
+        let (mut writer, sink) = writer_with(&["line-one-secret\nline-two-secret"]);
+        writer.write_all(b"line-one-se").unwrap();
+        writer.flush().unwrap();
+        writer.write_all(b"cret\nline-two").unwrap();
+        writer.flush().unwrap();
+        writer.write_all(b"-secret\n").unwrap();
+        writer.finish().unwrap();
+        assert_eq!(sink.text(), "[redacted]\n[redacted]\n");
+    }
+
+    #[test]
+    fn a_flush_writes_text_that_cannot_start_a_match() {
+        let (mut writer, sink) = writer_with(&["canary-0001"]);
+        writer.write_all(b"progress 5% ok").unwrap();
+        writer.flush().unwrap();
+        assert_eq!(sink.text(), "progress 5% ok");
+        writer.write_all(b" canary-0001").unwrap();
+        writer.flush().unwrap();
+        assert_eq!(sink.text(), "progress 5% ok [redacted]");
+    }
+
+    #[test]
+    fn json_values_are_redacted_before_serialisation() {
+        let redactor = Redactor::new();
+        // JSON escaping changes these characters, so byte-level redaction of
+        // the serialised text would not find the secret.
+        redactor.register("se\"cr\\et-0001");
+        let value = serde_json::json!({
+            "token": "before se\"cr\\et-0001 after",
+            "se\"cr\\et-0001": [1, {"nested": jwt()}],
+        });
+        let serialised = serde_json::to_string(&value).unwrap();
+        assert_eq!(redactor.redact(&serialised).matches(REDACTED).count(), 1);
+        let safe = redactor.redact_value(&value);
+        let text = serde_json::to_string(&safe).unwrap();
+        let parsed: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["token"], "before [redacted] after");
+        assert_eq!(parsed[REDACTED][1]["nested"], REDACTED);
+        assert!(!redactor.recognises_value(&safe));
+        assert!(redactor.recognises_value(&value));
+        assert!(redactor.recognises(&jwt()));
+        assert!(!redactor.recognises("plain"));
     }
 
     #[test]

@@ -159,6 +159,18 @@ touch the real keyring, Microsoft Graph or the identity platform.
 - Each claim about the service in docs and comments carries its evidence
   label from `docs/SPEC.md` (Observed, Docs, Derived, Assumption).
 
+## Review before every pull request
+
+Before a pull request is opened, two independent reviewers read its diff
+from `main`: Codex and agy (Gemini). The two reviews run in parallel.
+
+- Fix every finding, then verify again with the commands below and a fresh
+  review of the changed diff.
+- Repeat until a pass finds no regression and no blocker an operator would
+  hit in normal use.
+- List any edge cases that remain as open items in the pull request body.
+- The pull request body states that both reviews ran.
+
 ## Verification
 
 For ordinary Rust changes, run:

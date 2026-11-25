@@ -6,13 +6,21 @@
 //! - a globally unique identifier (GUID) that is neither synthetic
 //!   (`00000000-0000-4000-8000-0000000000NN`) nor an allowed Microsoft
 //!   constant;
-//! - an email address outside `*.example`;
-//! - a URL whose host and path are not an allowed pair;
+//! - an email address outside `*.example`, internationalised ones included;
+//! - a URL whose normalised host and path are not an allowed pair;
 //! - a `docs/reviews/` directory, or an absolute path into a home directory
-//!   (private notes and prototypes live there);
+//!   (private notes and prototypes live there), in Unix or Windows form;
+//! - a file that cannot be read as UTF-8 text;
 //! - any term in the file named by `PURVIEW_LINT_DENYLIST`, when that
 //!   variable is set. The file lives outside the repository and lists
-//!   private names a maintainer wants kept out, one per line.
+//!   private names and path fragments a maintainer wants kept out, one per
+//!   line; blank lines and lines starting with `#` are skipped.
+//!
+//! Each line is scanned as written, with JSON-escaped slashes undone, and
+//! percent-decoded. The report names the file, line, column and rule, never
+//! the matched value: the value is the private data the lint exists to keep
+//! out of public CI logs. A file path that contains a deny-list term is
+//! withheld too.
 //!
 //! Test inputs that must fail the lint are assembled at run time, so this
 //! file passes its own scan.
@@ -43,12 +51,39 @@ const ALLOWED_GUIDS: &[&str] = &[
 /// no person or organisation.
 const THREAD_DOMAINS: &[&str] = &["thread.v2", "thread.skype", "thread.tacv2"];
 
+/// URL schemes the lint recognises.
+const SCHEMES: &[&str] = &["https://", "http://", "wss://", "ws://"];
+
+const RULE_GUID: &str = "GUID is neither synthetic nor an allowed constant";
+const RULE_EMAIL: &str = "email address outside *.example";
+const RULE_URL: &str = "URL host and path are not an allowed pair";
+const RULE_HOME: &str = "absolute path into a home directory";
+const RULE_DENY: &str = "term from PURVIEW_LINT_DENYLIST";
+const RULE_REVIEWS: &str = "review history is private and must stay outside the published tree";
+const RULE_UNREADABLE: &str = "file could not be read; the lint fails closed";
+const RULE_NOT_UTF8: &str = "file is not UTF-8 text; the lint cannot check it";
+const RULE_DENY_PATH: &str = "file path contains a term from PURVIEW_LINT_DENYLIST";
+
+/// One finding. `value` is kept for de-duplication and tests and is never
+/// rendered.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Finding {
     file: String,
     line: usize,
+    /// 1-based character column in the line as written; 0 when the match
+    /// was found only after decoding.
+    column: usize,
     rule: &'static str,
-    text: String,
+    variant: &'static str,
+    detail: String,
+    value: String,
+}
+
+/// A deny-list term with its line number in the deny-list file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DenyTerm {
+    line: usize,
+    term: String,
 }
 
 #[test]
@@ -57,48 +92,85 @@ fn public_files_hold_only_synthetic_data() {
     let files = scanned_files(root);
     assert!(
         files.iter().any(|file| file == "docs/SPEC.md"),
-        "the lint found none of the files it should scan: {files:?}"
+        "the lint found none of the files it should scan"
     );
     let denylist = load_denylist();
     let mut findings = Vec::new();
     if root.join("docs/reviews").exists() {
-        findings.push(Finding {
-            file: "docs/reviews/".into(),
-            line: 0,
-            rule: "review history is private and must stay outside the published tree",
-            text: String::new(),
-        });
+        findings.push(file_finding("docs/reviews/", RULE_REVIEWS));
     }
     for file in &files {
         if file.starts_with("docs/reviews/") {
-            findings.push(Finding {
-                file: file.clone(),
-                line: 0,
-                rule: "review history is private and must stay outside the published tree",
-                text: String::new(),
-            });
+            findings.push(file_finding(file, RULE_REVIEWS));
             continue;
         }
-        let Ok(bytes) = std::fs::read(root.join(file)) else {
-            continue; // listed but deleted in the working tree
-        };
-        let text = String::from_utf8_lossy(&bytes);
-        findings.extend(scan_text(file, &text, &denylist));
+        if contains_term(file, &denylist).is_some() {
+            findings.push(file_finding(file, RULE_DENY_PATH));
+        }
+        match read_for_scan(&root.join(file)) {
+            Ok(Some(text)) => findings.extend(scan_text(file, &text, &denylist)),
+            Ok(None) => {} // listed by git but deleted in the working tree
+            Err(rule) => findings.push(file_finding(file, rule)),
+        }
     }
-    findings.sort();
-    assert!(
-        findings.is_empty(),
-        "public-data lint: {} finding(s)\n{}",
-        findings.len(),
-        findings
-            .iter()
-            .map(|finding| format!(
-                "  {}:{}: {}: {}",
-                finding.file, finding.line, finding.rule, finding.text
-            ))
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
+    assert!(findings.is_empty(), "{}", render(&findings, &denylist));
+}
+
+fn file_finding(file: &str, rule: &'static str) -> Finding {
+    Finding {
+        file: file.to_owned(),
+        line: 0,
+        column: 0,
+        rule,
+        variant: "",
+        detail: String::new(),
+        value: String::new(),
+    }
+}
+
+/// Reads a file as UTF-8 text. A missing file is `Ok(None)`; any other
+/// failure is an error, so the lint never passes a file it did not read.
+fn read_for_scan(path: &Path) -> Result<Option<String>, &'static str> {
+    match std::fs::read(path) {
+        Ok(bytes) => String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|_| RULE_NOT_UTF8),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(RULE_UNREADABLE),
+    }
+}
+
+/// The failure report: file, line, column and rule, never the matched
+/// value, and no path that contains a deny-list term.
+fn render(findings: &[Finding], denylist: &[DenyTerm]) -> String {
+    let mut sorted = findings.to_vec();
+    sorted.sort();
+    sorted.dedup();
+    let lines: Vec<String> = sorted
+        .iter()
+        .map(|finding| {
+            let file = if contains_term(&finding.file, denylist).is_some() {
+                "[path withheld: it contains a deny-list term]".to_owned()
+            } else {
+                finding.file.clone()
+            };
+            let place = match (finding.line, finding.column) {
+                (0, _) => file,
+                (line, 0) => format!("{file}:{line}"),
+                (line, column) => format!("{file}:{line}:{column}"),
+            };
+            format!(
+                "  {place}: {}{}{}",
+                finding.rule, finding.detail, finding.variant
+            )
+        })
+        .collect();
+    format!(
+        "public-data lint: {} finding(s). Matched values are not shown; open each \
+         location to see them.\n{}",
+        lines.len(),
+        lines.join("\n")
+    )
 }
 
 /// Tracked files, plus untracked files git does not ignore, so a new file
@@ -140,10 +212,11 @@ fn walk(root: &Path) -> BTreeSet<String> {
     let mut found = BTreeSet::new();
     let mut pending: Vec<PathBuf> = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(&directory) else {
-            continue;
-        };
-        for entry in entries.flatten() {
+        let entries = std::fs::read_dir(&directory)
+            .unwrap_or_else(|_| panic!("the lint could not list a directory; it fails closed"));
+        for entry in entries {
+            let entry =
+                entry.unwrap_or_else(|_| panic!("the lint could not list a directory entry"));
             let path = entry.path();
             let relative = path
                 .strip_prefix(root)
@@ -155,69 +228,156 @@ fn walk(root: &Path) -> BTreeSet<String> {
             }
             match entry.file_type() {
                 Ok(kind) if kind.is_dir() => pending.push(path),
-                Ok(kind) if kind.is_file() => {
+                _ => {
                     found.insert(relative);
                 }
-                _ => {}
             }
         }
     }
     found
 }
 
-fn load_denylist() -> Vec<String> {
+fn load_denylist() -> Vec<DenyTerm> {
     let Some(path) = std::env::var_os("PURVIEW_LINT_DENYLIST").filter(|value| !value.is_empty())
     else {
         return Vec::new();
     };
-    let contents = std::fs::read_to_string(&path).unwrap_or_else(|error| {
-        panic!("PURVIEW_LINT_DENYLIST names a file that cannot be read: {error}")
-    });
+    let contents = std::fs::read_to_string(&path)
+        .unwrap_or_else(|_| panic!("PURVIEW_LINT_DENYLIST names a file that cannot be read"));
+    parse_denylist(&contents)
+}
+
+/// Terms, lower-cased, each with its 1-based line in the deny-list file.
+fn parse_denylist(contents: &str) -> Vec<DenyTerm> {
     contents
         .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(str::to_lowercase)
+        .enumerate()
+        .map(|(index, line)| (index + 1, line.trim()))
+        .filter(|(_, line)| !line.is_empty() && !line.starts_with('#'))
+        .map(|(line, term)| DenyTerm {
+            line,
+            term: term.to_lowercase(),
+        })
         .collect()
 }
 
-fn scan_text(file: &str, text: &str, denylist: &[String]) -> Vec<Finding> {
-    let mut findings = Vec::new();
+fn contains_term<'a>(text: &str, denylist: &'a [DenyTerm]) -> Option<&'a DenyTerm> {
+    let lower = text.to_lowercase();
+    denylist.iter().find(|deny| lower.contains(&deny.term))
+}
+
+/// The forms of a line the lint scans: as written, with JSON's `\/`
+/// undone, and percent-decoded.
+fn variants(line: &str) -> Vec<(&'static str, String)> {
+    let mut forms = vec![("", line.to_owned())];
+    if line.contains("\\/") {
+        forms.push((" (in JSON-escaped text)", line.replace("\\/", "/")));
+    }
+    if line.contains('%') {
+        let decoded = percent_decode_lossy(line);
+        if decoded != line {
+            forms.push((" (in percent-decoded text)", decoded.clone()));
+            if decoded.contains('%') {
+                let twice = percent_decode_lossy(&decoded);
+                if twice != decoded {
+                    forms.push((" (in percent-decoded text)", twice));
+                }
+            }
+        }
+    }
+    forms
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn percent_decode(text: &str) -> Vec<u8> {
+    let bytes = text.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+            {
+                output.push(high * 16 + low);
+                index += 3;
+                continue;
+            }
+        }
+        output.push(bytes[index]);
+        index += 1;
+    }
+    output
+}
+
+fn percent_decode_lossy(text: &str) -> String {
+    String::from_utf8_lossy(&percent_decode(text)).into_owned()
+}
+
+fn scan_text(file: &str, text: &str, denylist: &[DenyTerm]) -> Vec<Finding> {
+    let mut findings: Vec<Finding> = Vec::new();
     for (index, line) in text.lines().enumerate() {
-        let mut found = |rule: &'static str, value: String| {
-            findings.push(Finding {
-                file: file.to_owned(),
-                line: index + 1,
-                rule,
-                text: value,
-            });
-        };
-        for guid in guids(line) {
-            if !guid_allowed(&guid) {
-                found("GUID is neither synthetic nor an allowed constant", guid);
+        let mut seen: BTreeSet<(&'static str, String)> = BTreeSet::new();
+        for (variant, form) in variants(line) {
+            let raw = variant.is_empty();
+            let mut found = |rule: &'static str, start: usize, value: String, detail: String| {
+                if !seen.insert((rule, value.clone())) {
+                    return;
+                }
+                findings.push(Finding {
+                    file: file.to_owned(),
+                    line: index + 1,
+                    column: if raw {
+                        form[..start].chars().count() + 1
+                    } else {
+                        0
+                    },
+                    rule,
+                    variant,
+                    detail,
+                    value,
+                });
+            };
+            for (start, guid) in guids(&form) {
+                if !guid_allowed(&guid) {
+                    found(RULE_GUID, start, guid, String::new());
+                }
             }
-        }
-        for address in email_addresses(line) {
-            if !email_allowed(&address) {
-                found("email address outside *.example", address);
+            for (start, address) in email_addresses(&form) {
+                if !email_allowed(&address) {
+                    found(RULE_EMAIL, start, address, String::new());
+                }
             }
-        }
-        for url in urls(line) {
-            if !url_allowed(&url) {
-                found("URL host and path are not an allowed pair", url);
+            for (start, url) in urls(&form) {
+                if let UrlMatch::Url(url) = url {
+                    if !url_allowed(&url) {
+                        found(RULE_URL, start, url, String::new());
+                    }
+                }
             }
-        }
-        for path in home_paths(line) {
-            found("absolute path into a home directory", path);
-        }
-        let lower = line.to_lowercase();
-        for (number, term) in denylist.iter().enumerate() {
-            if lower.contains(term.as_str()) {
-                // The term itself is private, so only its position is shown.
-                found(
-                    "term from PURVIEW_LINT_DENYLIST",
-                    format!("term {}", number + 1),
-                );
+            for (start, path) in home_paths(&form) {
+                found(RULE_HOME, start, path, String::new());
+            }
+            let lower = form.to_lowercase();
+            for deny in denylist {
+                if let Some(start) = lower.find(&deny.term) {
+                    // `lower` can differ in length from `form`; the column is
+                    // approximate for non-ASCII text.
+                    let start = form.char_indices().nth(lower[..start].chars().count());
+                    found(
+                        RULE_DENY,
+                        start.map_or(0, |(byte, _)| byte),
+                        deny.term.clone(),
+                        format!(" (deny-list line {})", deny.line),
+                    );
+                }
             }
         }
     }
@@ -226,14 +386,15 @@ fn scan_text(file: &str, text: &str, denylist: &[String]) -> Vec<Finding> {
 
 // GUIDs.
 
-fn guids(line: &str) -> Vec<String> {
+/// GUID-shaped runs. Any character except a hex digit delimits one, so a
+/// GUID inside `Reports-<guid>-x.zip` is found.
+fn guids(line: &str) -> Vec<(usize, String)> {
     const SHAPE: [usize; 5] = [8, 4, 4, 4, 12];
     let bytes = line.as_bytes();
     let mut found = Vec::new();
     let mut start = 0;
     while start + 36 <= bytes.len() {
-        let boundary_before =
-            start == 0 || !(bytes[start - 1].is_ascii_hexdigit() || bytes[start - 1] == b'-');
+        let boundary_before = start == 0 || !bytes[start - 1].is_ascii_hexdigit();
         let boundary_after = bytes
             .get(start + 36)
             .is_none_or(|byte| !byte.is_ascii_hexdigit());
@@ -250,7 +411,7 @@ fn guids(line: &str) -> Vec<String> {
             position += length;
         }
         if shaped && boundary_before && boundary_after {
-            found.push(line[start..start + 36].to_owned());
+            found.push((start, line[start..start + 36].to_owned()));
             start += 36;
         } else {
             start += 1;
@@ -269,36 +430,52 @@ fn guid_allowed(guid: &str) -> bool {
 
 // Email addresses.
 
-fn is_local_part_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'%' | b'+' | b'-')
+fn is_local_part_char(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '.' | '_' | '%' | '+' | '-')
 }
 
-fn is_domain_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-')
+fn is_domain_char(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '.' | '-')
 }
 
-fn email_addresses(line: &str) -> Vec<String> {
-    let bytes = line.as_bytes();
+/// Address-shaped runs around `@` or the full-width `＠`. Non-ASCII local
+/// parts and domains count, so internationalised addresses are checked.
+fn email_addresses(line: &str) -> Vec<(usize, String)> {
+    let characters: Vec<(usize, char)> = line.char_indices().collect();
     let mut found = Vec::new();
-    for (at, _) in line.match_indices('@') {
-        let mut start = at;
-        while start > 0 && is_local_part_byte(bytes[start - 1]) {
-            start -= 1;
+    for (position, &(_, character)) in characters.iter().enumerate() {
+        if character != '@' && character != '\u{FF20}' {
+            continue;
         }
-        let mut end = at + 1;
-        while end < bytes.len() && is_domain_byte(bytes[end]) {
-            end += 1;
+        let mut first = position;
+        while first > 0 && is_local_part_char(characters[first - 1].1) {
+            first -= 1;
         }
-        let local = line[start..at].trim_start_matches('.');
-        let domain = line[at + 1..end].trim_end_matches(['.', '-']);
+        let mut last = position + 1;
+        while last < characters.len() && is_domain_char(characters[last].1) {
+            last += 1;
+        }
+        while first < position && characters[first].1 == '.' {
+            first += 1;
+        }
+        let local: String = characters[first..position]
+            .iter()
+            .map(|(_, character)| *character)
+            .collect();
+        let domain: String = characters[position + 1..last]
+            .iter()
+            .map(|(_, character)| *character)
+            .collect::<String>()
+            .trim_end_matches(['.', '-'])
+            .to_owned();
         if local.is_empty() || !domain.contains('.') {
             continue;
         }
         let top_level = domain.rsplit('.').next().unwrap_or_default();
-        if top_level.len() < 2 || !top_level.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+        if top_level.chars().count() < 2 || !top_level.chars().any(char::is_alphabetic) {
             continue;
         }
-        found.push(format!("{local}@{domain}"));
+        found.push((characters[first].0, format!("{local}@{domain}")));
     }
     found
 }
@@ -306,72 +483,114 @@ fn email_addresses(line: &str) -> Vec<String> {
 fn email_allowed(address: &str) -> bool {
     let domain = address
         .rsplit_once('@')
-        .map(|(_, domain)| domain.to_ascii_lowercase())
+        .map(|(_, domain)| domain.to_lowercase())
         .unwrap_or_default();
-    domain == "example" || domain.ends_with(".example") || THREAD_DOMAINS.contains(&domain.as_str())
+    domain == "example"
+        || (domain.ends_with(".example") && domain.is_ascii())
+        || THREAD_DOMAINS.contains(&domain.as_str())
 }
 
 // URLs.
 
-fn urls(line: &str) -> Vec<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UrlMatch {
+    /// A documented placeholder such as `https://<host>/` or
+    /// `https://${HOST}/`.
+    Placeholder,
+    Url(String),
+}
+
+fn is_url_stop(character: char) -> bool {
+    character.is_whitespace()
+        || matches!(
+            character,
+            '"' | '\'' | '<' | '>' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
+        )
+}
+
+/// Every URL in the line, nested ones in a query or fragment included,
+/// since the search resumes right after each scheme.
+fn urls(line: &str) -> Vec<(usize, UrlMatch)> {
     let lower = line.to_ascii_lowercase();
     let mut found = Vec::new();
     let mut search = 0;
-    while let Some(offset) = lower[search..].find("http") {
-        let start = search + offset;
-        let rest = &lower[start..];
-        let scheme_length = if rest.starts_with("https://") {
-            8
-        } else if rest.starts_with("http://") {
-            7
-        } else {
-            search = start + 4;
-            continue;
-        };
-        let end = line[start + scheme_length..]
-            .find(|character: char| {
-                character.is_whitespace()
-                    || matches!(
-                        character,
-                        '"' | '\''
-                            | '<'
-                            | '>'
-                            | '`'
-                            | '('
-                            | ')'
-                            | '['
-                            | ']'
-                            | '{'
-                            | '}'
-                            | '\\'
-                            | '|'
-                    )
+    while search < lower.len() {
+        let next = SCHEMES
+            .iter()
+            .filter_map(|scheme| {
+                lower[search..]
+                    .find(scheme)
+                    .map(|offset| (search + offset, scheme.len()))
             })
-            .map_or(line.len(), |offset| start + scheme_length + offset);
-        let url = line[start..end].trim_end_matches(['.', ',', ';', ':', '!', '?', '*']);
-        found.push(url.to_owned());
-        search = end.max(start + scheme_length);
+            .min();
+        let Some((start, scheme_length)) = next else {
+            break;
+        };
+        let after = &line[start + scheme_length..];
+        if after.is_empty()
+            || after.starts_with(['<', '{'])
+            || after.starts_with("${")
+            || after.starts_with(is_url_stop)
+        {
+            found.push((start, UrlMatch::Placeholder));
+        } else {
+            let end = after
+                .find(is_url_stop)
+                .map_or(line.len(), |offset| start + scheme_length + offset);
+            let url = line[start..end].trim_end_matches(['.', ',', ';', ':', '!', '?', '*']);
+            found.push((start, UrlMatch::Url(url.to_owned())));
+        }
+        search = start + scheme_length;
     }
     found
 }
 
-/// Splits a URL into its lower-cased host and its path.
-fn host_and_path(url: &str) -> (String, String) {
+/// A URL's lower-cased host and its normalised path segments, or `None`
+/// when either cannot be read safely: a host with characters outside
+/// `[a-z0-9.-]` (including `%`, `$` and non-ASCII), a non-numeric port, a
+/// path that does not percent-decode to UTF-8, or a `..` above the root.
+fn host_and_segments(url: &str) -> Option<(String, Vec<String>)> {
     let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
     let authority_end = after_scheme
-        .find(['/', '?', '#'])
+        .find(['/', '?', '#', '\\'])
         .unwrap_or(after_scheme.len());
     let authority = &after_scheme[..authority_end];
     let host_port = authority
         .rsplit_once('@')
         .map_or(authority, |(_, host)| host);
-    let host = host_port.split(':').next().unwrap_or_default();
+    let (host, port) = match host_port.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (host_port, None),
+    };
+    if port.is_some_and(|port| !port.is_empty() && !port.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return None;
+    }
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty()
+        || !host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-')
+    {
+        return None;
+    }
     let rest = &after_scheme[authority_end..];
-    let path = rest.split(['?', '#']).next().unwrap_or_default();
-    (
-        host.trim_end_matches('.').to_ascii_lowercase(),
-        path.to_owned(),
-    )
+    let raw_path = rest.split(['?', '#']).next().unwrap_or_default();
+    let decoded = String::from_utf8(percent_decode(raw_path)).ok()?;
+    if decoded.contains('%') {
+        return None; // encoded twice
+    }
+    let mut segments: Vec<String> = Vec::new();
+    for segment in decoded.split(['/', '\\']) {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop()?;
+            }
+            other => segments.push(other.to_owned()),
+        }
+    }
+    Some((host, segments))
 }
 
 fn is_proxy_host(host: &str) -> bool {
@@ -385,61 +604,107 @@ fn is_proxy_host(host: &str) -> bool {
 }
 
 /// A delegated permission written as a Graph resource URI, such as
-/// `/eDiscovery.ReadWrite.All`, or `/.default`.
-fn is_scope_path(path: &str) -> bool {
-    let Some(scope) = path.strip_prefix('/') else {
-        return false;
-    };
+/// `eDiscovery.ReadWrite.All`, or `.default`.
+fn is_scope_segment(scope: &str) -> bool {
     scope == ".default"
         || (scope.contains('.')
-            && !scope.starts_with('.')
-            && !scope.ends_with('.')
             && scope.split('.').all(|part| {
                 !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_alphabetic())
             }))
 }
 
 fn url_allowed(url: &str) -> bool {
-    let (host, path) = host_and_path(url);
-    if host.is_empty() || host.contains(['$', '%']) {
-        return true; // a template, such as https://<host>/ or ${HOST}
-    }
+    let Some((host, segments)) = host_and_segments(url) else {
+        return false;
+    };
+    let first = |name: &str| {
+        segments
+            .first()
+            .is_some_and(|segment| segment.eq_ignore_ascii_case(name))
+    };
     if host == "localhost" || host == "127.0.0.1" || host == "example" || host.ends_with(".example")
     {
         return true;
     }
     match host.as_str() {
         "graph.microsoft.com" => {
-            path.is_empty()
-                || path == "/"
-                || path == "/v1.0"
-                || path.starts_with("/v1.0/")
-                || is_scope_path(&path)
+            segments.is_empty()
+                || segments[0] == "v1.0"
+                || (segments.len() == 1 && is_scope_segment(&segments[0]))
         }
         "login.microsoftonline.com" | "learn.microsoft.com" | "aka.ms" => true,
-        "github.com" => path == "/aberoham" || path.starts_with("/aberoham/"),
-        "img.shields.io" => path.starts_with("/github/") && path.contains("/aberoham/"),
-        _ if is_proxy_host(&host) => path.starts_with("/ediscovery/api/proxy/"),
+        "github.com" => first("aberoham"),
+        "img.shields.io" => {
+            first("github")
+                && segments
+                    .iter()
+                    .any(|segment| segment.eq_ignore_ascii_case("aberoham"))
+        }
+        _ if is_proxy_host(&host) => {
+            segments.len() > 3
+                && segments[0] == "ediscovery"
+                && segments[1] == "api"
+                && segments[2] == "proxy"
+        }
         _ => false,
     }
 }
 
 // Home directories.
 
-fn home_paths(line: &str) -> Vec<String> {
+fn is_name_char(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '.' | '_' | '-')
+}
+
+fn name_after(text: &str) -> Option<String> {
+    let name: String = text.chars().take_while(|c| is_name_char(*c)).collect();
+    (!name.is_empty()).then_some(name)
+}
+
+/// Absolute paths into a home directory: `/Users/<name>` and
+/// `/home/<name>`, and `X:\Users\<name>` in any case, with any drive
+/// letter, with `/`, `\` or an escaped `\\` as separator. A placeholder such
+/// as `/Users/<you>` passes.
+fn home_paths(line: &str) -> Vec<(usize, String)> {
     let mut found = Vec::new();
-    for prefix in ["/Users/", "/home/", "C:\\Users\\", "c:\\users\\"] {
+    for prefix in ["/Users/", "/home/"] {
         for (start, _) in line.match_indices(prefix) {
-            let after = &line[start + prefix.len()..];
-            let name: String = after
-                .chars()
-                .take_while(|character| {
-                    character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
-                })
-                .collect();
-            if !name.is_empty() {
-                found.push(format!("{prefix}{name}"));
+            if let Some(name) = name_after(&line[start + prefix.len()..]) {
+                found.push((start, format!("{prefix}{name}")));
             }
+        }
+    }
+    let bytes = line.as_bytes();
+    for (start, _) in line.match_indices(':') {
+        if start == 0 || !bytes[start - 1].is_ascii_alphabetic() {
+            continue;
+        }
+        if start >= 2 && bytes[start - 2].is_ascii_alphanumeric() {
+            continue; // part of a longer word, such as `https:`
+        }
+        let mut rest = &line[start + 1..];
+        let separator = |text: &str| -> Option<usize> {
+            if text.starts_with("\\\\") {
+                Some(2)
+            } else if text.starts_with(['\\', '/']) {
+                Some(1)
+            } else {
+                None
+            }
+        };
+        let Some(skip) = separator(rest) else {
+            continue;
+        };
+        rest = &rest[skip..];
+        if rest.len() < 5 || !rest[..5].eq_ignore_ascii_case("users") {
+            continue;
+        }
+        rest = &rest[5..];
+        let Some(skip) = separator(rest) else {
+            continue;
+        };
+        if let Some(name) = name_after(&rest[skip..]) {
+            found.push((start - 1, format!("users path {name}")));
         }
     }
     found
@@ -452,6 +717,10 @@ fn join(parts: &[&str]) -> String {
     parts.concat()
 }
 
+fn values(findings: &[Finding]) -> Vec<&str> {
+    findings.iter().map(|f| f.value.as_str()).collect()
+}
+
 #[test]
 fn synthetic_and_constant_guids_pass_and_others_fail() {
     assert!(guid_allowed("00000000-0000-4000-8000-000000000001"));
@@ -461,41 +730,68 @@ fn synthetic_and_constant_guids_pass_and_others_fail() {
     assert!(!guid_allowed(&real_looking));
     let near_synthetic = join(&["00000000-0000-4000-8000-", "000000000123"]);
     assert!(!guid_allowed(&near_synthetic));
-    let findings = scan_text("x", &format!("id: {real_looking}."), &[]);
-    assert_eq!(findings.len(), 1);
-    assert_eq!(findings[0].text, real_looking);
 }
 
 #[test]
-fn guid_detection_needs_the_whole_shape_and_boundaries() {
-    assert_eq!(
-        guids("00000000-0000-4000-8000-000000000001"),
-        ["00000000-0000-4000-8000-000000000001"]
-    );
+fn guid_detection_needs_the_whole_shape_and_a_non_hex_boundary() {
+    let guid = "00000000-0000-4000-8000-000000000001";
+    assert_eq!(guids(guid), [(0, guid.to_owned())]);
     assert!(guids("00000000-0000-4000-8000-00000000000").is_empty());
     assert!(guids("a00000000-0000-4000-8000-000000000001").is_empty());
     assert!(guids("00000000-0000-4000-8000-000000000001f").is_empty());
     assert!(guids("0000000-0000-4000-8000-000000000001").is_empty());
+    let real = join(&["3f2a9c1e", "-7b4d-4e0a-9c8f-", "1a2b3c4d5e6f"]);
+    for text in [
+        join(&["case-", &real]),
+        join(&["Reports-", &real, "-x.zip"]),
+        join(&["{", &real, "}"]),
+        join(&["id_", &real]),
+    ] {
+        assert_eq!(
+            values(&scan_text("f", &text, &[])),
+            [real.as_str()],
+            "{text}"
+        );
+    }
 }
 
 #[test]
-fn only_example_addresses_pass() {
-    assert!(email_addresses("alex@contoso.example")
-        .iter()
-        .all(|a| email_allowed(a)));
-    assert!(email_addresses("<sam@fabrikam.example>")
-        .iter()
-        .all(|a| email_allowed(a)));
+fn addresses_are_extracted_exactly_and_only_example_passes() {
+    assert_eq!(
+        email_addresses("to alex@contoso.example."),
+        [(3, "alex@contoso.example".to_owned())]
+    );
     let outside = join(&["alex", "@", "contoso.com"]);
     assert_eq!(
         email_addresses(&format!("mail {outside}, please")),
-        [outside.as_str()]
+        [(5, outside.clone())]
     );
     assert!(!email_allowed(&outside));
+    assert!(email_allowed("sam@fabrikam.example"));
+    assert!(email_allowed("SAM@FABRIKAM.EXAMPLE"));
     let lookalike = join(&["alex", "@", "contoso.example.net"]);
     assert!(!email_allowed(&lookalike));
     let thread = join(&["19:abc", "@", "thread.v2"]);
-    assert!(email_addresses(&thread).iter().all(|a| email_allowed(a)));
+    assert_eq!(
+        email_addresses(&thread),
+        [(3, join(&["abc", "@", "thread.v2"]))]
+    );
+    assert!(email_allowed(&join(&["abc", "@", "thread.v2"])));
+}
+
+#[test]
+fn internationalised_and_encoded_addresses_are_checked() {
+    let idn = join(&["josé", "@", "bücher.de"]);
+    assert_eq!(values(&scan_text("f", &idn, &[])), [idn.as_str()]);
+    let wide = join(&["alex", "\u{FF20}", "contoso.com"]);
+    assert_eq!(scan_text("f", &wide, &[]).len(), 1);
+    let encoded = join(&["mailto:alex", "%40", "contoso.com"]);
+    let findings = scan_text("f", &encoded, &[]);
+    assert_eq!(
+        values(&findings),
+        [join(&["alex", "@", "contoso.com"]).as_str()]
+    );
+    assert_eq!(findings[0].column, 0);
 }
 
 #[test]
@@ -524,6 +820,7 @@ fn urls_pass_only_on_allowed_host_and_path_pairs() {
         "learn.microsoft.com/graph/api/resources/ediscovery-ediscoverycase",
         "aka.ms/anything",
         "github.com/aberoham/ms-purview-cli",
+        "github.com/Aberoham/ms-purview-cli",
         "img.shields.io/github/actions/workflow/status/aberoham/ms-purview-cli/ci.yml",
         "contoso.example/path",
         "localhost:8400/callback",
@@ -534,7 +831,13 @@ fn urls_pass_only_on_allowed_host_and_path_pairs() {
     for refused in [
         "graph.microsoft.com/beta/security/cases",
         "graph.microsoft.com/v1.0.evil",
+        "graph.microsoft.com/v1.0/../beta/security",
+        "graph.microsoft.com/v1.0/%2e%2e/beta",
+        "graph.microsoft.com/v1.0%2f..%2fbeta",
+        "graph.microsoft.com/v1.0/%252e%252e/beta",
+        "graph.microsoft.com/..",
         "github.com/someone-else/repo",
+        "github.com/aberoham/../someone-else",
         "img.shields.io/badge/x",
         "eur.proxyservice.ediscovery.svc.cloud.microsoft/other",
         "proxyservice.ediscovery.svc.cloud.microsoft/ediscovery/api/proxy/x",
@@ -542,6 +845,10 @@ fn urls_pass_only_on_allowed_host_and_path_pairs() {
         "contoso.com/",
         "example.com/",
         "graph.microsoft.com.evil.test/v1.0/",
+        "intranet$corp.test/",
+        "intranet%2ecorp.test/",
+        "bücher.de/",
+        "graph.microsoft.com:x443/v1.0/",
     ] {
         assert!(!url_allowed(&url(refused)), "{refused}");
     }
@@ -550,7 +857,7 @@ fn urls_pass_only_on_allowed_host_and_path_pairs() {
 }
 
 #[test]
-fn urls_are_cut_at_markdown_and_quote_boundaries() {
+fn urls_are_cut_at_markdown_and_quote_boundaries_and_nested_ones_are_found() {
     let text = join(&[
         "[docs](",
         "https",
@@ -558,41 +865,150 @@ fn urls_are_cut_at_markdown_and_quote_boundaries() {
         "http",
         "://localhost/callback\"",
     ]);
+    let found: Vec<UrlMatch> = urls(&text).into_iter().map(|(_, url)| url).collect();
     assert_eq!(
-        urls(&text),
+        found,
         [
-            join(&["https", "://github.com/aberoham/ms-purview-cli"]),
-            join(&["http", "://localhost/callback"]),
+            UrlMatch::Url(join(&["https", "://github.com/aberoham/ms-purview-cli"])),
+            UrlMatch::Url(join(&["http", "://localhost/callback"])),
         ]
     );
-    let bare = join(&["see ", "HTTPS", "://contoso.com"]);
-    let found = urls(&bare);
-    assert_eq!(found.len(), 1);
-    assert!(!url_allowed(&found[0]));
-}
-
-#[test]
-fn placeholders_are_not_urls_to_check() {
-    let url = |rest: &str| join(&["https", "://", rest]);
-    assert!(url_allowed(&url("")));
-    assert!(url_allowed(&url("${HOST}/x")));
-}
-
-#[test]
-fn home_directory_paths_are_refused_but_placeholders_pass() {
-    let path = join(&["/", "Users", "/", "someone", "/notes.md"]);
-    assert_eq!(home_paths(&path), [join(&["/", "Users", "/", "someone"])]);
-    assert!(home_paths("/Users/<you>/Library").is_empty());
-    let linux = join(&["/", "home", "/", "dev/proto.py"]);
-    assert_eq!(home_paths(&linux).len(), 1);
-}
-
-#[test]
-fn denylist_terms_match_case_insensitively_and_are_not_echoed() {
-    let term = join(&["private", "-name"]);
-    let findings = scan_text("x", "a PRIVATE-NAME b", &[term]);
+    let nested = join(&[
+        "https",
+        "://login.microsoftonline.com/x?redirect=",
+        "https",
+        "://intranet.corp.test/y",
+    ]);
+    let findings = scan_text("f", &nested, &[]);
     assert_eq!(findings.len(), 1);
-    assert_eq!(findings[0].text, "term 1");
+    assert_eq!(findings[0].rule, RULE_URL);
+    let escaped = join(&["\"", "https", ":\\/\\/intranet.corp.test\\/y\""]);
+    assert_eq!(scan_text("f", &escaped, &[]).len(), 1);
+    let encoded = join(&[
+        "https",
+        "://aka.ms/x?u=",
+        "https",
+        "%3A%2F%2Fintranet.corp.test%2Fy",
+    ]);
+    assert_eq!(scan_text("f", &encoded, &[]).len(), 1);
+}
+
+#[test]
+fn only_documented_placeholders_skip_the_url_check() {
+    for rest in ["<host>/x", "{host}/x", "${HOST}/x", ""] {
+        let line = join(&["https", "://", rest]);
+        assert_eq!(urls(&line), [(0, UrlMatch::Placeholder)], "{rest}");
+    }
+    for rest in ["$HOST/x", "%HOST%/x"] {
+        let line = join(&["https", "://", rest]);
+        assert_eq!(scan_text("f", &line, &[]).len(), 1, "{rest}");
+    }
+}
+
+#[test]
+fn home_directory_paths_are_refused_in_every_form() {
+    let refused = [
+        join(&["/", "Users", "/", "someone", "/notes.md"]),
+        join(&["/", "home", "/", "dev/proto.py"]),
+        join(&["C", ":\\", "Users", "\\", "someone"]),
+        join(&["\"C", ":\\\\", "Users", "\\\\", "someone\""]),
+        join(&["c", ":/", "users", "/", "someone"]),
+        join(&["D", ":\\", "USERS", "\\", "someone"]),
+        join(&["/", "Users", "/", "zoë/x"]),
+    ];
+    for text in &refused {
+        assert_eq!(home_paths(text).len(), 1, "{text}");
+        assert_eq!(scan_text("f", text, &[]).len(), 1, "{text}");
+    }
+    for text in [
+        "/Users/<you>/Library",
+        "/home/$USER/x",
+        "C:\\Users\\<you>",
+        "https://example/x",
+        "%USERPROFILE%\\x",
+    ] {
+        assert!(home_paths(text).is_empty(), "{text}");
+    }
+}
+
+#[test]
+fn deny_list_terms_keep_their_file_line_numbers() {
+    let parsed = parse_denylist(&join(&[
+        "# private terms\n\n",
+        "First-Term\n",
+        "  \n",
+        "second\n",
+    ]));
+    assert_eq!(
+        parsed,
+        [
+            DenyTerm {
+                line: 3,
+                term: "first-term".into()
+            },
+            DenyTerm {
+                line: 5,
+                term: "second".into()
+            },
+        ]
+    );
+}
+
+/// A complete file with several rules firing on one line: the rendered
+/// report names locations and rules and never a matched value, a deny-list
+/// term, or a path that contains one.
+#[test]
+fn the_report_never_shows_matched_values_or_deny_list_terms() {
+    let term = join(&["private", "-name"]);
+    let address = join(&["alex", "@", "private-name.test"]);
+    let guid = join(&["3f2a9c1e", "-7b4d-4e0a-9c8f-", "1a2b3c4d5e6f"]);
+    let url = join(&["https", "://private-name.test/notes"]);
+    let home = join(&["/", "Users", "/", "private-name"]);
+    let file = join(&[
+        "line one is clean\n",
+        "see ",
+        &address,
+        " and ",
+        &guid,
+        " at ",
+        &url,
+        " in ",
+        &home,
+        "\n",
+    ]);
+    let denylist = parse_denylist(&join(&["# comment\n", &term, "\n"]));
+    let path = join(&["docs/", &term, ".md"]);
+    let mut findings = scan_text(&path, &file, &denylist);
+    let rules: BTreeSet<&str> = findings.iter().map(|f| f.rule).collect();
+    assert_eq!(
+        rules,
+        BTreeSet::from([RULE_EMAIL, RULE_GUID, RULE_URL, RULE_HOME, RULE_DENY])
+    );
+    assert!(findings.iter().all(|f| f.line == 2));
+    findings.push(file_finding(&path, RULE_DENY_PATH));
+    let report = render(&findings, &denylist);
+    for secret in [&term, &address, &guid, &url, &home, &path] {
+        assert!(
+            !report.to_lowercase().contains(&secret.to_lowercase()),
+            "{report}"
+        );
+    }
+    assert!(report.contains("deny-list line 2"), "{report}");
+    assert!(report.contains("[path withheld"), "{report}");
+    assert!(report.contains(":2:5: email address"), "{report}");
+}
+
+#[test]
+fn unreadable_and_non_utf8_files_fail_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = dir.path().join("binary.json");
+    std::fs::write(&binary, [0xff, 0xfe, 0x00, 0x41]).unwrap();
+    assert_eq!(read_for_scan(&binary), Err(RULE_NOT_UTF8));
+    assert_eq!(read_for_scan(dir.path()), Err(RULE_UNREADABLE));
+    assert_eq!(read_for_scan(&dir.path().join("missing")), Ok(None));
+    let text = dir.path().join("text.md");
+    std::fs::write(&text, "fine").unwrap();
+    assert_eq!(read_for_scan(&text), Ok(Some("fine".into())));
 }
 
 #[test]

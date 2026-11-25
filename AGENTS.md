@@ -38,11 +38,15 @@ search data, in code, fixtures, docs, commit messages or issues.
 The public-data lint, `tests/fixture_lint.rs`, enforces these rules on
 `tests/`, `docs/`, `contrib/`, `src/`, `README.md`, `SKILL.md`, `AGENTS.md`
 and `CHANGELOG.md`. It refuses GUIDs that are neither synthetic nor allowed
-Microsoft constants, email addresses outside `*.example`, URLs outside the
-allowed host and path pairs, absolute paths into a home directory, and
-`docs/reviews/`. A maintainer can add private terms of their own through a
+Microsoft constants, email addresses outside `*.example`, URLs whose
+normalised host and path are not an allowed pair, absolute paths into a
+home directory, files it cannot read as UTF-8 text, and `docs/reviews/`.
+Each line is also checked percent-decoded and with JSON's `\/` undone. A
+maintainer can add private terms or path fragments of their own through a
 file outside the repository named by `PURVIEW_LINT_DENYLIST`, one term per
-line; findings show the term's line number, never the term. The lint runs
+line. The report gives file, line, column and rule but never the matched
+value, because CI logs are public; a deny-list finding gives the term's
+line in that file, and a path containing a term is withheld. The lint runs
 in `.github/workflows/public-data.yml` on every pull request and every push
 to `main`, including changes to Markdown and `docs/` alone.
 

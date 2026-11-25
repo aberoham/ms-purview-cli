@@ -6,6 +6,8 @@
 //! host rule, the credential store and the clock here. The production
 //! `Env` reads no environment variable that could change an endpoint.
 
+use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
@@ -26,7 +28,15 @@ pub struct Env {
     pub stderr_is_terminal: bool,
     /// `PURVIEW_CONFIG_DIR`; `None` means the platform default.
     pub config_dir: Option<PathBuf>,
+    /// The `PURVIEW_*` variables that set flag defaults, as captured by
+    /// `production()`. Commands read flag defaults only from here, never
+    /// from the process environment, so an in-process run does not depend
+    /// on the shell that started the tests.
+    pub vars: BTreeMap<String, OsString>,
 }
+
+/// The environment variables that give global flags their defaults.
+pub const FLAG_VARIABLES: &[&str] = &["PURVIEW_JSON", "PURVIEW_RESULTS_ONLY", "PURVIEW_PLAIN"];
 
 impl fmt::Debug for Env {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -37,6 +47,7 @@ impl fmt::Debug for Env {
             .field("stdout_is_terminal", &self.stdout_is_terminal)
             .field("stderr_is_terminal", &self.stderr_is_terminal)
             .field("config_dir", &self.config_dir)
+            .field("vars", &self.vars)
             .finish_non_exhaustive()
     }
 }
@@ -55,25 +66,41 @@ impl Env {
             config_dir: std::env::var_os("PURVIEW_CONFIG_DIR")
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from),
+            vars: FLAG_VARIABLES
+                .iter()
+                .filter_map(|name| std::env::var_os(name).map(|value| ((*name).to_owned(), value)))
+                .collect(),
         }
     }
 
     /// An `Env` whose stdout and stderr are kept in memory, with no
-    /// terminal attached, for in-process tests.
+    /// terminal attached and no `PURVIEW_*` variables set, for in-process
+    /// tests.
     #[doc(hidden)]
     pub fn in_memory() -> (Self, Captured) {
-        let redactor = Arc::new(Redactor::new());
         let captured = Captured::default();
-        let env = Self {
-            stdout: RedactingWriter::new(Box::new(captured.stdout.clone()), redactor.clone()),
-            stderr: RedactingWriter::new(Box::new(captured.stderr.clone()), redactor.clone()),
+        let env = Self::with_writers(
+            Box::new(captured.stdout.clone()),
+            Box::new(captured.stderr.clone()),
+        );
+        (env, captured)
+    }
+
+    /// An `Env` over the given streams, with no terminal attached and no
+    /// `PURVIEW_*` variables set, for tests of output failures.
+    #[doc(hidden)]
+    pub fn with_writers(stdout: Box<dyn Write + Send>, stderr: Box<dyn Write + Send>) -> Self {
+        let redactor = Arc::new(Redactor::new());
+        Self {
+            stdout: RedactingWriter::new(stdout, redactor.clone()),
+            stderr: RedactingWriter::new(stderr, redactor.clone()),
             redactor,
             stdin_is_terminal: false,
             stdout_is_terminal: false,
             stderr_is_terminal: false,
             config_dir: None,
-        };
-        (env, captured)
+            vars: BTreeMap::new(),
+        }
     }
 }
 

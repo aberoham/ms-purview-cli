@@ -6,12 +6,7 @@ use serde_json::Value;
 
 fn purview() -> Command {
     let mut command = Command::new(assert_cmd::cargo::cargo_bin!("purview"));
-    for name in [
-        "PURVIEW_JSON",
-        "PURVIEW_RESULTS_ONLY",
-        "PURVIEW_PLAIN",
-        "PURVIEW_BUILD_COMMIT",
-    ] {
+    for name in ["PURVIEW_JSON", "PURVIEW_RESULTS_ONLY", "PURVIEW_PLAIN"] {
         command.env_remove(name);
     }
     command
@@ -81,12 +76,22 @@ fn version_results_only_drops_the_envelope() {
     }
 }
 
+/// The commit is recorded only at build time, through
+/// `PURVIEW_BUILD_COMMIT`; without it the text form says `unknown`.
 #[test]
-fn a_recorded_commit_is_not_needed_for_the_text_form() {
-    let output = purview().arg("version").output().unwrap();
-    let text = String::from_utf8(output.stdout).unwrap();
-    let commit = text.split(' ').nth(2).unwrap();
-    assert!(!commit.contains(char::is_whitespace));
+fn the_commit_field_is_the_recorded_commit_or_unknown() {
+    let output = purview()
+        .arg("version")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).unwrap();
+    let expected = option_env!("PURVIEW_BUILD_COMMIT")
+        .filter(|commit| !commit.is_empty())
+        .unwrap_or("unknown");
+    assert_eq!(text.split(' ').nth(2), Some(expected), "{text:?}");
 }
 
 #[test]
@@ -120,11 +125,17 @@ fn argument_errors_without_json_go_to_stderr_only() {
         .assert()
         .code(1)
         .stdout(predicate::str::is_empty())
-        .stderr(predicate::str::contains("--bogus"));
+        .stderr(predicate::str::starts_with(
+            "Error: unexpected argument '--bogus' found\n",
+        ))
+        .stderr(predicate::str::contains("Usage: purview version"));
     purview()
         .assert()
         .code(1)
         .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::starts_with(
+            "Error: a command is required\n",
+        ))
         .stderr(predicate::str::contains("Usage"));
 }
 
@@ -138,18 +149,56 @@ fn a_json_flag_after_a_double_dash_does_not_ask_for_json() {
 }
 
 #[test]
-fn an_invalid_json_variable_is_refused_by_clap_in_human_form() {
+fn an_invalid_json_variable_is_refused_in_human_form() {
     purview()
         .env("PURVIEW_JSON", "yes")
         .arg("version")
         .assert()
         .code(1)
         .stdout(predicate::str::is_empty())
-        .stderr(predicate::str::contains("PURVIEW_JSON").or(predicate::str::contains("yes")));
+        .stderr("Error: PURVIEW_JSON must be true or false\n");
 }
 
 #[test]
-fn help_is_success_and_lists_only_version() {
+fn json_variables_are_read_by_the_binary() {
+    let output = purview()
+        .env("PURVIEW_JSON", "true")
+        .env("PURVIEW_PLAIN", "false")
+        .arg("version")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(value["count"], 1);
+}
+
+/// A pipe whose reading end is already closed makes every write fail with
+/// a broken pipe, as when the reader of `purview ... | head` has exited.
+#[test]
+fn a_failed_stdout_write_exits_1() {
+    for args in [
+        &["version", "--json"][..],
+        &["version"][..],
+        &["--help"][..],
+    ] {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("purview"))
+            .env_remove("PURVIEW_JSON")
+            .args(args)
+            .stdout(writer)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.starts_with("Error: "), "{args:?}: {stderr}");
+    }
+}
+
+#[test]
+fn help_is_success_and_lists_exactly_the_shipped_commands() {
     let output = purview()
         .arg("--help")
         .assert()
@@ -159,15 +208,12 @@ fn help_is_success_and_lists_only_version() {
         .stdout
         .clone();
     let text = String::from_utf8(output).unwrap();
-    assert!(text.contains("version"), "{text}");
-    for later in [
-        "auth", "case", "search", "estimate", "report", "export", "parse",
-    ] {
-        assert!(
-            !text
-                .lines()
-                .any(|line| line.trim_start().starts_with(&format!("{later} "))),
-            "{later} is listed before it exists: {text}"
-        );
-    }
+    let commands: Vec<&str> = text
+        .lines()
+        .skip_while(|line| *line != "Commands:")
+        .skip(1)
+        .take_while(|line| !line.trim().is_empty())
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
+    assert_eq!(commands, ["version", "help"], "{text}");
 }

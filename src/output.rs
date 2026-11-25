@@ -50,8 +50,16 @@ pub fn error_value(error: &PurviewError) -> Value {
     })
 }
 
+/// Writes `value` as pretty JSON and a newline. A failure of the writer is
+/// `PurviewError::Io`, so callers can tell it from a serialisation error.
 pub fn write_pretty_json(mut writer: impl Write, value: &Value) -> Result<()> {
-    serde_json::to_writer_pretty(&mut writer, value)?;
+    serde_json::to_writer_pretty(&mut writer, value).map_err(|error| {
+        if error.is_io() {
+            PurviewError::Io(error.into())
+        } else {
+            PurviewError::Json(error)
+        }
+    })?;
     writeln!(writer)?;
     Ok(())
 }

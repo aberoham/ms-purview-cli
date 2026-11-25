@@ -1215,6 +1215,14 @@ contract.
 `{email, upn, oid, display_name, tenant_id, client_id, login_time}`. Symlinks are refused, modes are 0600
 and 0700, and writes are atomic, as in `entra`.
 
+- On Windows there are no modes. The configuration lives under the user's profile and relies on
+  that directory's default access control list (ACL); the tool sets no ACL of its own. Any
+  reparse point (a symlink or a junction) is refused as the configuration directory, the
+  accounts directory or `config.json`.
+- Keys the running release does not read are kept when the file is saved.
+- `config.json` never holds a secret. Saving refuses any value the Redactor recognises
+  (section 6.8).
+
 ### 5.4 Data directory
 
 Downloads go to `dirs::data_local_dir()/purview/cases/<case-id>/<operation-id>/` (mode 0700),

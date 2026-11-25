@@ -60,8 +60,11 @@ that the test files pass their own scan.
   `execute_with(Env, args) -> Outcome` runs a whole command in-process; it
   is `#[doc(hidden)]` and exists for tests.
 - `src/env.rs` defines `Env`: stdout and stderr (each through the
-  Redactor), terminal detection and the configuration directory override
-  (`PURVIEW_CONFIG_DIR`). Later pull requests add the Graph origin, the token
+  Redactor), terminal detection, the configuration directory override
+  (`PURVIEW_CONFIG_DIR`) and the `PURVIEW_*` variables that give flags their
+  defaults. `Env::production()` captures those variables once; Clap never
+  reads the process environment, so an in-process test does not depend on
+  the shell that runs it. `Env::in_memory()` sets none. Later pull requests add the Graph origin, the token
   endpoint, the download host rule, the credential store and the clock.
   `Env::production()` reads no environment variable that could change an
   endpoint, so the release binary has no test path that could send a token
@@ -71,8 +74,11 @@ that the test files pass their own scan.
 - `src/output.rs` implements tables, `--plain` tab-separated values, the
   JSON envelopes and terminal sanitisation.
 - `src/config.rs` reads and writes `config.json` atomically, refuses
-  symlinks, and keeps files at mode 0600 and directories at 0700. It also
-  resolves the data directory for downloads.
+  links (on Windows, any reparse point) at the configuration directory, the
+  accounts directory and the file, keeps files at mode 0600 and directories
+  at 0700 on Unix, keeps keys it does not read, and refuses to save a
+  secret. On Windows it relies on the profile directory's default ACL. It
+  also resolves the data directory for downloads.
 - `src/redact.rs` defines the `Redactor` and `RedactingWriter`.
 - `build.rs` records the target triple for `purview version`. The release
   workflow sets `PURVIEW_BUILD_COMMIT`.
@@ -94,9 +100,13 @@ check whether the other repository needs the same fix.
 - A failure exits 1. Under `--json` it prints
   `{"error": {"code", "status", "message"}}` on stdout and nothing on
   stderr; otherwise `Error: …` goes to stderr and nothing to stdout.
-- Argument errors that Clap raises follow the same rule. Their code is
-  `CommandFailed`. `--json` before a `--`, or `PURVIEW_JSON=true`, asks for
-  the JSON shape. `--help` exits 0 on stdout.
+- Argument errors, including Clap's and an invalid `PURVIEW_*` value, follow
+  the same rule. Their code is `CommandFailed`; the human form is `Error: `
+  and the message, then Clap's usage. `--json` before a `--`, or
+  `PURVIEW_JSON=true`, asks for the JSON shape. `--help` exits 0 on stdout.
+- If stdout cannot be written or flushed, the command exits 1 with
+  `Error: could not write to standard output: …` on stderr, whatever it
+  printed before. No second JSON document follows a partial one.
 - Exit codes 3, 4, 5 and 130, the write-plan shapes and the JSON Lines
   (JSONL) commands arrive with the pull requests that need them. Their
   shapes are fixed in `docs/SPEC.md` section 3.3; implement them as written
@@ -108,6 +118,13 @@ check whether the other repository needs the same fix.
   and later trace files and the download manifest. Never write to
   `std::io::stdout()` or `std::io::stderr()`, or use `println!` and
   `eprintln!`, in command code. Pass `Env`'s writers instead.
+- JSON is redacted as a value (`Redactor::redact_value`) before it is
+  serialised, because escaping can hide a secret from byte-level matching;
+  the writers redact the bytes again. `RedactingWriter::flush` keeps back
+  any tail that could still become a match, and `finish` drains it;
+  `execute_with` calls `finish` on both streams and checks the result.
+- `config.json` never holds a secret: `Config::save` refuses to write a
+  value the Redactor recognises.
 
 ## Transport guarantees
 

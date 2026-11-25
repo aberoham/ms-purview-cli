@@ -1835,7 +1835,7 @@ pub fn parse_msg(bytes: &[u8]) -> Result<MsgItem, MsgError>; // pure, no I/O
 
     | Host | Allowed paths |
     |---|---|
-    | `graph.microsoft.com` | `/v1.0/…` |
+    | `graph.microsoft.com` | `/v1.0/…`; an empty path or `/`; permission-scope paths (`/<Name>.<Name>…`, `/.default`) |
     | `login.microsoftonline.com` | any |
     | `*.proxyservice.ediscovery.svc.cloud.microsoft` | `/ediscovery/api/proxy/…` |
     | `learn.microsoft.com` | any |

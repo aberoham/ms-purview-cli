@@ -62,7 +62,8 @@ const RULE_DENY: &str = "term from PURVIEW_LINT_DENYLIST";
 const RULE_REVIEWS: &str = "review history is private and must stay outside the published tree";
 const RULE_UNREADABLE: &str = "file could not be read; the lint fails closed";
 const RULE_NOT_UTF8: &str = "file is not UTF-8 text; the lint cannot check it";
-const RULE_DENY_PATH: &str = "file path contains a term from PURVIEW_LINT_DENYLIST";
+const RULE_PRIVATE_PATH: &str =
+    "file path holds data the lint refuses (a deny-list term, GUID, address, URL or home path)";
 
 /// One finding. `value` is kept for de-duplication and tests and is never
 /// rendered.
@@ -104,8 +105,8 @@ fn public_files_hold_only_synthetic_data() {
             findings.push(file_finding(file, RULE_REVIEWS));
             continue;
         }
-        if contains_term(file, &denylist).is_some() {
-            findings.push(file_finding(file, RULE_DENY_PATH));
+        if path_is_private(file, &denylist) {
+            findings.push(file_finding(file, RULE_PRIVATE_PATH));
         }
         match read_for_scan(&root.join(file)) {
             Ok(Some(text)) => findings.extend(scan_text(file, &text, &denylist)),
@@ -140,8 +141,15 @@ fn read_for_scan(path: &Path) -> Result<Option<String>, &'static str> {
     }
 }
 
+/// Whether a file path itself holds something the lint refuses: a
+/// deny-list term, or a match for any built-in rule. Such a path is a
+/// finding of its own and is never shown.
+fn path_is_private(file: &str, denylist: &[DenyTerm]) -> bool {
+    !scan_text(file, file, denylist).is_empty()
+}
+
 /// The failure report: file, line, column and rule, never the matched
-/// value, and no path that contains a deny-list term.
+/// value, and no path that holds refused data.
 fn render(findings: &[Finding], denylist: &[DenyTerm]) -> String {
     let mut sorted = findings.to_vec();
     sorted.sort();
@@ -149,8 +157,8 @@ fn render(findings: &[Finding], denylist: &[DenyTerm]) -> String {
     let lines: Vec<String> = sorted
         .iter()
         .map(|finding| {
-            let file = if contains_term(&finding.file, denylist).is_some() {
-                "[path withheld: it contains a deny-list term]".to_owned()
+            let file = if path_is_private(&finding.file, denylist) {
+                "[path withheld: it holds data the lint refuses]".to_owned()
             } else {
                 finding.file.clone()
             };
@@ -259,11 +267,6 @@ fn parse_denylist(contents: &str) -> Vec<DenyTerm> {
             term: term.to_lowercase(),
         })
         .collect()
-}
-
-fn contains_term<'a>(text: &str, denylist: &'a [DenyTerm]) -> Option<&'a DenyTerm> {
-    let lower = text.to_lowercase();
-    denylist.iter().find(|deny| lower.contains(&deny.term))
 }
 
 /// The forms of a line the lint scans: as written, with JSON's `\/`
@@ -530,13 +533,19 @@ fn urls(line: &str) -> Vec<(usize, UrlMatch)> {
         if after.is_empty()
             || after.starts_with(['<', '{'])
             || after.starts_with("${")
-            || after.starts_with(is_url_stop)
+            || (after.starts_with(is_url_stop) && !after.starts_with('['))
         {
             found.push((start, UrlMatch::Placeholder));
         } else {
-            let end = after
+            // A bracketed IPv6 host is a host, not a template: read past it.
+            let skip = if after.starts_with('[') {
+                after.find(']').map_or(after.len(), |close| close + 1)
+            } else {
+                0
+            };
+            let end = after[skip..]
                 .find(is_url_stop)
-                .map_or(line.len(), |offset| start + scheme_length + offset);
+                .map_or(line.len(), |offset| start + scheme_length + skip + offset);
             let url = line[start..end].trim_end_matches(['.', ',', ';', ':', '!', '?', '*']);
             found.push((start, UrlMatch::Url(url.to_owned())));
         }
@@ -613,6 +622,49 @@ fn is_scope_segment(scope: &str) -> bool {
             }))
 }
 
+/// Shields route words that may come between `/github/` and the owner,
+/// such as `actions/workflow/status` or `v/release`.
+const SHIELDS_ROUTE_WORDS: &[&str] = &[
+    "actions",
+    "workflow",
+    "status",
+    "v",
+    "release",
+    "release-date",
+    "tag",
+    "license",
+    "stars",
+    "forks",
+    "watchers",
+    "issues",
+    "issues-pr",
+    "last-commit",
+    "commit-activity",
+    "downloads",
+    "contributors",
+    "languages",
+    "top",
+    "code-size",
+    "repo-size",
+    "check-runs",
+    "checks-status",
+];
+
+/// `/github/<route words>/aberoham/<repository>/…`: the owner sits right
+/// after the route words and is followed by a repository.
+fn is_own_shields_badge(segments: &[String]) -> bool {
+    if segments.first().map(String::as_str) != Some("github") {
+        return false;
+    }
+    let owner = segments[1..]
+        .iter()
+        .position(|segment| !SHIELDS_ROUTE_WORDS.contains(&segment.to_ascii_lowercase().as_str()))
+        .map(|offset| offset + 1);
+    owner.is_some_and(|index| {
+        index >= 2 && segments[index].eq_ignore_ascii_case("aberoham") && index + 1 < segments.len()
+    })
+}
+
 fn url_allowed(url: &str) -> bool {
     let Some((host, segments)) = host_and_segments(url) else {
         return false;
@@ -634,12 +686,7 @@ fn url_allowed(url: &str) -> bool {
         }
         "login.microsoftonline.com" | "learn.microsoft.com" | "aka.ms" => true,
         "github.com" => first("aberoham"),
-        "img.shields.io" => {
-            first("github")
-                && segments
-                    .iter()
-                    .any(|segment| segment.eq_ignore_ascii_case("aberoham"))
-        }
+        "img.shields.io" => is_own_shields_badge(&segments),
         _ if is_proxy_host(&host) => {
             segments.len() > 3
                 && segments[0] == "ediscovery"
@@ -696,10 +743,14 @@ fn home_paths(line: &str) -> Vec<(usize, String)> {
             continue;
         };
         rest = &rest[skip..];
-        if rest.len() < 5 || !rest[..5].eq_ignore_ascii_case("users") {
+        if !rest
+            .as_bytes()
+            .get(..5)
+            .is_some_and(|word| word.eq_ignore_ascii_case(b"users"))
+        {
             continue;
         }
-        rest = &rest[5..];
+        rest = &rest[5..]; // the five bytes are ASCII, so this is a boundary
         let Some(skip) = separator(rest) else {
             continue;
         };
@@ -828,6 +879,12 @@ fn urls_pass_only_on_allowed_host_and_path_pairs() {
     ] {
         assert!(url_allowed(&url(allowed)), "{allowed}");
     }
+    for allowed in [
+        "img.shields.io/github/v/release/aberoham/ms-purview-cli",
+        "img.shields.io/github/license/aberoham/ms-purview-cli",
+    ] {
+        assert!(url_allowed(&url(allowed)), "{allowed}");
+    }
     for refused in [
         "graph.microsoft.com/beta/security/cases",
         "graph.microsoft.com/v1.0.evil",
@@ -839,6 +896,11 @@ fn urls_pass_only_on_allowed_host_and_path_pairs() {
         "github.com/someone-else/repo",
         "github.com/aberoham/../someone-else",
         "img.shields.io/badge/x",
+        "img.shields.io/github/stars/other-owner/aberoham",
+        "img.shields.io/github/aberoham/ms-purview-cli",
+        "img.shields.io/github/license/aberoham",
+        "[::1]/x",
+        "[2001:db8::1]:8443/x",
         "eur.proxyservice.ediscovery.svc.cloud.microsoft/other",
         "proxyservice.ediscovery.svc.cloud.microsoft/ediscovery/api/proxy/x",
         "a.b.proxyservice.ediscovery.svc.cloud.microsoft/ediscovery/api/proxy/x",
@@ -932,6 +994,52 @@ fn home_directory_paths_are_refused_in_every_form() {
 }
 
 #[test]
+fn a_bracketed_host_is_checked_not_skipped() {
+    let line = join(&["see ", "https", "://[2001:db8::1]/x"]);
+    assert_eq!(urls(&line).len(), 1);
+    assert!(matches!(urls(&line)[0].1, UrlMatch::Url(_)));
+    assert_eq!(scan_text("f", &line, &[]).len(), 1);
+}
+
+#[test]
+fn multibyte_text_after_a_drive_letter_does_not_panic() {
+    for text in [
+        join(&["D", ":/abcdé/fixture"]),
+        join(&["D", ":\\é", "users"]),
+        join(&["x", ":/", "usé"]),
+    ] {
+        assert!(home_paths(&text).is_empty(), "{text}");
+        assert!(scan_text("f", &text, &[]).is_empty(), "{text}");
+    }
+    let named = join(&["D", ":/", "Users", "/", "zoë"]);
+    assert!(!home_paths(&named).is_empty());
+}
+
+/// With no deny list, a file whose name holds a value a built-in rule
+/// refuses is reported without showing the name.
+#[test]
+fn a_path_holding_refused_data_is_withheld_with_an_empty_deny_list() {
+    let guid = join(&["3f2a9c1e", "-7b4d-4e0a-9c8f-", "1a2b3c4d5e6f"]);
+    let address = join(&["alex", "@", "contoso.com"]);
+    for name in [
+        join(&["tests/fixtures/", &guid, ".json"]),
+        join(&["docs/", &address, ".md"]),
+    ] {
+        assert!(path_is_private(&name, &[]));
+        let mut findings = scan_text(&name, &join(&["id ", &guid, "\n"]), &[]);
+        findings.push(file_finding(&name, RULE_PRIVATE_PATH));
+        let report = render(&findings, &[]);
+        assert!(!report.contains(&guid), "{report}");
+        assert!(!report.contains(&address), "{report}");
+        assert!(report.contains("[path withheld"), "{report}");
+    }
+    assert!(!path_is_private(
+        "tests/fixtures/graph/cases-list.json",
+        &[]
+    ));
+}
+
+#[test]
 fn deny_list_terms_keep_their_file_line_numbers() {
     let parsed = parse_denylist(&join(&[
         "# private terms\n\n",
@@ -985,7 +1093,7 @@ fn the_report_never_shows_matched_values_or_deny_list_terms() {
         BTreeSet::from([RULE_EMAIL, RULE_GUID, RULE_URL, RULE_HOME, RULE_DENY])
     );
     assert!(findings.iter().all(|f| f.line == 2));
-    findings.push(file_finding(&path, RULE_DENY_PATH));
+    findings.push(file_finding(&path, RULE_PRIVATE_PATH));
     let report = render(&findings, &denylist);
     for secret in [&term, &address, &guid, &url, &home, &path] {
         assert!(

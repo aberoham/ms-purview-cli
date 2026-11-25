@@ -67,7 +67,13 @@ impl Redactor {
 
     /// Whether `text` holds a registered secret or a JWT-shaped run.
     pub fn recognises(&self, text: &str) -> bool {
-        !self.spans(text.as_bytes()).is_empty()
+        self.recognises_bytes(text.as_bytes())
+    }
+
+    /// Whether `bytes` hold a registered secret or a JWT-shaped run
+    /// anywhere, JSON syntax and numbers included.
+    pub fn recognises_bytes(&self, bytes: &[u8]) -> bool {
+        !self.spans(bytes).is_empty()
     }
 
     /// Redacts every string in a JSON value, object keys included, before
@@ -88,8 +94,9 @@ impl Redactor {
         }
     }
 
-    /// Whether any string in a JSON value, object keys included, holds a
-    /// registered secret or a JWT-shaped run.
+    /// Whether any part of a JSON value holds a registered secret or a
+    /// JWT-shaped run: strings, object keys, and the text of numbers,
+    /// booleans and nulls.
     pub fn recognises_value(&self, value: &Value) -> bool {
         match value {
             Value::String(text) => self.recognises(text),
@@ -97,7 +104,9 @@ impl Redactor {
             Value::Object(map) => map
                 .iter()
                 .any(|(key, item)| self.recognises(key) || self.recognises_value(item)),
-            _ => false,
+            Value::Number(number) => self.recognises(&number.to_string()),
+            Value::Bool(flag) => self.recognises(if *flag { "true" } else { "false" }),
+            Value::Null => self.recognises("null"),
         }
     }
 
@@ -280,6 +289,7 @@ pub struct RedactingWriter {
     inner: Box<dyn Write + Send>,
     redactor: Arc<Redactor>,
     pending: Vec<u8>,
+    failed: bool,
 }
 
 impl fmt::Debug for RedactingWriter {
@@ -297,6 +307,7 @@ impl RedactingWriter {
             inner,
             redactor,
             pending: Vec::new(),
+            failed: false,
         }
     }
 
@@ -304,7 +315,8 @@ impl RedactingWriter {
         if let Some(last_newline) = self.pending.iter().rposition(|byte| *byte == b'\n') {
             let rest = self.pending.split_off(last_newline + 1);
             let lines = std::mem::replace(&mut self.pending, rest);
-            self.inner.write_all(&self.redactor.redact_bytes(&lines))?;
+            let redacted = self.redactor.redact_bytes(&lines);
+            self.pass_on(&redacted)?;
         }
         Ok(())
     }
@@ -322,20 +334,39 @@ impl Write for RedactingWriter {
         if hold > 0 {
             let tail = self.pending.split_off(hold);
             let ready = std::mem::replace(&mut self.pending, tail);
-            self.inner.write_all(&self.redactor.redact_bytes(&ready))?;
+            let redacted = self.redactor.redact_bytes(&ready);
+            self.pass_on(&redacted)?;
         }
-        self.inner.flush()
+        self.flush_inner()
     }
 }
 
 impl RedactingWriter {
+    /// Whether the underlying stream has refused a write or a flush.
+    pub fn has_failed(&self) -> bool {
+        self.failed
+    }
+
+    fn pass_on(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let result = self.inner.write_all(bytes);
+        self.failed |= result.is_err();
+        result
+    }
+
+    fn flush_inner(&mut self) -> io::Result<()> {
+        let result = self.inner.flush();
+        self.failed |= result.is_err();
+        result
+    }
+
     /// Ends the stream: redacts and writes every held byte, then flushes.
     pub fn finish(&mut self) -> io::Result<()> {
         if !self.pending.is_empty() {
             let rest = std::mem::take(&mut self.pending);
-            self.inner.write_all(&self.redactor.redact_bytes(&rest))?;
+            let redacted = self.redactor.redact_bytes(&rest);
+            self.pass_on(&redacted)?;
         }
-        self.inner.flush()
+        self.flush_inner()
     }
 }
 
@@ -603,6 +634,11 @@ mod tests {
         assert!(!redactor.recognises_value(&safe));
         assert!(redactor.recognises_value(&value));
         assert!(redactor.recognises(&jwt()));
+        let numeric = Redactor::new();
+        numeric.register("4815162");
+        assert!(numeric.recognises_bytes(br#"{"n":4815162}"#));
+        assert!(numeric.recognises_value(&serde_json::json!({"n": 4815162})));
+        assert!(!numeric.recognises_value(&serde_json::json!({"n": 4815163})));
         assert!(!redactor.recognises("plain"));
     }
 

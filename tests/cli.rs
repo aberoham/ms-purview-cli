@@ -156,7 +156,27 @@ fn an_invalid_json_variable_is_refused_in_human_form() {
         .assert()
         .code(1)
         .stdout(predicate::str::is_empty())
-        .stderr("Error: PURVIEW_JSON must be true or false\n");
+        .stderr(predicate::str::starts_with(
+            "Error: PURVIEW_JSON must be true or false\n\nUsage: purview [OPTIONS] <COMMAND>",
+        ));
+}
+
+#[test]
+fn an_invalid_plain_variable_still_answers_in_json_when_json_is_set() {
+    for args in [&["version"][..], &["version", "--bogus"][..]] {
+        let output = purview()
+            .env("PURVIEW_JSON", "true")
+            .env("PURVIEW_PLAIN", "bad")
+            .args(args)
+            .assert()
+            .code(1)
+            .stderr(predicate::str::is_empty())
+            .get_output()
+            .stdout
+            .clone();
+        let value: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(value["error"]["code"], "CommandFailed", "{args:?}");
+    }
 }
 
 #[test]
@@ -187,13 +207,19 @@ fn a_failed_stdout_write_exits_1() {
         drop(reader);
         let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("purview"))
             .env_remove("PURVIEW_JSON")
+            .env_remove("PURVIEW_RESULTS_ONLY")
+            .env_remove("PURVIEW_PLAIN")
             .args(args)
             .stdout(writer)
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(1), "{args:?}");
         let stderr = String::from_utf8(output.stderr).unwrap();
-        assert!(stderr.starts_with("Error: "), "{args:?}: {stderr}");
+        assert!(
+            stderr.starts_with("Error: could not write to standard output: "),
+            "{args:?}: {stderr}"
+        );
+        assert_eq!(stderr.lines().count(), 1, "{args:?}: {stderr}");
     }
 }
 

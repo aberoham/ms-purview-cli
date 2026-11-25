@@ -3,22 +3,22 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::io::{self, Write};
+use std::io::Write;
 
-use clap::{error::ErrorKind, Parser, Subcommand};
+use clap::{error::ErrorKind, CommandFactory, Parser, Subcommand};
 use serde_json::{json, Value};
 
 use crate::env::Env;
 use crate::error::{PurviewError, Result};
-use crate::output::{
-    error_value, sanitize, sanitize_multiline, write_pretty_json, OutputFormat, OutputOptions,
-};
+use crate::output::{error_value, sanitize, sanitize_multiline, OutputFormat, OutputOptions};
 
 /// The command line. Clap never reads the process environment here: flag
 /// defaults come from `Env::vars` (see `FlagDefaults`).
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "purview",
+    // Fixed, so usage reads `purview` and not `purview.exe` on Windows.
+    bin_name = "purview",
     about = "Microsoft Purview eDiscovery (Premium) from the terminal, through Microsoft Graph",
     after_help = "\
 Examples:
@@ -134,7 +134,12 @@ where
 {
     let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
     let defaults = FlagDefaults::from_vars(&env.vars);
-    let json_default = defaults.as_ref().is_ok_and(|defaults| defaults.json);
+    // Read on its own, so that an invalid PURVIEW_PLAIN or
+    // PURVIEW_RESULTS_ONLY still gets its error in JSON when asked.
+    let json_default = env
+        .vars
+        .get("PURVIEW_JSON")
+        .is_some_and(|value| value == "true");
     let mut printer = Printer::default();
     let mut outcome = match (Cli::try_parse_from(&args), defaults) {
         (Ok(cli), Ok(defaults)) => {
@@ -142,11 +147,26 @@ where
             let json_mode = options.format == OutputFormat::Json;
             match run(&mut env, &options, cli.command).await {
                 Ok(outcome) => printer.deliver(&mut env, outcome),
+                // A command that failed because stdout refused its output
+                // gets the output diagnostic, not a second error.
+                Err(PurviewError::Io(error)) if env.stdout.has_failed() => {
+                    printer.output_failed(&mut env, &error)
+                }
+                Err(error) if env.stdout.has_failed() => printer.output_failed(&mut env, &error),
                 Err(error) => printer.fail(&mut env, json_mode, &error),
             }
         }
         (Ok(cli), Err(message)) => {
-            printer.fail(&mut env, cli.json, &PurviewError::message(message))
+            let usage = Cli::command().render_usage().to_string();
+            let message = format!(
+                "{message}\n\n{}\n\nFor more information, try '--help'.",
+                usage.trim_end()
+            );
+            printer.fail(
+                &mut env,
+                cli.json || json_default,
+                &PurviewError::message(message),
+            )
         }
         (Err(error), _) => printer.parse_failure(&mut env, &args, json_default, error),
     };
@@ -188,27 +208,36 @@ impl Printer {
         let Some(value) = outcome.stdout_value else {
             return outcome;
         };
-        let safe = env.redactor.redact_value(&value);
-        match write_pretty_json(&mut env.stdout, &safe) {
-            Ok(()) => Outcome {
-                exit_code: outcome.exit_code,
-                stdout_value: Some(safe),
+        match json_document(env, &value) {
+            Some((safe, bytes)) => match env.stdout.write_all(&bytes) {
+                Ok(()) => Outcome {
+                    exit_code: outcome.exit_code,
+                    stdout_value: Some(safe),
+                },
+                Err(error) => self.output_failed(env, &error),
             },
-            Err(PurviewError::Io(error)) => self.output_failed(env, &error),
-            Err(error) => self.fail(env, false, &error),
+            None => self.fail(
+                env,
+                true,
+                &PurviewError::message(
+                    "refusing to print the result: a part of it outside a JSON string, such as \
+                     a number, matches a secret the tool holds",
+                ),
+            ),
         }
     }
 
     /// Exit 1: the error document on stdout under `--json`, otherwise
-    /// `Error: …` on stderr.
+    /// `Error: …` on stderr. An error document that cannot be printed
+    /// safely falls back to stderr.
     fn fail(&mut self, env: &mut Env, json_mode: bool, error: &PurviewError) -> Outcome {
         if json_mode && !self.stdout_failed {
-            let value = env.redactor.redact_value(&error_value(error));
-            return match write_pretty_json(&mut env.stdout, &value) {
-                Ok(()) => Outcome::failure(Some(value)),
-                Err(PurviewError::Io(write_error)) => self.output_failed(env, &write_error),
-                Err(_) => Outcome::failure(None),
-            };
+            if let Some((value, bytes)) = json_document(env, &error_value(error)) {
+                return match env.stdout.write_all(&bytes) {
+                    Ok(()) => Outcome::failure(Some(value)),
+                    Err(write_error) => self.output_failed(env, &write_error),
+                };
+            }
         }
         let _ = writeln!(
             env.stderr,
@@ -219,7 +248,7 @@ impl Printer {
     }
 
     /// Stdout could not be written or flushed: say so on stderr, once.
-    fn output_failed(&mut self, env: &mut Env, error: &io::Error) -> Outcome {
+    fn output_failed(&mut self, env: &mut Env, error: &dyn std::fmt::Display) -> Outcome {
         if !self.stdout_failed {
             self.stdout_failed = true;
             let _ = writeln!(
@@ -260,6 +289,18 @@ impl Printer {
         let json_mode = json_requested(args, json_default);
         self.fail(env, json_mode, &PurviewError::message(message))
     }
+}
+
+/// The document as it will be printed: strings redacted as values, then
+/// serialised with a final newline. `None` when the serialised bytes still
+/// match a secret, which can only happen outside string contents (a number,
+/// say); byte redaction there would break the JSON, so the caller fails
+/// closed instead.
+fn json_document(env: &Env, value: &Value) -> Option<(Value, Vec<u8>)> {
+    let safe = env.redactor.redact_value(value);
+    let mut bytes = serde_json::to_vec_pretty(&safe).ok()?;
+    bytes.push(b'\n');
+    (!env.redactor.recognises_bytes(&bytes)).then_some((safe, bytes))
 }
 
 /// Whether a command line Clap refused asked for JSON: `--json` before any
@@ -309,6 +350,7 @@ fn version(env: &mut Env, output: &OutputOptions) -> Result<Outcome> {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::sync::{Arc, Mutex};
 
     use super::*;
@@ -328,7 +370,12 @@ mod tests {
         let fields: Vec<&str> = text.trim_end().split(' ').collect();
         assert_eq!(fields.len(), 4, "{text:?}");
         assert_eq!(fields[..2], ["purview", VERSION]);
-        assert_eq!(fields[2], BUILD_COMMIT.unwrap_or("unknown"));
+        assert_eq!(
+            fields[2],
+            BUILD_COMMIT
+                .filter(|commit| !commit.is_empty())
+                .unwrap_or("unknown")
+        );
         assert_eq!(fields[3], BUILD_TARGET);
         assert!(captured.stderr.text().is_empty());
     }
@@ -364,11 +411,65 @@ mod tests {
         with_vars(&mut env, &[("PURVIEW_PLAIN", "yes")]);
         let outcome = execute_with(env, ["purview", "version"]).await;
         assert_eq!(outcome, Outcome::failure(None));
+        let text = captured.stderr.text();
         assert_eq!(
-            captured.stderr.text(),
-            "Error: PURVIEW_PLAIN must be true or false\n"
+            text.lines().next(),
+            Some("Error: PURVIEW_PLAIN must be true or false"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Usage: purview [OPTIONS] <COMMAND>"),
+            "{text}"
         );
         assert!(captured.stdout.text().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_invalid_flag_variable_still_answers_in_json_when_asked() {
+        for args in [
+            &["purview", "version"][..],
+            &["purview", "version", "--bogus"][..],
+        ] {
+            let (mut env, captured) = Env::in_memory();
+            with_vars(
+                &mut env,
+                &[("PURVIEW_JSON", "true"), ("PURVIEW_PLAIN", "yes")],
+            );
+            let outcome = execute_with(env, args.to_vec()).await;
+            assert_eq!(outcome.exit_code, 1, "{args:?}");
+            let printed: Value = serde_json::from_str(&captured.stdout.text()).unwrap();
+            assert_eq!(Some(&printed), outcome.stdout_value.as_ref(), "{args:?}");
+            assert_eq!(printed["error"]["code"], "CommandFailed");
+            assert!(captured.stderr.text().is_empty(), "{args:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_secret_outside_a_json_string_fails_closed_with_valid_output() {
+        // "1" matches the count; the error document has no 1 in it.
+        let (env, captured) = Env::in_memory();
+        env.redactor.register("1");
+        let outcome = execute_with(env, ["purview", "--json", "version"]).await;
+        assert_eq!(outcome.exit_code, 1);
+        let printed: Value = serde_json::from_str(&captured.stdout.text()).unwrap();
+        assert_eq!(Some(&printed), outcome.stdout_value.as_ref());
+        assert!(printed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("refusing to print the result"));
+
+        // With "0" too, the error document cannot be printed either: it goes
+        // to stderr and stdout stays empty.
+        let (env, captured) = Env::in_memory();
+        env.redactor.register("1");
+        env.redactor.register("0");
+        let outcome = execute_with(env, ["purview", "--json", "version"]).await;
+        assert_eq!(outcome, Outcome::failure(None));
+        assert!(captured.stdout.text().is_empty());
+        assert!(captured
+            .stderr
+            .text()
+            .starts_with("Error: refusing to print the result"));
     }
 
     #[tokio::test]
@@ -455,6 +556,8 @@ mod tests {
     struct Faulty {
         fail_write: bool,
         fail_flush: bool,
+        /// Bytes accepted before writes start failing.
+        accept: usize,
         written: Arc<Mutex<Vec<u8>>>,
     }
 
@@ -463,7 +566,15 @@ mod tests {
             Self {
                 fail_write,
                 fail_flush,
+                accept: 0,
                 written: Arc::default(),
+            }
+        }
+
+        fn accepting(accept: usize) -> Self {
+            Self {
+                accept,
+                ..Self::new(true, false)
             }
         }
 
@@ -474,10 +585,17 @@ mod tests {
 
     impl Write for Faulty {
         fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            let mut written = self.written.lock().unwrap();
             if self.fail_write {
-                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
+                let room = self.accept.saturating_sub(written.len());
+                if room == 0 {
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
+                }
+                let taken = room.min(buffer.len());
+                written.extend_from_slice(&buffer[..taken]);
+                return Ok(taken);
             }
-            self.written.lock().unwrap().extend_from_slice(buffer);
+            written.extend_from_slice(buffer);
             Ok(buffer.len())
         }
 
@@ -504,10 +622,18 @@ mod tests {
             &["purview", "--help"][..],
             &["purview", "version", "--bogus", "--json"][..],
         ] {
-            let (outcome, stderr) = run_with_stdout(Faulty::new(true, false), args).await;
-            assert_eq!(outcome, Outcome::failure(None), "{args:?}");
-            assert_eq!(stderr.matches("Error: ").count(), 1, "{args:?}: {stderr}");
-            assert!(stderr.contains("closed"), "{args:?}: {stderr}");
+            for stdout in [
+                Faulty::new(true, false),
+                Faulty::new(true, true),
+                Faulty::accepting(9),
+            ] {
+                let (outcome, stderr) = run_with_stdout(stdout, args).await;
+                assert_eq!(outcome, Outcome::failure(None), "{args:?}");
+                assert_eq!(
+                    stderr, "Error: could not write to standard output: closed\n",
+                    "{args:?}"
+                );
+            }
         }
     }
 

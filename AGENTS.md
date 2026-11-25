@@ -119,8 +119,13 @@ check whether the other repository needs the same fix.
   `std::io::stdout()` or `std::io::stderr()`, or use `println!` and
   `eprintln!`, in command code. Pass `Env`'s writers instead.
 - JSON is redacted as a value (`Redactor::redact_value`) before it is
-  serialised, because escaping can hide a secret from byte-level matching;
-  the writers redact the bytes again. `RedactingWriter::flush` keeps back
+  serialised, because escaping can hide a secret from byte-level matching.
+  The serialised bytes are then checked; a match left outside string
+  contents (a number, say) cannot be redacted without breaking the JSON,
+  so the document is not printed and the command exits 1 with an error
+  document, or with `Error: …` on stderr if that document matches too.
+  `Outcome::stdout_value` is always the document actually printed. The
+  writers redact the bytes again. `RedactingWriter::flush` keeps back
   any tail that could still become a match, and `finish` drains it;
   `execute_with` calls `finish` on both streams and checks the result.
 - `config.json` never holds a secret: `Config::save` refuses to write a

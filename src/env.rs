@@ -47,7 +47,8 @@ impl fmt::Debug for Env {
             .field("stdout_is_terminal", &self.stdout_is_terminal)
             .field("stderr_is_terminal", &self.stderr_is_terminal)
             .field("config_dir", &self.config_dir)
-            .field("vars", &self.vars)
+            // Names only: a value could be anything a user pasted.
+            .field("vars", &self.vars.keys().collect::<Vec<_>>())
             .finish_non_exhaustive()
     }
 }
@@ -140,5 +141,21 @@ impl Write for SharedBuffer {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_debug_form_names_flag_variables_without_their_values() {
+        let (mut env, _) = Env::in_memory();
+        env.redactor.register("canary-plain-0001");
+        env.vars
+            .insert("PURVIEW_PLAIN".into(), "canary-plain-0001".into());
+        let shown = format!("{env:?}");
+        assert!(shown.contains("PURVIEW_PLAIN"), "{shown}");
+        assert!(!shown.contains("canary"), "{shown}");
     }
 }

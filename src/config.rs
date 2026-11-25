@@ -62,18 +62,24 @@ impl Config {
     /// default configuration. A linked directory or file is refused. Modes
     /// readable by others are tightened, with a warning written to
     /// `warnings` (the command's redacted stderr).
+    ///
+    /// This is the only way to load: the directory is checked first, and
+    /// checked again after the read, so a file under a linked or replaced
+    /// directory is never accepted.
     pub fn load(dir: &Path, warnings: &mut dyn Write) -> Result<Self> {
         let dir = normalise(dir);
-        if !check_existing_dir(&dir, warnings)? {
+        let Some(checked) = check_existing_dir(&dir, warnings)? else {
             return Ok(Self::default());
-        }
-        Self::load_from(&dir.join(CONFIG_FILE), warnings)
+        };
+        let config = Self::load_file(&dir.join(CONFIG_FILE), warnings)?;
+        checked.still_the_same()?;
+        Ok(config)
     }
 
     /// Loads one file. It is inspected without following links, then opened,
     /// and the opened file must be the one inspected; its mode is tightened
     /// and its contents read through that same handle.
-    pub fn load_from(path: &Path, warnings: &mut dyn Write) -> Result<Self> {
+    fn load_file(path: &Path, warnings: &mut dyn Write) -> Result<Self> {
         let metadata = match fs::symlink_metadata(path) {
             Ok(value) => value,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -97,7 +103,10 @@ impl Config {
     /// secret or a JSON Web Token) is refused before anything is written.
     pub fn save(&self, dir: &Path, redactor: &Redactor) -> Result<()> {
         let value = serde_json::to_value(self)?;
-        if redactor.recognises_value(&value) {
+        let data = serde_json::to_vec_pretty(&value)?;
+        // The value check covers strings whose JSON escaping hides a match;
+        // the byte check covers numbers and everything else as written.
+        if redactor.recognises_value(&value) || redactor.recognises_bytes(&data) {
             return Err(PurviewError::message(
                 "refusing to save config.json: a value in it looks like a secret (a token the \
                  tool holds, or a JSON Web Token); configuration never holds secrets",
@@ -105,7 +114,6 @@ impl Config {
         }
         let dir = normalise(dir);
         ensure_config_dirs(&dir)?;
-        let data = serde_json::to_vec_pretty(&value)?;
         atomic_write(&dir.join(CONFIG_FILE), &data)
     }
 }
@@ -205,8 +213,11 @@ fn atomic_write_named(path: &Path, data: &[u8], names: impl Iterator<Item = Stri
             return Err(refusal(path, "is a link, refusing to replace it"));
         }
     }
-    let (mut file, temporary) = create_temporary(&parent, names)?;
+    let (file, temporary) = create_temporary(&parent, names)?;
     let mut guard = TemporaryFile(Some(temporary));
+    // Declared after the guard, so on an early return the file is closed
+    // before the guard removes it, which Windows requires.
+    let mut file = file;
     let path_for_guard = guard.path().to_path_buf();
     #[cfg(unix)]
     {
@@ -314,16 +325,45 @@ fn check_dir_kind(path: &Path) -> Result<Option<fs::Metadata>> {
     }
 }
 
+/// An existing configuration directory, inspected without following links.
+/// On Unix it is also held open: its mode is tightened through that handle,
+/// and its identity is checked again after the read. Standard Rust has no
+/// way to open a file relative to a directory handle, so `config.json`
+/// itself is still looked up by path between those two checks.
+struct CheckedDir {
+    path: PathBuf,
+    metadata: fs::Metadata,
+}
+
+impl CheckedDir {
+    /// Refuses if the directory was replaced, or became a link, since it
+    /// was checked. On Windows only the kind is checked again, because a
+    /// directory's size and modification time change with its entries.
+    fn still_the_same(&self) -> Result<()> {
+        let now = check_dir_kind(&self.path)?
+            .ok_or_else(|| refusal(&self.path, "disappeared while it was being read"))?;
+        if cfg!(unix) && !same_file(&self.metadata, &now) {
+            return Err(refusal(&self.path, "changed while it was being read"));
+        }
+        Ok(())
+    }
+}
+
 /// Checks an existing configuration directory before reading from it, and
-/// tightens a mode open to others. Returns whether it exists.
-fn check_existing_dir(dir: &Path, warnings: &mut dyn Write) -> Result<bool> {
+/// tightens a mode open to others. `None` when it does not exist.
+fn check_existing_dir(dir: &Path, warnings: &mut dyn Write) -> Result<Option<CheckedDir>> {
     let Some(metadata) = check_dir_kind(dir)? else {
-        return Ok(false);
+        return Ok(None);
     };
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = metadata.permissions().mode() & 0o777;
+        let handle = File::open(dir)?;
+        let opened = handle.metadata()?;
+        if !opened.is_dir() || !same_file(&metadata, &opened) {
+            return Err(refusal(dir, "changed while it was being opened"));
+        }
+        let mode = opened.permissions().mode() & 0o777;
         if mode & 0o077 != 0 {
             writeln!(
                 warnings,
@@ -331,12 +371,15 @@ fn check_existing_dir(dir: &Path, warnings: &mut dyn Write) -> Result<bool> {
                 shown(dir),
                 mode
             )?;
-            set_mode(dir, 0o700)?;
+            handle.set_permissions(fs::Permissions::from_mode(0o700))?;
         }
     }
     #[cfg(not(unix))]
-    let _ = (metadata, warnings);
-    Ok(true)
+    let _ = warnings;
+    Ok(Some(CheckedDir {
+        path: dir.to_path_buf(),
+        metadata,
+    }))
 }
 
 /// Opens `path`, checks that the opened file is the one `expected`
@@ -347,7 +390,15 @@ fn read_verified(
     expected: &fs::Metadata,
     warnings: &mut dyn Write,
 ) -> Result<Vec<u8>> {
-    let mut file = File::open(path)?;
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        #[cfg(unix)]
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            repair_unreadable(path, expected, warnings)?;
+            File::open(path)?
+        }
+        Err(error) => return Err(error.into()),
+    };
     let opened = file.metadata()?;
     if !opened.is_file() || !same_file(expected, &opened) {
         return Err(refusal(path, "changed while it was being opened"));
@@ -371,6 +422,27 @@ fn read_verified(
     let mut contents = Vec::new();
     file.read_to_end(&mut contents)?;
     Ok(contents)
+}
+
+/// A config file its owner cannot read, such as mode 0240: open it for
+/// writing only, check it is the file inspected, and set 0600 through that
+/// handle. The caller then reopens it for reading and checks it again.
+#[cfg(unix)]
+fn repair_unreadable(path: &Path, expected: &fs::Metadata, warnings: &mut dyn Write) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let handle = OpenOptions::new().write(true).open(path)?;
+    let opened = handle.metadata()?;
+    if !opened.is_file() || !same_file(expected, &opened) {
+        return Err(refusal(path, "changed while it was being opened"));
+    }
+    writeln!(
+        warnings,
+        "warning: config file {} has permissions {:o}, expected 600; fixing",
+        shown(path),
+        opened.permissions().mode() & 0o777
+    )?;
+    handle.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(())
 }
 
 /// Whether two metadata records describe the same file. On Unix this is
@@ -584,10 +656,94 @@ mod tests {
         assert!(first[0].starts_with(".config.json.tmp-"));
     }
 
+    /// Runs the write in a child test process whose working directory is a
+    /// fresh temporary directory, so the test never changes this process's
+    /// directory or writes into the repository.
     #[test]
     fn a_bare_file_name_writes_in_the_current_directory() {
         assert_eq!(parent_dir(Path::new("config.json")), PathBuf::from("."));
         assert_eq!(parent_dir(Path::new("a/config.json")), PathBuf::from("a"));
+        if std::env::var_os("PURVIEW_TEST_BARE_NAME_CHILD").is_some() {
+            atomic_write(Path::new("bare.json"), br#"{"ok":true}"#).unwrap();
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "config::tests::a_bare_file_name_writes_in_the_current_directory",
+                "--test-threads=1",
+            ])
+            .env("PURVIEW_TEST_BARE_NAME_CHILD", "1")
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{output:?}"
+        );
+        assert_eq!(
+            fs::read(dir.path().join("bare.json")).unwrap(),
+            br#"{"ok":true}"#
+        );
+        let names: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["bare.json"]);
+    }
+
+    #[test]
+    fn save_refuses_a_registered_number() {
+        let dir = tempdir().unwrap();
+        let redactor = Redactor::new();
+        redactor.register("4815162");
+        let mut config = Config::default();
+        config
+            .extra
+            .insert("later_count".into(), serde_json::json!(4815162));
+        let message = config.save(dir.path(), &redactor).unwrap_err().to_string();
+        assert!(message.contains("looks like a secret"), "{message}");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_owner_unreadable_config_is_repaired_and_read() {
+        use std::os::unix::fs::PermissionsExt;
+        for mode in [0o240, 0o644] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("config.json");
+            fs::write(&path, br#"{"default_account":"alex@contoso.example"}"#).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            let mut warnings = Vec::new();
+            let config = Config::load(dir.path(), &mut warnings).unwrap();
+            assert_eq!(config.default_account, "alex@contoso.example", "{mode:o}");
+            let warnings = String::from_utf8(warnings).unwrap();
+            assert!(warnings.contains("expected 600"), "{mode:o}: {warnings}");
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "{mode:o}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_replaced_during_the_read_is_refused() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("purview");
+        fs::create_dir(&root).unwrap();
+        let checked = check_existing_dir(&root, &mut no_warnings())
+            .unwrap()
+            .unwrap();
+        checked.still_the_same().unwrap();
+        fs::rename(&root, dir.path().join("moved")).unwrap();
+        fs::create_dir(&root).unwrap();
+        let error = checked.still_the_same().unwrap_err().to_string();
+        assert!(error.contains("changed while it was being read"), "{error}");
     }
 
     #[cfg(unix)]
@@ -667,7 +823,7 @@ mod tests {
         fs::write(&target, b"{}").unwrap();
         let link = dir.path().join("config.json");
         symlink(&target, &link).unwrap();
-        assert!(Config::load_from(&link, &mut no_warnings())
+        assert!(Config::load_file(&link, &mut no_warnings())
             .unwrap_err()
             .to_string()
             .contains("is a link"));

@@ -76,8 +76,10 @@ pub fn write_rows(
         for row in rows {
             let fields: Vec<_> = indices
                 .iter()
-                .filter_map(|index| row.get(*index))
-                .map(|value| sanitize(value))
+                .map(|index| {
+                    row.get(*index)
+                        .map_or_else(String::new, |value| sanitize(value))
+                })
                 .collect();
             writeln!(writer, "{}", fields.join("\t"))?;
         }
@@ -132,9 +134,18 @@ pub fn selected_indices(select: &str, headers: &[&str]) -> Result<Option<Vec<usi
     if select.is_empty() {
         return Ok(None);
     }
-    select
+    let fields: Vec<&str> = select
         .split(',')
         .filter(|field| !field.trim().is_empty())
+        .collect();
+    if fields.is_empty() {
+        return Err(PurviewError::message(format!(
+            "--select names no column; this output's columns are {}",
+            headers.join(", ")
+        )));
+    }
+    fields
+        .into_iter()
         .map(|field| {
             headers
                 .iter()
@@ -259,6 +270,35 @@ mod tests {
             .to_string();
         assert!(error.contains("\"mial\""), "{error}");
         assert!(error.contains("NAME, EMAIL"), "{error}");
+    }
+
+    #[test]
+    fn a_selection_with_no_column_names_is_refused() {
+        for select in [",", " ", " , "] {
+            let error = selected_indices(select, &["NAME", "EMAIL"])
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("names no column;"), "{select:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_missing_plain_cell_keeps_its_column() {
+        let mut output = Vec::new();
+        write_rows(
+            &mut output,
+            &options(OutputFormat::Plain, "", false),
+            &["ID", "NAME", "EMAIL"],
+            &[
+                vec!["1".into()],
+                vec!["2".into(), "Sam".into(), "s@contoso.example".into()],
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "1\t\t\n2\tSam\ts@contoso.example\n"
+        );
     }
 
     #[test]

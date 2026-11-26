@@ -191,8 +191,13 @@ JSON: `{"account", "upn", "tenantId", "clientId", "graphScope", "downloadReady"}
 
 Redeems the stored refresh token for both resources, with the scopes already stored. It
 never narrows or widens scopes; sign in again with `auth login` (with or without
-`--read-only`) to change them, as `entra` requires for narrowing. It succeeds only if the
-network refresh and the credential-store write both succeed.
+`--read-only`) to change them, as `entra` requires for narrowing. A Graph response whose
+permissions differ from the stored set is refused and nothing is stored (section 4.5). It
+succeeds only if both redemptions and every credential-store write succeed. Each result is
+stored before the next step: if the download redemption fails with `AADSTS65001`, the Graph
+rotation stays stored, the refused download entry is removed from the store, and the
+command exits 1 with `DownloadNotConsented`. Only `auth login` treats that refusal as a
+warning.
 
 JSON: `{"account", "graphExpiresAt", "downloadExpiresAt", "graphScope"}`.
 
@@ -686,12 +691,29 @@ pub trait TokenProvider: Send + Sync {
 - `GraphClient` and `DownloadClient` hold an `Arc<dyn TokenProvider>`, never a token string.
 - Before each request, `graph` refreshes when fewer than 60 s remain; before a POST, when
   fewer than 5 minutes remain. Refresh rotates the refresh token and stores the newest one.
+  A refresh is written to the credential store before its tokens are used. If the store
+  refuses the write, the refresh is that command's error, and the rotated refresh token is
+  never used; the provider keeps the credential the store still holds.
+- The Graph refresh request is built from the stored scope list: short Graph permission
+  names get the `https://graph.microsoft.com/` prefix, repeats are dropped and
+  `offline_access` is added when missing. A response whose Graph permission set (ignoring
+  case, the resource prefix and the OpenID Connect entries) differs from the stored one is
+  refused, and nothing is stored: the stored scope must describe the token in use, and a
+  refresh must neither widen nor narrow a session. A response without a `scope` keeps the
+  stored list.
 - `download` runs only when a download starts, after polling ends, never at command start.
   It refreshes when fewer than 5 minutes remain, before each file. The server is assumed to
   check the token when a request starts, not during the transfer (Assumption; PR 4.1 checks
   this with a download that outlasts the token).
 - A missing `download` entry in the stored credential triggers one silent refresh attempt.
-  If that fails, the error is `DownloadNotConsented` with its remedy.
+  If the identity platform refuses it for want of consent (error code `65001`, matched as a
+  complete code), the error is `DownloadNotConsented` with its remedy. Any other failure,
+  such as a network error or an expired session, keeps its own error and remedy, and a
+  later call may try again.
+- A consent refusal, whether for a missing entry or while renewing an expired one, stops
+  further download attempts in the process: the entry is cleared and the credential stored
+  without it, so a later call finds no expired entry to renew and fails at once with
+  `DownloadNotConsented`.
 - Concurrent refreshes in one process share one refresh request, guarded by a
   `tokio::sync::Mutex` (tokio feature `sync`). Writes from several processes to the store
   follow `entra`'s locking.
@@ -2217,10 +2239,11 @@ The `aberoham/homebrew-tap` formula `purview` reads releases, as it does for `en
 | `dirs` | | 0.1 |
 | `keyring` | `apple-native`, `linux-native`, `windows-native` | 1.1 |
 | `security-framework` (macOS) | | 1.1 |
-| `reqwest` | `json`, `rustls-tls`, `gzip`, `stream`; no default features | 1.1 |
-| `url`, `uuid`, `chrono` | `serde` each | 1.1 |
-| `base64`, `sha2`, `getrandom` | | 1.1 |
+| `reqwest` | `json`, `rustls-tls`, `gzip`; no default features. `stream` is added in 1.5 with the download client | 1.1 |
+| `url`, `uuid`, `chrono` | (default features); add `serde` only where a later PR serialises one of these types | 1.1 |
+| `base64` | | 1.1 |
 | `async-trait` | | 1.1 |
+| `sha2`, `getrandom` | | 1.2 (PKCE) |
 | `webbrowser` | | 1.2 |
 | `futures-util` | | 1.5 |
 | `zip` | `deflate` (plus `deflate64` only if PR 4.1 finds it) | 1.5 |

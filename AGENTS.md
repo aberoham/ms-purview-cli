@@ -81,8 +81,10 @@ that the test files pass their own scan.
 - `src/token.rs` defines `SecretString`, `GraphToken`, `DownloadToken`, the
   stored `Credential` and the `TokenProvider` trait. `StoredTokenProvider`
   refreshes lazily, shares one refresh per process behind a
-  `tokio::sync::Mutex`, stores every rotated refresh token, and registers
-  every secret it sees with the Redactor.
+  `tokio::sync::Mutex`, writes every refresh to the store before using it
+  (a refused write is the command's error), refuses a refresh that changes
+  the Graph permission set, and registers every secret it sees with the
+  Redactor.
 - `src/secrets.rs` is the `CredentialStore` trait, `KeyringStore` (Windows
   chunking and lock, macOS label, Linux keyutils) and the in-memory
   `MemoryStore` tests use.
@@ -133,6 +135,14 @@ check whether the other repository needs the same fix.
 - A failure exits 1. Under `--json` it prints
   `{"error": {"code", "status", "message"}}` on stdout and nothing on
   stderr; otherwise `Error: …` goes to stderr and nothing to stdout.
+- One exception: `auth login` writes its interactive sign-in text (the app
+  registration line and the device-code prompt) to stderr in every mode,
+  `--json` included, because the person signing in must see the code. Under
+  `--json`, stdout still holds exactly one document, and a failure after
+  the prompt still puts its error document on stdout.
+- An explicit flag given a blank value (`--account ""`, `--client-id ""`,
+  `--tenant-id ""`) is an error, raised before any fallback, configuration
+  read or network call. An empty `PURVIEW_*` variable counts as unset.
 - Argument errors, including Clap's and an invalid `PURVIEW_*` value, follow
   the same rule. Their code is `CommandFailed`; the human form is `Error: `
   and the message, then Clap's usage. `--json` before a `--`, or

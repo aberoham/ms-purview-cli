@@ -169,6 +169,9 @@ Record here, without identifiers:
 - the `scope` strings the token endpoint returned for Graph and for the download resource,
   with any tenant-specific part replaced by a placeholder;
 - whether the download redemption returned a new refresh token;
-- whether `auth refresh` succeeded with the stored scopes, and both expiry times moved;
+- whether `auth refresh` succeeded with the stored scopes, and both expiry times moved.
+  The tool refuses a Graph refresh whose permission set differs from the stored one
+  (`docs/SPEC.md` section 4.5), so record whether the refresh response's `scope` named the
+  same permissions as the sign-in response, in short or prefixed form;
 - that the operating-system credential store held one item, named `purview — <email>`
   on macOS.

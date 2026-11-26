@@ -54,7 +54,13 @@ FAULT_MESSAGES = {
     '"message":"Service unavailable."}})',
     "definite": 'ERROR: Forbidden({"error":{"code":"Authorization_RequestDenied",'
     '"message":"Insufficient privileges to complete the operation."}})',
+    # A server error over several lines, with a carriage return and a bell
+    # character to strip, and no final newline.
+    "multiline": 'ERROR: Bad Gateway({"error":{"code":"badGateway"}})\r\n'
+    "Second line of the error\a\nThird line of the error",
 }
+# Fault kinds whose message az writes without a final newline.
+NO_FINAL_NEWLINE = {"multiline"}
 
 # Command words, then (allowed options, required options).
 COMMANDS = {
@@ -549,10 +555,13 @@ def main():
     with open(state_path, encoding="utf-8") as handle:
         state = json.load(handle)
     status = 0
+    ending = "\n"
     try:
         words, options = parse(argv)
         apply_edits(state, line)
         fault = fault_for(state, line)
+        if fault is not None and fault["kind"] in NO_FINAL_NEWLINE:
+            ending = ""
         if fault is not None and not fault.get("applied", False):
             raise AzError(FAULT_MESSAGES[fault["kind"]])
         result = run(state, words, options)
@@ -560,7 +569,7 @@ def main():
             raise AzError(FAULT_MESSAGES[fault["kind"]])
         emit(result, options)
     except AzError as error:
-        sys.stderr.write(error.message + "\n")
+        sys.stderr.write(error.message + ending)
         status = error.code
     except (KeyError, IndexError, ValueError, TypeError, AttributeError) as error:
         sys.stderr.write(f"fake az: malformed call: {error!r}\n")

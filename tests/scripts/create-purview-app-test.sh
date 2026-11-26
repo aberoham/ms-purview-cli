@@ -787,10 +787,10 @@ test_tenant_wide_write_grant_is_shown_under_per_user_read_only() {
   local vars=("TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=alex@contoso.example READ_ONLY=1)
   run "${vars[@]}"
   expect_status 0
-  expect_out "Microsoft Graph, all users (AllPrincipals): $GRAPH_SCOPE"
+  expect_out "Microsoft Graph, all users (AllPrincipals), grant gAll: $GRAPH_SCOPE"
   expect_out "WARNING: this grant gives more than the plan asks for: it covers every user in the tenant, but the plan asks for per-user consent; it also holds eDiscovery.ReadWrite.All, which the plan does not ask for."
   expect_out "az rest --method DELETE --url $G/oauth2PermissionGrants/gAll"
-  expect_out "Purview eDiscovery, all users (AllPrincipals): eDiscovery.Download.Read"
+  expect_out "Purview eDiscovery, all users (AllPrincipals), grant gAllDl: eDiscovery.Download.Read"
   expect_err "2 existing consent grant(s) give more than this plan asks for"
   expect_reads_only
   : >"$FAKE_AZ_LOG"
@@ -803,6 +803,8 @@ POST /oauth2PermissionGrants $principal,"resourceId":"$GRAPH_SP","scope":"eDisco
 POST /oauth2PermissionGrants $principal,"resourceId":"$EDISC_SP","scope":"eDiscovery.Download.Read"}
 EOF
   expect_line "    purview auth login --client-id $APP_ID --tenant-id $T --read-only"
+  reject_out "az rest --method DELETE"
+  expect_out "Run the dry run again to see them as they are now, with removal commands where they apply."
   end_case
 }
 
@@ -1074,94 +1076,6 @@ grant_json() {
     "$1" "$APP_SP" "$2" "$3" "$4" "$5"
 }
 
-test_wrong_audience_grant_gets_only_removal_advice() {
-  new_case wrong_audience_grant_gets_only_removal_advice
-  done_state
-  # Two tenant-wide grants under a per-user plan. Shrinking the first, which
-  # holds only openid, to the plan's scopes would add write consent for every
-  # user. The second has an extra scope, so a narrowing PATCH exists, but it
-  # would still leave consent for every user: only removal is offered.
-  GRANTS="$DONE_GRANTS,$(grant_json gAll AllPrincipals null "$GRAPH_SP" openid)"
-  GRANTS="$GRANTS,$(grant_json gAllDl AllPrincipals null "$EDISC_SP" "eDiscovery.Download.Read User.Read")"
-  write_state
-  run "TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=alex@contoso.example
-  expect_status 0
-  expect_out "WARNING: this grant gives more than the plan asks for: it covers every user in the tenant, but the plan asks for per-user consent."
-  expect_out "WARNING: this grant gives more than the plan asks for: it covers every user in the tenant, but the plan asks for per-user consent; it also holds User.Read, which the plan does not ask for."
-  expect_out "az rest --method DELETE --url $G/oauth2PermissionGrants/gAll"
-  expect_out "az rest --method DELETE --url $G/oauth2PermissionGrants/gAllDl"
-  reject_out "PATCH the same URL"
-  end_case
-}
-
-test_scope_only_advice_is_a_strict_subset() {
-  new_case scope_only_advice_is_a_strict_subset
-  done_state
-  GRANTS="$(grant_json g1 Principal "\"$ALEX\"" "$GRAPH_SP" "$GRAPH_SCOPE User.Read Mail.Read"),$(grant_json g2 Principal "\"$ALEX\"" "$EDISC_SP" eDiscovery.Download.Read)"
-  write_state
-  run "TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=alex@contoso.example
-  expect_status 0
-  expect_out "it also holds User.Read Mail.Read, which the plan does not ask for."
-  expect_line "      To keep it with only the scopes the plan asks for, PATCH the same URL with {\"scope\":\"$GRAPH_SCOPE\"}."
-  end_case
-  # A grant that holds none of the planned scopes gets no PATCH advice: the
-  # only reduced set would be empty.
-  new_case scope_only_advice_needs_a_non_empty_subset
-  done_state
-  GRANTS="$(grant_json g1 Principal "\"$ALEX\"" "$GRAPH_SP" "$GRAPH_SCOPE"),$(grant_json g2 Principal "\"$ALEX\"" "$EDISC_SP" User.Read)"
-  write_state
-  run "TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=alex@contoso.example
-  expect_status 0
-  expect_out "Purview eDiscovery, alex@contoso.example (Principal): User.Read"
-  expect_out "az rest --method DELETE --url $G/oauth2PermissionGrants/g2"
-  reject_out "PATCH the same URL"
-  end_case
-}
-
-test_former_assignee_grants_are_warned() {
-  new_case former_assignee_grants_are_warned
-  done_state
-  # The completed setup is for alex; the plan now names sam instead. The
-  # eDiscovery grant also holds an extra scope, so a narrowing PATCH exists,
-  # but it would keep consent for a user who is no longer assigned.
-  GRANTS="$(grant_json g1 Principal "\"$ALEX\"" "$GRAPH_SP" "$GRAPH_SCOPE"),$(grant_json g2 Principal "\"$ALEX\"" "$EDISC_SP" "eDiscovery.Download.Read User.Read")"
-  write_state
-  run "TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=sam@contoso.example
-  expect_status 0
-  expect_out "Microsoft Graph, user $ALEX (not in this plan) (Principal): $GRAPH_SCOPE"
-  expect_out "WARNING: this grant gives more than the plan asks for: it is for a user this plan does not assign."
-  expect_out "WARNING: this grant gives more than the plan asks for: it is for a user this plan does not assign; it also holds User.Read, which the plan does not ask for."
-  expect_out "az rest --method DELETE --url $G/oauth2PermissionGrants/g1"
-  expect_out "az rest --method DELETE --url $G/oauth2PermissionGrants/g2"
-  reject_out "PATCH the same URL"
-  expect_err "2 existing consent grant(s) give more than this plan asks for"
-  expect_reads_only
-  end_case
-  # Under tenant consent a per-user grant is narrower than the plan, so it
-  # gets no warning.
-  new_case per_user_grant_under_tenant_consent_is_not_warned
-  done_state
-  write_state
-  run "TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=sam@contoso.example CONSENT=tenant
-  expect_status 0
-  reject_out "WARNING"
-  end_case
-}
-
-test_extended_grant_keeps_its_scopes_in_the_wording() {
-  new_case extended_grant_keeps_its_scopes_in_the_wording
-  done_state
-  GRANTS="$(grant_json g1 Principal "\"$ALEX\"" "$GRAPH_SP" "openid User.Read"),$(grant_json g2 Principal "\"$ALEX\"" "$EDISC_SP" eDiscovery.Download.Read)"
-  write_state
-  run "TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=alex@contoso.example
-  expect_status 0
-  expect_out "(will be extended to: openid User.Read eDiscovery.ReadWrite.All offline_access profile)"
-  expect_out "this grant's existing scopes are kept."
-  reject_out "stays as it is"
-  expect_line "      To keep it with only the scopes the plan asks for, PATCH the same URL with {\"scope\":\"openid\"}."
-  end_case
-}
-
 test_invalid_grant_id_is_refused() {
   new_case invalid_grant_id_is_refused
   done_state
@@ -1240,6 +1154,155 @@ test_group_lookup_failure_is_not_reported_as_missing() {
   expect_status nonzero
   expect_out "UNRESOLVED group 00000000-0000-4000-8000-000000000032: no group found"
   reject_out "could not be checked"
+  end_case
+}
+
+test_wrong_audience_grant_gets_only_removal_advice() {
+  new_case wrong_audience_grant_gets_only_removal_advice
+  done_state
+  # Two tenant-wide grants under a per-user plan. Neither may get a command
+  # that changes its scopes: only removal is offered, because any narrowed
+  # version would still cover every user.
+  GRANTS="$DONE_GRANTS,$(grant_json gAll AllPrincipals null "$GRAPH_SP" openid)"
+  GRANTS="$GRANTS,$(grant_json gAllDl AllPrincipals null "$EDISC_SP" "eDiscovery.Download.Read User.Read")"
+  write_state
+  run "TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=alex@contoso.example
+  expect_status 0
+  expect_out "Microsoft Graph, all users (AllPrincipals), grant gAll: openid"
+  expect_out "WARNING: this grant gives more than the plan asks for: it covers every user in the tenant, but the plan asks for per-user consent."
+  expect_out "WARNING: this grant gives more than the plan asks for: it covers every user in the tenant, but the plan asks for per-user consent; it also holds User.Read, which the plan does not ask for."
+  expect_out "az rest --method DELETE --url $G/oauth2PermissionGrants/gAll"
+  expect_out "az rest --method DELETE --url $G/oauth2PermissionGrants/gAllDl"
+  reject_out "PATCH"
+  end_case
+}
+
+test_extra_scopes_get_no_command() {
+  new_case extra_scopes_get_no_command
+  done_state
+  # Grants for the planned user with scopes beyond the plan, one of them with
+  # none of the planned scopes. Their audience is right, so they get neither
+  # a removal command nor a command that rewrites their scopes.
+  GRANTS="$(grant_json g1 Principal "\"$ALEX\"" "$GRAPH_SP" "$GRAPH_SCOPE User.Read Mail.Read"),$(grant_json g2 Principal "\"$ALEX\"" "$EDISC_SP" User.Read)"
+  write_state
+  run "TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=alex@contoso.example
+  expect_status 0
+  expect_out "Microsoft Graph, alex@contoso.example (Principal), grant g1: $GRAPH_SCOPE User.Read Mail.Read"
+  expect_out "WARNING: this grant gives more than the plan asks for: it also holds User.Read Mail.Read, which the plan does not ask for."
+  expect_out "Purview eDiscovery, alex@contoso.example (Principal), grant g2: User.Read"
+  expect_out "To narrow it, remove the extra scopes by hand in the Entra admin center or with"
+  reject_out "az rest"
+  reject_out "PATCH"
+  end_case
+}
+
+test_former_assignee_grants_are_warned() {
+  new_case former_assignee_grants_are_warned
+  done_state
+  # The completed setup is for alex; the plan now names sam instead.
+  GRANTS="$(grant_json g1 Principal "\"$ALEX\"" "$GRAPH_SP" "$GRAPH_SCOPE"),$(grant_json g2 Principal "\"$ALEX\"" "$EDISC_SP" "eDiscovery.Download.Read User.Read")"
+  write_state
+  run "TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=sam@contoso.example
+  expect_status 0
+  expect_out "Microsoft Graph, user $ALEX (not in this plan) (Principal), grant g1: $GRAPH_SCOPE"
+  expect_out "WARNING: this grant gives more than the plan asks for: it is for a user this plan does not assign."
+  expect_out "WARNING: this grant gives more than the plan asks for: it is for a user this plan does not assign; it also holds User.Read, which the plan does not ask for."
+  expect_out "az rest --method DELETE --url $G/oauth2PermissionGrants/g1"
+  expect_out "az rest --method DELETE --url $G/oauth2PermissionGrants/g2"
+  reject_out "PATCH"
+  expect_err "2 existing consent grant(s) give more than this plan asks for"
+  expect_reads_only
+  end_case
+  # Under tenant consent a per-user grant is narrower than the plan, so it
+  # gets no warning.
+  new_case per_user_grant_under_tenant_consent_is_not_warned
+  done_state
+  write_state
+  run "TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=sam@contoso.example CONSENT=tenant
+  expect_status 0
+  reject_out "WARNING"
+  end_case
+}
+
+test_failed_lookup_gives_no_removal_commands() {
+  new_case failed_lookup_gives_no_removal_commands
+  done_state
+  # The completed setup is for alex, and the plan names alex again, but the
+  # lookup of alex is refused. Alex's own grants must not be taken for a
+  # former assignee's, and no grant gets a removal command.
+  GRANTS="$DONE_GRANTS,$(grant_json gAll AllPrincipals null "$GRAPH_SP" openid)"
+  fault '^ad user show --id alex@contoso.example' definite false
+  write_state
+  run "TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=alex@contoso.example
+  expect_status nonzero
+  expect_out "UNRESOLVED alex@contoso.example: the lookup could not be checked"
+  expect_out "NOTE: this grant's user is not among the assignees that resolved. An assignee"
+  expect_out "could not be checked."
+  reject_out "it is for a user this plan does not assign"
+  expect_out "it covers every user in the tenant, but the plan asks for per-user consent."
+  expect_out "No removal command is given while an assignee lookup is unresolved."
+  reject_out "az rest --method DELETE"
+  expect_reads_only
+  end_case
+}
+
+test_apply_gives_no_grant_advice() {
+  new_case apply_gives_no_grant_advice
+  done_state
+  # The grant lacks planned scopes and holds an extra one, so --apply extends
+  # it. Advice from the state before the run would be stale afterwards.
+  GRANTS="$(grant_json g1 Principal "\"$ALEX\"" "$GRAPH_SP" "openid User.Read"),$(grant_json g2 Principal "\"$ALEX\"" "$EDISC_SP" eDiscovery.Download.Read)"
+  GRANTS="$GRANTS,$(grant_json gAll AllPrincipals null "$GRAPH_SP" openid)"
+  write_state
+  run "TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=alex@contoso.example --apply
+  expect_status 0
+  expect_out "(will be extended to: openid User.Read eDiscovery.ReadWrite.All offline_access profile)"
+  expect_out "this grant's existing scopes are kept."
+  reject_out "stays as it is"
+  reject_out "az rest"
+  reject_out "PATCH the same URL"
+  expect_out "2 consent grant(s) gave more than the plan asks for when this run started; see WARNING above."
+  expect_out "Run the dry run again to see them as they are now, with removal commands where they apply."
+  expect_mutations <<EOF
+PATCH /oauth2PermissionGrants/g1 {"scope":"openid User.Read eDiscovery.ReadWrite.All offline_access profile"}
+EOF
+  end_case
+  # The dry run afterwards describes the extended grant as it is now and
+  # still offers no command that rewrites its scopes.
+  new_case dry_run_after_apply_describes_the_new_state
+  done_state
+  GRANTS="$(grant_json g1 Principal "\"$ALEX\"" "$GRAPH_SP" "openid User.Read eDiscovery.ReadWrite.All offline_access profile"),$(grant_json g2 Principal "\"$ALEX\"" "$EDISC_SP" eDiscovery.Download.Read)"
+  GRANTS="$GRANTS,$(grant_json gAll AllPrincipals null "$GRAPH_SP" openid)"
+  write_state
+  run "TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=alex@contoso.example
+  expect_status 0
+  expect_out "Microsoft Graph for alex@contoso.example: $GRAPH_SCOPE (present)"
+  expect_out "it also holds User.Read, which the plan does not ask for."
+  expect_out "az rest --method DELETE --url $G/oauth2PermissionGrants/gAll"
+  reject_out "oauth2PermissionGrants/g1"
+  reject_out "PATCH"
+  end_case
+}
+
+test_multi_line_az_error_keeps_its_lines() {
+  new_case multi_line_az_error_keeps_its_lines
+  # az's error runs over three lines, holds a carriage return and a bell
+  # character, and has no final newline.
+  fault '^rest --method POST --url https://graph.microsoft.com/v1.0/applications --body' multiline false
+  write_state
+  run "${restricted_vars[@]}" --apply
+  expect_status nonzero
+  local err="$case_dir/err" after
+  grep -qxF '    ERROR: Bad Gateway({"error":{"code":"badGateway"}})' "$err" ||
+    problem "the first line of az's error is not on a line of its own"
+  grep -qxF '    Second line of the error' "$err" || problem "the second line of az's error was not kept"
+  grep -qxF '    Third line of the error' "$err" || problem "the last line of az's error was not kept"
+  ! grep -q "$(printf '[\r\a]')" "$err" || problem "a control character reached the terminal"
+  # Exactly one newline ends the error: the next message starts on the next
+  # line, with no blank line between.
+  after=$(awk 'found && !done { print; done = 1 } $0 == "    Third line of the error" { found = 1 }' "$err")
+  [ "$after" = "    The outcome is unclear. Reading the result back; nothing is resent." ] ||
+    problem "the error did not end with exactly one newline; next line: '$after'"
   end_case
 }
 

@@ -256,9 +256,16 @@ edisc_grant_scope=eDiscovery.Download.Read
 err_file=$(mktemp "${TMPDIR:-/tmp}/create-purview-app.XXXXXX")
 trap 'rm -f "$err_file"' EXIT
 
+# show_az_error prints az's error, indented, on stderr. It keeps line breaks
+# but removes every other control character, and ends with exactly one
+# newline whether or not az's output did. The loop, not sed, adds the
+# indent, because BSD and GNU sed treat a missing final newline differently.
 show_az_error() {
-  sanitize "$(cat "$err_file")" | sed 's/^/    /' >&2
-  echo >&2
+  local text line
+  text=$(tr -d '\000-\011\013-\037\177' <"$err_file")
+  while IFS= read -r line; do
+    printf '    %s\n' "$line" >&2
+  done <<<"$text"
 }
 
 # read_az WHAT ARGS... runs one read and prints its output. A failed read
@@ -792,40 +799,31 @@ is_planned_user() {
   return 1
 }
 
-# words_kept HAVE WANTED prints the words of HAVE that WANTED also holds, in
-# HAVE's order: the grant's scopes with the extras taken out.
-words_kept() {
-  local w out=""
-  for w in $1; do
-    [ -n "$(words_missing "$w" "$2")" ] || out="$out${out:+ }$w"
-  done
-  printf '%s' "$out"
-}
-
-# print_grant_advice ID SCOPE WANTED WRONG_AUDIENCE says how to narrow a
-# grant by hand. A grant for the wrong audience can only be removed. For a
-# grant with extra scopes, a PATCH is offered only when its body is a strict,
-# non-empty subset of the grant's current scopes, so following the advice
-# can never add a scope.
-print_grant_advice() {
-  local kept current
+# print_removal_advice ID gives the command that removes a grant whose
+# audience is definitely outside the plan. It gives none under --apply,
+# because the run may change the grants it is about, and none while an
+# assignee lookup is unresolved, because the plan's users are then not known.
+print_removal_advice() {
+  if [ "$apply" = true ]; then
+    return 0
+  fi
+  if [ "$unresolved" -gt 0 ]; then
+    echo "      No removal command is given while an assignee lookup is unresolved."
+    return 0
+  fi
   if ! [[ "$1" =~ $GRANT_ID_RE ]]; then
-    echo "      Its id holds unexpected characters; remove it in the Entra admin center."
+    echo "      Its id holds unexpected characters; remove it in the Entra admin center if that is wanted."
     return 0
   fi
   echo "      To remove the whole grant by hand:"
   echo "        az rest --method DELETE --url $GRAPH/oauth2PermissionGrants/$1"
-  [ "$4" = false ] || return 0
-  current=$(join_words "$2") || return 0
-  kept=$(words_kept "$current" "$3")
-  if [ -n "$kept" ] && [ "$kept" != "$current" ]; then
-    echo "      To keep it with only the scopes the plan asks for, PATCH the same URL with {\"scope\":\"$kept\"}."
-  fi
 }
 
 # print_existing_grants lists every grant the application already holds on
 # Graph and on the eDiscovery app, and warns about each one that gives more
-# than this plan asks for. It sets broader_grants to the number of warnings.
+# than this plan asks for. It gives no command that narrows a grant: a
+# narrowed scope list worked out from this run's state could remove scopes
+# that an --apply run adds. It sets broader_grants to the number of warnings.
 broader_grants=0
 print_existing_grants() {
   local line id res type principal scope res_label wanted who extra reasons wrong_audience
@@ -855,7 +853,7 @@ print_existing_grants() {
     else
       who="$(principal_label "$principal") (Principal)"
     fi
-    echo "    - $res_label, $who: $scope"
+    echo "    - $res_label, $who, grant $id: $scope"
     reasons=""
     wrong_audience=false
     if [ "$CONSENT" = principal ]; then
@@ -863,8 +861,14 @@ print_existing_grants() {
         wrong_audience=true
         reasons="it covers every user in the tenant, but the plan asks for per-user consent"
       elif ! is_planned_user "$principal"; then
-        wrong_audience=true
-        reasons="it is for a user this plan does not assign"
+        if [ "$unresolved" -gt 0 ]; then
+          echo "      NOTE: this grant's user is not among the assignees that resolved. An assignee"
+          echo "      lookup did not resolve, so whether the grant is for a user outside the plan"
+          echo "      could not be checked."
+        else
+          wrong_audience=true
+          reasons="it is for a user this plan does not assign"
+        fi
       fi
     fi
     extra=$(words_missing "$scope" "$wanted")
@@ -875,7 +879,13 @@ print_existing_grants() {
     broader_grants=$((broader_grants + 1))
     echo "      WARNING: this grant gives more than the plan asks for: $reasons."
     echo "      The script never removes a grant or a scope: this grant's existing scopes are kept."
-    print_grant_advice "$id" "$scope" "$wanted" "$wrong_audience"
+    if [ -n "$extra" ]; then
+      echo "      To narrow it, remove the extra scopes by hand in the Entra admin center or with"
+      echo "      Microsoft Graph, if that is wanted."
+    fi
+    if [ "$wrong_audience" = true ]; then
+      print_removal_advice "$id"
+    fi
   done <<<"$existing_grants"
 }
 
@@ -1052,6 +1062,13 @@ print_login() {
   echo "Add --browser to sign in through a browser on this machine instead of with a device code."
   echo "Later runs of this script for this application need CLIENT_ID=$app_id."
   echo "Each user also needs the eDiscovery Manager or eDiscovery Administrator role group in the Purview portal."
+  # The warnings came from the state before this run, which may have changed
+  # those grants, so --apply gives no grant advice of its own.
+  if [ "$broader_grants" -gt 0 ]; then
+    echo
+    echo "$broader_grants consent grant(s) gave more than the plan asks for when this run started; see WARNING above."
+    echo "This run may have changed them. Run the dry run again to see them as they are now, with removal commands where they apply."
+  fi
 }
 
 if [ "$changes" -eq 0 ]; then

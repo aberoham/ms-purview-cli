@@ -130,15 +130,24 @@ app roles, because the default access role it assigns is valid only for an app
 with none (Docs).
 
 It never removes a consent grant or a scope; a grant it extends keeps its
-existing scopes. When an existing grant gives more than the plan asks for, the
-plan shows a warning with the grant's id and the `az rest` command that
-removes it. Examples are a tenant-wide `eDiscovery.ReadWrite.All` grant kept
-after a move to `CONSENT=principal` and `READ_ONLY=1`, a per-user grant for a
-user no longer in `ASSIGN_USERS`, and an extra scope on a grant. For a grant
-whose only excess is extra scopes, the plan also offers a PATCH that keeps just
-the scopes the plan asks for, and only when that set is smaller than what the
-grant holds. Remove such a grant by hand if the narrower setup must be strict. With `READ_ONLY=1`, the sign-in command the
-script prints ends with `--read-only`.
+existing scopes. The plan warns about each existing grant that gives more than
+the plan asks for, and names its resource, type, user and id:
+
+- **Extra scopes.** The warning lists the scopes the plan does not ask for. The
+  script gives no command for these: narrow the grant by hand in the Entra
+  admin center or with Graph, if that is wanted.
+- **An audience outside the plan.** Examples are a tenant-wide grant, such as a
+  tenant-wide `eDiscovery.ReadWrite.All` grant kept after a move to
+  `CONSENT=principal` and `READ_ONLY=1`, and a per-user grant for a user no
+  longer in `ASSIGN_USERS`. The dry run prints the `az rest` command that
+  removes the grant.
+
+The dry run gives no removal command while any assignee lookup is unresolved,
+because the plan's users are then not known; it says that the grant's audience
+could not be checked. `--apply` prints the same warnings but no commands,
+because the run may change those grants. If there were warnings, it ends by
+saying to run the dry run again to see the grants as they are now. With
+`READ_ONLY=1`, the sign-in command the script prints ends with `--read-only`.
 
 #### Variables
 

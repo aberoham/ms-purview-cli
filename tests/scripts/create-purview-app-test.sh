@@ -1024,30 +1024,222 @@ test_fake_az_rejects_what_real_az_would() {
   new_case fake_az_rejects_what_real_az_would
   done_state
   write_state
-  local s
-  for call in "account show extra" "ad sp show --id $APP_ID --bogus 1" "ad sp show" \
-    "ad app list --filter x --filter y"; do
+  local s err="$case_dir/probe-err"
+  # probe WANT_EXIT REASON ARGS... runs the fake directly and checks that it
+  # fails with that exit and for that reason. Every probe passes a supported
+  # -o, so a missing output format cannot be what refuses it.
+  probe() {
+    local want=$1 reason=$2
+    shift 2
     s=0
-    # shellcheck disable=SC2086 # each case is a list of words
-    PATH="$here/fake-bin:$PATH" az $call >/dev/null 2>&1 || s=$?
-    [ "$s" -eq 99 ] || problem "fake az accepted: $call (exit $s)"
-  done
-  # fake_write METHOD PATH BODY WANT checks the fake's exit status for a write.
-  fake_write() {
-    s=0
-    PATH="$here/fake-bin:$PATH" az rest --method "$1" --url "$G$2" --body "$3" -o none >/dev/null 2>&1 || s=$?
-    [ "$s" -eq "$4" ] || problem "fake az gave exit $s, not $4, for $1 $2"
+    PATH="$here/fake-bin:$PATH" az "$@" >/dev/null 2>"$err" || s=$?
+    [ "$s" -eq "$want" ] || problem "fake az gave exit $s, not $want, for: $*"
+    if [ -n "$reason" ] && ! grep -qF -- "$reason" "$err"; then
+      problem "fake az refused '$*' for another reason: $(cat "$err")"
+    fi
   }
+  # The same calls with nothing wrong are accepted, so each probe below fails
+  # only for the fault it adds.
+  probe 0 "" account show --query tenantId -o tsv
+  probe 0 "" ad sp show --id "$APP_ID" --query id -o tsv
+  probe 99 "unsupported command words" account show extra --query tenantId -o tsv
+  probe 99 "unsupported option --bogus" ad sp show --id "$APP_ID" --bogus 1 -o tsv
+  probe 99 "missing options ['--id']" ad sp show --query id -o tsv
+  probe 99 "repeated option --filter" ad app list --filter x --filter y -o tsv
+  probe 99 "unsupported output format: json" ad sp show --id "$APP_ID" --query id -o json
   local assignment grant
   assignment="{\"principalId\":\"$ALEX\",\"resourceId\":\"$APP_SP\",\"appRoleId\":\"$ROLE\"}"
   grant="{\"clientId\":\"$APP_SP\",\"consentType\":\"Principal\",\"principalId\":\"$ALEX\",\"resourceId\":\"$GRAPH_SP\",\"scope\":\"openid\"}"
   # A service principal PATCH by appId, an unknown body field, and duplicate
   # assignments, owners and grants.
-  fake_write PATCH "/servicePrincipals/$APP_ID" '{"appRoleAssignmentRequired":true}' 3
-  fake_write PATCH "/servicePrincipals/$APP_SP" '{"appId":"x"}' 99
-  fake_write POST "/servicePrincipals/$APP_SP/appRoleAssignedTo" "$assignment" 1
-  fake_write POST "/applications/$APP_OBJ/owners/\$ref" "{\"@odata.id\":\"$G/directoryObjects/$ALEX\"}" 1
-  fake_write POST /oauth2PermissionGrants "$grant" 1
+  probe 3 "Service principal does not exist" rest --method PATCH --url "$G/servicePrincipals/$APP_ID" \
+    --body '{"appRoleAssignmentRequired":true}' -o none
+  probe 99 "unsupported body fields ['appId']" rest --method PATCH --url "$G/servicePrincipals/$APP_SP" \
+    --body '{"appId":"x"}' -o none
+  probe 1 "Permission being assigned already exists on the object" rest --method POST \
+    --url "$G/servicePrincipals/$APP_SP/appRoleAssignedTo" --body "$assignment" -o none
+  probe 1 "One or more added object references already exist" rest --method POST \
+    --url "$G/applications/$APP_OBJ/owners/\$ref" --body "{\"@odata.id\":\"$G/directoryObjects/$ALEX\"}" -o none
+  probe 1 "Permission entry already exists." rest --method POST --url "$G/oauth2PermissionGrants" \
+    --body "$grant" -o none
+  end_case
+}
+
+# --- Round-three cases --------------------------------------------------------
+
+# grant_json ID TYPE PRINCIPAL RESOURCE SCOPE prints a grant of the app's
+# service principal. PRINCIPAL is null for AllPrincipals.
+grant_json() {
+  printf '{"id":"%s","clientId":"%s","consentType":"%s","principalId":%s,"resourceId":"%s","scope":"%s"}' \
+    "$1" "$APP_SP" "$2" "$3" "$4" "$5"
+}
+
+test_wrong_audience_grant_gets_only_removal_advice() {
+  new_case wrong_audience_grant_gets_only_removal_advice
+  done_state
+  # Two tenant-wide grants under a per-user plan. Shrinking the first, which
+  # holds only openid, to the plan's scopes would add write consent for every
+  # user. The second has an extra scope, so a narrowing PATCH exists, but it
+  # would still leave consent for every user: only removal is offered.
+  GRANTS="$DONE_GRANTS,$(grant_json gAll AllPrincipals null "$GRAPH_SP" openid)"
+  GRANTS="$GRANTS,$(grant_json gAllDl AllPrincipals null "$EDISC_SP" "eDiscovery.Download.Read User.Read")"
+  write_state
+  run "TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=alex@contoso.example
+  expect_status 0
+  expect_out "WARNING: this grant gives more than the plan asks for: it covers every user in the tenant, but the plan asks for per-user consent."
+  expect_out "WARNING: this grant gives more than the plan asks for: it covers every user in the tenant, but the plan asks for per-user consent; it also holds User.Read, which the plan does not ask for."
+  expect_out "az rest --method DELETE --url $G/oauth2PermissionGrants/gAll"
+  expect_out "az rest --method DELETE --url $G/oauth2PermissionGrants/gAllDl"
+  reject_out "PATCH the same URL"
+  end_case
+}
+
+test_scope_only_advice_is_a_strict_subset() {
+  new_case scope_only_advice_is_a_strict_subset
+  done_state
+  GRANTS="$(grant_json g1 Principal "\"$ALEX\"" "$GRAPH_SP" "$GRAPH_SCOPE User.Read Mail.Read"),$(grant_json g2 Principal "\"$ALEX\"" "$EDISC_SP" eDiscovery.Download.Read)"
+  write_state
+  run "TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=alex@contoso.example
+  expect_status 0
+  expect_out "it also holds User.Read Mail.Read, which the plan does not ask for."
+  expect_line "      To keep it with only the scopes the plan asks for, PATCH the same URL with {\"scope\":\"$GRAPH_SCOPE\"}."
+  end_case
+  # A grant that holds none of the planned scopes gets no PATCH advice: the
+  # only reduced set would be empty.
+  new_case scope_only_advice_needs_a_non_empty_subset
+  done_state
+  GRANTS="$(grant_json g1 Principal "\"$ALEX\"" "$GRAPH_SP" "$GRAPH_SCOPE"),$(grant_json g2 Principal "\"$ALEX\"" "$EDISC_SP" User.Read)"
+  write_state
+  run "TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=alex@contoso.example
+  expect_status 0
+  expect_out "Purview eDiscovery, alex@contoso.example (Principal): User.Read"
+  expect_out "az rest --method DELETE --url $G/oauth2PermissionGrants/g2"
+  reject_out "PATCH the same URL"
+  end_case
+}
+
+test_former_assignee_grants_are_warned() {
+  new_case former_assignee_grants_are_warned
+  done_state
+  # The completed setup is for alex; the plan now names sam instead. The
+  # eDiscovery grant also holds an extra scope, so a narrowing PATCH exists,
+  # but it would keep consent for a user who is no longer assigned.
+  GRANTS="$(grant_json g1 Principal "\"$ALEX\"" "$GRAPH_SP" "$GRAPH_SCOPE"),$(grant_json g2 Principal "\"$ALEX\"" "$EDISC_SP" "eDiscovery.Download.Read User.Read")"
+  write_state
+  run "TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=sam@contoso.example
+  expect_status 0
+  expect_out "Microsoft Graph, user $ALEX (not in this plan) (Principal): $GRAPH_SCOPE"
+  expect_out "WARNING: this grant gives more than the plan asks for: it is for a user this plan does not assign."
+  expect_out "WARNING: this grant gives more than the plan asks for: it is for a user this plan does not assign; it also holds User.Read, which the plan does not ask for."
+  expect_out "az rest --method DELETE --url $G/oauth2PermissionGrants/g1"
+  expect_out "az rest --method DELETE --url $G/oauth2PermissionGrants/g2"
+  reject_out "PATCH the same URL"
+  expect_err "2 existing consent grant(s) give more than this plan asks for"
+  expect_reads_only
+  end_case
+  # Under tenant consent a per-user grant is narrower than the plan, so it
+  # gets no warning.
+  new_case per_user_grant_under_tenant_consent_is_not_warned
+  done_state
+  write_state
+  run "TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=sam@contoso.example CONSENT=tenant
+  expect_status 0
+  reject_out "WARNING"
+  end_case
+}
+
+test_extended_grant_keeps_its_scopes_in_the_wording() {
+  new_case extended_grant_keeps_its_scopes_in_the_wording
+  done_state
+  GRANTS="$(grant_json g1 Principal "\"$ALEX\"" "$GRAPH_SP" "openid User.Read"),$(grant_json g2 Principal "\"$ALEX\"" "$EDISC_SP" eDiscovery.Download.Read)"
+  write_state
+  run "TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=alex@contoso.example
+  expect_status 0
+  expect_out "(will be extended to: openid User.Read eDiscovery.ReadWrite.All offline_access profile)"
+  expect_out "this grant's existing scopes are kept."
+  reject_out "stays as it is"
+  expect_line "      To keep it with only the scopes the plan asks for, PATCH the same URL with {\"scope\":\"openid\"}."
+  end_case
+}
+
+test_invalid_grant_id_is_refused() {
+  new_case invalid_grant_id_is_refused
+  done_state
+  GRANTS="$(grant_json g/1 Principal "\"$ALEX\"" "$GRAPH_SP" openid),$(grant_json g2 Principal "\"$ALEX\"" "$EDISC_SP" eDiscovery.Download.Read)"
+  write_state
+  run "TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=alex@contoso.example --apply
+  expect_status nonzero
+  expect_err "has an id of unexpected characters"
+  expect_reads_only
+  end_case
+}
+
+test_invalid_scope_word_is_refused() {
+  new_case invalid_scope_word_is_refused
+  done_state
+  GRANTS="$(grant_json g1 Principal "\"$ALEX\"" "$GRAPH_SP" "openid pro;file"),$(grant_json g2 Principal "\"$ALEX\"" "$EDISC_SP" eDiscovery.Download.Read)"
+  write_state
+  run "TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=alex@contoso.example --apply
+  expect_status nonzero
+  expect_err "holds a scope of unexpected characters"
+  expect_reads_only
+  end_case
+}
+
+test_unreadable_reread_grant_scope_stops_its_update() {
+  new_case unreadable_reread_grant_scope_stops_its_update
+  done_state
+  # The planned grant holds no scope at all, so a re-read whose scope cannot
+  # be parsed must not compare equal to it.
+  GRANTS="$(grant_json g1 Principal "\"$ALEX\"" "$GRAPH_SP" ""),$(grant_json g2 Principal "\"$ALEX\"" "$EDISC_SP" eDiscovery.Download.Read)"
+  edit '^rest --method GET --url [^ ]*/oauth2PermissionGrants' 2 grant g1 '{"scope": "pro;file"}'
+  write_state
+  run "TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=alex@contoso.example --apply
+  expect_status nonzero
+  expect_err "consent grant g1 changed after this run read it"
+  expect_no_mutation
+  end_case
+}
+
+test_user_lookup_failure_is_not_reported_as_missing() {
+  new_case user_lookup_failure_is_not_reported_as_missing
+  fault '^ad user show --id sam@contoso.example' definite false
+  write_state
+  run "${restricted_vars[@]}"
+  expect_status nonzero
+  expect_out "UNRESOLVED sam@contoso.example: the lookup could not be checked; az's error is shown above"
+  expect_err "error: could not look up sam@contoso.example:"
+  expect_err "Insufficient privileges to complete the operation."
+  reject_out "sam@contoso.example: no directory user found"
+  expect_out "alex@contoso.example -> $ALEX: will be assigned"
+  expect_reads_only
+  end_case
+  new_case missing_user_is_reported_as_not_found
+  write_state
+  run "TENANT_ID=$T" "ASSIGN_USERS=nobody@contoso.example"
+  expect_status nonzero
+  expect_out "UNRESOLVED nobody@contoso.example: no directory user found"
+  reject_out "could not be checked"
+  end_case
+}
+
+test_group_lookup_failure_is_not_reported_as_missing() {
+  new_case group_lookup_failure_is_not_reported_as_missing
+  fault '^rest --method GET --url [^ ]*/groups/' throttle false
+  write_state
+  run "TENANT_ID=$T" "GROUP_OBJECT_ID=$GROUP" CONSENT=tenant --apply
+  expect_status nonzero
+  expect_out "UNRESOLVED group $GROUP: the lookup could not be checked; az's error is shown above"
+  expect_err "Too Many Requests"
+  reject_out "no group found"
+  expect_no_mutation
+  end_case
+  new_case missing_group_is_reported_as_not_found
+  write_state
+  run "TENANT_ID=$T" "GROUP_OBJECT_ID=00000000-0000-4000-8000-000000000032" CONSENT=tenant
+  expect_status nonzero
+  expect_out "UNRESOLVED group 00000000-0000-4000-8000-000000000032: no group found"
+  reject_out "could not be checked"
   end_case
 }
 

@@ -92,10 +92,18 @@ follows these rules:
 - **Readiness is checked with reads.** After creating a service principal it
   reads it back every 5 seconds, for up to 60 seconds, before the next change.
 - **An unclear result is read back.** If a change times out, is throttled, gets
-  a server error or fails without a definite reason, the script reads back
-  every field the change set, names the step and stops with a non-zero exit.
-  It reports one of three results: found; not found by a successful read; or
-  not checked, because the read failed too, with that read's error. It never
+  a server error or fails without a definite reason, the script reads back,
+  names the step and stops with a non-zero exit. What it reads depends on the
+  step. After a create it checks only whether the object exists: the
+  application by its display name, a service principal by its application
+  id. It does not check the new object's settings; the next run's plan
+  shows them. After an application update it compares every field the
+  update set: the API permissions, `isFallbackPublicClient` and the full
+  list of redirect URIs. After setting `appRoleAssignmentRequired` it reads
+  that value. After an owner, assignment or grant it checks for that owner,
+  that assignment, or a grant with every planned scope. It reports one
+  of three results: found; not found by a successful read; or not checked,
+  because the read failed too, with that read's error. It never
   reports a failed read as absence. Directory changes can take a few minutes
   to show, so after "not found" wait, then run the dry run again before
   `--apply`. Every step reads the current state first and skips what already
@@ -121,12 +129,15 @@ refuses, before any change, a restricted setup on a registration that declares
 app roles, because the default access role it assigns is valid only for an app
 with none (Docs).
 
-It never removes a consent grant or a scope. When an existing grant gives more
-than the plan asks for, the plan shows a warning with the grant's id and the
-`az rest` command that removes it. Two examples are a tenant-wide
-`eDiscovery.ReadWrite.All` grant kept after a move to `CONSENT=principal` and
-`READ_ONLY=1`, and any extra scope on a grant. Remove such a grant by hand if
-the narrower setup must be strict. With `READ_ONLY=1`, the sign-in command the
+It never removes a consent grant or a scope; a grant it extends keeps its
+existing scopes. When an existing grant gives more than the plan asks for, the
+plan shows a warning with the grant's id and the `az rest` command that
+removes it. Examples are a tenant-wide `eDiscovery.ReadWrite.All` grant kept
+after a move to `CONSENT=principal` and `READ_ONLY=1`, a per-user grant for a
+user no longer in `ASSIGN_USERS`, and an extra scope on a grant. For a grant
+whose only excess is extra scopes, the plan also offers a PATCH that keeps just
+the scopes the plan asks for, and only when that set is smaller than what the
+grant holds. Remove such a grant by hand if the narrower setup must be strict. With `READ_ONLY=1`, the sign-in command the
 script prints ends with `--read-only`.
 
 #### Variables

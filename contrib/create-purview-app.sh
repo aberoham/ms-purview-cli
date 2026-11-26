@@ -572,6 +572,20 @@ add_assignee() { # id label kind
     a_assigned+=(false)
   fi
 }
+# unresolved_lookup LABEL NOT_FOUND records an assignee that did not resolve.
+# A definite not-found from az records NOT_FOUND. Any other failure, such as
+# a refusal, throttling, an expired session or a network error, shows az's
+# error and records that the lookup could not be checked.
+unresolved_lookup() {
+  unresolved=$((unresolved + 1))
+  if grep -Eq 'Request_ResourceNotFound|does not exist or one of its queried reference-property objects are not present|(^|ERROR: )Not Found(\(|$)' "$err_file"; then
+    unresolved_lines+=("$1: $2")
+    return 0
+  fi
+  echo "error: could not look up $1:" >&2
+  show_az_error
+  unresolved_lines+=("$1: the lookup could not be checked; az's error is shown above")
+}
 for word in ${assign_words[@]+"${assign_words[@]}"}; do
   if user=$(az ad user show --id "$word" --query "[id, userPrincipalName]" -o tsv 2>"$err_file"); then
     uid=$(first_line "$user")
@@ -580,18 +594,21 @@ for word in ${assign_words[@]+"${assign_words[@]}"}; do
       add_assignee "$(lower "$uid")" "$upn" user
       continue
     fi
+    echo "az returned no readable object id" >"$err_file"
   fi
-  unresolved=$((unresolved + 1))
-  unresolved_lines+=("$word: no directory user found (check the sign-in name, which may differ from the mail address)")
+  unresolved_lookup "$word" "no directory user found (check the sign-in name, which may differ from the mail address)"
 done
 if [ -n "$GROUP_OBJECT_ID" ]; then
   if group=$(az rest --method GET --url "$GRAPH/groups/$GROUP_OBJECT_ID?\$select=id,displayName" \
-    --query "[id, displayName]" -o tsv 2>"$err_file") &&
-    is_guid "$(first_line "$group")"; then
-    add_assignee "$GROUP_OBJECT_ID" "group $(sanitize "$(sed -n 2p <<<"$group")")" group
+    --query "[id, displayName]" -o tsv 2>"$err_file"); then
+    if is_guid "$(first_line "$group")"; then
+      add_assignee "$GROUP_OBJECT_ID" "group $(sanitize "$(sed -n 2p <<<"$group")")" group
+    else
+      echo "az returned no readable object id" >"$err_file"
+      unresolved_lookup "group $GROUP_OBJECT_ID" "no group found"
+    fi
   else
-    unresolved=$((unresolved + 1))
-    unresolved_lines+=("group $GROUP_OBJECT_ID: no group found")
+    unresolved_lookup "group $GROUP_OBJECT_ID" "no group found"
   fi
 fi
 
@@ -763,12 +780,55 @@ principal_label() {
   printf 'user %s (not in this plan)' "$(sanitize "$1")"
 }
 
+# is_planned_user ID reports whether ID is one of the users this plan assigns.
+is_planned_user() {
+  local i=0
+  while [ "$i" -lt "${#a_ids[@]}" ]; do
+    if [ "${a_ids[$i]}" = "$1" ] && [ "${a_kinds[$i]}" = user ]; then
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# words_kept HAVE WANTED prints the words of HAVE that WANTED also holds, in
+# HAVE's order: the grant's scopes with the extras taken out.
+words_kept() {
+  local w out=""
+  for w in $1; do
+    [ -n "$(words_missing "$w" "$2")" ] || out="$out${out:+ }$w"
+  done
+  printf '%s' "$out"
+}
+
+# print_grant_advice ID SCOPE WANTED WRONG_AUDIENCE says how to narrow a
+# grant by hand. A grant for the wrong audience can only be removed. For a
+# grant with extra scopes, a PATCH is offered only when its body is a strict,
+# non-empty subset of the grant's current scopes, so following the advice
+# can never add a scope.
+print_grant_advice() {
+  local kept current
+  if ! [[ "$1" =~ $GRANT_ID_RE ]]; then
+    echo "      Its id holds unexpected characters; remove it in the Entra admin center."
+    return 0
+  fi
+  echo "      To remove the whole grant by hand:"
+  echo "        az rest --method DELETE --url $GRAPH/oauth2PermissionGrants/$1"
+  [ "$4" = false ] || return 0
+  current=$(join_words "$2") || return 0
+  kept=$(words_kept "$current" "$3")
+  if [ -n "$kept" ] && [ "$kept" != "$current" ]; then
+    echo "      To keep it with only the scopes the plan asks for, PATCH the same URL with {\"scope\":\"$kept\"}."
+  fi
+}
+
 # print_existing_grants lists every grant the application already holds on
 # Graph and on the eDiscovery app, and warns about each one that gives more
 # than this plan asks for. It sets broader_grants to the number of warnings.
 broader_grants=0
 print_existing_grants() {
-  local line id res type principal scope res_label wanted who extra reasons
+  local line id res type principal scope res_label wanted who extra reasons wrong_audience
   echo "  Existing consent grants of this application on these two resources:"
   if [ -z "$existing_grants" ]; then
     echo "    none"
@@ -797,8 +857,15 @@ print_existing_grants() {
     fi
     echo "    - $res_label, $who: $scope"
     reasons=""
-    if [ "$type" = AllPrincipals ] && [ "$CONSENT" = principal ]; then
-      reasons="it covers every user in the tenant, but the plan asks for per-user consent"
+    wrong_audience=false
+    if [ "$CONSENT" = principal ]; then
+      if [ "$type" = AllPrincipals ]; then
+        wrong_audience=true
+        reasons="it covers every user in the tenant, but the plan asks for per-user consent"
+      elif ! is_planned_user "$principal"; then
+        wrong_audience=true
+        reasons="it is for a user this plan does not assign"
+      fi
     fi
     extra=$(words_missing "$scope" "$wanted")
     if [ -n "$extra" ]; then
@@ -807,14 +874,8 @@ print_existing_grants() {
     [ -n "$reasons" ] || continue
     broader_grants=$((broader_grants + 1))
     echo "      WARNING: this grant gives more than the plan asks for: $reasons."
-    echo "      The script never removes a grant or a scope, so this grant stays as it is."
-    if [[ "$id" =~ $GRANT_ID_RE ]]; then
-      echo "      To remove the whole grant by hand:"
-      echo "        az rest --method DELETE --url $GRAPH/oauth2PermissionGrants/$id"
-      echo "      To keep it with fewer scopes, PATCH the same URL with a body such as {\"scope\":\"$wanted\"}."
-    else
-      echo "      Its id holds unexpected characters; remove it in the Entra admin center."
-    fi
+    echo "      The script never removes a grant or a scope: this grant's existing scopes are kept."
+    print_grant_advice "$id" "$scope" "$wanted" "$wrong_audience"
   done <<<"$existing_grants"
 }
 
@@ -1269,7 +1330,8 @@ while [ "$i" -lt "${#g_res[@]}" ]; do
       # it and stop if its scope changed since planning.
       existing_grants=$(read_pages "the consent grants of application $app_id" "$(grants_url)" "$GRANT_FIELDS")
       if ! now_scope=$(grant_scope_by_id "${g_grant_id[$i]}") ||
-        [ "$(join_words "$now_scope" || true)" != "${g_old_scope[$i]}" ]; then
+        ! now_scope=$(join_words "$now_scope") ||
+        [ "$now_scope" != "${g_old_scope[$i]}" ]; then
         fail "consent grant ${g_grant_id[$i]} changed after this run read it. Nothing was sent to it; run the script again to plan from the new state."
       fi
       send "extend $res_label consent for ${g_who[$i]}" PATCH \

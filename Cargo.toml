@@ -2,7 +2,7 @@
 name = "ms-purview-cli"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.99"
+rust-version = "1.100"
 license = "MIT"
 description = "Microsoft Purview eDiscovery (Premium) from the terminal, through Microsoft Graph"
 repository = "https://github.com/aberoham/ms-purview-cli"

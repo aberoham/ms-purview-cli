@@ -201,6 +201,10 @@ local code-signing identity, against the same tenant and registration as the PR 
 - **Credential compatibility:** the `v0.1.0-rc.1` release build then ran `auth refresh`
   on the credential the branch build had stored, and it succeeded without a keychain
   prompt. (Observed)
+- **Assignment required:** the same sign-in address, opened by the tool in the default
+  browser, landed in a profile signed in to a different account, which was not assigned to
+  the app. The identity platform refused it with `AADSTS50105` (the user is not assigned to
+  the application) before any consent prompt. (Observed)
 - **Not observed:** whether the browser reached the listener over IPv4 or IPv6.
 - **Setup script, dry run:** `contrib/create-purview-app.sh` without `--apply`, with
   `CLIENT_ID` naming the existing registration and the signed-in account in

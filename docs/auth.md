@@ -220,7 +220,10 @@ Exchange (PKCE, RFC 7636) on a loopback redirect:
    flow does.
 
 The browser must run on the same computer, because the redirect goes to the
-loopback address. Over a remote shell, use the device code. The command waits
+loopback address. The tool cannot choose a browser profile: if the default
+one is signed in to another account, open the printed address in the right
+profile instead. Either tab can finish the sign-in. An account that is not
+assigned to the app gets `AADSTS50105` (Observed). Over a remote shell, use the device code. The command waits
 up to 15 minutes. The page asks which account to use (`prompt=select_account`).
 
 The registration lists `http://localhost/callback` without a port. The identity

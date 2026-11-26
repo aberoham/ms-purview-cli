@@ -2303,7 +2303,7 @@ The `aberoham/homebrew-tap` formula `purview` reads releases, as it does for `en
 | `async-trait` | | 1.1 |
 | `sha2` | | 1.1 (account lock file names) |
 | `getrandom` | | 1.2 (PKCE) |
-| `webbrowser` | | 1.2 |
+| (no browser crate) | `auth login --browser` runs the platform's opener (`open`, `rundll32 url.dll,FileProtocolHandler`, `xdg-open`) with null standard streams, so a browser cannot write into the command's output | 1.2 |
 | `futures-util` | | 1.5 |
 | `zip` | `deflate` (plus `deflate64` only if PR 4.1 finds it) | 1.5 |
 | `regex` | | 1.6 |

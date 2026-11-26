@@ -956,7 +956,7 @@ async fn a_url_quoted_in_a_graph_error_loses_its_secret_query_values() {
         .unwrap_err();
     let text = error.to_string();
     assert!(!text.contains("canary"), "{text}");
-    assert!(text.contains("/v1.0/x?sig=REDACTED&%24top=1."), "{text}");
+    assert!(text.contains("/v1.0/x?REDACTED"), "{text}");
 }
 
 #[tokio::test]

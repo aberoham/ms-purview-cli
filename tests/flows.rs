@@ -2908,10 +2908,7 @@ async fn a_signed_url_in_a_graph_error_reaches_no_output_or_trace_with_its_signa
                 .as_str()
                 .unwrap()
                 .to_owned();
-            assert!(
-                detail.contains("O'Brien.pdf?sig=REDACTED&se=REDACTED'."),
-                "{detail}"
-            );
+            assert!(detail.contains("O'Brien.pdf?REDACTED"), "{detail}");
         } else {
             assert!(
                 run.stdout().contains("Purview role: denied"),

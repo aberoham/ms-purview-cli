@@ -437,7 +437,12 @@ pub fn url(value: &::url::Url, redactor: &Redactor) -> String {
         let pairs: Vec<(String, String)> = value
             .query_pairs()
             .map(|(key, item)| {
-                if KEPT_QUERY_KEYS.contains(&key.as_ref()) && !redactor.recognises(&item) {
+                // A kept value that holds another URL is not an OData
+                // option but text run together with one.
+                if KEPT_QUERY_KEYS.contains(&key.as_ref())
+                    && !redactor.recognises(&item)
+                    && !item.contains("://")
+                {
                     (key.into_owned(), item.into_owned())
                 } else if is_plain_key(&key) {
                     (key.into_owned(), REDACTED_QUERY_VALUE.to_owned())
@@ -457,15 +462,18 @@ pub fn url(value: &::url::Url, redactor: &Redactor) -> String {
     clean.to_string()
 }
 
-/// `text` with every `http://` or `https://` URL in it passed through
-/// `url`, for free text such as a Graph error message. A URL runs from its
-/// scheme to the next whitespace, so no query can be cut off from the URL
-/// it belongs to (a quote or bracket inside a URL is legal); only trailing
-/// punctuation and closing quotes are trimmed back off the end, and they
-/// hold no query. A URL that does not parse keeps nothing after its first
-/// `?` or `#`.
+/// `text` as it may be shown or recorded. A string that is one URL and
+/// nothing else (a `downloadUrl` or `@odata.nextLink` field) goes through
+/// `url`, which keeps the OData query options. In any other text, such as
+/// a Graph error message, a URL keeps only its scheme, host and path:
+/// everything from its first `?` or `#` to the next whitespace becomes
+/// `?REDACTED`. Free text gives no reliable end to a URL (quotes, brackets
+/// and a second URL can all run on from it), so no part of a query in it
+/// is kept.
 pub fn urls_in_text(text: &str, redactor: &Redactor) -> String {
-    const TRAILING: &[char] = &['.', ',', ';', ':', '!', ')', ']', '}', '"', '\'', '`', '>'];
+    if let Some(parsed) = single_url(text) {
+        return url(&parsed, redactor);
+    }
     let lower = text.to_ascii_lowercase();
     let mut output = String::with_capacity(text.len());
     let mut position = 0;
@@ -479,18 +487,31 @@ pub fn urls_in_text(text: &str, redactor: &Redactor) -> String {
         let token = rest
             .find(char::is_whitespace)
             .map_or(rest, |end| &rest[..end]);
-        let candidate = token.trim_end_matches(TRAILING);
         output.push_str(&text[position..start]);
-        match ::url::Url::parse(candidate) {
-            Ok(parsed) => output.push_str(&url(&parsed, redactor)),
-            Err(_) => output.push_str(candidate.split(['?', '#']).next().unwrap_or_default()),
+        match token.find(['?', '#']) {
+            Some(cut) => {
+                output.push_str(&token[..cut]);
+                output.push('?');
+                output.push_str(REDACTED_QUERY_VALUE);
+            }
+            None => output.push_str(token),
         }
-        output.push_str(&token[candidate.len()..]);
         // The scheme alone is at least seven bytes, so this always moves.
         position = start + token.len().max(1);
     }
     output.push_str(&text[position..]);
     output
+}
+
+/// `text` as a URL when it is exactly one: no whitespace, an `http` or
+/// `https` scheme at the start, and no second `://` anywhere.
+fn single_url(text: &str) -> Option<::url::Url> {
+    let lower = text.to_ascii_lowercase();
+    let starts = lower.starts_with("https://") || lower.starts_with("http://");
+    if !starts || text.contains(char::is_whitespace) || lower.matches("://").count() != 1 {
+        return None;
+    }
+    ::url::Url::parse(text).ok()
 }
 
 /// Percent-decodes `text`, keeping any byte sequence that is not valid
@@ -903,12 +924,13 @@ mod tests {
     }
 
     #[test]
-    fn urls_in_free_text_lose_their_secret_query_values() {
+    fn urls_in_free_text_lose_their_whole_query() {
         let redactor = Redactor::new();
         let proxy = concat!(
             "https://alpha.proxyservice.ediscovery.svc.cloud.microsoft/ediscovery/api/proxy/x",
             "?sig=canary-sig-0001&downloadType=Report"
         );
+        let path_only = proxy.split('?').next().unwrap();
         // An address the parser refuses, joined at run time so that the
         // public-data lint does not read it.
         let broken = ["https://", "[bad?token=canary-token-0001"].concat();
@@ -917,36 +939,46 @@ mod tests {
              or {broken} now"
         );
         let shown = urls_in_text(&text, &redactor);
-        assert!(!shown.contains("canary"), "{shown}");
-        let kept = proxy.replace("canary-sig-0001", "REDACTED");
-        assert!(
-            shown.starts_with(&format!("Download from {kept}. Or \"")),
-            "{shown}"
+        assert_eq!(
+            shown,
+            format!(
+                "Download from {path_only}?REDACTED Or \"HTTP://graph.microsoft.com/v1.0/y?REDACTED \
+                 or {}?REDACTED now",
+                ["https://", "[bad"].concat()
+            )
         );
-        assert!(
-            shown.ends_with(&format!(", or {} now", ["https://", "[bad"].concat())),
-            "{shown}"
-        );
+        for text in [
+            "see https://graph.microsoft.com/v1.0/O'Brien.pdf?sig=canary-sig-0002 now",
+            "see 'https://graph.microsoft.com/v1.0/a\"b(c)?sig=canary-sig-0003'.",
+            // Two URLs run together, with no space between them.
+            "[\"https://one.example/x?$top=1\",\"https://two.example/y?sig=canary-sig-0004\"]",
+            "https://one.example/x?$top=1https://two.example/y?sig=canary-sig-0005",
+            "https://one.example/x#https://two.example/y?sig=canary-sig-0006",
+        ] {
+            let shown = urls_in_text(text, &redactor);
+            assert!(!shown.contains("canary"), "{text}: {shown}");
+        }
         assert_eq!(
             urls_in_text("no address here", &redactor),
             "no address here"
         );
-        // Quotes and brackets inside a URL do not end it.
-        for text in [
-            "see https://graph.microsoft.com/v1.0/O'Brien.pdf?sig=canary-sig-0002 now",
-            "see 'https://graph.microsoft.com/v1.0/a\"b(c)?sig=canary-sig-0003'.",
-            "https://graph.microsoft.com/v1.0/x?a=1&sig=canary-sig-0004",
-        ] {
-            let shown = urls_in_text(text, &redactor);
-            assert!(!shown.contains("canary"), "{text}: {shown}");
-            assert!(shown.contains("sig=REDACTED"), "{text}: {shown}");
-        }
+    }
+
+    #[test]
+    fn a_string_that_is_one_url_keeps_its_odata_options() {
+        let redactor = Redactor::new();
         assert_eq!(
             urls_in_text(
-                "('https://graph.microsoft.com/v1.0/x?sig=canary-sig-0005').",
+                "https://graph.microsoft.com/v1.0/x?$skiptoken=page-0002&sig=canary-sig-0007",
                 &redactor
             ),
-            "('https://graph.microsoft.com/v1.0/x?sig=REDACTED')."
+            "https://graph.microsoft.com/v1.0/x?%24skiptoken=page-0002&sig=REDACTED"
         );
+        // A kept value that holds another URL is not kept.
+        let joined = urls_in_text(
+            "https://one.example/x?$top=1%22,%22https%3A//two.example/y?sig=canary-sig-0008",
+            &redactor,
+        );
+        assert!(!joined.contains("canary"), "{joined}");
     }
 }

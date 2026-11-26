@@ -108,21 +108,6 @@ impl CredentialLock {
                 Err(error) => return Err(failed("open", error)),
             }
         };
-        // The creation mode applies only to a new file; one an earlier
-        // release created more open is narrowed through its handle.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = file
-                .metadata()
-                .map_err(|error| failed("inspect", error))?
-                .permissions()
-                .mode();
-            if mode & 0o077 != 0 {
-                file.set_permissions(std::fs::Permissions::from_mode(0o600))
-                    .map_err(|error| failed("narrow", error))?;
-            }
-        }
         loop {
             match file.try_lock() {
                 Ok(()) => return Ok(Self { _file: file }),
@@ -141,41 +126,25 @@ impl CredentialLock {
     }
 }
 
-/// Creates a lock folder and any missing parents with mode 0700, and narrows
-/// the folder itself to 0700 if it already exists more open. On macOS the
+/// Creates a lock folder and any missing parents with mode 0700. On macOS the
 /// local data directory is also the configuration directory, so a lock taken
-/// first would otherwise create `purview/` with the default mode. Windows has
-/// no modes and relies on the profile's access control list.
+/// first would otherwise create `purview/` with the default mode. A folder
+/// that already exists keeps its mode: changing the mode of an existing path
+/// would need a no-follow open that standard Rust does not offer. A lock
+/// folder that is a link, or not a folder, is refused. Windows has no modes
+/// and relies on the profile's access control list.
 fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        use std::os::unix::fs::DirBuilderExt;
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(dir)?;
-        // Read without following a link: a linked lock folder is refused, so
-        // the narrowing below never reaches a folder the tool does not own.
-        let metadata = std::fs::symlink_metadata(dir)?;
-        if !metadata.file_type().is_dir() {
+        if !std::fs::symlink_metadata(dir)?.file_type().is_dir() {
             return Err(std::io::Error::other(
                 "the lock folder is a link or not a folder; refusing to use it",
             ));
-        }
-        if metadata.permissions().mode() & 0o077 != 0 {
-            // Narrow through a handle that is checked to be the folder just
-            // inspected, so a swap for a link in between is refused, as
-            // config.rs does for its own folders.
-            use std::os::unix::fs::MetadataExt;
-            let handle = File::open(dir)?;
-            let opened = handle.metadata()?;
-            if !opened.is_dir() || opened.dev() != metadata.dev() || opened.ino() != metadata.ino()
-            {
-                return Err(std::io::Error::other(
-                    "the lock folder changed while it was being opened; refusing to use it",
-                ));
-            }
-            handle.set_permissions(std::fs::Permissions::from_mode(0o700))?;
         }
         Ok(())
     }
@@ -995,16 +964,14 @@ mod tests {
         assert_eq!(mode(&app), 0o700);
         assert_eq!(mode(&app.join("account-locks")), 0o700);
         assert_eq!(mode(&path), 0o600);
-        // A lock folder and lock file an earlier release left open are narrowed.
+        // An existing folder keeps its mode; only new paths are created private.
         std::fs::set_permissions(
             app.join("account-locks"),
             std::fs::Permissions::from_mode(0o755),
         )
         .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         drop(CredentialLock::acquire(&path, Duration::ZERO).unwrap());
-        assert_eq!(mode(&app.join("account-locks")), 0o700);
-        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&app.join("account-locks")), 0o755);
     }
 
     #[cfg(unix)]

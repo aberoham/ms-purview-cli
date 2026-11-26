@@ -574,8 +574,18 @@ pub async fn login_device_code(
                  permission",
             )
         })?;
+    // The principal binds the account key to one identity; without it the
+    // key could later be taken over by someone else.
+    if claims.tid.is_empty() || claims.oid.is_empty() {
+        return Err(PurviewError::message(
+            "the sign-in returned an id token without the tid or oid claim, so the account \
+             cannot be bound to one identity; nothing was stored",
+        ));
+    }
     let mut credential = Credential {
         email: claims.account.clone(),
+        tid: claims.tid.clone(),
+        oid: claims.oid.clone(),
         client_id: identity.client_id().to_owned(),
         tenant_id: identity.tenant_id().to_owned(),
         refresh_token,
@@ -610,11 +620,7 @@ pub async fn login_device_code(
         upn: claims.upn,
         oid: claims.oid,
         display_name: claims.name,
-        tenant_id: if claims.tid.is_empty() {
-            identity.tenant_id().to_owned()
-        } else {
-            claims.tid
-        },
+        tenant_id: claims.tid,
         client_id: identity.client_id().to_owned(),
         login_time: clock
             .now()

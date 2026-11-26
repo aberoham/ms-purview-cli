@@ -442,6 +442,7 @@ pub struct MemoryStore {
     values: Mutex<BTreeMap<String, Vec<u8>>>,
     locks: AtomicUsize,
     fail_writes: AtomicBool,
+    fail_deletes: AtomicBool,
 }
 
 /// Names the stored keys and counts, never the stored values.
@@ -480,6 +481,13 @@ impl MemoryStore {
         self.fail_writes.store(fail, Ordering::SeqCst);
     }
 
+    /// Makes every later deletion of a credential's primary entry fail, or
+    /// succeed again. Chunk entries (`<key>:<n>`, `<key>:s<slot>:<n>`) are
+    /// still deleted, so a chunked write's own clean-up is unaffected.
+    pub fn fail_deletes(&self, fail: bool) {
+        self.fail_deletes.store(fail, Ordering::SeqCst);
+    }
+
     fn values(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Vec<u8>>> {
         self.values
             .lock()
@@ -514,6 +522,14 @@ impl CredentialStore for MemoryStore {
     }
 
     fn delete(&self, key: &str) -> Result<bool> {
+        let is_chunk = key
+            .rsplit_once(':')
+            .is_some_and(|(_, last)| last.chars().all(|c| c.is_ascii_digit()));
+        if self.fail_deletes.load(Ordering::SeqCst) && !is_chunk {
+            return Err(PurviewError::message(
+                "the in-memory credential store refused the deletion",
+            ));
+        }
         Ok(self.values().remove(key).is_some())
     }
 

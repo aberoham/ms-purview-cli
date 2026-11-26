@@ -153,13 +153,17 @@ impl fmt::Debug for AccessToken {
 }
 
 /// The credential stored for one account (`docs/SPEC.md` section 5.1):
-/// the app registration that issued it, the newest refresh token, the
-/// Graph token and, once consent allows, the download token. Every
-/// redemption uses the registration recorded here, so tokens and
-/// registration cannot come apart.
+/// the principal it belongs to, the app registration that issued it, the
+/// newest refresh token, the Graph token and, once consent allows, the
+/// download token. Every redemption uses the registration recorded here,
+/// so tokens and registration cannot come apart, and the principal binds
+/// the account key to one identity.
 #[derive(Clone)]
 pub struct Credential {
     pub email: String,
+    /// The `tid` and `oid` claims of the identity the tokens belong to.
+    pub tid: String,
+    pub oid: String,
     pub client_id: String,
     pub tenant_id: String,
     pub refresh_token: SecretString,
@@ -172,6 +176,8 @@ impl fmt::Debug for Credential {
         formatter
             .debug_struct("Credential")
             .field("email", &self.email)
+            .field("tid", &self.tid)
+            .field("oid", &self.oid)
             .field("client_id", &self.client_id)
             .field("tenant_id", &self.tenant_id)
             .field("refresh_token", &self.refresh_token)
@@ -187,6 +193,8 @@ impl fmt::Debug for Credential {
 struct StoredRecord<'a> {
     version: u32,
     email: &'a str,
+    tid: &'a str,
+    oid: &'a str,
     client_id: &'a str,
     tenant_id: &'a str,
     refresh_token: &'a str,
@@ -206,6 +214,10 @@ struct StoredToken<'a> {
 struct LoadedRecord {
     version: u32,
     email: String,
+    #[serde(default)]
+    tid: String,
+    #[serde(default)]
+    oid: String,
     #[serde(default)]
     client_id: String,
     #[serde(default)]
@@ -240,6 +252,46 @@ impl LoadedToken {
 }
 
 impl Credential {
+    /// Whether `tid` and `oid` name the identity this credential belongs
+    /// to, ignoring case.
+    pub fn belongs_to(&self, tid: &str, oid: &str) -> bool {
+        self.tid.eq_ignore_ascii_case(tid.trim()) && self.oid.eq_ignore_ascii_case(oid.trim())
+    }
+
+    /// The `tid` and `oid` recorded in whatever is stored under `email`'s
+    /// key, read leniently, so that a credential this release cannot use
+    /// still says whom it belonged to. `None` when nothing is stored; empty
+    /// strings when the item records no principal or cannot be parsed.
+    /// Token fields are registered with the Redactor as they are seen.
+    pub fn stored_principal(
+        store: &dyn CredentialStore,
+        email: &str,
+        redactor: &Redactor,
+    ) -> Result<Option<(String, String)>> {
+        let Some(text) = find_value(store, &token_key(email))? else {
+            return Ok(None);
+        };
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+        for pointer in [
+            "/refresh_token",
+            "/graph/access_token",
+            "/download/access_token",
+        ] {
+            if let Some(secret) = value.pointer(pointer).and_then(serde_json::Value::as_str) {
+                redactor.register(secret);
+            }
+        }
+        let text_at = |name: &str| {
+            value
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_owned()
+        };
+        Ok(Some((text_at("tid"), text_at("oid"))))
+    }
+
     /// The JSON written to the credential store.
     pub fn to_json(&self) -> Result<String> {
         fn stored(token: &AccessToken) -> StoredToken<'_> {
@@ -252,6 +304,8 @@ impl Credential {
         let record = StoredRecord {
             version: CREDENTIAL_VERSION,
             email: &self.email,
+            tid: &self.tid,
+            oid: &self.oid,
             client_id: &self.client_id,
             tenant_id: &self.tenant_id,
             refresh_token: self.refresh_token.expose(),
@@ -281,6 +335,8 @@ impl Credential {
         }
         let credential = Self {
             email: record.email,
+            tid: record.tid,
+            oid: record.oid,
             client_id: record.client_id,
             tenant_id: record.tenant_id,
             refresh_token: record.refresh_token,
@@ -309,6 +365,10 @@ impl Credential {
             return Err(damaged(
                 "does not record the app registration that issued it",
             ));
+        }
+        // Without the principal, the key cannot be tied to one identity.
+        if credential.tid.trim().is_empty() || credential.oid.trim().is_empty() {
+            return Err(damaged("does not record the identity it belongs to"));
         }
         if credential.refresh_token.is_empty() {
             return Err(damaged("has no refresh token"));
@@ -375,6 +435,10 @@ struct State {
     /// failure, a Windows clean-up failure), so the store may hold a newer
     /// credential than `credential`. The next call reads it again first.
     reload: bool,
+    /// `invalidate_graph` was called and no Graph refresh has been stored
+    /// since. A reload keeps the invalidation: the token it reads back may
+    /// be the one the service refused.
+    graph_invalidated: bool,
 }
 
 /// The production `TokenProvider`: one account's stored credential,
@@ -437,6 +501,7 @@ impl StoredTokenProvider {
                 credential,
                 download_refused: false,
                 reload: false,
+                graph_invalidated: false,
             }),
         })
     }
@@ -452,6 +517,7 @@ impl StoredTokenProvider {
         self.reload_if_needed(&mut state)?;
         let refreshed = self.refresh_graph(&state.credential).await?;
         self.commit(&mut state, refreshed)?;
+        state.graph_invalidated = false;
         match self.refresh_download(&state.credential).await {
             Ok(refreshed) => {
                 self.commit(&mut state, refreshed)?;
@@ -553,13 +619,22 @@ impl StoredTokenProvider {
             || !loaded
                 .tenant_id
                 .eq_ignore_ascii_case(&state.credential.tenant_id)
+            || !loaded.belongs_to(&state.credential.tid, &state.credential.oid)
         {
             return Err(PurviewError::message(
-                "the stored credential now belongs to another app registration; run the \
-                 command again",
+                "the stored credential now belongs to another app registration or identity; \
+                 run the command again",
             ));
         }
+        // A download token in the store was written after any refusal this
+        // process saw (a refusal clears it), so consent has been given since.
+        if loaded.download.is_some() {
+            state.download_refused = false;
+        }
         state.credential = loaded;
+        if state.graph_invalidated {
+            state.credential.graph.expires_at = DateTime::<Utc>::UNIX_EPOCH;
+        }
         state.reload = false;
         Ok(())
     }
@@ -596,6 +671,7 @@ impl TokenProvider for StoredTokenProvider {
         {
             let refreshed = self.refresh_graph(&state.credential).await?;
             self.commit(&mut state, refreshed)?;
+            state.graph_invalidated = false;
         }
         Ok(GraphToken(state.credential.graph.token.clone()))
     }
@@ -633,6 +709,7 @@ impl TokenProvider for StoredTokenProvider {
     async fn invalidate_graph(&self) {
         let mut state = self.state.lock().await;
         state.credential.graph.expires_at = DateTime::<Utc>::UNIX_EPOCH;
+        state.graph_invalidated = true;
     }
 }
 
@@ -651,6 +728,7 @@ mod tests {
     const CLIENT: &str = "00000000-0000-4000-8000-000000000001";
     const TENANT: &str = "00000000-0000-4000-8000-000000000002";
     const EMAIL: &str = "alex@contoso.example";
+    const OID: &str = "00000000-0000-4000-8000-000000000011";
 
     fn token(seconds_left: i64, value: &str, scope: &str) -> AccessToken {
         AccessToken {
@@ -663,6 +741,8 @@ mod tests {
     fn credential(graph_seconds: i64, download: Option<i64>) -> Credential {
         Credential {
             email: EMAIL.into(),
+            tid: TENANT.into(),
+            oid: OID.into(),
             client_id: CLIENT.into(),
             tenant_id: TENANT.into(),
             refresh_token: SecretString::new("canary-refresh-0001"),
@@ -758,9 +838,9 @@ mod tests {
         let shown = format!("{credential:?}");
         assert!(
             shown.starts_with(&format!(
-                "Credential {{ email: \"{EMAIL}\", client_id: \"{CLIENT}\", tenant_id: \
-                 \"{TENANT}\", refresh_token: [redacted], graph: AccessToken {{ token: \
-                 [redacted],"
+                "Credential {{ email: \"{EMAIL}\", tid: \"{TENANT}\", oid: \"{OID}\", \
+                 client_id: \"{CLIENT}\", tenant_id: \"{TENANT}\", refresh_token: [redacted], \
+                 graph: AccessToken {{ token: [redacted],"
             )),
             "{shown}"
         );
@@ -779,6 +859,8 @@ mod tests {
             json!({
                 "version": 1,
                 "email": EMAIL,
+                "tid": TENANT,
+                "oid": OID,
                 "client_id": CLIENT,
                 "tenant_id": TENANT,
                 "refresh_token": "canary-refresh-0001",
@@ -811,6 +893,7 @@ mod tests {
     #[test]
     fn an_unreadable_expiry_counts_as_expired() {
         let text = json!({"version": 1, "email": EMAIL, "client_id": CLIENT, "tenant_id": TENANT,
+                          "tid": TENANT, "oid": OID,
                           "refresh_token": "r",
                           "graph": {"access_token": "a", "expires_at": "soon",
                                     "scope": "eDiscovery.ReadWrite.All"}});
@@ -1100,6 +1183,7 @@ mod tests {
     fn a_loaded_credential_must_be_usable_and_belong_to_its_key() {
         let redactor = Redactor::new();
         let base = json!({"version": 1, "email": EMAIL, "client_id": CLIENT, "tenant_id": TENANT,
+                          "tid": TENANT, "oid": OID,
                           "refresh_token": "r",
                           "graph": {"access_token": "a", "expires_at": "2026-01-05T10:00:00Z",
                                     "scope": "eDiscovery.ReadWrite.All"}});
@@ -1116,6 +1200,8 @@ mod tests {
                 json!(""),
                 "does not record the app registration",
             ),
+            ("/oid", json!(""), "does not record the identity"),
+            ("/tid", json!(" "), "does not record the identity"),
             (
                 "/tenant_id",
                 json!("organizations"),
@@ -1164,7 +1250,22 @@ mod tests {
     /// failure or a Windows clean-up failure does after the item is live.
     struct CommitsThenFails {
         inner: Arc<MemoryStore>,
-        fail_once: std::sync::atomic::AtomicBool,
+        /// The write, counting from 1, that reports a failure after it
+        /// takes effect; 0 for none. Counted down as writes happen.
+        fail_at: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CommitsThenFails {
+        fn new(inner: Arc<MemoryStore>) -> Self {
+            Self {
+                inner,
+                fail_at: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn fail_write(&self, nth: usize) {
+            self.fail_at.store(nth, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     impl CredentialStore for CommitsThenFails {
@@ -1172,12 +1273,14 @@ mod tests {
             self.inner.get_password(key)
         }
         fn set_password(&self, key: &str, value: &str) -> Result<()> {
+            use std::sync::atomic::Ordering;
             self.inner.set_password(key, value)?;
-            if self
-                .fail_once
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
-            {
-                return Err(PurviewError::message("labelling the item failed"));
+            let left = self.fail_at.load(Ordering::SeqCst);
+            if left > 0 {
+                self.fail_at.store(left - 1, Ordering::SeqCst);
+                if left == 1 {
+                    return Err(PurviewError::message("labelling the item failed"));
+                }
             }
             Ok(())
         }
@@ -1195,14 +1298,9 @@ mod tests {
     #[tokio::test]
     async fn after_a_store_error_that_committed_the_next_call_reloads_the_store() {
         let memory = Arc::new(MemoryStore::default());
-        let store = Arc::new(CommitsThenFails {
-            inner: memory.clone(),
-            fail_once: std::sync::atomic::AtomicBool::new(false),
-        });
+        let store = Arc::new(CommitsThenFails::new(memory.clone()));
         let setup = setup_with(credential(0, None), store.clone(), memory).await;
-        store
-            .fail_once
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        store.fail_write(1);
         Mock::given(method("POST"))
             .and(body_string_contains("refresh_token=canary-refresh-0001"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -1265,5 +1363,101 @@ mod tests {
         setup.provider.refresh_all().await.unwrap();
         let token = setup.provider.download(margin).await.unwrap();
         assert_eq!(token.expose(), "canary-download-0002");
+    }
+
+    #[tokio::test]
+    async fn a_reload_after_a_refusal_finds_a_later_download_token() {
+        let memory = Arc::new(MemoryStore::default());
+        let store = Arc::new(CommitsThenFails::new(memory.clone()));
+        let setup = setup_with(credential(3600, None), store.clone(), memory).await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("b26e684c"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": "invalid_grant",
+                "error_codes": [65001],
+            })))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&setup.server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("b26e684c"))
+            .respond_with(response("canary-download-0002", "canary-refresh-0003"))
+            .with_priority(2)
+            .mount(&setup.server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("graph.microsoft.com"))
+            .respond_with(response("canary-graph-0002", "canary-refresh-0002"))
+            .mount(&setup.server)
+            .await;
+        let margin = Duration::from_secs(300);
+        // 1. Consent is refused.
+        let error = setup.provider.download(margin).await.unwrap_err();
+        assert_eq!(error.metadata(), ("DownloadNotConsented", 0));
+        // 2. After consent, an explicit refresh stores the download token,
+        //    but the store reports a failure after the write took effect.
+        store.fail_write(2);
+        let error = setup.provider.refresh_all().await.unwrap_err();
+        assert!(
+            error.to_string().contains("labelling the item failed"),
+            "{error}"
+        );
+        assert_eq!(
+            stored(&setup)["download"]["access_token"],
+            "canary-download-0002"
+        );
+        // 3. The next download reloads, finds that token and uses it.
+        let token = setup.provider.download(margin).await.unwrap();
+        assert_eq!(token.expose(), "canary-download-0002");
+    }
+
+    #[tokio::test]
+    async fn a_pending_reload_keeps_an_invalidated_graph_token_invalid() {
+        let memory = Arc::new(MemoryStore::default());
+        let store = Arc::new(CommitsThenFails::new(memory.clone()));
+        let setup = setup_with(credential(3600, None), store.clone(), memory).await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("b26e684c"))
+            .respond_with(response("canary-download-0002", "canary-refresh-0001"))
+            .mount(&setup.server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("graph.microsoft.com"))
+            .respond_with(response("canary-graph-0002", "canary-refresh-0002"))
+            .expect(1)
+            .mount(&setup.server)
+            .await;
+        // A download whose store write commits and then fails leaves a
+        // reload pending.
+        store.fail_write(1);
+        assert!(setup
+            .provider
+            .download(Duration::from_secs(300))
+            .await
+            .is_err());
+        // The service refuses the Graph token, so it is invalidated; the
+        // reload must not bring back the stored (unexpired) copy.
+        setup.provider.invalidate_graph().await;
+        let token = setup.provider.graph(Duration::from_secs(60)).await.unwrap();
+        assert_eq!(token.expose(), "canary-graph-0002");
+    }
+
+    #[test]
+    fn a_stored_principal_is_read_even_from_a_credential_this_release_refuses() {
+        let store = MemoryStore::default();
+        let redactor = Redactor::new();
+        assert_eq!(
+            Credential::stored_principal(&store, EMAIL, &redactor).unwrap(),
+            None
+        );
+        let text = json!({"version": 1, "email": EMAIL, "tid": TENANT, "oid": OID,
+                          "refresh_token": "canary-refresh-0009", "graph": {"access_token": "a"}});
+        crate::secrets::store_value(&store, &token_key(EMAIL), &text.to_string()).unwrap();
+        assert_eq!(
+            Credential::stored_principal(&store, EMAIL, &redactor).unwrap(),
+            Some((TENANT.to_owned(), OID.to_owned()))
+        );
+        assert!(redactor.recognises("canary-refresh-0009"));
     }
 }

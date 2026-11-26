@@ -10,8 +10,9 @@ use std::sync::Arc;
 use base64::Engine;
 use ms_purview_cli::cli::{execute_with, Outcome};
 use ms_purview_cli::env::{test_epoch, Captured, Env, ManualClock};
-use ms_purview_cli::secrets::MemoryStore;
+use ms_purview_cli::secrets::{AccountLocks, MemoryStore};
 use serde_json::Value;
+use std::time::Duration;
 use url::form_urlencoded;
 use wiremock::{Match, MockServer, Request};
 
@@ -117,12 +118,30 @@ pub struct Harness {
 
 impl Harness {
     pub async fn new() -> Self {
+        Self::with_store(MemoryStore::default()).await
+    }
+
+    /// A harness over the given store, such as `MemoryStore::chunked`.
+    pub async fn with_store(store: MemoryStore) -> Self {
         Self {
-            store: Arc::new(MemoryStore::default()),
+            store: Arc::new(store),
             clock: Arc::new(ManualClock::new(test_epoch())),
             root: tempfile::tempdir().unwrap(),
             identity: MockServer::start().await,
         }
+    }
+
+    /// The per-account locks every command of this harness takes.
+    pub fn account_locks(&self) -> AccountLocks {
+        AccountLocks {
+            dir: self.root.path().join("locks"),
+            wait: Duration::from_secs(5),
+        }
+    }
+
+    /// The lock file `AccountLocks` uses for `email`.
+    pub fn lock_path(&self, email: &str) -> PathBuf {
+        self.account_locks().dir.join(format!("{email}.lock"))
     }
 
     pub fn config_dir(&self) -> PathBuf {
@@ -135,6 +154,7 @@ impl Harness {
         env.clock = self.clock.clone();
         env.config_dir = Some(self.config_dir());
         env.identity_base = url::Url::parse(&self.identity.uri()).unwrap();
+        env.account_locks = Some(self.account_locks());
         (env, captured)
     }
 

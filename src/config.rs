@@ -289,6 +289,36 @@ pub fn list_accounts(config_dir: &Path, warnings: &mut dyn Write) -> Result<Vec<
     Ok(accounts)
 }
 
+/// The account file at exactly `email`'s path, with the directory checks
+/// `list_accounts` makes. `None` when there is no file there. Unlike
+/// listing, an unreadable or malformed file is an error, not skipped: the
+/// caller must not mistake a damaged file for an absent one.
+pub fn read_account_file(
+    config_dir: &Path,
+    email: &str,
+    warnings: &mut dyn Write,
+) -> Result<Option<AccountRecord>> {
+    let config_dir = normalise(config_dir);
+    let path = account_file_path(&config_dir, email)?;
+    let Some(config_checked) = check_existing_dir(&config_dir, warnings)? else {
+        return Ok(None);
+    };
+    let Some(accounts_checked) = check_existing_dir(&accounts_dir(&config_dir), warnings)? else {
+        return Ok(None);
+    };
+    let record = match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+        Ok(metadata) if !is_link_like(&metadata) && !metadata.is_file() => {
+            return Err(refusal(&path, "is not a regular file"));
+        }
+        Ok(_) => read_account(&path, warnings)?,
+    };
+    accounts_checked.still_the_same()?;
+    config_checked.still_the_same()?;
+    Ok(record)
+}
+
 fn read_account(path: &Path, warnings: &mut dyn Write) -> Result<Option<AccountRecord>> {
     let metadata = fs::symlink_metadata(path)?;
     if is_link_like(&metadata) {

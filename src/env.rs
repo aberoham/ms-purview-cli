@@ -177,6 +177,10 @@ pub struct Env {
     /// of a sign-in that stops part way. Always `None` in production.
     #[doc(hidden)]
     pub login_write_fault: Option<LoginWrite>,
+    /// The per-account locks that serialise login, logout and refresh
+    /// commits across processes. `None` in `in_memory()` until a test sets
+    /// them.
+    pub account_locks: Option<crate::secrets::AccountLocks>,
 }
 
 /// One of the writes that store a sign-in, in the order they are made.
@@ -239,6 +243,7 @@ impl Env {
             clock: Arc::new(SystemClock::default()),
             identity_timeout: crate::auth::REQUEST_TIMEOUT,
             login_write_fault: None,
+            account_locks: crate::secrets::AccountLocks::production(),
         }
     }
 
@@ -276,6 +281,7 @@ impl Env {
             clock: Arc::new(ManualClock::new(test_epoch())),
             identity_timeout: crate::auth::REQUEST_TIMEOUT,
             login_write_fault: None,
+            account_locks: None,
         }
     }
 }

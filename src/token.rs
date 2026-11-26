@@ -18,7 +18,20 @@ use crate::auth::{self, IdentityClient, TokenResponse};
 use crate::env::Clock;
 use crate::error::{PurviewError, Result};
 use crate::redact::{Redactor, REDACTED};
-use crate::secrets::{find_value, store_value, token_key, CredentialStore};
+use crate::secrets::{
+    entry_exists, find_value, store_value, token_key, AccountLocks, CredentialStore,
+};
+
+/// What the entry under an account key says about its owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredPrincipal {
+    /// Nothing is stored under the key.
+    Absent,
+    /// The ids the entry records; either may be empty.
+    Recorded { tid: String, oid: String },
+    /// Something is stored, but it cannot be read as a credential.
+    Unreadable,
+}
 
 /// The version of the stored credential's JSON shape.
 pub const CREDENTIAL_VERSION: u32 = 1;
@@ -176,8 +189,8 @@ impl fmt::Debug for Credential {
         formatter
             .debug_struct("Credential")
             .field("email", &self.email)
-            .field("tid", &self.tid)
-            .field("oid", &self.oid)
+            // The principal ids are left out: a damaged entry could hold
+            // anything in them, a token included.
             .field("client_id", &self.client_id)
             .field("tenant_id", &self.tenant_id)
             .field("refresh_token", &self.refresh_token)
@@ -258,20 +271,34 @@ impl Credential {
         self.tid.eq_ignore_ascii_case(tid.trim()) && self.oid.eq_ignore_ascii_case(oid.trim())
     }
 
-    /// The `tid` and `oid` recorded in whatever is stored under `email`'s
-    /// key, read leniently, so that a credential this release cannot use
-    /// still says whom it belonged to. `None` when nothing is stored; empty
-    /// strings when the item records no principal or cannot be parsed.
-    /// Token fields are registered with the Redactor as they are seen.
+    /// Whether `other` belongs to the same principal through the same app
+    /// registration.
+    pub fn same_owner(&self, other: &Credential) -> bool {
+        self.belongs_to(&other.tid, &other.oid)
+            && self.client_id.eq_ignore_ascii_case(&other.client_id)
+            && self.tenant_id.eq_ignore_ascii_case(&other.tenant_id)
+    }
+
+    /// What is stored under `email`'s key says about its owner, read
+    /// leniently, so that a credential this release cannot use still says
+    /// whom it belonged to. Existence is checked raw first, so a damaged
+    /// entry, or chunks without a header, count as stored. Token fields
+    /// are registered with the Redactor as they are seen.
     pub fn stored_principal(
         store: &dyn CredentialStore,
         email: &str,
         redactor: &Redactor,
-    ) -> Result<Option<(String, String)>> {
-        let Some(text) = find_value(store, &token_key(email))? else {
-            return Ok(None);
+    ) -> Result<StoredPrincipal> {
+        let key = token_key(email);
+        if !entry_exists(store, &key)? {
+            return Ok(StoredPrincipal::Absent);
+        }
+        let Ok(Some(text)) = find_value(store, &key) else {
+            return Ok(StoredPrincipal::Unreadable);
         };
-        let value: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return Ok(StoredPrincipal::Unreadable);
+        };
         for pointer in [
             "/refresh_token",
             "/graph/access_token",
@@ -289,7 +316,10 @@ impl Credential {
                 .trim()
                 .to_owned()
         };
-        Ok(Some((text_at("tid"), text_at("oid"))))
+        Ok(StoredPrincipal::Recorded {
+            tid: text_at("tid"),
+            oid: text_at("oid"),
+        })
     }
 
     /// The JSON written to the credential store.
@@ -425,35 +455,57 @@ impl Credential {
     }
 }
 
+/// What a store write that reported a failure was doing. The write may
+/// still have taken effect (a macOS label failure or a Windows clean-up
+/// failure comes after the item is live), unlike a write the store refused
+/// outright; the next call reads the store again and reconciles against
+/// this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteKind {
+    /// A refreshed Graph token and any rotated refresh token.
+    Graph,
+    /// A newly granted download token.
+    StoreDownload,
+    /// Removing a download token after a consent refusal.
+    ClearDownload,
+}
+
+struct Uncertain {
+    kind: WriteKind,
+    written: Credential,
+}
+
 struct State {
     credential: Credential,
     /// A consent refusal for the download resource was seen in this
     /// process, and no download token has been stored since; `download`
     /// fails at once.
     download_refused: bool,
-    /// A store write failed after it may have taken effect (a macOS label
-    /// failure, a Windows clean-up failure), so the store may hold a newer
-    /// credential than `credential`. The next call reads it again first.
-    reload: bool,
-    /// `invalidate_graph` was called and no Graph refresh has been stored
-    /// since. A reload keeps the invalidation: the token it reads back may
-    /// be the one the service refused.
-    graph_invalidated: bool,
+    /// A write that reported a failure, which the next call reconciles.
+    uncertain: Option<Uncertain>,
+    /// The Graph token `invalidate_graph` was called for, until a refresh
+    /// is stored. A reload that reads that same token back keeps it
+    /// expired; a different token was stored after it and is left alone.
+    invalidated_graph: Option<SecretString>,
 }
 
 /// The production `TokenProvider`: one account's stored credential,
 /// refreshed against the identity platform through the app registration
 /// recorded in that credential. Every refresh is written to the store
 /// before its tokens are used: a refresh works on a copy, and the copy
-/// replaces the provider's state only once the store has accepted it. A
-/// store failure is the caller's error, and the rotated refresh token is
-/// not used. Concurrent callers share one refresh, because the state lock
-/// is held across the request.
+/// replaces the provider's state only once the store has accepted it.
+/// Before each write, under the account lock, the provider checks that the
+/// key still holds a credential of the same principal and registration, so
+/// a concurrent sign-in by someone else is never overwritten. A failed
+/// write is the caller's error, and its rotated refresh token is not used.
+/// Concurrent callers in one process share one refresh, because the state
+/// lock is held across the request.
 pub struct StoredTokenProvider {
     identity: IdentityClient,
     store: Arc<dyn CredentialStore>,
     redactor: Arc<Redactor>,
     clock: Arc<dyn Clock>,
+    account_locks: Option<AccountLocks>,
     state: tokio::sync::Mutex<State>,
 }
 
@@ -497,13 +549,20 @@ impl StoredTokenProvider {
             store,
             redactor,
             clock,
+            account_locks: None,
             state: tokio::sync::Mutex::new(State {
                 credential,
                 download_refused: false,
-                reload: false,
-                graph_invalidated: false,
+                uncertain: None,
+                invalidated_graph: None,
             }),
         })
+    }
+
+    /// Takes the account lock around each store write.
+    pub fn with_account_locks(mut self, locks: Option<AccountLocks>) -> Self {
+        self.account_locks = locks;
+        self
     }
 
     /// `auth refresh`: redeems the refresh token for both resources with
@@ -514,17 +573,16 @@ impl StoredTokenProvider {
     /// download token, and fails with `DownloadNotConsented`.
     pub async fn refresh_all(&self) -> Result<Credential> {
         let mut state = self.state.lock().await;
-        self.reload_if_needed(&mut state)?;
+        self.reconcile(&mut state)?;
         let refreshed = self.refresh_graph(&state.credential).await?;
-        self.commit(&mut state, refreshed)?;
-        state.graph_invalidated = false;
+        self.commit(&mut state, refreshed, WriteKind::Graph).await?;
         match self.refresh_download(&state.credential).await {
             Ok(refreshed) => {
-                self.commit(&mut state, refreshed)?;
-                state.download_refused = false;
+                self.commit(&mut state, refreshed, WriteKind::StoreDownload)
+                    .await?;
             }
             Err(error) if error.is_consent_required() => {
-                self.refuse_download(&mut state)?;
+                self.refuse_download(&mut state).await?;
                 return Err(self.not_consented(&state));
             }
             Err(error) => return Err(error),
@@ -585,25 +643,62 @@ impl StoredTokenProvider {
         Ok(refreshed)
     }
 
-    /// Stores `refreshed`, then makes it the provider's state. If the store
-    /// reports a failure, the state keeps the previous credential and is
-    /// marked for reloading, since a failure can follow a write that took
-    /// effect.
-    fn commit(&self, state: &mut State, refreshed: Credential) -> Result<()> {
+    /// Stores `refreshed`, then makes it the provider's state. Under the
+    /// account lock, the key must still hold this principal's credential
+    /// through this registration. A write the store refuses leaves the
+    /// state as it was; a failure reported after the write may have taken
+    /// effect is recorded, and the next call reconciles it.
+    async fn commit(
+        &self,
+        state: &mut State,
+        refreshed: Credential,
+        kind: WriteKind,
+    ) -> Result<()> {
+        let _lock = match &self.account_locks {
+            Some(locks) => Some(locks.lock(&refreshed.email).await?),
+            None => None,
+        };
+        self.verify_owner(&state.credential)?;
         if let Err(error) = refreshed.save(self.store.as_ref()) {
-            state.reload = true;
+            state.uncertain = Some(Uncertain {
+                kind,
+                written: refreshed,
+            });
             return Err(error);
+        }
+        if kind == WriteKind::Graph {
+            state.invalidated_graph = None;
+        }
+        if kind == WriteKind::StoreDownload {
+            state.download_refused = false;
         }
         state.credential = refreshed;
         Ok(())
     }
 
-    /// After a store failure, reads the credential the store holds now, so
-    /// the next redemption uses the newest refresh token it has.
-    fn reload_if_needed(&self, state: &mut State) -> Result<()> {
-        if !state.reload {
-            return Ok(());
+    /// Refuses to write over the key unless it holds a credential of the
+    /// same principal through the same registration as `expected`.
+    fn verify_owner(&self, expected: &Credential) -> Result<()> {
+        let stored = Credential::load(self.store.as_ref(), &expected.email, &self.redactor)
+            .ok()
+            .flatten();
+        match stored {
+            Some(stored) if stored.same_owner(expected) => Ok(()),
+            _ => Err(PurviewError::message(format!(
+                "the credential for {} was replaced or removed by another command while this \
+                 one ran, so nothing was stored; run the command again",
+                crate::output::sanitize(&expected.email)
+            ))),
         }
+    }
+
+    /// After a write that reported a failure, reads the credential the
+    /// store holds now, so the next redemption uses the newest refresh
+    /// token it has, and reconciles against what that write was doing.
+    fn reconcile(&self, state: &mut State) -> Result<()> {
+        let Some(uncertain) = state.uncertain.take() else {
+            return Ok(());
+        };
         let email = state.credential.email.clone();
         let loaded =
             Credential::load(self.store.as_ref(), &email, &self.redactor)?.ok_or_else(|| {
@@ -613,41 +708,51 @@ impl StoredTokenProvider {
                     crate::output::sanitize(&email)
                 ))
             })?;
-        if !loaded
-            .client_id
-            .eq_ignore_ascii_case(&state.credential.client_id)
-            || !loaded
-                .tenant_id
-                .eq_ignore_ascii_case(&state.credential.tenant_id)
-            || !loaded.belongs_to(&state.credential.tid, &state.credential.oid)
-        {
+        if !loaded.same_owner(&state.credential) {
+            // Refused before any redemption with someone else's tokens.
+            state.uncertain = Some(uncertain);
             return Err(PurviewError::message(
                 "the stored credential now belongs to another app registration or identity; \
-                 run the command again",
+                 nothing was sent. Run 'purview auth logout' for this account, then sign in \
+                 again",
             ));
         }
-        // A download token in the store was written after any refusal this
-        // process saw (a refusal clears it), so consent has been given since.
-        if loaded.download.is_some() {
-            state.download_refused = false;
+        let mut loaded = loaded;
+        match uncertain.kind {
+            WriteKind::StoreDownload => {
+                let granted = uncertain.written.download.as_ref();
+                if loaded.download.as_ref().map(|token| &token.token) == granted.map(|t| &t.token) {
+                    state.download_refused = false;
+                }
+            }
+            WriteKind::ClearDownload => {
+                // The refusal stands whether or not the removal landed; a
+                // token it did not remove is not used.
+                loaded.download = None;
+            }
+            WriteKind::Graph => {}
+        }
+        if let Some(invalidated) = &state.invalidated_graph {
+            if &loaded.graph.token == invalidated {
+                loaded.graph.expires_at = DateTime::<Utc>::UNIX_EPOCH;
+            } else {
+                state.invalidated_graph = None;
+            }
         }
         state.credential = loaded;
-        if state.graph_invalidated {
-            state.credential.graph.expires_at = DateTime::<Utc>::UNIX_EPOCH;
-        }
-        state.reload = false;
         Ok(())
     }
 
     /// After a consent refusal: the download entry is cleared and the
     /// credential stored without it, so no later call in this process, nor
     /// a later process, renews a token the app may no longer get.
-    fn refuse_download(&self, state: &mut State) -> Result<()> {
+    async fn refuse_download(&self, state: &mut State) -> Result<()> {
         state.download_refused = true;
         if state.credential.download.is_some() {
             let mut cleared = state.credential.clone();
             cleared.download = None;
-            self.commit(state, cleared)?;
+            self.commit(state, cleared, WriteKind::ClearDownload)
+                .await?;
         }
         Ok(())
     }
@@ -663,15 +768,14 @@ impl StoredTokenProvider {
 impl TokenProvider for StoredTokenProvider {
     async fn graph(&self, min_validity: Duration) -> Result<GraphToken> {
         let mut state = self.state.lock().await;
-        self.reload_if_needed(&mut state)?;
+        self.reconcile(&mut state)?;
         if !state
             .credential
             .graph
             .valid_for(self.clock.now(), min_validity)
         {
             let refreshed = self.refresh_graph(&state.credential).await?;
-            self.commit(&mut state, refreshed)?;
-            state.graph_invalidated = false;
+            self.commit(&mut state, refreshed, WriteKind::Graph).await?;
         }
         Ok(GraphToken(state.credential.graph.token.clone()))
     }
@@ -681,7 +785,7 @@ impl TokenProvider for StoredTokenProvider {
     /// a revoked session keeps its own error, whose remedy is different.
     async fn download(&self, min_validity: Duration) -> Result<DownloadToken> {
         let mut state = self.state.lock().await;
-        self.reload_if_needed(&mut state)?;
+        self.reconcile(&mut state)?;
         if state.download_refused {
             return Err(self.not_consented(&state));
         }
@@ -691,9 +795,12 @@ impl TokenProvider for StoredTokenProvider {
             }
         }
         match self.refresh_download(&state.credential).await {
-            Ok(refreshed) => self.commit(&mut state, refreshed)?,
+            Ok(refreshed) => {
+                self.commit(&mut state, refreshed, WriteKind::StoreDownload)
+                    .await?
+            }
             Err(error) if error.is_consent_required() => {
-                self.refuse_download(&mut state)?;
+                self.refuse_download(&mut state).await?;
                 return Err(self.not_consented(&state));
             }
             Err(error) => return Err(error),
@@ -708,8 +815,8 @@ impl TokenProvider for StoredTokenProvider {
 
     async fn invalidate_graph(&self) {
         let mut state = self.state.lock().await;
+        state.invalidated_graph = Some(state.credential.graph.token.clone());
         state.credential.graph.expires_at = DateTime::<Utc>::UNIX_EPOCH;
-        state.graph_invalidated = true;
     }
 }
 
@@ -835,18 +942,19 @@ mod tests {
             "AccessToken { token: [redacted], expires_at: 2026-01-05T09:01:40Z, scope: \
              \"eDiscovery.ReadWrite.All openid\" }"
         );
-        let shown = format!("{credential:?}");
-        assert!(
-            shown.starts_with(&format!(
-                "Credential {{ email: \"{EMAIL}\", tid: \"{TENANT}\", oid: \"{OID}\", \
-                 client_id: \"{CLIENT}\", tenant_id: \"{TENANT}\", refresh_token: [redacted], \
-                 graph: AccessToken {{ token: [redacted],"
-            )),
-            "{shown}"
-        );
-        assert!(
-            shown.contains("download: Some(AccessToken { token: [redacted],"),
-            "{shown}"
+        // Canaries in the principal ids, which a damaged entry could hold.
+        let mut credential = credential;
+        credential.tid = "canary-tid-0001".into();
+        credential.oid = "canary-oid-0001".into();
+        assert_eq!(
+            format!("{credential:?}"),
+            format!(
+                "Credential {{ email: \"{EMAIL}\", client_id: \"{CLIENT}\", tenant_id: \
+                 \"{TENANT}\", refresh_token: [redacted], graph: AccessToken {{ token: \
+                 [redacted], expires_at: 2026-01-05T09:01:40Z, scope: \"eDiscovery.ReadWrite.All \
+                 openid\" }}, download: Some(AccessToken {{ token: [redacted], expires_at: \
+                 2026-01-05T09:01:40Z, scope: \"d\" }}) }}"
+            )
         );
     }
 
@@ -1449,15 +1557,135 @@ mod tests {
         let redactor = Redactor::new();
         assert_eq!(
             Credential::stored_principal(&store, EMAIL, &redactor).unwrap(),
-            None
+            StoredPrincipal::Absent
         );
         let text = json!({"version": 1, "email": EMAIL, "tid": TENANT, "oid": OID,
                           "refresh_token": "canary-refresh-0009", "graph": {"access_token": "a"}});
         crate::secrets::store_value(&store, &token_key(EMAIL), &text.to_string()).unwrap();
         assert_eq!(
             Credential::stored_principal(&store, EMAIL, &redactor).unwrap(),
-            Some((TENANT.to_owned(), OID.to_owned()))
+            StoredPrincipal::Recorded {
+                tid: TENANT.to_owned(),
+                oid: OID.to_owned()
+            }
         );
         assert!(redactor.recognises("canary-refresh-0009"));
+    }
+
+    #[tokio::test]
+    async fn a_reload_that_finds_another_principal_is_refused_before_any_redemption() {
+        let memory = Arc::new(MemoryStore::default());
+        let store = Arc::new(CommitsThenFails::new(memory.clone()));
+        let setup = setup_with(credential(0, None), store.clone(), memory.clone()).await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "canary-graph-0002",
+                "refresh_token": "canary-refresh-0002",
+                "expires_in": 1,
+                "scope": "eDiscovery.ReadWrite.All openid",
+            })))
+            .expect(1)
+            .mount(&setup.server)
+            .await;
+        store.fail_write(1);
+        assert!(setup.provider.graph(Duration::from_secs(60)).await.is_err());
+        // Someone else's credential, through the same registration, now
+        // holds the key.
+        let mut other = credential(3600, None);
+        other.oid = "00000000-0000-4000-8000-000000000099".into();
+        other.save(memory.as_ref()).unwrap();
+        let error = setup
+            .provider
+            .graph(Duration::from_secs(60))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("another app registration or identity"),
+            "{error}"
+        );
+        // The mock's expect(1) proves no second redemption was sent.
+    }
+
+    #[tokio::test]
+    async fn a_refused_clearing_write_does_not_bring_back_the_refused_download_token() {
+        // A download token with four minutes left.
+        let setup = setup(credential(3600, Some(240))).await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": "invalid_grant",
+                "error_codes": [65001],
+            })))
+            // One refusal: the later call must not ask again, nor use the
+            // token the refusal was about.
+            .expect(1)
+            .mount(&setup.server)
+            .await;
+        // Renewal is refused for want of consent, and the write that would
+        // clear the token is refused too.
+        setup.memory.fail_writes(true);
+        assert!(setup
+            .provider
+            .download(Duration::from_secs(300))
+            .await
+            .is_err());
+        setup.memory.fail_writes(false);
+        assert!(stored(&setup).get("download").is_some());
+        // With a margin the old token would meet, it is still not used.
+        let error = setup
+            .provider
+            .download(Duration::from_secs(60))
+            .await
+            .unwrap_err();
+        assert_eq!(error.metadata(), ("DownloadNotConsented", 0));
+    }
+
+    #[tokio::test]
+    async fn a_reload_leaves_a_graph_token_stored_after_the_invalidation_alone() {
+        let memory = Arc::new(MemoryStore::default());
+        let store = Arc::new(CommitsThenFails::new(memory.clone()));
+        let setup = setup_with(credential(3600, None), store.clone(), memory).await;
+        Mock::given(method("POST"))
+            .respond_with(response("canary-graph-0002", "canary-refresh-0002"))
+            .expect(1)
+            .mount(&setup.server)
+            .await;
+        setup.provider.invalidate_graph().await;
+        // The refresh is stored, and the store then reports a failure.
+        store.fail_write(1);
+        assert!(setup.provider.graph(Duration::from_secs(60)).await.is_err());
+        // The token read back is the new one, not the invalidated one, so
+        // it is used without another redemption.
+        let token = setup.provider.graph(Duration::from_secs(60)).await.unwrap();
+        assert_eq!(token.expose(), "canary-graph-0002");
+    }
+
+    #[tokio::test]
+    async fn a_rotation_is_not_committed_over_another_principal_s_credential() {
+        let setup = setup(credential(0, None)).await;
+        Mock::given(method("POST"))
+            .respond_with(response("canary-graph-0002", "canary-refresh-0002"))
+            .expect(1)
+            .mount(&setup.server)
+            .await;
+        // While this provider runs, another sign-in stores someone else's
+        // credential under the key.
+        let mut other = credential(3600, None);
+        other.oid = "00000000-0000-4000-8000-000000000099".into();
+        other.refresh_token = SecretString::new("canary-refresh-0099");
+        other.save(setup.memory.as_ref()).unwrap();
+        let error = setup
+            .provider
+            .graph(Duration::from_secs(60))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("replaced or removed by another command"),
+            "{error}"
+        );
+        assert_eq!(stored(&setup)["refresh_token"], "canary-refresh-0099");
     }
 }

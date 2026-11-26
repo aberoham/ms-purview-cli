@@ -7,6 +7,7 @@ mod support;
 use std::time::Duration;
 
 use ms_purview_cli::env::LoginWrite;
+use ms_purview_cli::secrets::{CredentialStore, MemoryStore};
 use serde_json::Value;
 use support::*;
 use wiremock::matchers::{method, path};
@@ -1254,8 +1255,7 @@ async fn a_credential_store_refusal_on_first_sign_in_stores_nothing() {
     harness.store.fail_writes(false);
     assert_eq!(run.outcome.exit_code, 1);
     assert!(
-        run.stderr()
-            .contains("nothing from this sign-in was stored"),
+        run.stderr().contains("nothing from this sign-in was kept"),
         "{}",
         run.stderr()
     );
@@ -1929,4 +1929,323 @@ async fn login_with_fault_as(
     env.login_write_fault = Some(write);
     let outcome = ms_purview_cli::cli::execute_with(env, ["purview", "auth", "login"]).await;
     Run { outcome, captured }
+}
+
+const OTHER_OID: &str = "00000000-0000-4000-8000-000000000099";
+
+/// Waits until the mock identity platform has received `count` requests.
+async fn wait_for_requests(harness: &Harness, count: usize) {
+    for _ in 0..200 {
+        if harness.identity.received_requests().await.unwrap().len() >= count {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the identity platform never received {count} requests");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlapping_sign_ins_under_one_key_never_both_succeed() {
+    let harness = Harness::new().await;
+    // Another login holds Alex's account lock while it writes.
+    std::fs::create_dir_all(harness.account_locks().dir).unwrap();
+    let held =
+        ms_purview_cli::secrets::CredentialLock::acquire(&harness.lock_path(ALEX), Duration::ZERO)
+            .unwrap();
+    // A second identity signs in under the same key; it finishes in the
+    // browser, then waits for the lock.
+    mount_login_as(&harness, "id-claims-preferred.json", |claims| {
+        claims["oid"] = OTHER_OID.into();
+    })
+    .await;
+    let second_done = std::sync::atomic::AtomicBool::new(false);
+    let second = async {
+        let run = harness
+            .run(&[
+                "auth",
+                "login",
+                "--client-id",
+                CLIENT_ID,
+                "--tenant-id",
+                TENANT_ID,
+            ])
+            .await;
+        second_done.store(true, std::sync::atomic::Ordering::SeqCst);
+        run
+    };
+    let holder = async {
+        // device code, one poll, the download redemption
+        wait_for_requests(&harness, 3).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let waited = !second_done.load(std::sync::atomic::Ordering::SeqCst);
+        // The lock holder completes the first identity's sign-in.
+        harness.identity.reset().await;
+        mount_login(
+            &harness,
+            "id-claims-preferred.json",
+            json_response(200, fixture("token-download.json")),
+        )
+        .await;
+        let (mut env, captured) = harness.env();
+        env.account_locks = None; // it is the holder
+        let first = ms_purview_cli::cli::execute_with(
+            env,
+            [
+                "purview",
+                "auth",
+                "login",
+                "--client-id",
+                CLIENT_ID,
+                "--tenant-id",
+                TENANT_ID,
+            ],
+        )
+        .await;
+        drop(held);
+        (waited, first, captured)
+    };
+    let (second, (waited, first, captured)) = tokio::join!(second, holder);
+    assert!(waited, "the second login did not wait for the lock");
+    assert_eq!(first.exit_code, 0, "{}", captured.stderr.text());
+    assert_eq!(second.outcome.exit_code, 1);
+    assert!(
+        second.stderr().contains("belongs to another identity"),
+        "{}",
+        second.stderr()
+    );
+    assert_eq!(
+        harness.stored(ALEX).unwrap()["oid"],
+        "00000000-0000-4000-8000-000000000011"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sign_in_that_cannot_get_the_lock_stores_nothing() {
+    let harness = Harness::new().await;
+    std::fs::create_dir_all(harness.account_locks().dir).unwrap();
+    let _held =
+        ms_purview_cli::secrets::CredentialLock::acquire(&harness.lock_path(ALEX), Duration::ZERO)
+            .unwrap();
+    mount_login(
+        &harness,
+        "id-claims-preferred.json",
+        json_response(200, fixture("token-download.json")),
+    )
+    .await;
+    let (mut env, captured) = harness.env();
+    env.account_locks = Some(ms_purview_cli::secrets::AccountLocks {
+        wait: Duration::from_millis(300),
+        ..harness.account_locks()
+    });
+    let outcome = ms_purview_cli::cli::execute_with(
+        env,
+        [
+            "purview",
+            "--json",
+            "auth",
+            "login",
+            "--client-id",
+            CLIENT_ID,
+            "--tenant-id",
+            TENANT_ID,
+        ],
+    )
+    .await;
+    assert_eq!(outcome.exit_code, 1);
+    let printed: Value = serde_json::from_str(&captured.stdout.text()).unwrap();
+    assert_eq!(printed["error"]["code"], "CredentialLockBusy");
+    harness.assert_store_empty();
+    assert!(!harness.account_file(ALEX).exists());
+}
+
+#[tokio::test]
+async fn logout_names_an_exact_key_before_matching_a_upn() {
+    let harness = Harness::new().await;
+    sign_in_alex(&harness).await;
+    // An orphan credential whose key is Alex's recorded upn.
+    let orphan = "purview:token:alex.w@contoso.example";
+    harness.store.set_password(orphan, "{damaged").unwrap();
+    let run = harness
+        .run(&["auth", "logout", "--account", "alex.w@contoso.example"])
+        .await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
+    assert!(!harness.store.keys().contains(&orphan.to_owned()));
+    // Alex, whose upn that is, is untouched.
+    assert_eq!(harness.credentials(), [ALEX]);
+    assert!(harness.account_file(ALEX).exists());
+}
+
+#[tokio::test]
+async fn logout_sweeps_headerless_chunks_and_damaged_entries_in_the_windows_layout() {
+    let harness = Harness::with_store(MemoryStore::chunked(64)).await;
+    let key = format!("purview:token:{ALEX}");
+    // Chunks a failed first write left without a header, in both slots.
+    harness
+        .store
+        .set_secret(&format!("{key}:0"), b"canary-refresh-0001")
+        .unwrap();
+    harness
+        .store
+        .set_secret(&format!("{key}:s1:3"), b"canary-refresh-0002")
+        .unwrap();
+    let run = harness.run(&["auth", "logout", "--account", ALEX]).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
+    harness.assert_store_empty();
+
+    // A primary entry that is not UTF-8 and not a credential.
+    harness.store.set_secret(&key, &[0xff, 0xfe, 0x00]).unwrap();
+    let run = harness.run(&["auth", "logout", "--account", ALEX]).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
+    harness.assert_store_empty();
+}
+
+#[tokio::test]
+async fn a_first_sign_in_whose_header_write_fails_sweeps_its_chunks() {
+    let harness = Harness::with_store(MemoryStore::chunked(64)).await;
+    mount_login(
+        &harness,
+        "id-claims-preferred.json",
+        json_response(200, fixture("token-download.json")),
+    )
+    .await;
+    harness.store.fail_headers(true);
+    let run = harness
+        .run(&[
+            "auth",
+            "login",
+            "--client-id",
+            CLIENT_ID,
+            "--tenant-id",
+            TENANT_ID,
+        ])
+        .await;
+    harness.store.fail_headers(false);
+    assert_eq!(run.outcome.exit_code, 1);
+    assert!(
+        run.stderr().contains("nothing from this sign-in was kept"),
+        "{}",
+        run.stderr()
+    );
+    harness.assert_store_empty();
+    harness.assert_no_canaries(&run);
+}
+
+/// Signs Alex in and returns the run, with the store already holding
+/// `entry` under Alex's key and an account file as `file` says.
+async fn sign_in_over(harness: &Harness, entry: Option<&str>, file: Option<Value>) -> Run {
+    if let Some(entry) = entry {
+        harness
+            .store
+            .set_password(&format!("purview:token:{ALEX}"), entry)
+            .unwrap();
+    }
+    if let Some(file) = file {
+        std::fs::create_dir_all(harness.config_dir().join("accounts")).unwrap();
+        std::fs::write(harness.account_file(ALEX), file.to_string()).unwrap();
+    }
+    mount_login(
+        harness,
+        "id-claims-preferred.json",
+        json_response(200, fixture("token-download.json")),
+    )
+    .await;
+    harness
+        .run(&[
+            "auth",
+            "login",
+            "--client-id",
+            CLIENT_ID,
+            "--tenant-id",
+            TENANT_ID,
+        ])
+        .await
+}
+
+fn alex_file() -> Value {
+    serde_json::json!({
+        "email": ALEX,
+        "upn": "alex.w@contoso.example",
+        "oid": "00000000-0000-4000-8000-000000000011",
+        "display_name": "Alex Wilber",
+        "tenant_id": TENANT_ID,
+        "client_id": CLIENT_ID,
+        "login_time": "2026-01-05T09:00:10Z",
+    })
+}
+
+#[tokio::test]
+async fn a_key_held_only_by_a_differently_stamped_credential_is_refused() {
+    let harness = Harness::new().await;
+    let entry = serde_json::json!({
+        "version": 1, "email": ALEX, "tid": TENANT_ID, "oid": OTHER_OID,
+        "client_id": CLIENT_ID, "tenant_id": TENANT_ID, "refresh_token": "canary-other-refresh-0001",
+        "graph": {"access_token": "canary-other-access-0001", "scope": "eDiscovery.ReadWrite.All"},
+    })
+    .to_string();
+    let run = sign_in_over(&harness, Some(&entry), None).await;
+    assert_eq!(run.outcome.exit_code, 1);
+    assert!(
+        run.stderr().contains("belongs to another identity"),
+        "{}",
+        run.stderr()
+    );
+    assert!(
+        run.stderr()
+            .contains(&format!("purview auth logout --account {ALEX}")),
+        "{}",
+        run.stderr()
+    );
+    assert_eq!(harness.stored(ALEX).unwrap()["oid"], OTHER_OID);
+    assert!(!harness.account_file(ALEX).exists());
+}
+
+#[tokio::test]
+async fn a_partly_recorded_or_unreadable_destination_counts_as_owned() {
+    // A credential that keeps a different oid but lacks its tid.
+    let harness = Harness::new().await;
+    let partial = serde_json::json!({"version": 1, "email": ALEX, "oid": OTHER_OID}).to_string();
+    let run = sign_in_over(&harness, Some(&partial), None).await;
+    assert_eq!(run.outcome.exit_code, 1, "partial credential");
+    assert!(!harness.account_file(ALEX).exists());
+
+    // A damaged credential and no account file to vouch for the key.
+    let harness = Harness::new().await;
+    let run = sign_in_over(&harness, Some("{damaged"), None).await;
+    assert_eq!(run.outcome.exit_code, 1, "damaged credential");
+    assert!(
+        run.stderr().contains("purview auth logout --account"),
+        "{}",
+        run.stderr()
+    );
+
+    // An account file with both ids but a malformed field, and no credential.
+    let harness = Harness::new().await;
+    let mut malformed = alex_file();
+    malformed["display_name"] = 5.into();
+    let run = sign_in_over(&harness, None, Some(malformed.clone())).await;
+    assert_eq!(run.outcome.exit_code, 1, "malformed account file");
+    harness.assert_store_empty();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&std::fs::read(harness.account_file(ALEX)).unwrap())
+            .unwrap(),
+        malformed
+    );
+
+    // An account file that records the oid but not the tid.
+    let harness = Harness::new().await;
+    let mut partial_file = alex_file();
+    partial_file["tenant_id"] = "".into();
+    let run = sign_in_over(&harness, None, Some(partial_file)).await;
+    assert_eq!(run.outcome.exit_code, 1, "partly recorded account file");
+    harness.assert_store_empty();
+}
+
+#[tokio::test]
+async fn a_damaged_credential_is_repaired_when_the_account_file_vouches_for_the_identity() {
+    let harness = Harness::new().await;
+    let run = sign_in_over(&harness, Some("{damaged"), Some(alex_file())).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
+    let stored = harness.stored(ALEX).unwrap();
+    assert_eq!(stored["oid"], "00000000-0000-4000-8000-000000000011");
+    assert_eq!(stored["refresh_token"], "canary-refresh-0002");
 }

@@ -74,7 +74,8 @@ only read-only `az` calls and prints a plan:
 - who may sign in: `appRoleAssignmentRequired` and what it means;
 - the consent it will grant, by type and scope for each resource.
 
-Read the plan, then run the same command with `--apply`. The script never
+Read the plan, then run the same command with `--apply`. Argument errors exit
+2, other failures 1. The script never
 prompts, so it also runs where there is no terminal.
 
 With `--apply` it carries out the plan in this order: the eDiscovery app's
@@ -96,14 +97,22 @@ Without `CLIENT_ID`, the script refuses to create an app when one with the same
 display name already exists, and lists its application id. Set `CLIENT_ID` to
 that id to update it instead.
 
+On an update it changes only what differs from the plan. It adds the redirect
+URI without removing others, and adds the signed-in user as owner only when
+the app has no owner at all, which is what an interrupted create leaves. It
+never removes a scope from a consent grant: switching an existing app to
+`READ_ONLY=1` leaves `eDiscovery.ReadWrite.All` on its grants, and the plan
+says so. Remove that scope from the grant by hand if the read-only setup must
+be strict.
+
 #### Variables
 
 | Variable | Meaning |
 |---|---|
 | `TENANT_ID` | Directory (tenant) id. Required |
 | `CLIENT_ID` | Application (client) id of an existing registration to update |
-| `APP_NAME` | Display name of a new registration. Default `Purview CLI (eDiscovery)` |
-| `ASSIGN_USERS` | Space-separated user principal names or object ids to assign |
+| `APP_NAME` | Display name of a new registration: letters, digits, spaces and `( ) . _ -`, up to 120 characters. Default `Purview CLI (eDiscovery)` |
+| `ASSIGN_USERS` | Space-separated user principal names or object ids to assign. Give a guest whose name holds `#` by object id |
 | `GROUP_OBJECT_ID` | A group's object id to assign. Needs `CONSENT=tenant` |
 | `READ_ONLY=1` | Ask for `eDiscovery.Read.All` instead of `eDiscovery.ReadWrite.All` |
 | `CONSENT` | `principal` (default) or `tenant` |

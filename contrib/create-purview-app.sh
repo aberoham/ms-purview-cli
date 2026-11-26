@@ -67,7 +67,7 @@ readonly REDIRECT_URI=http://localhost/callback
 readonly POLL_INTERVAL=5
 readonly POLL_LIMIT=60
 
-# These queries are fixed strings; tests/scripts/fake-az answers them.
+# These queries are fixed strings; tests/scripts/fake-bin/az answers them.
 readonly SP_ROW_QUERY='[].[id, appRoleAssignmentRequired]'
 readonly SCOPES_QUERY='oauth2PermissionScopes[].[value, id]'
 readonly APP_ROW_QUERY='[].[id, signInAudience, isFallbackPublicClient, displayName]'

@@ -2233,8 +2233,9 @@ The `aberoham/homebrew-tap` formula `purview` reads releases, as it does for `en
 
 Dev-dependencies: `wiremock`, `assert_cmd`, `predicates`, `tempfile`.
 
-The release profile is `lto = true`, `codegen-units = 1`, `strip = true`. The minimum Rust
-version is current stable.
+The release profile is `lto = true`, `codegen-units = 1`, `strip = true`. `Cargo.toml` declares the
+minimum Rust version; local rustup builds and CI use the release pinned in
+`rust-toolchain.toml`, raised in its own pull request.
 
 ---
 

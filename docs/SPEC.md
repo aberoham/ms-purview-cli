@@ -192,7 +192,8 @@ JSON: `{"account", "upn", "tenantId", "clientId", "graphScope", "downloadReady"}
 Redeems the stored refresh token for both resources, with the scopes already stored. It
 never narrows or widens scopes; sign in again with `auth login` (with or without
 `--read-only`) to change them, as `entra` requires for narrowing. A Graph response whose
-permissions differ from the stored set is refused and nothing is stored (section 4.5). It
+permissions differ from the stored set is refused and nothing is stored (section 4.5); the
+error names neither set. It
 succeeds only if both redemptions and every credential-store write succeed. Each result is
 stored before the next step: if the download redemption fails with `AADSTS65001`, the Graph
 rotation stays stored, the refused download entry is removed from the store, and the
@@ -1129,12 +1130,19 @@ whatever properties can be read, with `error: "unsupportedClass"` when they have
 **Stored credential.** One credential-store item per account, holding JSON:
 
 ```json
-{"version":1,"email":"alex@contoso.example","refresh_token":"…",
+{"version":1,"email":"alex@contoso.example",
+ "client_id":"<application-client-id>","tenant_id":"<tenant-id>","refresh_token":"…",
  "graph":{"access_token":"…","expires_at":"…","scope":"…"},
  "download":{"access_token":"…","expires_at":"…","scope":"…"}}
 ```
 
-`download` may be absent. The service name is `purview`, the key `purview:token:<email>`,
+`download` may be absent. `client_id` and `tenant_id` name the app registration and tenant
+that issued the tokens. Every refresh and redemption uses the registration recorded here,
+never one from `config.json` or the account file, so tokens and registration cannot come
+apart. A stored credential without them, or with values that are not GUIDs, is treated as
+needing sign-in (`auth login` again), not as matching. If the account file or `config.json`
+names a different registration, a sign-in stopped part way: `auth refresh` refuses with a
+"sign in again" error and sends nothing. The service name is `purview`, the key `purview:token:<email>`,
 the macOS label `purview — <email>`, and the description `Microsoft Purview eDiscovery
 token`. Windows chunking and Linux keyutils behave as in `entra`. The credential store is the
 only place a token is ever persisted.
@@ -1234,7 +1242,22 @@ contract.
 
 `config.json` lives under `dirs::config_dir()/purview/`, overridable with
 `PURVIEW_CONFIG_DIR`. Account files are `accounts/<email>.json`, holding
-`{email, upn, oid, display_name, tenant_id, client_id, login_time}`. Symlinks are refused, modes are 0600
+`{email, upn, oid, display_name, tenant_id, client_id, login_time}`. The account file is for
+display and account selection (`tenant_id` is the id token's `tid`, and `oid` binds
+`--account` at sign-in); `config.json` `clients` only says which registration to offer at
+the next sign-in. Neither chooses the registration a refresh uses (section 5.1).
+
+`auth login` stores a sign-in in this order: the credential, replaced in place under its
+key (the old item is not deleted first, so a macOS keychain item keeps its access list);
+then the account file; then `config.json`. A failure at the first write leaves the earlier
+sign-in as it was. A failure at the account file on a first sign-in removes the new
+credential again; on a later sign-in it leaves an account file that may name the old
+registration, which `auth refresh` detects. A failure at `config.json` leaves a working
+account whose stale registration, if it differs, `auth refresh` also detects.
+
+When `--account` (or `PURVIEW_ACCOUNT`) names a stored account, the sign-in must return
+that account's recorded `tid` and `oid`; otherwise the returned account key or `upn` must
+equal the name given, ignoring case. On a mismatch nothing is written. Symlinks are refused, modes are 0600
 and 0700, and writes are atomic, as in `entra`.
 
 - On Windows there are no modes. The configuration lives under the user's profile and relies on

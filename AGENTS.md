@@ -70,7 +70,10 @@ that the test files pass their own scan.
   production uses `https://login.microsoftonline.com`, the operating-system
   keyring and the system clock; `Env::in_memory()` uses an unreachable
   `.example` host, an empty `MemoryStore` and a `ManualClock`, and tests
-  point the base URL at a wiremock origin. Later pull requests add the Graph
+  point the base URL at a wiremock origin. It also carries the
+  identity-platform request timeout and a test-only `login_write_fault`,
+  always `None` in production, that makes one of `auth login`'s writes
+  fail. Later pull requests add the Graph
   origin and the download host rule. `Env::production()` reads no
   environment variable that could change an endpoint, so the release binary
   has no test path that could send a token to another host.
@@ -79,10 +82,13 @@ that the test files pass their own scan.
   account claims from the id token. OAuth errors keep only the
   allow-listed fields of `docs/SPEC.md` section 6.8, redacted.
 - `src/token.rs` defines `SecretString`, `GraphToken`, `DownloadToken`, the
-  stored `Credential` and the `TokenProvider` trait. `StoredTokenProvider`
+  stored `Credential` (stamped with the app registration that issued it,
+  which every refresh uses) and the `TokenProvider` trait. `StoredTokenProvider`
   refreshes lazily, shares one refresh per process behind a
   `tokio::sync::Mutex`, writes every refresh to the store before using it
-  (a refused write is the command's error), refuses a refresh that changes
+  (a refused write is the command's error, and the provider reads the
+  store again before its next redemption in case the write took effect),
+  refuses a refresh that changes
   the Graph permission set, and registers every secret it sees with the
   Redactor.
 - `src/secrets.rs` is the `CredentialStore` trait, `KeyringStore` (Windows
@@ -211,7 +217,8 @@ Preserve these so that users do not have to sign in again after an upgrade:
 
 - service name `purview`, key `purview:token:<email>`, macOS label
   `purview — <email>` and description `Microsoft Purview eDiscovery token`;
-- the stored JSON shape with `"version": 1` (`docs/SPEC.md` section 5.1);
+- the stored JSON shape with `"version": 1`, including the issuing
+  `client_id` and `tenant_id` (`docs/SPEC.md` section 5.1);
 - the `config.json` and `accounts/<email>.json` shapes (section 5.3).
 
 Tests use an in-memory credential store and synthetic records. They never

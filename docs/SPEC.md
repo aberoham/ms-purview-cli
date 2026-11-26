@@ -208,8 +208,10 @@ Calls `GET /security/cases/ediscoveryCases?$top=1` to prove the Graph token and 
 role. It reads the download token's expiry from local metadata and never sends that token.
 
 Output: account, tenant, scopes, both expiries, `purviewRole: ok | denied | unknown`. A 403
-means `denied`; anything else that fails means `unknown`. That a missing role gives 403 is an
-Assumption, checked in PR 1.4.
+means `denied`; any other failure of the read means `unknown`; each exits 0. A Graph token
+that cannot be had (the identity platform refuses the refresh, or the refreshed credential
+cannot be stored) is an error, exit 1, so that a check of the exit code alone sees a broken
+sign-in. That a missing role gives 403 is an Assumption, checked in PR 1.4.
 
 #### `purview auth list`, `purview auth logout [--account]` (local)
 
@@ -606,8 +608,8 @@ tests/
 
 **Origins.** `Origin` is scheme, host and effective port. The Graph origin is
 `https://graph.microsoft.com:443`, set in `Env`. `GraphClient` sends a request only when the
-URL's origin equals the Graph origin exactly. That covers paging links and polling URLs as
-well as constructed routes. Redirects are disabled. User-controlled path segments are encoded
+URL's origin equals the Graph origin exactly and its path lies below the base path `/v1.0/`.
+That covers paging links and polling URLs as well as constructed routes. Redirects are disabled. User-controlled path segments are encoded
 one at a time through `url::Url`.
 
 **Routes.** Requests come only from `ReadRoute` and `WriteRoute`.
@@ -638,8 +640,8 @@ Adding a write needs a reviewed design, a change to that test and an update to
 **Retries.**
 
 - **GET:** at most 3 attempts. Retries happen on connection errors, timeouts, a truncated
-  body, 429, 500, 502, 503 and 504. `Retry-After` is honoured in seconds or HTTP-date form.
-  Otherwise the wait is 250 ms × 2^(attempt−1), capped at 30 s. A 401 makes the token
+  body, 429, 500, 502, 503 and 504. `Retry-After` is honoured in seconds or HTTP-date form,
+  up to 60 s; a longer one ends the GET with Graph's error rather than wait. Otherwise the wait is 250 ms × 2^(attempt−1), capped at 30 s. A 401 makes the token
   provider refresh once, then the GET is retried once.
 - **POST: never retried automatically**, whatever the status or error. A `Retry-After` header
   says when to try again; it does not prove the first request had no effect. If the outcome

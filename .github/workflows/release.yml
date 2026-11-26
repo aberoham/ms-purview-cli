@@ -257,6 +257,11 @@ jobs:
           tar xzf "${package}.tar.gz" -C "$unpacked"
           python3 .github/scripts/macos-signing.py sign "$unpacked/$package/bin/purview" com.aberoham.purview --notarize
           tar czf "${package}.tar.gz" -C "$unpacked" "$package"
+      # Runs whatever happened above, and before the upload action, so the
+      # unlocked signing identity is gone before any further code runs.
+      - name: Remove signing credentials
+        if: always()
+        run: python3 .github/scripts/macos-signing.py cleanup
       - name: Replace the unsigned artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -264,9 +269,6 @@ jobs:
           path: purview-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
           if-no-files-found: error
           overwrite: true
-      - name: Remove signing credentials
-        if: always()
-        run: python3 .github/scripts/macos-signing.py cleanup
 
   release:
     name: Create release

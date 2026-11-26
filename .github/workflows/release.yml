@@ -179,11 +179,15 @@ jobs:
         run: |
           set -euo pipefail
           binary="target/${TARGET}/release/purview"
-          if readelf --program-headers --wide "$binary" | grep -q INTERP; then
+          # Each inspection runs on its own line, so a readelf failure stops
+          # the job under set -e instead of reading as "nothing found".
+          headers="$(readelf --program-headers --wide "$binary")"
+          dynamic="$(readelf --dynamic --wide "$binary")"
+          if grep -q INTERP <<<"$headers"; then
             echo "${binary} requests a program interpreter" >&2
             exit 1
           fi
-          if readelf --dynamic --wide "$binary" | grep -q NEEDED; then
+          if grep -q NEEDED <<<"$dynamic"; then
             echo "${binary} depends on shared libraries" >&2
             exit 1
           fi

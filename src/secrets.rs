@@ -554,10 +554,11 @@ mod tests {
     fn the_memory_store_debug_form_shows_no_value() {
         let store = MemoryStore::default();
         store.set_password("account", "canary-secret-0001").unwrap();
-        let shown = format!("{store:?}");
-        assert!(
-            shown.contains("account") && !shown.contains("canary"),
-            "{shown}"
+        // The whole form: key names and the lock count, and no bytes in
+        // any rendering (a derived Debug would print them as numbers).
+        assert_eq!(
+            format!("{store:?}"),
+            "MemoryStore { keys: [\"account\"], locks: 0, .. }"
         );
     }
 

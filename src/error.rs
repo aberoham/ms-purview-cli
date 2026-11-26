@@ -245,9 +245,16 @@ mod tests {
     #[test]
     fn a_keyring_error_keeps_no_stored_bytes() {
         let error = PurviewError::from(keyring::Error::BadEncoding(b"canary-bytes-0001".to_vec()));
-        for shown in [format!("{error:?}"), error.to_string()] {
-            assert!(!shown.contains("canary"), "{shown}");
-        }
+        let message = keyring::Error::BadEncoding(Vec::new()).to_string();
+        assert_eq!(format!("{error:?}"), format!("Keyring({message:?})"));
+        assert_eq!(
+            error.to_string(),
+            format!("credential store operation failed: {message}")
+        );
+        // Neither form holds the bytes, as text or as the numbers a derived
+        // Debug of a Vec<u8> would print.
+        let numbers = format!("{:?}", b"canary-bytes-0001".to_vec());
+        assert!(!format!("{error:?}").contains(numbers.trim_matches(['[', ']'])));
     }
 
     #[test]

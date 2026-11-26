@@ -455,6 +455,13 @@ impl Credential {
             .map_err(|error| error.context("storing the credential in the credential store"))
     }
 
+    /// `save` for a sign-in the ownership check has authorised to replace
+    /// a damaged entry under the key.
+    pub fn save_repairing(&self, store: &dyn CredentialStore) -> Result<()> {
+        crate::secrets::store_value_repairing(store, &token_key(&self.email), &self.to_json()?)
+            .map_err(|error| error.context("storing the credential in the credential store"))
+    }
+
     fn register(&self, redactor: &Redactor) {
         redactor.register(self.refresh_token.expose());
         redactor.register(self.graph.token.expose());

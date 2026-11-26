@@ -2342,7 +2342,13 @@ async fn exact_key_logout_refuses_a_linked_account_file_before_deleting() {
 
 #[tokio::test]
 async fn an_undecodable_primary_is_repaired_when_the_account_file_vouches() {
-    let harness = Harness::with_store(MemoryStore::chunked(64)).await;
+    for store in [MemoryStore::chunked(64), MemoryStore::windows(64)] {
+        repair_an_undecodable_primary(store).await;
+    }
+}
+
+async fn repair_an_undecodable_primary(store: MemoryStore) {
+    let harness = Harness::with_store(store).await;
     harness
         .store
         .set_secret(&format!("purview:token:{ALEX}"), &[0xff, 0xfe, 0x00])

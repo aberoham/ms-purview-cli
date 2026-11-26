@@ -56,6 +56,12 @@ pub enum PurviewError {
     #[error("credential store operation failed: {0}")]
     Keyring(String),
 
+    /// A stored password entry that its backend cannot decode (on Windows,
+    /// a blob that is not UTF-16LE). Kept apart from access failures, so
+    /// that a repair the ownership check authorised can replace it.
+    #[error("a stored credential entry could not be decoded: {0}")]
+    CredentialEncoding(String),
+
     #[error(
         "another purview process kept the credential lock {path} busy for over {seconds} \
          seconds; wait for it to finish and try again"
@@ -141,9 +147,12 @@ impl PurviewError {
             Self::DownloadNotConsented { .. } => ("DownloadNotConsented", 0),
             Self::CredentialLockBusy { .. } => ("CredentialLockBusy", 0),
             Self::CredentialLockFailed { .. } => ("CredentialLockFailed", 0),
-            Self::Message(_) | Self::Io(_) | Self::Json(_) | Self::Http(_) | Self::Keyring(_) => {
-                ("CommandFailed", 0)
-            }
+            Self::Message(_)
+            | Self::Io(_)
+            | Self::Json(_)
+            | Self::Http(_)
+            | Self::Keyring(_)
+            | Self::CredentialEncoding(_) => ("CommandFailed", 0),
         }
     }
 
@@ -159,6 +168,16 @@ impl PurviewError {
                         .is_some_and(|rest| !rest.starts_with(|c: char| c.is_ascii_digit()))
             }
             Self::Context { source, .. } => source.is_consent_required(),
+            _ => false,
+        }
+    }
+
+    /// Whether a stored entry could not be decoded, as opposed to the
+    /// store failing to give access to it.
+    pub fn is_credential_encoding(&self) -> bool {
+        match self {
+            Self::CredentialEncoding(_) => true,
+            Self::Context { source, .. } => source.is_credential_encoding(),
             _ => false,
         }
     }

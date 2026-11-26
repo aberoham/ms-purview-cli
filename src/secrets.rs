@@ -180,6 +180,10 @@ fn absent_as_none<T>(result: keyring::Result<T>, operation: &str) -> Result<Opti
     match result {
         Ok(value) => Ok(Some(value)),
         Err(keyring::Error::NoEntry) => Ok(None),
+        Err(keyring::Error::BadEncoding(_)) => Err(PurviewError::CredentialEncoding(
+            "the entry is not text in the backend's encoding".to_owned(),
+        )
+        .context(operation)),
         Err(error) => Err(PurviewError::from(error).context(operation)),
     }
 }
@@ -283,7 +287,16 @@ const SLOTS: [u8; 2] = [0, 1];
 
 pub fn store_value(store: &dyn CredentialStore, key: &str, value: &str) -> Result<()> {
     let _lock = store.lock()?;
-    store_value_with_chunk_size(store, key, value, store.chunk_bytes())
+    store_value_inner(store, key, value, store.chunk_bytes(), false)
+}
+
+/// `store_value` for a sign-in the ownership check has authorised to
+/// replace a damaged entry: a primary entry the backend cannot decode is
+/// then treated as an unusable header and overwritten. Every other error,
+/// store-access failures included, still fails.
+pub fn store_value_repairing(store: &dyn CredentialStore, key: &str, value: &str) -> Result<()> {
+    let _lock = store.lock()?;
+    store_value_inner(store, key, value, store.chunk_bytes(), true)
 }
 
 pub fn get_value(store: &dyn CredentialStore, key: &str) -> Result<String> {
@@ -406,11 +419,22 @@ fn chunk_key(key: &str, slot: u8, index: usize) -> String {
     }
 }
 
+#[cfg(test)]
 fn store_value_with_chunk_size(
     store: &dyn CredentialStore,
     key: &str,
     value: &str,
     chunk_bytes: Option<usize>,
+) -> Result<()> {
+    store_value_inner(store, key, value, chunk_bytes, false)
+}
+
+fn store_value_inner(
+    store: &dyn CredentialStore,
+    key: &str,
+    value: &str,
+    chunk_bytes: Option<usize>,
+    repair: bool,
 ) -> Result<()> {
     match chunk_bytes {
         None => store.set_password(key, value),
@@ -425,7 +449,7 @@ fn store_value_with_chunk_size(
                     chunks.len()
                 )));
             }
-            let previous = stored_header(store, key)?;
+            let previous = stored_header(store, key, repair)?;
             // Write into the slot the current header does not use, so a
             // failure part way leaves the stored credential intact.
             let slot = match &previous {
@@ -469,15 +493,22 @@ fn parse_chunk_header(value: &str) -> Result<Option<ChunkHeader>> {
 
 /// The current header, or `None` when there is no entry, the entry is a
 /// legacy single value, or its header is unusable and will be overwritten.
-/// A primary entry that is not UTF-8 or not a valid header counts as no
-/// header: the write replaces it. Store-access errors still fail, which is
-/// why the entry is read raw rather than through `get_password`.
-fn stored_header(store: &dyn CredentialStore, key: &str) -> Result<Option<ChunkHeader>> {
-    match store.get_secret(key)? {
-        Some(bytes) => Ok(String::from_utf8(bytes)
-            .ok()
-            .and_then(|primary| parse_chunk_header(&primary).ok().flatten())),
-        None => Ok(None),
+/// The entry is read through the backend's password decoder (UTF-16LE on
+/// Windows), as it was written: reading the bytes raw would make a valid
+/// header look unusable, and the writer would then overwrite the slot the
+/// live credential uses. A decoding failure is an unusable header only
+/// when `repair` says the ownership check authorised replacing the entry;
+/// store-access errors always fail.
+fn stored_header(
+    store: &dyn CredentialStore,
+    key: &str,
+    repair: bool,
+) -> Result<Option<ChunkHeader>> {
+    match store.get_password(key) {
+        Ok(Some(primary)) => Ok(parse_chunk_header(&primary).ok().flatten()),
+        Ok(None) => Ok(None),
+        Err(error) if repair && error.is_credential_encoding() => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -524,6 +555,9 @@ pub struct MemoryStore {
     fail_deletes: AtomicBool,
     fail_headers: AtomicBool,
     chunk_bytes: Option<usize>,
+    /// Password entries are kept as UTF-16LE, as keyring's Windows backend
+    /// stores them; secret entries stay raw.
+    utf16_passwords: bool,
 }
 
 /// The platform's layout: chunked on Windows, as the real store is, so
@@ -537,6 +571,7 @@ impl Default for MemoryStore {
             fail_deletes: AtomicBool::default(),
             fail_headers: AtomicBool::default(),
             chunk_bytes: CHUNK_BYTES,
+            utf16_passwords: cfg!(windows),
         }
     }
 }
@@ -559,6 +594,16 @@ impl MemoryStore {
     pub fn chunked(size: usize) -> Self {
         Self {
             chunk_bytes: Some(size),
+            ..Self::default()
+        }
+    }
+
+    /// The Windows layout on any platform: chunks of `size` bytes behind a
+    /// header, and password entries encoded as UTF-16LE.
+    pub fn windows(size: usize) -> Self {
+        Self {
+            chunk_bytes: Some(size),
+            utf16_passwords: true,
             ..Self::default()
         }
     }
@@ -609,10 +654,27 @@ impl MemoryStore {
 
 impl CredentialStore for MemoryStore {
     fn get_password(&self, key: &str) -> Result<Option<String>> {
-        self.get_secret(key)?
-            .map(String::from_utf8)
-            .transpose()
-            .map_err(|error| PurviewError::message(error.to_string()))
+        let Some(bytes) = self.get_secret(key)? else {
+            return Ok(None);
+        };
+        let decoded = if self.utf16_passwords {
+            if bytes.len() % 2 != 0 {
+                None
+            } else {
+                let units: Vec<u16> = bytes
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|pair| u16::from_le_bytes(*pair))
+                    .collect();
+                String::from_utf16(&units).ok()
+            }
+        } else {
+            String::from_utf8(bytes).ok()
+        };
+        decoded.map(Some).ok_or_else(|| {
+            PurviewError::CredentialEncoding("the in-memory entry is not valid text".to_owned())
+        })
     }
 
     fn set_password(&self, key: &str, value: &str) -> Result<()> {
@@ -620,6 +682,10 @@ impl CredentialStore for MemoryStore {
             return Err(PurviewError::message(
                 "the in-memory credential store refused the primary entry",
             ));
+        }
+        if self.utf16_passwords {
+            let bytes: Vec<u8> = value.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            return self.set_secret(key, &bytes);
         }
         self.set_secret(key, value.as_bytes())
     }
@@ -697,6 +763,31 @@ mod tests {
             format!("{store:?}"),
             "MemoryStore { keys: [\"account\"], locks: 0, .. }"
         );
+    }
+
+    #[test]
+    fn a_refused_header_write_keeps_a_utf16_header_and_its_chunks_intact() {
+        // The Windows layout: a two-chunk value behind a UTF-16LE header.
+        let store = MemoryStore::windows(4);
+        store_value(&store, "account", "abcdefg").unwrap();
+        let header = store.get_secret("account").unwrap().unwrap();
+        assert_eq!(header[1], 0, "the header is UTF-16LE: {header:?}");
+        // A one-chunk replacement whose header write is refused must go to
+        // the other slot, leaving the live chunks alone.
+        store.fail_headers(true);
+        assert!(store_value(&store, "account", "xyz").is_err());
+        store.fail_headers(false);
+        assert_eq!(get_value(&store, "account").unwrap(), "abcdefg");
+    }
+
+    #[test]
+    fn only_a_repair_replaces_a_primary_the_backend_cannot_decode() {
+        let store = MemoryStore::windows(4);
+        store.set_secret("account", &[0xff, 0xfe, 0x00]).unwrap();
+        let error = store_value(&store, "account", "abcdefg").unwrap_err();
+        assert!(error.is_credential_encoding(), "{error}");
+        store_value_repairing(&store, "account", "abcdefg").unwrap();
+        assert_eq!(get_value(&store, "account").unwrap(), "abcdefg");
     }
 
     #[test]

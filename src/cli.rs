@@ -774,13 +774,15 @@ async fn store_login(
     // Held from the ownership check to the last write or rollback, so a
     // concurrent sign-in under the same key cannot slip in between.
     let _lock = account_lock(env, &record.email).await?;
-    let first_sign_in = check_key_owner(env, dir, record)?;
+    let (first_sign_in, repair) = check_key_owner(env, dir, record)?;
     // The injected fault fires after the store has taken the write, as a
     // macOS label failure or a Windows clean-up failure does.
-    if let Err(error) = credential
-        .save(env.credentials.as_ref())
-        .and_then(|()| fault(env, LoginWrite::Credential))
-    {
+    let saved = if repair {
+        credential.save_repairing(env.credentials.as_ref())
+    } else {
+        credential.save(env.credentials.as_ref())
+    };
+    if let Err(error) = saved.and_then(|()| fault(env, LoginWrite::Credential)) {
         return Err(credential_write_failed(
             env,
             &record.email,
@@ -845,8 +847,9 @@ async fn store_login(
 ///   which case the sign-in replaces (repairs) it.
 ///
 /// Returns whether nothing at all is stored under the key (a first
-/// sign-in). The caller holds the account lock.
-fn check_key_owner(env: &mut Env, dir: &Path, record: &AccountRecord) -> Result<bool> {
+/// sign-in), and whether the sign-in is authorised to repair a damaged
+/// credential. The caller holds the account lock.
+fn check_key_owner(env: &mut Env, dir: &Path, record: &AccountRecord) -> Result<(bool, bool)> {
     let same = |recorded: &str, signed_in: &str| {
         !recorded.trim().is_empty() && recorded.trim().eq_ignore_ascii_case(signed_in)
     };
@@ -886,7 +889,8 @@ fn check_key_owner(env: &mut Env, dir: &Path, record: &AccountRecord) -> Result<
              free the key, then sign in again"
         )));
     }
-    Ok(file_absent && stored == StoredPrincipal::Absent)
+    let repair = file_matches && stored == StoredPrincipal::Unreadable;
+    Ok((file_absent && stored == StoredPrincipal::Absent, repair))
 }
 
 /// After a credential write that reported a failure. The store may have

@@ -284,9 +284,10 @@ pub fn selected_indices(select: &str, headers: &[&str]) -> Result<Option<Vec<usi
                 .iter()
                 .position(|header| header.eq_ignore_ascii_case(field.trim()))
                 .ok_or_else(|| {
+                    // The name is not repeated: a value pasted by mistake
+                    // could be anything.
                     PurviewError::message(format!(
-                        "--select names no column {:?}; this output's columns are {}",
-                        field.trim(),
+                        "--select names a column this output does not have; its columns are {}",
                         headers.join(", ")
                     ))
                 })
@@ -487,7 +488,8 @@ mod tests {
         let error = selected_indices("name,mial", &headers)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("\"mial\""), "{error}");
+        assert!(!error.contains("mial"), "{error}");
+        assert!(error.contains("does not have"), "{error}");
         assert!(error.contains("NAME, EMAIL"), "{error}");
     }
 

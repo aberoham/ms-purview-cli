@@ -103,7 +103,7 @@ The tool never places a hold.
 | `--json` | `PURVIEW_JSON` | JSON output; shapes per exit code in section 3.3 |
 | `--results-only` | `PURVIEW_RESULTS_ONLY` | With `--json` and exit 0, print `results` without the envelope |
 | `--plain` | `PURVIEW_PLAIN` | Tab-separated values (TSV), no header |
-| `--select COLS` | `PURVIEW_SELECT` | Table or `--plain` columns by header name. An unknown name is an error, raised before sign-in. Every table's columns are listed in `docs/command-reference.md` |
+| `--select COLS` | `PURVIEW_SELECT` | Table or `--plain` columns by header name. An unknown name is an error, raised before sign-in in every output format; the error does not repeat the name. Every table's columns are listed in `docs/command-reference.md` |
 | `--account EMAIL` | `PURVIEW_ACCOUNT` | Stored identity to use. Matches the stored account key, or the `upn` claim recorded at sign-in, case-insensitively. No alias resolution (there is no `/me` read) and no fallback to another account |
 | `-v, --verbose` | `PURVIEW_VERBOSE` | Requests and sign-in steps on stderr, through the redactor (section 6.8) |
 | `--timeout SECS` | `PURVIEW_TIMEOUT` | Per-request Graph timeout. `0` means 60; at most 600. Downloads use their own timeouts (section 4.7) |
@@ -148,7 +148,7 @@ nothing else on stdout, whatever the exit code; their summary and any reasons go
 | 5 | Wait deadline reached | Operation waits: `{"caseId", "operationId", "status", "elapsedSeconds", "resume": [ … ], "error": {"code": "WaitTimeout", …}}`. Case-close waits: `{"caseId", "caseStatus", "elapsedSeconds", "resume": ["purview case get <case>"], "error": {"code": "WaitTimeout", …}}` |
 | 130 | Interrupted (Ctrl-C) while waiting | As exit 5, with code `Interrupted` |
 
-`resume` names the account the command ran as (`purview --account <email> …`), so that it
+`resume` names the account the command ran as (`purview --account=<email> …`, attached so that a name beginning with `-` stays a value), so that it
 resumes as the same identity whatever the default is then. It lists only commands that exist
 in the running release: `purview operation get <case>
 <op> --wait` from v0.1; `--check` added from v0.2; then `purview download <case> <op>`, which

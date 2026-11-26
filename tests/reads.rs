@@ -928,7 +928,7 @@ async fn the_deadline_exits_5_with_the_last_status_and_the_resume_command() {
             "operationId": ESTIMATE,
             "status": "running",
             "elapsedSeconds": 25,
-            "resume": [format!("purview --account {ALEX} operation get {CASE} {ESTIMATE} --wait")],
+            "resume": [format!("purview --account={ALEX} operation get {CASE} {ESTIMATE} --wait")],
             "error": {
                 "code": "WaitTimeout",
                 "status": 0,
@@ -966,7 +966,7 @@ async fn the_deadline_exits_5_with_the_last_status_and_the_resume_command() {
         human.stderr(),
         format!(
             "stopped waiting after 20s; the service carries on running the operation. Operation \
-             {ESTIMATE} was running. Resume with: purview --account {ALEX} operation get {CASE} {ESTIMATE} --wait\n"
+             {ESTIMATE} was running. Resume with: purview --account={ALEX} operation get {CASE} {ESTIMATE} --wait\n"
         )
     );
 }
@@ -1129,7 +1129,7 @@ async fn ctrl_c_ends_the_wait_with_exit_130_and_the_resume_command() {
     assert_eq!(
         document["resume"],
         json!([format!(
-            "purview --account {ALEX} operation get {CASE} {ESTIMATE} --wait"
+            "purview --account={ALEX} operation get {CASE} {ESTIMATE} --wait"
         )])
     );
     assert_eq!(requests(&harness).await.len(), 2);
@@ -1162,7 +1162,7 @@ async fn ctrl_c_during_the_first_read_abandons_it() {
         run.stderr(),
         format!(
             "interrupted after 0s; the service carries on running the operation. Operation \
-             {ESTIMATE} was not read yet. Resume with: purview --account {ALEX} operation get {CASE} {ESTIMATE} \
+             {ESTIMATE} was not read yet. Resume with: purview --account={ALEX} operation get {CASE} {ESTIMATE} \
              --wait\n"
         )
     );
@@ -1342,16 +1342,18 @@ async fn an_unknown_select_column_is_refused_before_sign_in() {
         &["search", "list", CASE][..],
         &["operation", "list", CASE, "--resolve"][..],
     ] {
-        let mut argv = vec!["--json", "--plain", "--select", "BOGUS"];
-        argv.remove(0);
-        argv.extend_from_slice(args);
-        let run = harness.run(&argv).await;
-        assert_eq!(run.outcome.exit_code, 1, "{args:?}");
-        assert!(
-            run.stderr().contains("--select names no column \"BOGUS\""),
-            "{args:?}: {}",
-            run.stderr()
-        );
+        for json in [false, true] {
+            let mut argv = vec!["--select", "canary-sig-0004"];
+            if json {
+                argv.push("--json");
+            }
+            argv.extend_from_slice(args);
+            let run = harness.run(&argv).await;
+            assert_eq!(run.outcome.exit_code, 1, "{args:?}");
+            let text = format!("{}{}", run.stdout(), run.stderr());
+            assert!(text.contains("does not have"), "{args:?}: {text}");
+            assert!(!text.contains("canary"), "{args:?}: {text}");
+        }
     }
     assert!(requests(&harness).await.is_empty());
 }
@@ -1546,4 +1548,210 @@ async fn an_incomplete_or_null_source_list_is_not_given_as_a_list() {
         "{}",
         run.stderr()
     );
+}
+
+/// Moves the clock past the deadline during the read, then answers with
+/// `status` and `body`.
+struct LateAnswer {
+    status: u16,
+    body: Value,
+    clock: Arc<ms_purview_cli::env::ManualClock>,
+}
+
+impl Respond for LateAnswer {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        self.clock.advance(Duration::from_secs(5));
+        json_response(self.status, self.body.clone())
+    }
+}
+
+#[tokio::test]
+async fn any_read_that_ends_after_the_deadline_exits_5() {
+    let harness = signed_in().await;
+    let mut no_id = fixture_value(&harness, "operation-estimate-running.json");
+    no_id["id"] = Value::Null;
+    let mut odd = fixture_value(&harness, "operation-estimate-running.json");
+    odd["status"] = json!("https://graph.example/x?sig=canary-sig-0005");
+    for (status, body, expected) in [
+        (200, no_id, Value::Null),
+        (403, fixture_value(&harness, "error-403.json"), Value::Null),
+        (200, odd, json!("https://graph.example/x?sig=REDACTED")),
+    ] {
+        harness.graph.reset().await;
+        Mock::given(method("GET"))
+            .and(path(operation_path(ESTIMATE)))
+            .respond_with(LateAnswer {
+                status,
+                body,
+                clock: harness.clock.clone(),
+            })
+            .mount(&harness.graph)
+            .await;
+        let run = harness
+            .run(&[
+                "--json",
+                "operation",
+                "get",
+                CASE,
+                ESTIMATE,
+                "--wait",
+                "--wait-timeout",
+                "1s",
+            ])
+            .await;
+        assert_eq!(run.outcome.exit_code, 5, "{status}: {}", run.stderr());
+        assert_eq!(run.json()["status"], expected, "{status}");
+        assert!(!run.stdout().contains("canary"));
+    }
+}
+
+#[tokio::test]
+async fn a_late_finished_read_does_not_say_the_service_is_still_running() {
+    let harness = signed_in().await;
+    Mock::given(method("GET"))
+        .and(path(operation_path(ESTIMATE)))
+        .respond_with(LateAnswer {
+            status: 200,
+            body: fixture_value(&harness, "operation-estimate-succeeded.json"),
+            clock: harness.clock.clone(),
+        })
+        .mount(&harness.graph)
+        .await;
+    let run = harness
+        .run(&[
+            "operation",
+            "get",
+            CASE,
+            ESTIMATE,
+            "--wait",
+            "--wait-timeout",
+            "1s",
+        ])
+        .await;
+    assert_eq!(run.outcome.exit_code, 5);
+    assert!(
+        run.stderr()
+            .starts_with("stopped waiting after 5s. Operation"),
+        "{}",
+        run.stderr()
+    );
+    assert!(run.stderr().contains("was succeeded"), "{}", run.stderr());
+}
+
+#[tokio::test]
+async fn progress_lines_redact_graph_s_text() {
+    let harness = signed_in().await;
+    let mut running = fixture_value(&harness, "operation-estimate-running.json");
+    running["action"] = json!("https://graph.example/x?sig=canary-sig-0006");
+    Mock::given(method("GET"))
+        .and(path(operation_path(ESTIMATE)))
+        .respond_with(json_response(200, running))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&harness.graph)
+        .await;
+    mount(
+        &harness,
+        &operation_path(ESTIMATE),
+        200,
+        "operation-estimate-succeeded.json",
+    )
+    .await;
+    let run = harness
+        .run_with(&["operation", "get", CASE, ESTIMATE, "--wait"], |env, _| {
+            env.stderr_is_terminal = true;
+        })
+        .await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
+    assert!(run.stderr().contains("sig=REDACTED"), "{}", run.stderr());
+    assert!(!run.stderr().contains("canary"));
+}
+
+#[tokio::test]
+async fn a_read_of_another_operation_fails_without_wait_too() {
+    let harness = signed_in().await;
+    let mut other = fixture_value(&harness, "operation-estimate-succeeded.json");
+    other["id"] = json!("aaaaaaaaaaaaaaaaaaaaaaaaaaaa0009");
+    Mock::given(method("GET"))
+        .and(path(operation_path(ESTIMATE)))
+        .respond_with(json_response(200, other))
+        .mount(&harness.graph)
+        .await;
+    let run = harness
+        .run(&["--json", "operation", "get", CASE, ESTIMATE])
+        .await;
+    assert_eq!(run.outcome.exit_code, 1);
+    assert!(run.json()["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("with operation aaaaaaaaaaaaaaaaaaaaaaaaaaaa0009"));
+}
+
+#[tokio::test]
+async fn a_url_cut_short_in_the_query_column_keeps_the_width() {
+    let harness = signed_in().await;
+    let mut body = fixture_value(&harness, "searches-list.json");
+    body["value"][0]["contentQuery"] = json!(format!(
+        "{} https://contoso.example/aaaaaaaaaaaaaaaaaaaa",
+        "x".repeat(60)
+    ));
+    Mock::given(method("GET"))
+        .and(path(case_path("/searches")))
+        .respond_with(json_response(200, body))
+        .mount(&harness.graph)
+        .await;
+    let run = harness
+        .run(&["--plain", "--select", "QUERY", "search", "list", CASE])
+        .await;
+    let first = run.stdout().lines().next().unwrap().to_owned();
+    assert_eq!(first.chars().count(), 80, "{first}");
+    assert!(first.ends_with('…'), "{first}");
+}
+
+#[tokio::test]
+async fn a_failed_resolve_read_with_trace_and_verbose_leaks_no_secret() {
+    let harness = signed_in().await;
+    mount(
+        &harness,
+        &case_path("/operations"),
+        200,
+        "operations-list.json",
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path(operation_path("aaaaaaaaaaaaaaaaaaaaaaaaaaaa0002")))
+        .respond_with(json_response(
+            403,
+            json!({"error": {
+                "code": "Forbidden",
+                "message": "see https://graph.example/x?sig=canary-sig-0007",
+            }}),
+        ))
+        .mount(&harness.graph)
+        .await;
+    for id in ["0001", "0003", "0004"] {
+        let mut body = signed(&harness, "operation-estimate-succeeded.json");
+        body["id"] = json!(format!("aaaaaaaaaaaaaaaaaaaaaaaaaaaa{id}"));
+        Mock::given(method("GET"))
+            .and(path(operation_path(&format!(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaa{id}"
+            ))))
+            .respond_with(json_response(200, body))
+            .mount(&harness.graph)
+            .await;
+    }
+    let trace = harness.root.path().join("trace-resolve");
+    let trace_arg = trace.display().to_string();
+    for json in [true, false] {
+        let mut argv = vec!["--verbose", "--trace", &trace_arg];
+        if json {
+            argv.push("--json");
+        }
+        argv.extend_from_slice(&["operation", "list", CASE, "--resolve"]);
+        let run = harness.run(&argv).await;
+        assert_eq!(run.outcome.exit_code, 1, "{}", run.stderr());
+        let mut values: Vec<&str> = CANARIES.to_vec();
+        values.extend(["canary-sig-0001", "canary-sig-0002", "canary-sig-0007"]);
+        harness.assert_absent(&run, &values);
+    }
 }

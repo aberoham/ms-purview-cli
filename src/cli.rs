@@ -1018,7 +1018,9 @@ async fn read_command(
     globals: &Globals,
     command: ReadCommand,
 ) -> Result<Outcome> {
-    if let (Some(columns), true) = (command.columns(), output.format != OutputFormat::Json) {
+    // Checked in every format, so that a typo fails the same way with or
+    // without --json, before sign-in.
+    if let Some(columns) = command.columns() {
         crate::output::selected_indices(&output.select, columns)?;
     }
     let (account, credential) = signed_in(env, globals)?;

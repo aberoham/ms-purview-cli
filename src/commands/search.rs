@@ -5,8 +5,8 @@ use std::io::Write;
 use serde_json::Value;
 
 use super::{
-    case_id, cut, date_text, resolve_search, shown, shown_fields, shown_rows, time_text,
-    warn_incomplete, warn_unreadable, Produced, Session,
+    case_id, cut, date_text, resolve_search, shown, shown_fields, time_text, warn_incomplete,
+    warn_unreadable, Produced, Session,
 };
 use crate::error::Result;
 use crate::model::valid::{CaseKey, SearchKey};
@@ -66,21 +66,28 @@ pub async fn list(session: &mut Session<'_>, case: &CaseKey) -> Result<Produced>
                 .untrusted_json_value(Value::Array(raw), count, &session.env.redactor)?,
         )));
     }
+    // Each cell goes through `shown` once. The query is redacted and
+    // sanitised before it is cut, so that no part of a secret survives the
+    // cut and the cut counts what the terminal shows; it is not redacted
+    // again after the cut, which would misread a URL cut short.
     let rows: Vec<Vec<String>> = searches
         .iter()
         .map(|search| {
             vec![
-                search.id.clone().unwrap_or_else(|| "?".to_owned()),
-                search
-                    .display_name
-                    .clone()
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or_else(|| "?".to_owned()),
-                search.data_source_scopes.clone().unwrap_or_default(),
+                shown(session, search.id.as_deref().unwrap_or("?")),
+                shown(
+                    session,
+                    search
+                        .display_name
+                        .as_deref()
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or("?"),
+                ),
+                shown(
+                    session,
+                    search.data_source_scopes.as_deref().unwrap_or_default(),
+                ),
                 date_text(search.created_date_time),
-                // Redacted and sanitised before it is cut, so that no part
-                // of a secret survives the cut and the cut counts what the
-                // terminal shows.
                 cut(
                     &sanitize(&shown(
                         session,
@@ -91,7 +98,6 @@ pub async fn list(session: &mut Session<'_>, case: &CaseKey) -> Result<Produced>
             ]
         })
         .collect();
-    let rows = shown_rows(session, rows);
     write_rows(&mut session.env.stdout, session.output, LIST_COLUMNS, &rows)?;
     Ok(Produced::success(None))
 }

@@ -240,13 +240,20 @@ check whether the other repository needs the same fix.
   written in section 3.3.
 - Every string from the tenant or a file goes through `sanitize` or
   `sanitize_multiline` before it reaches a terminal. JSON keeps the original
-  value, apart from `--wrap-untrusted`, which wraps each string under a key
-  in `output::UNTRUSTED_KEYS` at any depth.
-- A read command's JSON `results` is Graph's record as it came. Keys the
-  tool adds are ones Graph does not use on that record: `actionSource` on
-  `operation list` entries, `collection` on `operation get`, and the three
-  source lists that `search get` adds under Graph's navigation property
-  names when the record lacks them.
+  value, apart from two changes. Every URL is redacted as in the trace (a
+  string that is one URL keeps only its OData options; a URL in other text
+  keeps only scheme, host and path), and `--wrap-untrusted` wraps every
+  string under a key in `output::UNTRUSTED_KEYS`, at any depth. Human views
+  put tenant text through `redact::shown` once, before it is sanitised or
+  cut.
+- A read command's JSON `results` is Graph's record as it came, with those
+  changes. Keys the tool adds are ones Graph does not use on that record:
+  `actionSource` on `operation list` entries, `collection` on `operation
+  get`, and the three source lists that `search get` adds under Graph's
+  navigation property names when the record lacks them or has `null`
+  there, and only when the list reached its last page.
+- Diagnostics never repeat an argument value (`--select`, `<op>`, a case or
+  search name) or tenant text: a pasted value could be a secret.
 - Every sink writes through the Redactor: stdout and stderr through `Env`,
   and later trace files and the download manifest. Never write to
   `std::io::stdout()` or `std::io::stderr()`, or use `println!` and

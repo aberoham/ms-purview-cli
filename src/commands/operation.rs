@@ -12,7 +12,7 @@ use super::{
 };
 use crate::error::{PurviewError, Result};
 use crate::graph::GraphClient;
-use crate::model::valid::{CaseKey, PollTarget};
+use crate::model::valid::CaseKey;
 use crate::model::wire::{
     identity, Action, OperationDetail, OperationRecord, OperationStatus, Source,
 };
@@ -330,9 +330,7 @@ pub async fn get(
                 .graph
                 .get(&route, &Query::new(), &mut session.env.stderr)
                 .await?;
-            OperationRecord::from_value(body).ok_or_else(|| {
-                PurviewError::message("Graph returned an operation that is not an object")
-            })?
+            crate::poll::checked(body, &route)?
         }
         Some(wait) => {
             let started = session.env.clock.elapsed();
@@ -347,14 +345,18 @@ pub async fn get(
                 not_found_grace: None,
             };
             let shown_id = short_id(operation);
+            let redactor = session.env.redactor.clone();
             let mut progress =
                 |record: &OperationRecord, waited: Duration, log: &mut (dyn Write + Send)| {
                     if show_progress {
                         let _ = writeln!(
                             log,
                             "{} {shown_id}: {} · {}",
-                            sanitize(record.action(Source::Single).label()),
-                            sanitize(record.status.as_str()),
+                            sanitize(&crate::redact::shown(
+                                record.action(Source::Single).label(),
+                                &redactor
+                            )),
+                            sanitize(&crate::redact::shown(record.status.as_str(), &redactor)),
                             elapsed_text(waited)
                         );
                     }
@@ -374,7 +376,6 @@ pub async fn get(
             }
         }
     };
-    PollTarget::new(&record)?;
     warn_invalid_counts(&mut session.env.stderr, std::iter::once(&record));
     show(session, &record)
 }
@@ -557,32 +558,37 @@ fn stopped(
     waited: Duration,
     interrupted: bool,
 ) -> Result<Produced> {
+    // An unknown status is Graph's text, so it is shown as tenant text.
     let status = last
         .as_ref()
-        .map(|record| record.status.as_str().to_owned());
-    // The account is named, so that the command resumes as the same
+        .map(|record| shown(session, record.status.as_str()));
+    // Only a status that is still running is described as running.
+    let still_running = last
+        .as_ref()
+        .is_none_or(|record| !record.status.is_terminal());
+    let carries_on = if still_running {
+        "; the service carries on running the operation"
+    } else {
+        ""
+    };
+    // The account is named, attached with `=` so that a name beginning
+    // with `-` stays its value, and the command resumes as the same
     // identity whatever the default is then.
     let resume = format!(
-        "purview --account {} operation get {case} {operation} --wait",
+        "purview --account={} operation get {case} {operation} --wait",
         shell_word(&session.account.email)
     );
     let (exit_code, code, message) = if interrupted {
         (
             130,
             "Interrupted",
-            format!(
-                "interrupted after {}; the service carries on running the operation",
-                elapsed_text(waited)
-            ),
+            format!("interrupted after {}{carries_on}", elapsed_text(waited)),
         )
     } else {
         (
             5,
             "WaitTimeout",
-            format!(
-                "stopped waiting after {}; the service carries on running the operation",
-                elapsed_text(waited)
-            ),
+            format!("stopped waiting after {}{carries_on}", elapsed_text(waited)),
         )
     };
     if session.output.format == OutputFormat::Json {

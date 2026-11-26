@@ -107,36 +107,28 @@ impl Poller<'_> {
             };
             let waited = self.clock.elapsed().saturating_sub(started);
             let mut asked: Option<Duration> = None;
-            match read {
+            let read = match read {
                 Err(_elapsed) => return Ok(PollEnd::TimedOut { last }),
-                Ok(Ok(body)) => {
-                    let record = OperationRecord::from_value(body).ok_or_else(|| {
-                        PurviewError::message("Graph returned an operation that is not an object")
-                    })?;
-                    // Every record read is checked, not only the last: one
-                    // without an id or status, or for another operation,
-                    // ends the wait.
-                    let target = PollTarget::new(&record)?;
-                    if let ReadRoute::Operation(_, wanted) = route {
-                        if target.id != *wanted {
-                            return Err(PurviewError::message(format!(
-                                "Graph answered the read of operation {wanted} with operation {}",
-                                target.id
-                            )));
-                        }
-                    }
-                    // A read that ended after the deadline does not count:
-                    // the deadline covers the whole wait.
-                    if self.clock.elapsed() >= deadline {
-                        return Ok(PollEnd::TimedOut { last: Some(record) });
-                    }
+                Ok(read) => read.and_then(|body| checked(body, route)),
+            };
+            // A read that ended after the deadline does not count, whatever
+            // it says: the deadline covers the whole wait. A valid record
+            // still gives the last status.
+            if self.clock.elapsed() >= deadline {
+                if let Ok(record) = read {
+                    last = Some(record);
+                }
+                return Ok(PollEnd::TimedOut { last });
+            }
+            match read {
+                Ok(record) => {
                     if record.status.is_terminal() {
                         return Ok(PollEnd::Finished(record));
                     }
                     progress(&record, waited, log);
                     last = Some(record);
                 }
-                Ok(Err(error))
+                Err(error)
                     if error.graph_status() == Some(404)
                         && self.not_found_grace.is_some_and(|grace| waited < grace) =>
                 {
@@ -145,7 +137,7 @@ impl Poller<'_> {
                         "notice: the operation is not visible yet; reading it again"
                     );
                 }
-                Ok(Err(error)) if error.is_transient_graph_failure() => {
+                Err(error) if error.is_transient_graph_failure() => {
                     asked = error.retry_after();
                     let _ = writeln!(
                         log,
@@ -153,7 +145,7 @@ impl Poller<'_> {
                         sanitize(&error.to_string())
                     );
                 }
-                Ok(Err(error)) => return Err(error),
+                Err(error) => return Err(error),
             }
             let waited = self.clock.elapsed().saturating_sub(started);
             let interval = self
@@ -174,6 +166,25 @@ impl Poller<'_> {
             }
         }
     }
+}
+
+/// The record in a poll's answer, checked: every record read, not only
+/// the last, must have a valid id and status and be the operation asked
+/// for.
+pub fn checked(body: serde_json::Value, route: &ReadRoute) -> Result<OperationRecord> {
+    let record = OperationRecord::from_value(body).ok_or_else(|| {
+        PurviewError::message("Graph returned an operation that is not an object")
+    })?;
+    let target = PollTarget::new(&record)?;
+    if let ReadRoute::Operation(_, wanted) = route {
+        if target.id != *wanted {
+            return Err(PurviewError::message(format!(
+                "Graph answered the read of operation {wanted} with operation {}",
+                target.id
+            )));
+        }
+    }
+    Ok(record)
 }
 
 /// A duration for a person: `35s`, `4m10s`, `1h02m`.

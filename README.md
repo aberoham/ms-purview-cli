@@ -4,9 +4,10 @@
 eDiscovery from the terminal: create cases and searches, run estimates, item reports and
 exports, download and read the results, and close cases.**
 
-Status: early development. The binary has one command, `purview version`, and nothing is
-released yet; the install steps below apply from the first release. The design and phased
-plan are in [docs/SPEC.md](docs/SPEC.md).
+Status: early development. The binary signs in with a device code (`purview auth login`,
+`auth refresh`, `auth list`, `auth logout`) and prints its version; nothing is released
+yet, and the install steps below apply from the first release. The design and phased plan
+are in [docs/SPEC.md](docs/SPEC.md).
 
 Sibling of [ms-entra-cli](https://github.com/aberoham/ms-entra-cli).
 

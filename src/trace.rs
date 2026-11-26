@@ -306,9 +306,14 @@ static PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
 /// The name is unique to the process and the call, and a name already
 /// taken (a stale probe, another open) moves on to the next.
 fn probe_write(dir: &Path) -> std::io::Result<()> {
+    probe_write_counting(dir, &PROBES)
+}
+
+/// `probe_write` with the counter given, so a test can know the names.
+fn probe_write_counting(dir: &Path, counter: &std::sync::atomic::AtomicU64) -> std::io::Result<()> {
     let mut last = None;
     for _ in 0..8 {
-        let count = PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let count = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let probe = dir.join(format!(
             ".purview-trace-probe-{}-{count}",
             std::process::id()
@@ -534,26 +539,24 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("is a link"), "{error}");
-        // Stale probes of this process under the next names do not block
-        // the next open.
-        let next = PROBES.load(std::sync::atomic::Ordering::Relaxed);
-        for count in next..next + 3 {
-            std::fs::write(
+        // Stale probes under the first three names do not block the probe,
+        // and are left alone. The counter is the test's own, so the names
+        // are known.
+        let counter = std::sync::atomic::AtomicU64::new(0);
+        let stale: Vec<PathBuf> = (0..3)
+            .map(|count| {
                 dir.join(format!(
                     ".purview-trace-probe-{}-{count}",
                     std::process::id()
-                )),
-                b"",
-            )
-            .unwrap();
+                ))
+            })
+            .collect();
+        for path in &stale {
+            std::fs::write(path, b"").unwrap();
         }
-        TraceSink::open(
-            &dir,
-            Arc::new(Redactor::new()),
-            Arc::new(ManualClock::new(test_epoch())),
-            &mut Vec::new(),
-        )
-        .unwrap();
+        probe_write_counting(&dir, &counter).unwrap();
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 4);
+        assert!(stale.iter().all(|path| path.exists()));
     }
 
     #[test]

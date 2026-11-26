@@ -269,13 +269,30 @@ impl Credential {
             email: record.email,
             refresh_token: record.refresh_token,
             graph: record.graph.into_access_token(),
-            download: record.download.map(LoadedToken::into_access_token),
+            // A download entry that cannot be used counts as absent, so the
+            // provider obtains a new one rather than sending an empty token.
+            download: record
+                .download
+                .map(LoadedToken::into_access_token)
+                .filter(|token| !token.token.is_empty()),
         };
         credential.register(redactor);
+        let damaged = |what: &str| {
+            PurviewError::message(format!(
+                "the stored credential {what}; run 'purview auth login' again"
+            ))
+        };
+        if credential.email.trim().is_empty() {
+            return Err(damaged("names no account"));
+        }
         if credential.refresh_token.is_empty() {
-            return Err(PurviewError::message(
-                "the stored credential has no refresh token; run 'purview auth login' again",
-            ));
+            return Err(damaged("has no refresh token"));
+        }
+        if credential.graph.token.is_empty() {
+            return Err(damaged("has no Graph token"));
+        }
+        if auth::graph_permissions(&credential.graph.scope).is_empty() {
+            return Err(damaged("records no Graph permission"));
         }
         Ok(credential)
     }
@@ -286,10 +303,20 @@ impl Credential {
         email: &str,
         redactor: &Redactor,
     ) -> Result<Option<Self>> {
-        match find_value(store, &token_key(email))? {
-            Some(text) => Self::from_json(&text, redactor).map(Some),
-            None => Ok(None),
+        let Some(text) = find_value(store, &token_key(email))? else {
+            return Ok(None);
+        };
+        let credential = Self::from_json(&text, redactor)?;
+        // `save` writes under the embedded address, so a mismatch would
+        // move the credential to another account's key.
+        if !credential.email.eq_ignore_ascii_case(email.trim()) {
+            return Err(PurviewError::message(format!(
+                "the credential stored for {} names another account; run 'purview auth login' \
+                 again",
+                crate::output::sanitize(email)
+            )));
         }
+        Ok(Some(credential))
     }
 
     pub fn save(&self, store: &dyn CredentialStore) -> Result<()> {
@@ -313,34 +340,25 @@ impl Credential {
     }
 }
 
-/// What `TokenProvider::refresh_all` obtained.
-#[derive(Debug)]
-pub struct RefreshReport {
-    pub credential: Credential,
-    /// The download redemption was refused for want of consent; the
-    /// credential then holds no download token.
-    pub download_refused: Option<PurviewError>,
-}
-
 struct State {
     credential: Credential,
-    /// A missing download token gets one silent attempt per process.
-    download_attempted: bool,
+    /// A consent refusal for the download resource was seen in this
+    /// process; later `download` calls fail at once.
+    download_refused: bool,
 }
 
 /// The production `TokenProvider`: one account's stored credential,
-/// refreshed against the identity platform and written back after every
-/// rotation. Concurrent callers share one refresh, because the state lock
-/// is held across the request.
+/// refreshed against the identity platform. Every refresh is written to
+/// the store before its tokens are used: a refresh works on a copy, and
+/// the copy replaces the provider's state only once the store has accepted
+/// it. A store failure is the caller's error, and the rotated refresh
+/// token is never used. Concurrent callers share one refresh, because the
+/// state lock is held across the request.
 pub struct StoredTokenProvider {
     identity: IdentityClient,
     store: Arc<dyn CredentialStore>,
-    redactor: Arc<Redactor>,
     clock: Arc<dyn Clock>,
     state: tokio::sync::Mutex<State>,
-    /// Store writes that failed after a background refresh. The refreshed
-    /// token is still used; the caller may report these.
-    warnings: std::sync::Mutex<Vec<String>>,
 }
 
 impl fmt::Debug for StoredTokenProvider {
@@ -365,52 +383,40 @@ impl StoredTokenProvider {
         Self {
             identity,
             store,
-            redactor,
             clock,
             state: tokio::sync::Mutex::new(State {
                 credential,
-                download_attempted: false,
+                download_refused: false,
             }),
-            warnings: std::sync::Mutex::default(),
         }
     }
 
-    /// Store failures from background refreshes, oldest first.
-    pub fn take_warnings(&self) -> Vec<String> {
-        std::mem::take(
-            &mut self
-                .warnings
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        )
-    }
-
     /// `auth refresh`: redeems the refresh token for both resources with
-    /// the scopes already stored, then stores the result. A refusal of the
-    /// download resource for want of consent is reported, not fatal, and
-    /// leaves no download token. Any other failure, including the store
-    /// write, is an error.
-    pub async fn refresh_all(&self) -> Result<RefreshReport> {
+    /// the scopes already stored, storing each result before the next step.
+    /// It returns the stored credential only if both redemptions and both
+    /// store writes succeed. A consent refusal for the download resource
+    /// keeps the stored Graph rotation, stores the credential without its
+    /// download token, and fails with `DownloadNotConsented`.
+    pub async fn refresh_all(&self) -> Result<Credential> {
         let mut state = self.state.lock().await;
-        self.refresh_graph(&mut state.credential).await?;
-        state.credential.save(self.store.as_ref())?;
-        let download_refused = match self.refresh_download(&mut state.credential).await {
-            Ok(()) => None,
+        let refreshed = self.refresh_graph(&state.credential).await?;
+        self.commit(&mut state, refreshed)?;
+        match self.refresh_download(&state.credential).await {
+            Ok(refreshed) => self.commit(&mut state, refreshed)?,
             Err(error) if error.is_consent_required() => {
-                state.credential.download = None;
-                Some(error)
+                self.refuse_download(&mut state)?;
+                return Err(self.not_consented(&state));
             }
             Err(error) => return Err(error),
-        };
-        state.download_attempted = true;
-        state.credential.save(self.store.as_ref())?;
-        Ok(RefreshReport {
-            credential: state.credential.clone(),
-            download_refused,
-        })
+        }
+        Ok(state.credential.clone())
     }
 
-    async fn refresh_graph(&self, credential: &mut Credential) -> Result<()> {
+    /// A copy of `credential` with a new Graph token and any rotated
+    /// refresh token. A response whose Graph permissions differ from the
+    /// stored ones is refused: a refresh must neither widen nor narrow a
+    /// session, and the stored scope must describe the token in use.
+    async fn refresh_graph(&self, credential: &Credential) -> Result<Credential> {
         let scope = auth::graph_refresh_scope(&credential.graph.scope);
         let response = self
             .identity
@@ -420,12 +426,25 @@ impl StoredTokenProvider {
                 "refreshing the Graph token",
             )
             .await?;
-        credential.graph = AccessToken::from_response(&response, self.clock.now(), &scope);
-        credential.rotate(&response);
-        Ok(())
+        let mut refreshed = credential.clone();
+        refreshed.graph =
+            AccessToken::from_response(&response, self.clock.now(), &credential.graph.scope);
+        let before = auth::graph_permissions(&credential.graph.scope);
+        let after = auth::graph_permissions(&refreshed.graph.scope);
+        if before != after {
+            return Err(PurviewError::message(format!(
+                "the Graph refresh returned the permissions {:?} where {:?} are stored; the \
+                 session's permissions changed, so nothing was stored. Run 'purview auth login' \
+                 to sign in with the permissions the app now has",
+                after.into_iter().collect::<Vec<_>>().join(" "),
+                before.into_iter().collect::<Vec<_>>().join(" "),
+            )));
+        }
+        refreshed.rotate(&response);
+        Ok(refreshed)
     }
 
-    async fn refresh_download(&self, credential: &mut Credential) -> Result<()> {
+    async fn refresh_download(&self, credential: &Credential) -> Result<Credential> {
         let scope = auth::download_scope();
         let response = self
             .identity
@@ -435,24 +454,40 @@ impl StoredTokenProvider {
                 "redeeming the refresh token for the download token",
             )
             .await?;
-        credential.download = Some(AccessToken::from_response(
+        let mut refreshed = credential.clone();
+        refreshed.download = Some(AccessToken::from_response(
             &response,
             self.clock.now(),
             &scope,
         ));
-        credential.rotate(&response);
+        refreshed.rotate(&response);
+        Ok(refreshed)
+    }
+
+    /// Stores `refreshed`, then makes it the provider's state. If the store
+    /// refuses, the state keeps the credential the store still holds.
+    fn commit(&self, state: &mut State, refreshed: Credential) -> Result<()> {
+        refreshed.save(self.store.as_ref())?;
+        state.credential = refreshed;
         Ok(())
     }
 
-    /// Writes the credential after a background refresh. A failure is kept
-    /// as a warning: the new tokens are still usable in this process, and
-    /// the previous refresh token stays in the store.
-    fn persist(&self, credential: &Credential) {
-        if let Err(error) = credential.save(self.store.as_ref()) {
-            self.warnings
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(self.redactor.redact(&error.to_string()));
+    /// After a consent refusal: the download entry is cleared and the
+    /// credential stored without it, so no later call in this process, nor
+    /// a later process, renews a token the app may no longer get.
+    fn refuse_download(&self, state: &mut State) -> Result<()> {
+        state.download_refused = true;
+        if state.credential.download.is_some() {
+            let mut cleared = state.credential.clone();
+            cleared.download = None;
+            self.commit(state, cleared)?;
+        }
+        Ok(())
+    }
+
+    fn not_consented(&self, state: &State) -> PurviewError {
+        PurviewError::DownloadNotConsented {
+            account: state.credential.email.clone(),
         }
     }
 }
@@ -466,39 +501,33 @@ impl TokenProvider for StoredTokenProvider {
             .graph
             .valid_for(self.clock.now(), min_validity)
         {
-            self.refresh_graph(&mut state.credential).await?;
-            self.persist(&state.credential);
+            let refreshed = self.refresh_graph(&state.credential).await?;
+            self.commit(&mut state, refreshed)?;
         }
         Ok(GraphToken(state.credential.graph.token.clone()))
     }
 
+    /// Only a consent refusal becomes `DownloadNotConsented`, and only that
+    /// refusal stops later attempts in this process. A network failure or
+    /// a revoked session keeps its own error, whose remedy is different.
     async fn download(&self, min_validity: Duration) -> Result<DownloadToken> {
         let mut state = self.state.lock().await;
-        let now = self.clock.now();
+        if state.download_refused {
+            return Err(self.not_consented(&state));
+        }
         if let Some(download) = &state.credential.download {
-            if download.valid_for(now, min_validity) {
+            if download.valid_for(self.clock.now(), min_validity) {
                 return Ok(DownloadToken(download.token.clone()));
             }
-        } else if state.download_attempted {
-            return Err(PurviewError::DownloadNotConsented {
-                account: state.credential.email.clone(),
-            });
         }
-        match self.refresh_download(&mut state.credential).await {
-            Ok(()) => {}
-            // Only a consent refusal becomes `DownloadNotConsented`, and
-            // only that refusal stops later attempts in this process; a
-            // network failure or a revoked session keeps its own error,
-            // whose remedy is different.
+        match self.refresh_download(&state.credential).await {
+            Ok(refreshed) => self.commit(&mut state, refreshed)?,
             Err(error) if error.is_consent_required() => {
-                state.download_attempted = true;
-                return Err(PurviewError::DownloadNotConsented {
-                    account: state.credential.email.clone(),
-                });
+                self.refuse_download(&mut state)?;
+                return Err(self.not_consented(&state));
             }
             Err(error) => return Err(error),
         }
-        self.persist(&state.credential);
         let download = state
             .credential
             .download
@@ -656,7 +685,8 @@ mod tests {
     #[test]
     fn an_unreadable_expiry_counts_as_expired() {
         let text = json!({"version": 1, "email": EMAIL, "refresh_token": "r",
-                          "graph": {"access_token": "a", "expires_at": "soon"}});
+                          "graph": {"access_token": "a", "expires_at": "soon",
+                                    "scope": "eDiscovery.ReadWrite.All"}});
         let loaded = Credential::from_json(&text.to_string(), &Redactor::new()).unwrap();
         assert!(!loaded.graph.valid_for(test_epoch(), Duration::ZERO));
     }
@@ -810,21 +840,160 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_store_failure_after_a_background_refresh_is_a_warning() {
+    async fn a_store_failure_after_a_refresh_is_an_error_and_the_rotation_is_not_used() {
         let setup = setup(credential(0, None)).await;
         Mock::given(method("POST"))
+            .and(body_string_contains("refresh_token=canary-refresh-0001"))
             .respond_with(response("canary-graph-0002", "canary-refresh-0002"))
+            .expect(2)
             .mount(&setup.server)
             .await;
         setup.store.fail_writes(true);
+        let error = setup
+            .provider
+            .graph(Duration::from_secs(60))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("storing the credential"),
+            "{error}"
+        );
+        // The next attempt still redeems the stored refresh token, not the
+        // rotated one the store never accepted.
+        setup.store.fail_writes(false);
         let token = setup.provider.graph(Duration::from_secs(60)).await.unwrap();
         assert_eq!(token.expose(), "canary-graph-0002");
-        let warnings = setup.provider.take_warnings();
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(
-            warnings[0].contains("storing the credential"),
-            "{warnings:?}"
-        );
+        assert_eq!(stored(&setup)["refresh_token"], "canary-refresh-0002");
+    }
+
+    #[tokio::test]
+    async fn refresh_all_on_a_consent_refusal_keeps_the_graph_rotation_and_fails() {
+        let setup = setup(credential(3600, Some(3600))).await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("refresh_token=canary-refresh-0001"))
+            .respond_with(response("canary-graph-0002", "canary-refresh-0002"))
+            .expect(1)
+            .mount(&setup.server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("refresh_token=canary-refresh-0002"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": "invalid_grant",
+                "error_codes": [65001],
+            })))
+            .expect(1)
+            .mount(&setup.server)
+            .await;
+        let error = setup.provider.refresh_all().await.unwrap_err();
+        assert_eq!(error.metadata(), ("DownloadNotConsented", 0));
+        let stored = stored(&setup);
+        assert_eq!(stored["refresh_token"], "canary-refresh-0002");
+        assert_eq!(stored["graph"]["access_token"], "canary-graph-0002");
+        assert!(stored.get("download").is_none(), "{stored}");
+        // The refusal holds for the rest of the process.
+        let error = setup
+            .provider
+            .download(Duration::from_secs(300))
+            .await
+            .unwrap_err();
+        assert_eq!(error.metadata(), ("DownloadNotConsented", 0));
+    }
+
+    #[tokio::test]
+    async fn a_consent_refusal_renewing_an_expired_download_token_clears_it() {
+        let setup = setup(credential(3600, Some(10))).await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": "invalid_grant",
+                "error_description": "AADSTS65001: consent was withdrawn",
+            })))
+            .expect(1)
+            .mount(&setup.server)
+            .await;
+        for _ in 0..3 {
+            let error = setup
+                .provider
+                .download(Duration::from_secs(300))
+                .await
+                .unwrap_err();
+            assert_eq!(error.metadata(), ("DownloadNotConsented", 0));
+        }
+        assert!(stored(&setup).get("download").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_refresh_that_changes_the_graph_permissions_is_refused() {
+        let setup = setup(credential(0, None)).await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "canary-graph-0002",
+                "refresh_token": "canary-refresh-0002",
+                "expires_in": 3600,
+                "scope": "eDiscovery.Read.All openid profile",
+            })))
+            .mount(&setup.server)
+            .await;
+        let error = setup
+            .provider
+            .graph(Duration::from_secs(60))
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("ediscovery.read.all"), "{message}");
+        assert!(message.contains("purview auth login"), "{message}");
         assert_eq!(stored(&setup)["refresh_token"], "canary-refresh-0001");
+        assert_eq!(stored(&setup)["graph"]["access_token"], "canary-graph-0001");
+    }
+
+    #[tokio::test]
+    async fn a_response_without_a_scope_keeps_the_stored_permissions() {
+        let setup = setup(credential(0, None)).await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "canary-graph-0002",
+                "expires_in": 3600,
+            })))
+            .mount(&setup.server)
+            .await;
+        setup.provider.graph(Duration::from_secs(60)).await.unwrap();
+        let stored = stored(&setup);
+        assert_eq!(stored["graph"]["scope"], "eDiscovery.ReadWrite.All openid");
+        // No rotation came back, so the stored refresh token stays.
+        assert_eq!(stored["refresh_token"], "canary-refresh-0001");
+    }
+
+    #[test]
+    fn a_loaded_credential_must_be_usable_and_belong_to_its_key() {
+        let redactor = Redactor::new();
+        let base = json!({"version": 1, "email": EMAIL, "refresh_token": "r",
+                          "graph": {"access_token": "a", "expires_at": "2026-01-05T10:00:00Z",
+                                    "scope": "eDiscovery.ReadWrite.All"}});
+        for (pointer, value, expected) in [
+            ("/graph/access_token", json!(""), "no Graph token"),
+            (
+                "/graph/scope",
+                json!("openid offline_access"),
+                "no Graph permission",
+            ),
+            ("/email", json!(" "), "names no account"),
+        ] {
+            let mut damaged = base.clone();
+            *damaged.pointer_mut(pointer).unwrap() = value;
+            let error = Credential::from_json(&damaged.to_string(), &redactor).unwrap_err();
+            assert!(error.to_string().contains(expected), "{pointer}: {error}");
+        }
+        let mut with_empty_download = base.clone();
+        with_empty_download["download"] = json!({"access_token": "", "scope": "d"});
+        let loaded = Credential::from_json(&with_empty_download.to_string(), &redactor).unwrap();
+        assert!(loaded.download.is_none());
+
+        let store = MemoryStore::default();
+        crate::secrets::store_value(&store, &token_key("sam@contoso.example"), &base.to_string())
+            .unwrap();
+        let error = Credential::load(&store, "sam@contoso.example", &redactor).unwrap_err();
+        assert!(
+            error.to_string().contains("names another account"),
+            "{error}"
+        );
     }
 }

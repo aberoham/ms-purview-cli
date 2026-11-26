@@ -149,10 +149,28 @@ impl Harness {
     /// The stored credential for an account, parsed.
     pub fn stored(&self, email: &str) -> Option<Value> {
         let key = format!("purview:token:{email}");
-        self.store.keys().contains(&key).then(|| {
-            let text = ms_purview_cli::secrets::get_value(self.store.as_ref(), &key).unwrap();
-            serde_json::from_str(&text).unwrap()
-        })
+        let text = ms_purview_cli::secrets::find_value(self.store.as_ref(), &key).ok()??;
+        serde_json::from_str(&text).ok()
+    }
+
+    /// The accounts with a stored credential: the store's logical entries,
+    /// whatever chunk keys the platform layout adds (Windows splits each
+    /// credential into a header and chunks).
+    pub fn credentials(&self) -> Vec<String> {
+        let prefix = "purview:token:";
+        let mut accounts: Vec<String> = self
+            .store
+            .keys()
+            .iter()
+            .filter_map(|key| key.strip_prefix(prefix))
+            // Chunk keys add `:<n>` or `:s<slot>:<n>`; an account name can
+            // never hold a colon (it is refused as a file name).
+            .filter(|account| !account.contains(':'))
+            .filter(|account| self.stored(account).is_some_and(|v| v["version"] == 1))
+            .map(str::to_owned)
+            .collect();
+        accounts.sort();
+        accounts
     }
 
     pub fn config(&self) -> Value {

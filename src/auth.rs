@@ -59,11 +59,12 @@ pub fn download_scope() -> String {
     format!("{EDISCOVERY_APP_ID}/.default offline_access")
 }
 
-/// The scope for a Graph refresh: exactly the scopes stored with the token,
-/// with any short Graph permission name given its resource prefix, and
-/// `offline_access` added if the stored list lacks it. It never adds a
-/// permission, so a refresh cannot widen a session; and it never drops
-/// one, so it cannot narrow it.
+/// The scope for a Graph refresh, built from the scopes stored with the
+/// token: each short Graph permission name gets the Graph resource prefix,
+/// entries that repeat (ignoring case) are dropped, and `offline_access` is
+/// added if the list lacks it. No permission is added or removed, so the
+/// request asks for the stored permission set; `StoredTokenProvider`
+/// refuses a response that grants a different one.
 pub fn graph_refresh_scope(stored: &str) -> String {
     let mut scopes: Vec<String> = Vec::new();
     for scope in stored.split_whitespace() {
@@ -84,6 +85,23 @@ pub fn graph_refresh_scope(stored: &str) -> String {
         scopes.push("offline_access".to_owned());
     }
     scopes.join(" ")
+}
+
+/// The Graph permissions in a scope list, as lowercase short names: the
+/// OpenID Connect and `offline_access` entries are left out, and the Graph
+/// resource prefix is removed. A permission for another resource keeps its
+/// prefix. Two lists grant the same permissions when these sets are equal.
+pub fn graph_permissions(scope: &str) -> std::collections::BTreeSet<String> {
+    scope
+        .split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .filter(|item| !RESOURCELESS_SCOPES.contains(&item.as_str()))
+        .map(|item| match item.strip_prefix(GRAPH_RESOURCE) {
+            Some(short) => short.to_owned(),
+            None => item,
+        })
+        .filter(|item| !item.is_empty())
+        .collect()
 }
 
 /// An application (client) id must be a GUID.
@@ -281,11 +299,17 @@ impl IdentityClient {
     ) -> Result<TokenResponse> {
         let operation = "signing in with the device code";
         let mut interval = code.interval.unwrap_or(5).clamp(1, 120);
-        let lifetime = code.expires_in.unwrap_or(900).clamp(1, 3_600);
-        let deadline = clock.now() + chrono::Duration::seconds(lifetime as i64);
+        let lifetime = Duration::from_secs(code.expires_in.unwrap_or(900).clamp(1, 3_600));
+        // A monotonic deadline from the moment the code arrived: a change
+        // to the wall clock cannot extend it, and it bounds every sleep and
+        // request, so a success that arrives after it is refused.
+        let deadline = clock.elapsed() + lifetime;
+        let remaining = || deadline.saturating_sub(clock.elapsed());
         loop {
-            clock.sleep(Duration::from_secs(interval)).await;
-            if clock.now() >= deadline {
+            clock
+                .sleep(Duration::from_secs(interval).min(remaining()))
+                .await;
+            if remaining().is_zero() {
                 return Err(expired_device_code());
             }
             let form = [
@@ -293,7 +317,13 @@ impl IdentityClient {
                 ("grant_type", DEVICE_CODE_GRANT),
                 ("device_code", code.device_code.expose()),
             ];
-            let (status, body) = self.post("token", &form).await?;
+            let bound = remaining().min(REQUEST_TIMEOUT);
+            let (status, body) = tokio::time::timeout(bound, self.post("token", &form))
+                .await
+                .map_err(|_| expired_device_code())??;
+            if remaining().is_zero() {
+                return Err(expired_device_code());
+            }
             if status == StatusCode::OK {
                 return self.token_response(&body, operation);
             }
@@ -331,7 +361,24 @@ impl IdentityClient {
             .map_err(|error| PurviewError::message(transport_failure(&error)))?;
         let status = response.status();
         let body = bounded_body(response, MAX_OAUTH_RESPONSE).await?;
+        self.register_body_secrets(&body);
         Ok((status, body))
+    }
+
+    /// Registers every token-shaped field of a response body, whatever its
+    /// status, before anything reads it: an error body that hands out a
+    /// token and also quotes it in `error_description` must not carry it
+    /// to output.
+    fn register_body_secrets(&self, body: &[u8]) {
+        const SECRET_FIELDS: &[&str] =
+            &["access_token", "refresh_token", "id_token", "device_code"];
+        if let Ok(Value::Object(fields)) = serde_json::from_slice::<Value>(body) {
+            for name in SECRET_FIELDS {
+                if let Some(Value::String(secret)) = fields.get(*name) {
+                    self.redactor.register(secret);
+                }
+            }
+        }
     }
 
     fn endpoint(&self, leaf: &str) -> Result<Url> {

@@ -32,18 +32,36 @@ pub const IDENTITY_BASE: &str = "https://login.microsoftonline.com";
 /// polling without sleeping.
 #[async_trait]
 pub trait Clock: Send + Sync {
+    /// Wall-clock time, for token expiry stamps.
     fn now(&self) -> DateTime<Utc>;
+    /// Monotonic time since the clock was made, for deadlines that a change
+    /// to the wall clock must not move.
+    fn elapsed(&self) -> Duration;
     async fn sleep(&self, duration: Duration);
 }
 
 /// The system clock and tokio's timer.
-#[derive(Debug, Default)]
-pub struct SystemClock;
+#[derive(Debug)]
+pub struct SystemClock {
+    started: tokio::time::Instant,
+}
+
+impl Default for SystemClock {
+    fn default() -> Self {
+        Self {
+            started: tokio::time::Instant::now(),
+        }
+    }
+}
 
 #[async_trait]
 impl Clock for SystemClock {
     fn now(&self) -> DateTime<Utc> {
         Utc::now()
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.started.elapsed()
     }
 
     async fn sleep(&self, duration: Duration) {
@@ -57,6 +75,7 @@ impl Clock for SystemClock {
 #[derive(Debug)]
 pub struct ManualClock {
     now: Mutex<DateTime<Utc>>,
+    elapsed: Mutex<Duration>,
     slept: Mutex<Vec<Duration>>,
 }
 
@@ -65,16 +84,22 @@ impl ManualClock {
     pub fn new(now: DateTime<Utc>) -> Self {
         Self {
             now: Mutex::new(now),
+            elapsed: Mutex::default(),
             slept: Mutex::default(),
         }
     }
 
+    /// Moves the wall clock and the monotonic clock forward together.
     pub fn advance(&self, duration: Duration) {
         let mut now = self
             .now
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *now += chrono::Duration::from_std(duration).unwrap_or(chrono::Duration::MAX);
+        *self
+            .elapsed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) += duration;
     }
 
     /// Every sleep a command asked for, in order.
@@ -91,6 +116,13 @@ impl Clock for ManualClock {
     fn now(&self) -> DateTime<Utc> {
         *self
             .now
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn elapsed(&self) -> Duration {
+        *self
+            .elapsed
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -145,6 +177,7 @@ pub const FLAG_VARIABLES: &[&str] = &[
     "PURVIEW_JSON",
     "PURVIEW_RESULTS_ONLY",
     "PURVIEW_PLAIN",
+    "PURVIEW_SELECT",
     "PURVIEW_ACCOUNT",
     "PURVIEW_NO_INPUT",
     "PURVIEW_CLIENT_ID",
@@ -187,7 +220,7 @@ impl Env {
                 .collect(),
             identity_base: production_identity_base(),
             credentials: Arc::new(KeyringStore),
-            clock: Arc::new(SystemClock),
+            clock: Arc::new(SystemClock::default()),
         }
     }
 

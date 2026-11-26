@@ -165,8 +165,8 @@ public-client registration whose only assignee was the signing-in account.
 - **Sign-in:** the device-code flow succeeded on the first attempt. Login printed
   `downloadReady: true`; no `AADSTS65001` warning appeared.
 - **Graph scope returned:** `openid profile email https://graph.microsoft.com/eDiscovery.ReadWrite.All`
-  for both the sign-in and each refresh. The request named `offline_access`, which the
-  response omits, and did not name `email`, which the response adds. A refresh token was
+  for both the sign-in and each refresh. The sign-in request named `offline_access`, which
+  the response omitted, and did not name `email`, which the response added. A refresh token was
   issued all the same. The permission set compared by the tool did not change between
   sign-in and refresh, so the refresh was accepted.
 - **Account claims:** the id token carried `preferred_username`, `tid`, `oid` and `name`,
@@ -178,10 +178,10 @@ public-client registration whose only assignee was the signing-in account.
   `purview:token:<email>`, label `purview — <email>`, description
   `Microsoft Purview eDiscovery token`.
 - **Not observed:** the `scope` string of the download-resource response, and whether the
-  download redemption returned a new refresh token. The tool does not print either, and
-  reading the stored credential with another program would need a credential-store
-  prompt and expose the tokens.
-- **Found and fixed:** on macOS the local data directory is the configuration directory,
-  and the per-account lock created `account-locks/` and its parent with mode 0755 before
-  the configuration was first saved. Login then warned and narrowed the configuration
-  directory to 0700. Lock folders are now created 0700 and lock files 0600.
+  download redemption returned a new refresh token. The CLI did not report either value,
+  and the stored credential was not read.
+- **Permissions:** on macOS the local data directory is the configuration directory. The
+  per-account lock created `account-locks/` and its parent with mode 0755, and lock files
+  0644, before the configuration was first saved; login then warned and narrowed the
+  configuration directory to 0700. A later code change creates lock folders 0700 and
+  lock files 0600, and refuses a linked lock folder.

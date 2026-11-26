@@ -134,7 +134,14 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
             .recursive(true)
             .mode(0o700)
             .create(dir)?;
-        let metadata = std::fs::metadata(dir)?;
+        // Read without following a link: a linked lock folder is refused, so
+        // the narrowing below never reaches a folder the tool does not own.
+        let metadata = std::fs::symlink_metadata(dir)?;
+        if !metadata.file_type().is_dir() {
+            return Err(std::io::Error::other(
+                "the lock folder is a link or not a folder; refusing to use it",
+            ));
+        }
         if metadata.permissions().mode() & 0o077 != 0 {
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
         }
@@ -964,6 +971,25 @@ mod tests {
         .unwrap();
         drop(CredentialLock::acquire(&path, Duration::ZERO).unwrap());
         assert_eq!(mode(&app.join("account-locks")), 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_lock_folder_is_refused_and_its_target_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let shared = directory.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let app = directory.path().join("purview");
+        std::fs::create_dir(&app).unwrap();
+        std::os::unix::fs::symlink(&shared, app.join("account-locks")).unwrap();
+        let path = app.join("account-locks").join("key.lock");
+        let error = CredentialLock::acquire(&path, Duration::ZERO).unwrap_err();
+        assert_eq!(error.metadata().0, "CredentialLockFailed");
+        let target = std::fs::metadata(&shared).unwrap().permissions().mode() & 0o777;
+        assert_eq!(target, 0o755);
+        assert!(!shared.join("key.lock").exists());
     }
 
     #[test]

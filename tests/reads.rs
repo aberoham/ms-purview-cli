@@ -1161,7 +1161,7 @@ async fn ctrl_c_during_the_first_read_abandons_it() {
     assert_eq!(
         run.stderr(),
         format!(
-            "interrupted after 0s; the service carries on running the operation. Operation \
+            "interrupted after 0s. Operation \
              {ESTIMATE} was not read yet. Resume with: purview --account={ALEX} operation get {CASE} {ESTIMATE} \
              --wait\n"
         )
@@ -1356,6 +1356,23 @@ async fn an_unknown_select_column_is_refused_before_sign_in() {
         }
     }
     assert!(requests(&harness).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_signed_url_in_a_refused_argument_is_redacted() {
+    let harness = Harness::new().await;
+    let pasted = "https://graph.example/x?sig=canary-sig-0008";
+    for json in [true, false] {
+        let mut argv = vec!["operation", "list", CASE, "--action", pasted];
+        if json {
+            argv.insert(0, "--json");
+        }
+        let run = harness.run(&argv).await;
+        assert_eq!(run.outcome.exit_code, 1);
+        let text = format!("{}{}", run.stdout(), run.stderr());
+        assert!(!text.contains("canary"), "{text}");
+        assert!(text.contains("--action"), "{text}");
+    }
 }
 
 #[tokio::test]
@@ -1740,9 +1757,11 @@ async fn a_failed_resolve_read_with_trace_and_verbose_leaks_no_secret() {
             .mount(&harness.graph)
             .await;
     }
-    let trace = harness.root.path().join("trace-resolve");
-    let trace_arg = trace.display().to_string();
     for json in [true, false] {
+        // A directory per run: the manual clock stands still, so file names
+        // would repeat.
+        let trace = harness.root.path().join(format!("trace-resolve-{json}"));
+        let trace_arg = trace.display().to_string();
         let mut argv = vec!["--verbose", "--trace", &trace_arg];
         if json {
             argv.push("--json");
@@ -1753,5 +1772,39 @@ async fn a_failed_resolve_read_with_trace_and_verbose_leaks_no_secret() {
         let mut values: Vec<&str> = CANARIES.to_vec();
         values.extend(["canary-sig-0001", "canary-sig-0002", "canary-sig-0007"]);
         harness.assert_absent(&run, &values);
+        assert!(
+            !run.stderr().contains("could not write"),
+            "{}",
+            run.stderr()
+        );
+        let traced: Vec<String> = std::fs::read_dir(&trace)
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect();
+        assert!(
+            traced.iter().any(|text| text.contains("\"status\": 403")),
+            "{traced:?}"
+        );
     }
+}
+
+#[tokio::test]
+async fn mine_warns_when_graph_names_no_creator() {
+    let harness = signed_in().await;
+    let mut body = fixture_value(&harness, "cases-list.json");
+    for case in body["value"].as_array_mut().unwrap() {
+        case.as_object_mut().unwrap().remove("createdBy");
+    }
+    Mock::given(method("GET"))
+        .and(path(CASES))
+        .respond_with(json_response(200, body))
+        .mount(&harness.graph)
+        .await;
+    let run = harness.run(&["--plain", "case", "list", "--mine"]).await;
+    assert_eq!(run.outcome.exit_code, 0);
+    assert!(run.stdout().is_empty());
+    assert_eq!(
+        run.stderr(),
+        "warning: Graph's case records carry no createdBy, so --mine matches no case\n"
+    );
 }

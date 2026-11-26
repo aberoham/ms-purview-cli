@@ -846,6 +846,10 @@ impl Printer {
             let text = rendered.trim();
             text.strip_prefix("error: ").unwrap_or(text).to_owned()
         };
+        // Clap quotes the value it refused, which could be a signed URL
+        // pasted into the wrong place: URLs in its message are redacted as
+        // in any free text.
+        let message = crate::redact::urls_in_text(&message, &env.redactor);
         let json_mode = json_requested(args, json_default);
         self.fail(env, json_mode, &PurviewError::message(message))
     }

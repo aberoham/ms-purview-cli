@@ -11,6 +11,7 @@
 - Add `purview case list` (filters `--status`, `--name`, `--created-before`, `--created-after` and `--mine`) and `purview case get`. A `<case>` argument is a case id or an exact display name; several matches fail with `AmbiguousCase`, listing each match's id, status and creation date.
 - Add `purview search list` and `purview search get`; `search get` also reads the search's custodian, non-custodial and additional sources.
 - Add `purview operation list`, which marks entries the list cannot tell apart as `exportResult?` and refuses `--action report` and `--action export` without `--resolve` (`ResolveRequired`), and `purview operation get`, with `--wait`, `--wait-timeout` and `--poll-interval`. A finished operation that did not succeed exits 4 with an `outcome`; the wait deadline exits 5 (`WaitTimeout`) and Ctrl-C exits 130 (`Interrupted`), each with the command that resumes the wait.
+- Redact URL query values (all but the OData options and `downloadType`) in the read commands' output, and never repeat a refused argument value or tenant text in an error.
 - Add the global option `--wrap-untrusted` (`PURVIEW_WRAP_UNTRUSTED`), which wraps names, descriptions, external ids, queries and file names in JSON output in `[UNTRUSTED:<id>]` markers and adds an `untrustedNotice`.
 - Add a test that fails if `PATCH`, `PUT` or `DELETE` appears anywhere in the crate's source.
 - On macOS and Linux, create lock folders with mode 0700 and lock files with mode 0600, and refuse a linked lock folder; `v0.1.0-rc.1` created them with the default modes.

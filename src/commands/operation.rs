@@ -562,10 +562,10 @@ fn stopped(
     let status = last
         .as_ref()
         .map(|record| shown(session, record.status.as_str()));
-    // Only a status that is still running is described as running.
+    // Only a status read as still running is described as running.
     let still_running = last
         .as_ref()
-        .is_none_or(|record| !record.status.is_terminal());
+        .is_some_and(|record| !record.status.is_terminal());
     let carries_on = if still_running {
         "; the service carries on running the operation"
     } else {

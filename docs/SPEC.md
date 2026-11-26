@@ -270,6 +270,10 @@ Flags: `--status active|closing|closed|all` (default `all`), `--name SUBSTR`,
 - A case without `createdDateTime` is left out when either date flag is given.
 - When the sign-in recorded no `upn` (the observed id token had none), `--mine` compares
   `createdBy.user.userPrincipalName` with the account key.
+- The observed tenant's case records carried no `createdBy` at all, in the list or a single
+  `GET` (Observed, PR 1.4), so `--mine` matched nothing there; when no case read has
+  `createdBy`, the command says so on stderr. Section 3.5's `case close` check on
+  `createdBy` meets the same gap, and PR 2.6 has to settle it.
 
 Columns: `ID`, `NAME`, `STATUS`, `CREATED`, `AGE (DAYS)`, `CREATED BY`. Rows with a missing
 id or name are shown with `?` and counted in a stderr warning; they are not dropped. `AGE

@@ -161,13 +161,18 @@ impl Harness {
     }
 
     pub async fn run(&self, args: &[&str]) -> Run {
-        self.run_with(args, |_| {}).await
+        self.run_with(args, |_, _| {}).await
     }
 
     /// `run`, with the `Env` changed first, to set a browser or a timeout.
-    pub async fn run_with(&self, args: &[&str], configure: impl FnOnce(&mut Env)) -> Run {
+    /// The configuration also sees the streams the command will write to.
+    pub async fn run_with(
+        &self,
+        args: &[&str],
+        configure: impl FnOnce(&mut Env, &Captured),
+    ) -> Run {
         let (mut env, captured) = self.env();
-        configure(&mut env);
+        configure(&mut env, &captured);
         let mut argv = vec!["purview"];
         argv.extend_from_slice(args);
         // A command that waits for something that never comes fails the
@@ -332,9 +337,12 @@ fn paths_under(dir: &Path) -> Vec<PathBuf> {
 #[derive(Default)]
 pub struct ScriptedBrowser {
     pub visits: Vec<String>,
-    /// Report that the browser could not be opened, then make the visits a
-    /// moment later, as a person who opened the printed address would.
+    /// Report that the browser could not be opened, then make the visits
+    /// once the command has printed its warning, as a person who opened the
+    /// printed address would. Needs `stderr`.
     pub fail_open: bool,
+    /// The command's stderr, which a `fail_open` browser watches.
+    pub stderr: Mutex<Option<ms_purview_cli::env::SharedBuffer>>,
     pub opened: Mutex<Vec<url::Url>>,
     pub answers: Arc<Mutex<Vec<String>>>,
 }
@@ -417,10 +425,19 @@ impl BrowserOpener for ScriptedBrowser {
             }
         };
         if self.fail_open {
+            let stderr = self
+                .stderr
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("a fail_open browser watches the command's stderr");
             std::thread::spawn(move || {
-                // Long enough for the opener's failure to reach the command
-                // before the answer does, however loaded the runner.
-                std::thread::sleep(Duration::from_millis(1000));
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while !stderr.text().contains("could not open the browser")
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
                 play();
             });
             return Err(std::io::Error::other("no browser found"));

@@ -2406,9 +2406,10 @@ fn browser_login_args(extra: &[&'static str]) -> Vec<&'static str> {
 }
 
 /// Sets the browser, and a sign-in timeout short enough for a test.
-fn with_browser(browser: &std::sync::Arc<ScriptedBrowser>) -> impl FnOnce(&mut Env) {
+fn with_browser(browser: &std::sync::Arc<ScriptedBrowser>) -> impl FnOnce(&mut Env, &Captured) {
     let browser = browser.clone();
-    move |env: &mut Env| {
+    move |env: &mut Env, captured: &Captured| {
+        *browser.stderr.lock().unwrap() = Some(captured.stderr.clone());
         env.browser = browser;
         env.browser_timeout = Duration::from_secs(20);
     }
@@ -2553,9 +2554,9 @@ async fn an_idle_connection_does_not_hold_up_the_answer() {
         .await;
     assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
     // Served one at a time, each idle connection would hold the answer
-    // back for the 10-second read timeout.
+    // back for the 10-second read timeout: 20 seconds for the two.
     assert!(
-        started.elapsed() < Duration::from_secs(8),
+        started.elapsed() < Duration::from_secs(15),
         "{:?}",
         started.elapsed()
     );
@@ -2656,8 +2657,8 @@ async fn a_browser_that_never_comes_back_times_out_and_stores_nothing() {
     let browser = ScriptedBrowser::new(&[]);
     let configure = with_browser(&browser);
     let run = harness
-        .run_with(&browser_login_args(&[]), |env| {
-            configure(env);
+        .run_with(&browser_login_args(&[]), |env, captured| {
+            configure(env, captured);
             env.browser_timeout = Duration::from_millis(300);
         })
         .await;

@@ -56,6 +56,13 @@ pub trait CredentialStore: Send + Sync {
     fn lock(&self) -> Result<Option<CredentialLock>> {
         Ok(None)
     }
+
+    /// The largest value one entry may hold, when values are split into
+    /// chunks: Windows Credential Manager's limit on Windows, none
+    /// elsewhere. A test store may choose the Windows layout anywhere.
+    fn chunk_bytes(&self) -> Option<usize> {
+        CHUNK_BYTES
+    }
 }
 
 /// An exclusive operating-system file lock, released when dropped. Windows
@@ -276,7 +283,7 @@ const SLOTS: [u8; 2] = [0, 1];
 
 pub fn store_value(store: &dyn CredentialStore, key: &str, value: &str) -> Result<()> {
     let _lock = store.lock()?;
-    store_value_with_chunk_size(store, key, value, CHUNK_BYTES)
+    store_value_with_chunk_size(store, key, value, store.chunk_bytes())
 }
 
 pub fn get_value(store: &dyn CredentialStore, key: &str) -> Result<String> {
@@ -299,7 +306,66 @@ pub fn find_value(store: &dyn CredentialStore, key: &str) -> Result<Option<Strin
 
 pub fn delete_value(store: &dyn CredentialStore, key: &str) -> Result<()> {
     let _lock = store.lock()?;
-    delete_value_with_chunk_size(store, key, CHUNK_BYTES)
+    delete_value_with_chunk_size(store, key, store.chunk_bytes())
+}
+
+/// Whether anything is stored under `key`: the primary entry or, in the
+/// chunked layout, any chunk in either slot, header or not. Nothing is
+/// parsed, reassembled or decoded, so a damaged entry, or chunks a failed
+/// first write left without a header, still count.
+pub fn entry_exists(store: &dyn CredentialStore, key: &str) -> Result<bool> {
+    let _lock = store.lock()?;
+    if store.get_secret(key)?.is_some() {
+        return Ok(true);
+    }
+    if store.chunk_bytes().is_some() {
+        for slot in SLOTS {
+            for index in 0..MAX_CHUNKS {
+                if store.get_secret(&chunk_key(key, slot, index))?.is_some() {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Serialises the commands that write one account's local state, across
+/// processes: `auth login` from its ownership check to its last write or
+/// rollback, `auth logout`, and each refresh commit. It is a lock file per
+/// account key, taken with the same file lock the credential store uses on
+/// Windows, but a different file, so taking it never nests inside a store
+/// operation.
+#[derive(Debug, Clone)]
+pub struct AccountLocks {
+    pub dir: std::path::PathBuf,
+    pub wait: Duration,
+}
+
+impl AccountLocks {
+    /// The production locks: under the local data directory, like the
+    /// credential lock, and not under `PURVIEW_CONFIG_DIR`, because two
+    /// processes guarding the same credentials must meet at the same file.
+    pub fn production() -> Option<Self> {
+        dirs::data_local_dir().map(|root| Self {
+            dir: root.join(crate::config::APP_DIR).join("account-locks"),
+            wait: LOCK_WAIT,
+        })
+    }
+
+    /// Takes the lock for `email`, waiting up to `wait` for another holder.
+    /// The wait runs on a blocking thread.
+    pub async fn lock(&self, email: &str) -> Result<CredentialLock> {
+        let path = self
+            .dir
+            .join(format!("{}.lock", email.trim().to_ascii_lowercase()));
+        let wait = self.wait;
+        tokio::task::spawn_blocking(move || CredentialLock::acquire(&path, wait))
+            .await
+            .map_err(|error| {
+                PurviewError::message(format!("waiting for the account lock: {error}"))
+            })?
+    }
 }
 
 fn delete_value_with_chunk_size(
@@ -443,6 +509,8 @@ pub struct MemoryStore {
     locks: AtomicUsize,
     fail_writes: AtomicBool,
     fail_deletes: AtomicBool,
+    fail_headers: AtomicBool,
+    chunk_bytes: Option<usize>,
 }
 
 /// Names the stored keys and counts, never the stored values.
@@ -458,6 +526,22 @@ impl std::fmt::Debug for MemoryStore {
 
 #[doc(hidden)]
 impl MemoryStore {
+    /// A store that splits values into chunks of `size` bytes behind a
+    /// header, as Windows Credential Manager requires.
+    pub fn chunked(size: usize) -> Self {
+        Self {
+            chunk_bytes: Some(size),
+            ..Self::default()
+        }
+    }
+
+    /// Makes every later primary-entry write (`set_password`, which holds a
+    /// value or a chunk header) fail, while chunk writes succeed: a chunked
+    /// write that stops after its chunks and before its header.
+    pub fn fail_headers(&self, fail: bool) {
+        self.fail_headers.store(fail, Ordering::SeqCst);
+    }
+
     pub fn remove(&self, key: &str) {
         self.values().remove(key);
     }
@@ -504,6 +588,11 @@ impl CredentialStore for MemoryStore {
     }
 
     fn set_password(&self, key: &str, value: &str) -> Result<()> {
+        if self.fail_headers.load(Ordering::SeqCst) {
+            return Err(PurviewError::message(
+                "the in-memory credential store refused the primary entry",
+            ));
+        }
         self.set_secret(key, value.as_bytes())
     }
 
@@ -536,6 +625,10 @@ impl CredentialStore for MemoryStore {
     fn lock(&self) -> Result<Option<CredentialLock>> {
         self.locks.fetch_add(1, Ordering::SeqCst);
         Ok(None)
+    }
+
+    fn chunk_bytes(&self) -> Option<usize> {
+        self.chunk_bytes
     }
 }
 

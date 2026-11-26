@@ -330,9 +330,10 @@ impl IdentityClient {
                 ("grant_type", DEVICE_CODE_GRANT),
                 ("device_code", code.device_code.expose()),
             ];
-            let (status, body) = tokio::time::timeout(remaining(), self.post("token", &form))
-                .await
-                .map_err(|_| expired_device_code())??;
+            let (status, body) =
+                tokio::time::timeout(poll_bound(remaining()), self.post("token", &form))
+                    .await
+                    .map_err(|_| expired_device_code())??;
             if remaining().is_zero() {
                 return Err(expired_device_code());
             }
@@ -426,6 +427,14 @@ impl IdentityClient {
             _ => PurviewError::message(format!("{operation} failed with HTTP {}", status.as_u16())),
         }
     }
+}
+
+/// How long the outer timer lets one poll run: exactly what is left of the
+/// device code's lifetime. It has no shorter cap of its own; the client's
+/// own request timeout reports a stalled request as a transport failure,
+/// and a cap here would report it as an expired code instead.
+fn poll_bound(remaining: Duration) -> Duration {
+    remaining
 }
 
 fn expired_device_code() -> PurviewError {
@@ -719,6 +728,18 @@ mod tests {
         for token in [None, Some(SecretString::new("not-a-jwt"))] {
             let error = account_claims(token.as_ref()).unwrap_err();
             assert_eq!(error.metadata(), ("NoAccountClaim", 0));
+        }
+    }
+
+    #[test]
+    fn the_poll_timer_is_bounded_only_by_the_code_lifetime() {
+        // A cap such as the old 30-second one would shorten these.
+        for remaining in [
+            Duration::from_secs(31),
+            Duration::from_secs(900),
+            Duration::ZERO,
+        ] {
+            assert_eq!(poll_bound(remaining), remaining);
         }
     }
 

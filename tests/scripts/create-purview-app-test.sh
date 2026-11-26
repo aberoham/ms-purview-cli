@@ -6,11 +6,12 @@ set -euo pipefail
 #
 # Usage: tests/scripts/create-purview-app-test.sh [test name...]
 # TEST_BASH names the shell that runs the script under test (default: bash),
-# so the tests can run under macOS's /bin/bash 3.2 as well.
+# so the tests can run under macOS's /bin/bash 3.2 as well. TEST_SCRIPT runs
+# another copy of the script, such as a deliberately broken one.
 
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
-script="$root/contrib/create-purview-app.sh"
+script=${TEST_SCRIPT:-$root/contrib/create-purview-app.sh}
 test_bash=${TEST_BASH:-bash}
 work=$(mktemp -d "${TMPDIR:-/tmp}/create-purview-app-test.XXXXXX")
 trap 'rm -rf "$work"' EXIT
@@ -73,13 +74,19 @@ new_case() {
   export FAKE_AZ_STATE="$case_dir/state.json"
   export FAKE_AZ_LOG="$case_dir/log"
   : >"$FAKE_AZ_LOG"
+  : >"$case_dir/out"
+  : >"$case_dir/err"
   AZ_TENANT=$T
   EXTRA_SPS=""
   APPS=""
   ASSIGNMENTS=""
   GRANTS=""
   FAULTS=""
+  EDITS=""
   HIDDEN_POLLS=0
+  PAGE_SIZE=100
+  NEXT_LINK_BASE=$G
+  GRAPH_SP_STATE=$GRAPH_SP_JSON
 }
 
 write_state() {
@@ -88,9 +95,10 @@ write_state() {
  "users": [{"id": "$ALEX", "userPrincipalName": "alex@contoso.example"},
            {"id": "$SAM", "userPrincipalName": "sam@contoso.example"}],
  "groups": [{"id": "$GROUP", "displayName": "eDiscovery users"}],
- "sps": [$GRAPH_SP_JSON${EXTRA_SPS:+,$EXTRA_SPS}],
+ "sps": [$GRAPH_SP_STATE${EXTRA_SPS:+,$EXTRA_SPS}],
  "apps": [$APPS], "assignments": [$ASSIGNMENTS], "grants": [$GRANTS],
- "faults": [$FAULTS], "new_sp_hidden_polls": $HIDDEN_POLLS, "next_id": 96}
+ "faults": [$FAULTS], "edits": [$EDITS], "new_sp_hidden_polls": $HIDDEN_POLLS,
+ "page_size": $PAGE_SIZE, "next_link_base": "$NEXT_LINK_BASE", "next_id": 96}
 EOF
 }
 
@@ -138,13 +146,15 @@ expect_out() { grep -qF -- "$1" "$case_dir/out" || problem "stdout lacks: $1"; }
 expect_err() { grep -qF -- "$1" "$case_dir/err" || problem "stderr lacks: $1"; }
 reject_out() { ! grep -qF -- "$1" "$case_dir/out" || problem "stdout should not contain: $1"; }
 
-# az_calls prints the logged az calls, without the fake sleep lines.
-az_calls() { grep -v '^sleep ' "$FAKE_AZ_LOG" || true; }
+# az_calls prints the logged az calls, arguments joined by spaces, without
+# the fake sleep lines.
+az_calls() { python3 "$here/azlog.py" calls "$FAKE_AZ_LOG"; }
 
-# mutations prints each logged change as "METHOD path body".
-mutations() {
-  az_calls | sed -nE "s#^rest --method (POST|PATCH|PUT|DELETE) --url $G([^ ]*) --body (\{.*\}) (--query|-o) .*\$#\1 \2 \3#p"
-}
+# mutations prints each Graph write as "METHOD path body", read from the
+# exact arguments of each call.
+mutations() { python3 "$here/azlog.py" mutations "$FAKE_AZ_LOG"; }
+
+sleeps() { python3 "$here/azlog.py" sleeps "$FAKE_AZ_LOG"; }
 
 expect_mutations() {
   local expected="$case_dir/expected" actual="$case_dir/actual"
@@ -166,7 +176,7 @@ expect_no_mutation() {
 # call other than `az account show`.
 expect_at_most_account_show() {
   local other
-  other=$(az_calls | grep -v '^account show ' || true)
+  other=$(grep -v '^account show ' <<<"$(az_calls)" || true)
   [ -z "$other" ] || problem "unexpected az calls: $other"
 }
 
@@ -200,13 +210,20 @@ EOF
 }
 
 # count_calls PATTERN prints how many logged calls match the extended regex.
-count_calls() { az_calls | grep -cE -- "$1" || true; }
+count_calls() { grep -cE -- "$1" <<<"$(az_calls)" || true; }
 
 # line_after PATTERN prints the call that follows the first match.
-line_after() { az_calls | awk -v p="$1" 'found { print; exit } $0 ~ p { found = 1 }'; }
+line_after() { awk -v p="$1" 'found && !done { print; done = 1 } $0 ~ p { found = 1 }' <<<"$(az_calls)"; }
 
-fault() { # match kind applied
-  FAULTS="{\"match\": \"$1\", \"nth\": 1, \"kind\": \"$2\", \"applied\": $3}"
+# fault MATCH KIND APPLIED [NTH] adds a fault on the NTH call matching MATCH.
+fault() {
+  FAULTS="$FAULTS${FAULTS:+,}{\"match\": \"$1\", \"nth\": ${4:-1}, \"kind\": \"$2\", \"applied\": $3}"
+}
+
+# edit MATCH NTH TARGET KEY SET changes an object just before the NTH call
+# matching MATCH, as a concurrent administrator would.
+edit() {
+  EDITS="$EDITS${EDITS:+,}{\"match\": \"$1\", \"nth\": $2, \"target\": \"$3\", \"key\": \"$4\", \"set\": $5}"
 }
 
 restricted_vars=("TENANT_ID=$T" "ASSIGN_USERS=alex@contoso.example sam@contoso.example")
@@ -340,7 +357,7 @@ POST /oauth2PermissionGrants $principal:"$SAM","resourceId":"$NEW1",$grant_dl
 EOF
   # Each new service principal was hidden from two polls, so the script
   # slept twice after each create before it went on.
-  [ "$(grep -c '^sleep 5$' "$FAKE_AZ_LOG")" -eq 4 ] || problem "expected 4 polling sleeps"
+  [ "$(sleeps)" -eq 4 ] || problem "expected 4 polling sleeps"
   end_case
 }
 
@@ -395,7 +412,7 @@ test_update_changes_only_what_differs() {
   expect_status 0
   expect_out "Owner: the application already has owners; unchanged"
   expect_out "alex@contoso.example -> $ALEX: already assigned"
-  expect_out "The grant also holds 'User.Read'. This script never removes a scope"
+  expect_out "WARNING: this grant gives more than the plan asks for: it also holds User.Read"
   expect_out "purview auth login --client-id $APP_ID --tenant-id $T"
   expect_mutations <<EOF
 PATCH /applications/$APP_OBJ {"requiredResourceAccess":$RRA,"publicClient":{"redirectUris":["http://localhost:8400","http://localhost/callback"]}}
@@ -461,8 +478,8 @@ test_timeout_on_create_is_read_back_once() {
   expect_one_then_readback '^rest --method POST --url [^ ]*/v1.0/applications ' \
     "^ad app list --filter displayName eq 'Purview CLI \\(eDiscovery\\)'"
   expect_err "step 'create application 'Purview CLI (eDiscovery)'' was unclear"
-  expect_err "no application named 'Purview CLI (eDiscovery)' exists"
-  expect_err "Running the script again is safe"
+  expect_err "Read-back: not found by a successful read: an application named 'Purview CLI (eDiscovery)'"
+  expect_err "run the dry run again"
   [ "$(az_calls | tail -n 1 | cut -c1-11)" = "ad app list" ] || problem "a call followed the read-back"
   end_case
 }
@@ -492,7 +509,7 @@ test_throttle_on_assignment_is_read_back_once() {
     '^rest --method GET --url [^ ]*/appRoleAssignedTo'
   expect_err "Too Many Requests"
   expect_err "step 'assign alex@contoso.example ($ALEX)' was unclear"
-  expect_err "alex@contoso.example is not assigned"
+  expect_err "Read-back: not found by a successful read: an assignment for alex@contoso.example"
   [ "$(count_calls 'oauth2PermissionGrants --body')" -eq 0 ] || problem "consent was sent after the failure"
   end_case
 }
@@ -505,7 +522,7 @@ test_server_error_on_grant_is_read_back_once() {
   expect_status nonzero
   expect_one_then_readback '^rest --method POST --url [^ ]*/oauth2PermissionGrants' \
     '^rest --method GET --url [^ ]*/oauth2PermissionGrants'
-  expect_err "the grant exists with every planned scope"
+  expect_err "Read-back: found: the Microsoft Graph grant for alex@contoso.example holds every planned scope"
   end_case
 }
 
@@ -656,6 +673,381 @@ test_unknown_argument_is_refused() {
   run "${restricted_vars[@]}" --help
   expect_status 0
   expect_out "Usage: create-purview-app.sh [--apply]"
+  end_case
+}
+
+# --- Round-two cases ----------------------------------------------------------
+
+# expect_line LINE checks that stdout holds LINE as a whole line.
+expect_line() { grep -qxF -- "$1" "$case_dir/out" || problem "stdout lacks the line: $1"; }
+
+RRA_RO="[{\"resourceAppId\":\"$GRAPH_APP\",\"resourceAccess\":[{\"id\":\"$RO\",\"type\":\"Scope\"},{\"id\":\"$OFFLINE\",\"type\":\"Scope\"},{\"id\":\"$OPENID\",\"type\":\"Scope\"},{\"id\":\"$PROFILE\",\"type\":\"Scope\"}]},{\"resourceAppId\":\"$EDISC_APP\",\"resourceAccess\":[{\"id\":\"$DOWNLOAD\",\"type\":\"Scope\"}]}]"
+
+# app_json [key=json...] prints the completed registration's application
+# record with the given fields replaced, for example
+# app_json 'isFallbackPublicClient=false'.
+app_json() {
+  local fallback=true redirects='["http://localhost/callback"]' rra=$RRA
+  local owners="[\"$ALEX\"]" roles='[]' pair
+  for pair in "$@"; do
+    case "$pair" in
+      isFallbackPublicClient=*) fallback=${pair#*=} ;;
+      redirectUris=*) redirects=${pair#*=} ;;
+      requiredResourceAccess=*) rra=${pair#*=} ;;
+      owners=*) owners=${pair#*=} ;;
+      appRoles=*) roles=${pair#*=} ;;
+      *) problem "app_json: unknown field $pair" ;;
+    esac
+  done
+  printf '{"id":"%s","appId":"%s","displayName":"Purview CLI (eDiscovery)",' "$APP_OBJ" "$APP_ID"
+  printf '"signInAudience":"AzureADMyOrg","isFallbackPublicClient":%s,' "$fallback"
+  printf '"publicClient":{"redirectUris":%s},"requiredResourceAccess":%s,' "$redirects" "$rra"
+  printf '"owners":%s,"appRoles":%s}' "$owners" "$roles"
+}
+
+# done_state sets up the complete registration from an earlier run.
+done_state() {
+  EXTRA_SPS="$EDISC_SP_JSON,$DONE_SP"
+  APPS="$DONE_APP"
+  ASSIGNMENTS="$DONE_ASSIGNMENT"
+  GRANTS="$DONE_GRANTS"
+}
+
+test_large_scope_list_is_read_whole() {
+  new_case large_scope_list_is_read_whole
+  # Graph's real list runs to tens of kilobytes; this one is over 300, well
+  # past any pipe buffer. The wanted scopes come first, so a reader that
+  # stopped at the first match would end a pipe's writer with SIGPIPE.
+  local fillers="" n=1
+  while [ "$n" -le 6000 ]; do
+    fillers="$fillers$(printf ',["Filler.Scope.%04d","00000000-0000-4000-8000-%012x"]' "$n" $((0x1000 + n)))"
+    n=$((n + 1))
+  done
+  GRAPH_SP_STATE="{\"id\":\"$GRAPH_SP\",\"appId\":\"$GRAPH_APP\",\"scopes\":[
+    [\"eDiscovery.ReadWrite.All\",\"$RW\"],[\"eDiscovery.Read.All\",\"$RO\"],
+    [\"offline_access\",\"$OFFLINE\"],[\"openid\",\"$OPENID\"],[\"profile\",\"$PROFILE\"]$fillers]}"
+  write_state
+  run "${restricted_vars[@]}"
+  expect_status 0
+  expect_out "eDiscovery.ReadWrite.All   $RW Scope"
+  expect_out "Dry run: nothing was changed."
+  end_case
+}
+
+# unchecked_case NAME MESSAGE runs a restricted apply with the faults already
+# set and expects a read-back that could not check MESSAGE.
+unchecked_case() {
+  write_state
+  run "${restricted_vars[@]}" --apply
+  expect_status nonzero
+  expect_err "the read-back could not check $1"
+  expect_err "The read-back failed too:"
+  ! grep -qF "not found by a successful read" "$case_dir/err" || problem "a failed read was reported as absence"
+  ! grep -qF "Read-back: found" "$case_dir/err" || problem "a failed read was reported as found"
+}
+
+test_failed_app_read_back_is_unchecked() {
+  new_case failed_app_read_back_is_unchecked
+  fault '^rest --method POST --url https://graph.microsoft.com/v1.0/applications --body' timeout true
+  fault '^ad app list --filter displayName' server false 2
+  unchecked_case "whether an application named 'Purview CLI (eDiscovery)' exists"
+  end_case
+}
+
+test_failed_owner_read_back_is_unchecked() {
+  new_case failed_owner_read_back_is_unchecked
+  fault 'owners/[$]ref' timeout true
+  fault '^rest --method GET --url [^ ]*/owners' server false
+  unchecked_case "whether the signed-in user is an owner"
+  end_case
+}
+
+test_failed_assignment_read_back_is_unchecked() {
+  new_case failed_assignment_read_back_is_unchecked
+  fault '^rest --method POST --url [^ ]*/appRoleAssignedTo' throttle false
+  fault '^rest --method GET --url [^ ]*/appRoleAssignedTo' server false
+  unchecked_case "whether alex@contoso.example is assigned"
+  end_case
+}
+
+test_failed_grant_read_back_is_unchecked() {
+  new_case failed_grant_read_back_is_unchecked
+  fault '^rest --method POST --url [^ ]*/oauth2PermissionGrants' server true
+  fault '^rest --method GET --url [^ ]*/oauth2PermissionGrants' timeout false
+  unchecked_case "whether the Microsoft Graph grant for alex@contoso.example holds the planned scopes"
+  end_case
+}
+
+test_tenant_wide_write_grant_is_shown_under_per_user_read_only() {
+  new_case tenant_wide_write_grant_is_shown_under_per_user_read_only
+  done_state
+  GRANTS="{\"id\":\"gAll\",\"clientId\":\"$APP_SP\",\"consentType\":\"AllPrincipals\",\"principalId\":null,\"resourceId\":\"$GRAPH_SP\",\"scope\":\"$GRAPH_SCOPE\"},
+    {\"id\":\"gAllDl\",\"clientId\":\"$APP_SP\",\"consentType\":\"AllPrincipals\",\"principalId\":null,\"resourceId\":\"$EDISC_SP\",\"scope\":\"eDiscovery.Download.Read\"}"
+  write_state
+  local vars=("TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=alex@contoso.example READ_ONLY=1)
+  run "${vars[@]}"
+  expect_status 0
+  expect_out "Microsoft Graph, all users (AllPrincipals): $GRAPH_SCOPE"
+  expect_out "WARNING: this grant gives more than the plan asks for: it covers every user in the tenant, but the plan asks for per-user consent; it also holds eDiscovery.ReadWrite.All, which the plan does not ask for."
+  expect_out "az rest --method DELETE --url $G/oauth2PermissionGrants/gAll"
+  expect_out "Purview eDiscovery, all users (AllPrincipals): eDiscovery.Download.Read"
+  expect_err "2 existing consent grant(s) give more than this plan asks for"
+  expect_reads_only
+  : >"$FAKE_AZ_LOG"
+  run "${vars[@]}" --apply
+  expect_status 0
+  local principal="{\"clientId\":\"$APP_SP\",\"consentType\":\"Principal\",\"principalId\":\"$ALEX\""
+  expect_mutations <<EOF
+PATCH /applications/$APP_OBJ {"requiredResourceAccess":$RRA_RO}
+POST /oauth2PermissionGrants $principal,"resourceId":"$GRAPH_SP","scope":"eDiscovery.Read.All offline_access openid profile"}
+POST /oauth2PermissionGrants $principal,"resourceId":"$EDISC_SP","scope":"eDiscovery.Download.Read"}
+EOF
+  expect_line "    purview auth login --client-id $APP_ID --tenant-id $T --read-only"
+  end_case
+}
+
+test_read_only_login_command() {
+  new_case read_only_login_command
+  write_state
+  run "${restricted_vars[@]}" READ_ONLY=1 --apply
+  expect_status 0
+  expect_line "    purview auth login --client-id $NEW3 --tenant-id $T --read-only"
+  : >"$FAKE_AZ_LOG"
+  run "${restricted_vars[@]}" READ_ONLY=1 "CLIENT_ID=$NEW3" --apply
+  expect_status 0
+  expect_out "Nothing to change."
+  expect_line "    purview auth login --client-id $NEW3 --tenant-id $T --read-only"
+  expect_no_mutation
+  # Without READ_ONLY the command asks for nothing narrower.
+  end_case
+  new_case read_write_login_command
+  write_state
+  run "${restricted_vars[@]}" --apply
+  expect_status 0
+  expect_line "    purview auth login --client-id $NEW3 --tenant-id $T"
+  end_case
+}
+
+test_paging_finds_matches_on_later_pages() {
+  new_case paging_finds_matches_on_later_pages
+  done_state
+  PAGE_SIZE=1
+  APPS=$(app_json "owners=[\"$SAM\",\"$ALEX\"]")
+  ASSIGNMENTS="{\"id\":\"a0\",\"principalId\":\"$SAM\",\"resourceId\":\"$APP_SP\",\"appRoleId\":\"$ROLE\"},$DONE_ASSIGNMENT"
+  GRANTS="{\"id\":\"g0\",\"clientId\":\"$APP_SP\",\"consentType\":\"Principal\",\"principalId\":\"$SAM\",\"resourceId\":\"$GRAPH_SP\",\"scope\":\"$GRAPH_SCOPE\"},$DONE_GRANTS"
+  write_state
+  run "TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=alex@contoso.example --apply
+  expect_status 0
+  expect_out "alex@contoso.example -> $ALEX: already assigned"
+  expect_out "Microsoft Graph for alex@contoso.example: $GRAPH_SCOPE (present)"
+  expect_out "Nothing to change."
+  expect_no_mutation
+  [ "$(count_calls 'appRoleAssignedTo.*skiptoken')" -ge 1 ] || problem "the second page was never read"
+  end_case
+}
+
+test_continuation_link_off_graph_is_refused() {
+  new_case continuation_link_off_graph_is_refused
+  done_state
+  PAGE_SIZE=1
+  NEXT_LINK_BASE="https://graph.microsoft.com.contoso.example/v1.0"
+  ASSIGNMENTS="{\"id\":\"a0\",\"principalId\":\"$SAM\",\"resourceId\":\"$APP_SP\",\"appRoleId\":\"$ROLE\"},$DONE_ASSIGNMENT"
+  write_state
+  run "TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=alex@contoso.example --apply
+  expect_status nonzero
+  expect_err "a continuation link left the Graph v1.0 endpoint"
+  [ "$(count_calls 'contoso[.]example/v1.0')" -eq 0 ] || problem "the script followed a link off Graph"
+  expect_no_mutation
+  end_case
+}
+
+test_fallback_only_update_is_read_back() {
+  new_case fallback_only_update_is_read_back
+  done_state
+  APPS=$(app_json isFallbackPublicClient=false)
+  fault '^rest --method PATCH --url [^ ]*/applications/' timeout false
+  write_state
+  run "TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=alex@contoso.example --apply
+  expect_status nonzero
+  expect_mutations <<EOF
+PATCH /applications/$APP_OBJ {"isFallbackPublicClient":true}
+EOF
+  expect_err "Read-back: not found by a successful read: the planned values in application $APP_ID"
+  # The same failure after the change took effect reads back as found.
+  end_case
+  new_case fallback_only_update_took_effect
+  done_state
+  APPS=$(app_json isFallbackPublicClient=false)
+  fault '^rest --method PATCH --url [^ ]*/applications/' timeout true
+  write_state
+  run "TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=alex@contoso.example --apply
+  expect_status nonzero
+  expect_err "Read-back: found: every field of application $APP_ID that the update sets now matches the plan"
+  end_case
+}
+
+test_app_with_roles_is_refused() {
+  new_case app_with_roles_is_refused
+  done_state
+  APPS=$(app_json 'appRoles=[{"id":"00000000-0000-4000-8000-000000000051"}]')
+  write_state
+  run "TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=sam@contoso.example --apply
+  expect_status nonzero
+  expect_err "declares app roles"
+  expect_reads_only
+  end_case
+}
+
+test_restricted_plan_names_global_administrators() {
+  new_case restricted_plan_names_global_administrators
+  write_state
+  run "${restricted_vars[@]}"
+  expect_status 0
+  expect_out "Global Administrators, whom Microsoft does not hold to the assignment requirement."
+  end_case
+  new_case all_users_plan_needs_no_exception
+  write_state
+  run "TENANT_ID=$T" ALLOW_ALL_TENANT_USERS=1 CONSENT=tenant
+  reject_out "Global Administrators"
+  end_case
+}
+
+test_permissions_changed_after_planning_stop_the_update() {
+  new_case permissions_changed_after_planning_stop_the_update
+  done_state
+  APPS=$(app_json 'requiredResourceAccess=[]')
+  edit '^ad app show --id [^ ]* --query requiredResourceAccess' 2 app "$APP_ID" \
+    "{\"requiredResourceAccess\":[{\"resourceAppId\":\"$GRAPH_APP\",\"resourceAccess\":[{\"id\":\"$OPENID\",\"type\":\"Scope\"}]}]}"
+  write_state
+  run "TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=alex@contoso.example --apply
+  expect_status nonzero
+  expect_err "application $APP_ID changed after this run read it"
+  expect_no_mutation
+  end_case
+}
+
+test_redirects_changed_after_planning_stop_the_update() {
+  new_case redirects_changed_after_planning_stop_the_update
+  done_state
+  APPS=$(app_json 'redirectUris=[]')
+  edit '^ad app show --id [^ ]* --query publicClient.redirectUris' 2 app "$APP_ID" \
+    "{\"publicClient\":{\"redirectUris\":[\"http://localhost:8400\"]}}"
+  write_state
+  run "TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=alex@contoso.example --apply
+  expect_status nonzero
+  expect_out "Redirect URI http://localhost/callback: missing"
+  expect_err "application $APP_ID changed after this run read it"
+  expect_no_mutation
+  end_case
+}
+
+test_grant_changed_after_planning_stops_its_update() {
+  new_case grant_changed_after_planning_stops_its_update
+  done_state
+  GRANTS="${DONE_GRANTS/\"scope\":\"$GRAPH_SCOPE\"/\"scope\":\"openid profile\"}"
+  edit '^rest --method GET --url [^ ]*/oauth2PermissionGrants' 2 grant g1 '{"scope": "openid profile User.Read"}'
+  write_state
+  run "TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=alex@contoso.example --apply
+  expect_status nonzero
+  expect_err "consent grant g1 changed after this run read it"
+  expect_no_mutation
+  end_case
+}
+
+test_grant_scope_is_rebuilt_from_single_words() {
+  new_case grant_scope_is_rebuilt_from_single_words
+  done_state
+  GRANTS="${DONE_GRANTS/\"scope\":\"$GRAPH_SCOPE\"/\"scope\":\" openid\\tprofile\"}"
+  write_state
+  run "TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=alex@contoso.example --apply
+  expect_status 0
+  expect_mutations <<EOF
+PATCH /oauth2PermissionGrants/g1 {"scope":"openid profile eDiscovery.ReadWrite.All offline_access"}
+EOF
+  end_case
+}
+
+test_grant_scope_over_the_limit_is_refused() {
+  new_case grant_scope_over_the_limit_is_refused
+  done_state
+  local long="openid" n=1
+  while [ "$n" -le 383 ]; do
+    long="$long $(printf 'Word.%04d' "$n")"
+    n=$((n + 1))
+  done
+  GRANTS="${DONE_GRANTS/\"scope\":\"$GRAPH_SCOPE\"/\"scope\":\"$long\"}"
+  write_state
+  run "TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=alex@contoso.example
+  expect_status nonzero
+  expect_err "more than Graph's 3850"
+  expect_reads_only
+  end_case
+}
+
+test_unexpected_download_scope_id_is_refused() {
+  new_case unexpected_download_scope_id_is_refused
+  done_state
+  EXTRA_SPS="${EDISC_SP_JSON/$DOWNLOAD/00000000-0000-4000-8000-000000000099},$DONE_SP"
+  write_state
+  run "TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=alex@contoso.example --apply
+  expect_status nonzero
+  expect_err "not $DOWNLOAD"
+  expect_reads_only
+  end_case
+}
+
+test_polling_gives_up_after_sixty_seconds() {
+  new_case polling_gives_up_after_sixty_seconds
+  HIDDEN_POLLS=100
+  write_state
+  run "${restricted_vars[@]}" --apply
+  expect_status nonzero
+  expect_err "still not visible after 60s"
+  [ "$(sleeps)" -eq 12 ] || problem "expected 12 polling sleeps, got $(sleeps)"
+  [ "$(mutations | wc -l | tr -d ' ')" -eq 1 ] || problem "a change was sent before the principal was visible"
+  end_case
+}
+
+test_unsafe_redirect_uri_is_refused() {
+  new_case unsafe_redirect_uri_is_refused
+  done_state
+  APPS=$(app_json 'redirectUris=["http://localhost/a b"]')
+  write_state
+  run "TENANT_ID=$T" "CLIENT_ID=$APP_ID" ASSIGN_USERS=alex@contoso.example --apply
+  expect_status nonzero
+  expect_err "redirect URI with unexpected characters"
+  expect_reads_only
+  end_case
+}
+
+test_fake_az_rejects_what_real_az_would() {
+  new_case fake_az_rejects_what_real_az_would
+  done_state
+  write_state
+  local s
+  for call in "account show extra" "ad sp show --id $APP_ID --bogus 1" "ad sp show" \
+    "ad app list --filter x --filter y"; do
+    s=0
+    # shellcheck disable=SC2086 # each case is a list of words
+    PATH="$here/fake-bin:$PATH" az $call >/dev/null 2>&1 || s=$?
+    [ "$s" -eq 99 ] || problem "fake az accepted: $call (exit $s)"
+  done
+  # fake_write METHOD PATH BODY WANT checks the fake's exit status for a write.
+  fake_write() {
+    s=0
+    PATH="$here/fake-bin:$PATH" az rest --method "$1" --url "$G$2" --body "$3" -o none >/dev/null 2>&1 || s=$?
+    [ "$s" -eq "$4" ] || problem "fake az gave exit $s, not $4, for $1 $2"
+  }
+  local assignment grant
+  assignment="{\"principalId\":\"$ALEX\",\"resourceId\":\"$APP_SP\",\"appRoleId\":\"$ROLE\"}"
+  grant="{\"clientId\":\"$APP_SP\",\"consentType\":\"Principal\",\"principalId\":\"$ALEX\",\"resourceId\":\"$GRAPH_SP\",\"scope\":\"openid\"}"
+  # A service principal PATCH by appId, an unknown body field, and duplicate
+  # assignments, owners and grants.
+  fake_write PATCH "/servicePrincipals/$APP_ID" '{"appRoleAssignmentRequired":true}' 3
+  fake_write PATCH "/servicePrincipals/$APP_SP" '{"appId":"x"}' 99
+  fake_write POST "/servicePrincipals/$APP_SP/appRoleAssignedTo" "$assignment" 1
+  fake_write POST "/applications/$APP_OBJ/owners/\$ref" "{\"@odata.id\":\"$G/directoryObjects/$ALEX\"}" 1
+  fake_write POST /oauth2PermissionGrants "$grant" 1
   end_case
 }
 

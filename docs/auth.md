@@ -71,8 +71,12 @@ only read-only `az` calls and prints a plan:
 - the service principals it will create;
 - the full `requiredResourceAccess`;
 - each assignee, resolved to its object id and user principal name;
-- who may sign in: `appRoleAssignmentRequired` and what it means;
-- the consent it will grant, by type and scope for each resource.
+- who may sign in: `appRoleAssignmentRequired` and what it means, including
+  the Global Administrator exception for a restricted app;
+- the consent it will grant, by type and scope for each resource;
+- every consent grant the app already holds on Graph and on the eDiscovery
+  app, with its type, user and scopes, and a warning for each one that gives
+  more than the plan asks for.
 
 Read the plan, then run the same command with `--apply`. Argument errors exit
 2, other failures 1. The script never
@@ -82,16 +86,29 @@ With `--apply` it carries out the plan in this order: the eDiscovery app's
 service principal, the application and its owner, the application's service
 principal, assignment, then consent. Assignment comes before consent, so a run
 that stops part way never leaves a consented app that everyone can use. It
-follows three rules:
+follows these rules:
 
 - **Each change is sent once.** Nothing is retried automatically.
 - **Readiness is checked with reads.** After creating a service principal it
   reads it back every 5 seconds, for up to 60 seconds, before the next change.
 - **An unclear result is read back.** If a change times out, is throttled, gets
-  a server error or fails without a definite reason, the script reads back the
-  object it meant to create, says whether it exists, names the step and stops
-  with a non-zero exit. Running it again is then safe: every step reads the
-  current state first and skips what already matches.
+  a server error or fails without a definite reason, the script reads back
+  every field the change set, names the step and stops with a non-zero exit.
+  It reports one of three results: found; not found by a successful read; or
+  not checked, because the read failed too, with that read's error. It never
+  reports a failed read as absence. Directory changes can take a few minutes
+  to show, so after "not found" wait, then run the dry run again before
+  `--apply`. Every step reads the current state first and skips what already
+  matches.
+- **A replaced list is read again first.** Just before an update that
+  replaces the API permissions, the redirect URIs or a grant's scope, the
+  script reads that value again. If it changed since the plan was made, the
+  script sends nothing for it and stops. This narrows the window for a
+  concurrent change by another administrator but does not close it: the
+  script sends no version check with the update, and whether these Graph
+  resources accept one is not established (Assumption).
+
+Lists of owners, assignments and grants are read to their last page.
 
 Without `CLIENT_ID`, the script refuses to create an app when one with the same
 display name already exists, and lists its application id. Set `CLIENT_ID` to
@@ -100,10 +117,17 @@ that id to update it instead.
 On an update it changes only what differs from the plan. It adds the redirect
 URI without removing others, and adds the signed-in user as owner only when
 the app has no owner at all, which is what an interrupted create leaves. It
-never removes a scope from a consent grant: switching an existing app to
-`READ_ONLY=1` leaves `eDiscovery.ReadWrite.All` on its grants, and the plan
-says so. Remove that scope from the grant by hand if the read-only setup must
-be strict.
+refuses, before any change, a restricted setup on a registration that declares
+app roles, because the default access role it assigns is valid only for an app
+with none (Docs).
+
+It never removes a consent grant or a scope. When an existing grant gives more
+than the plan asks for, the plan shows a warning with the grant's id and the
+`az rest` command that removes it. Two examples are a tenant-wide
+`eDiscovery.ReadWrite.All` grant kept after a move to `CONSENT=principal` and
+`READ_ONLY=1`, and any extra scope on a grant. Remove such a grant by hand if
+the narrower setup must be strict. With `READ_ONLY=1`, the sign-in command the
+script prints ends with `--read-only`.
 
 #### Variables
 

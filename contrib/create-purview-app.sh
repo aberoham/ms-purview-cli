@@ -22,9 +22,16 @@ set -f
 #     every 5 seconds for up to 60 seconds before the next change.
 #   - If a change fails with an unclear outcome (a timeout, throttling, a
 #     server error, or a failure that az does not explain), the script reads
-#     the object back, reports whether it exists, and stops. Running it again
-#     is safe: every step reads the current state first and skips what
-#     already matches.
+#     the object back and stops. It reports one of three results: found, not
+#     found by a successful read, or not checked because the read failed.
+#     Every step reads the current state first and skips what already
+#     matches, so a later run carries on from where this one stopped.
+#   - Just before an update that replaces a list (API permissions, redirect
+#     URIs, a grant's scope), the script reads it again and stops if it
+#     changed since planning.
+#   - It never removes a grant or a scope. The plan lists every existing
+#     grant on the two resources and warns about any that gives more than
+#     the plan asks for.
 #   - Assignment is required and the users are assigned before any consent is
 #     granted, so an interrupted run never leaves a consented app that every
 #     user in the tenant may sign in to.
@@ -72,8 +79,12 @@ readonly SP_ROW_QUERY='[].[id, appRoleAssignmentRequired]'
 readonly SCOPES_QUERY='oauth2PermissionScopes[].[value, id]'
 readonly APP_ROW_QUERY='[].[id, signInAudience, isFallbackPublicClient, displayName]'
 readonly RRA_QUERY="requiredResourceAccess[].[resourceAppId, join(',', resourceAccess[].join(':', [id, type]))]"
-readonly ASSIGNMENTS_QUERY='value[].[principalId, appRoleId]'
-readonly GRANTS_QUERY='value[].[id, resourceId, consentType, principalId, scope]'
+# The fields read from each consent grant; get_pages builds the query.
+readonly GRANT_FIELDS='id, resourceId, consentType, principalId, scope'
+# Graph's limit on an oauth2PermissionGrant scope (Docs).
+readonly GRANT_SCOPE_LIMIT=3850
+# Collections are read to their last page; this caps a runaway loop.
+readonly PAGE_LIMIT=200
 
 readonly GUID_RE='^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$'
 # A user principal name of plain characters. Guest names that contain '#'
@@ -85,6 +96,9 @@ readonly GRANT_ID_RE='^[A-Za-z0-9_-]+$'
 # Characters allowed in an existing redirect URI that is copied into an
 # update. Anything else stops the script before it builds the request.
 readonly REDIRECT_RE='^[A-Za-z0-9:/._~?&=%+-]+$'
+# Characters allowed in the part of a continuation link after the Graph
+# v1.0 prefix. The link goes to az as an argument, never into a body.
+readonly NEXT_LINK_RE='^[A-Za-z0-9/._~?&=%+$,:()'"'"'-]+$'
 
 usage() {
   cat <<'EOF'
@@ -126,7 +140,9 @@ none_to_empty() {
 
 # field N LINE prints the Nth tab-separated field of LINE. cut keeps empty
 # fields, which `read` with a tab in IFS would merge.
-field() { printf '%s\n' "$2" | cut -f "$1"; }
+field() { cut -f "$1" <<<"$2"; }
+
+first_line() { sed -n 1p <<<"$1"; }
 
 # --- Arguments --------------------------------------------------------------
 
@@ -268,10 +284,59 @@ if [ "$current_tenant" != "$TENANT_ID" ]; then
 fi
 
 # --- Reads ------------------------------------------------------------------
+# Long az output goes to awk, sed and grep through here-strings, not pipes.
+# A reader that stops early would end a pipe's writer with SIGPIPE, and
+# pipefail would turn that into a silent exit.
 
 # scope_id LIST VALUE prints the id paired with VALUE in "value<TAB>id" lines.
 scope_id() {
-  printf '%s\n' "$1" | awk -F '\t' -v want="$2" '$1 == want { print $2; exit }'
+  awk -F '\t' -v want="$2" '!found && $1 == want { print $2; found = 1 }' <<<"$1"
+}
+
+# get_pages URL FIELDS reads a Graph collection to its last page and prints
+# one tab-separated line of FIELDS per item. Each page's continuation link
+# must stay on the Graph v1.0 endpoint. It returns 1, with the reason in
+# err_file, if a page cannot be read.
+get_pages() {
+  local url=$1 query out next pages=0
+  query="[[['next', \"@odata.nextLink\"]], value[].['row', $2]][]"
+  while :; do
+    out=$(az rest --method GET --url "$url" --query "$query" -o tsv 2>"$err_file") || return 1
+    awk -F '\t' '$1 == "row" { sub(/^row\t/, ""); print }' <<<"$out"
+    next=$(awk -F '\t' '$1 == "next" { print $2 }' <<<"$out")
+    if [ -z "$next" ] || [ "$next" = None ]; then
+      return 0
+    fi
+    case "$next" in
+      "$GRAPH/"*) ;;
+      *)
+        echo "a continuation link left the Graph v1.0 endpoint" >"$err_file"
+        return 1
+        ;;
+    esac
+    if ! [[ "${next#"$GRAPH/"}" =~ $NEXT_LINK_RE ]]; then
+      echo "a continuation link holds unexpected characters" >"$err_file"
+      return 1
+    fi
+    pages=$((pages + 1))
+    if [ "$pages" -ge "$PAGE_LIMIT" ]; then
+      echo "the collection has more than $PAGE_LIMIT pages" >"$err_file"
+      return 1
+    fi
+    url=$next
+  done
+}
+
+# read_pages WHAT URL FIELDS is get_pages for planning: a failure stops the
+# script.
+read_pages() {
+  local what=$1
+  shift
+  if ! get_pages "$@"; then
+    echo "error: could not read $what." >&2
+    show_az_error
+    exit 1
+  fi
 }
 
 graph_sp_id=$(read_az "the Microsoft Graph service principal" \
@@ -280,9 +345,11 @@ is_guid "$graph_sp_id" || fail "the Microsoft Graph service principal has no rea
 graph_sp_id=$(lower "$graph_sp_id")
 graph_scopes=$(read_az "the Microsoft Graph delegated scopes" \
   ad sp show --id "$GRAPH_APP_ID" --query "$SCOPES_QUERY" -o tsv)
+# Bash turns off errexit inside a command substitution, so the status of
+# each scope_id call is checked here rather than left to set -e.
 resolve_graph_scope() {
   local id
-  id=$(scope_id "$graph_scopes" "$1")
+  id=$(scope_id "$graph_scopes" "$1") || fail "could not search the Microsoft Graph scope list for $1."
   is_guid "$id" || fail "Microsoft Graph does not expose the delegated scope $1."
   lower "$id"
 }
@@ -291,22 +358,31 @@ offline_access_id=$(resolve_graph_scope offline_access)
 openid_id=$(resolve_graph_scope openid)
 profile_id=$(resolve_graph_scope profile)
 
+# check_download_scope LIST stops the script unless the eDiscovery service
+# principal gives eDiscovery.Download.Read the id this script expects.
+check_download_scope() {
+  local found
+  found=$(scope_id "$1" eDiscovery.Download.Read) ||
+    fail "could not search the Purview eDiscovery scope list."
+  found=$(lower "$found")
+  if [ "$found" != "$EDISCOVERY_DOWNLOAD_SCOPE_ID" ]; then
+    fail "the Purview eDiscovery service principal gives eDiscovery.Download.Read the id '$(sanitize "$found")', not $EDISCOVERY_DOWNLOAD_SCOPE_ID. Nothing was changed by this check; report it before running again."
+  fi
+}
+
 edisc_row=$(read_az "the Purview eDiscovery service principal" \
   ad sp list --filter "appId eq '$EDISCOVERY_APP_ID'" --query "$SP_ROW_QUERY" -o tsv)
-edisc_sp_id=$(none_to_empty "$(field 1 "$(printf '%s\n' "$edisc_row" | head -n 1)")")
+edisc_sp_id=$(none_to_empty "$(field 1 "$(first_line "$edisc_row")")")
+edisc_download_id=$EDISCOVERY_DOWNLOAD_SCOPE_ID
 if [ -n "$edisc_sp_id" ]; then
   is_guid "$edisc_sp_id" || fail "the Purview eDiscovery service principal has no readable object id."
   edisc_sp_id=$(lower "$edisc_sp_id")
   create_edisc_sp=false
   edisc_scopes=$(read_az "the Purview eDiscovery delegated scopes" \
     ad sp show --id "$EDISCOVERY_APP_ID" --query "$SCOPES_QUERY" -o tsv)
-  edisc_download_id=$(scope_id "$edisc_scopes" eDiscovery.Download.Read)
-  is_guid "$edisc_download_id" ||
-    fail "the Purview eDiscovery service principal does not expose eDiscovery.Download.Read."
-  edisc_download_id=$(lower "$edisc_download_id")
+  check_download_scope "$edisc_scopes"
 else
   create_edisc_sp=true
-  edisc_download_id=$EDISCOVERY_DOWNLOAD_SCOPE_ID
 fi
 
 # The application.
@@ -317,10 +393,11 @@ need_fallback=false
 need_redirect=false
 current_redirects=""
 current_rra=""
+current_rra_lines=""
 if [ -n "$CLIENT_ID" ]; then
   app_row=$(read_az "application $CLIENT_ID" \
     ad app list --filter "appId eq '$CLIENT_ID'" --query "$APP_ROW_QUERY" -o tsv)
-  app_row=$(printf '%s\n' "$app_row" | head -n 1)
+  app_row=$(first_line "$app_row")
   [ -n "$app_row" ] || fail "no application with appId $CLIENT_ID in tenant $TENANT_ID. Check CLIENT_ID, or unset it to create a new registration."
   app_obj_id=$(field 1 "$app_row")
   is_guid "$app_obj_id" || fail "application $CLIENT_ID has no readable object id."
@@ -333,17 +410,24 @@ if [ -n "$CLIENT_ID" ]; then
   [ "$fallback" = true ] || need_fallback=true
   app_display=$(sanitize "$(field 4- "$app_row")")
   app_id=$CLIENT_ID
+  # The default access role that assignments use is valid only on an app
+  # that declares no app roles (Docs, appRoleAssignment resource).
+  if [ "$restricted" = true ]; then
+    roles=$(read_az "the app roles of application $CLIENT_ID" \
+      ad app show --id "$CLIENT_ID" --query "appRoles[].id" -o tsv)
+    if [ -n "$roles" ]; then
+      fail "application $CLIENT_ID declares app roles, so the default access role this script assigns is not valid for it. Use a registration without app roles, or unset CLIENT_ID to create one."
+    fi
+  fi
   current_redirects=$(read_az "the redirect URIs of application $CLIENT_ID" \
     ad app show --id "$CLIENT_ID" --query publicClient.redirectUris -o tsv)
-  if ! printf '%s\n' "$current_redirects" | grep -qxF "$REDIRECT_URI"; then
+  if ! grep -qxF "$REDIRECT_URI" <<<"$current_redirects"; then
     need_redirect=true
     while IFS= read -r uri; do
       [ -n "$uri" ] || continue
       [[ "$uri" =~ $REDIRECT_RE ]] ||
         fail "application $CLIENT_ID has a public-client redirect URI with unexpected characters. Add $REDIRECT_URI by hand, then run this script again."
-    done <<EOF
-$current_redirects
-EOF
+    done <<<"$current_redirects"
   fi
   current_rra=$(read_az "the API permissions of application $CLIENT_ID" \
     ad app show --id "$CLIENT_ID" --query "$RRA_QUERY" -o tsv)
@@ -358,9 +442,7 @@ else
       else
         echo "    (an appId that is not a GUID)" >&2
       fi
-    done <<EOF
-$same_name
-EOF
+    done <<<"$same_name"
     echo "Set CLIENT_ID to update one of them, or choose another APP_NAME." >&2
     exit 1
   fi
@@ -376,7 +458,7 @@ intended_rra_plan=$(printf '%s\n' \
   "$GRAPH_APP_ID $openid_id Scope" \
   "$GRAPH_APP_ID $profile_id Scope" \
   "$EDISCOVERY_APP_ID $edisc_download_id Scope")
-intended_rra=$(printf '%s\n' "$intended_rra_plan" | sort)
+intended_rra=$(sort <<<"$intended_rra_plan")
 rra_json() {
   printf '[{"resourceAppId":"%s","resourceAccess":[' "$GRAPH_APP_ID"
   printf '{"id":"%s","type":"Scope"},' "$graph_main_id" "$offline_access_id" "$openid_id"
@@ -388,7 +470,7 @@ rra_json() {
 # normalize_rra turns the RRA_QUERY rows ("app<TAB>id:type,id:type") into
 # sorted "app id type" lines.
 normalize_rra() {
-  printf '%s\n' "$1" | awk -F '\t' '
+  awk -F '\t' '
     NF == 0 { next }
     {
       n = split($2, parts, ",")
@@ -397,7 +479,7 @@ normalize_rra() {
         split(parts[i], pair, ":")
         print tolower($1) " " tolower(pair[1]) " " pair[2]
       }
-    }' | sort
+    }' <<<"$1" | sort
 }
 need_rra=false
 if [ "$create_app" = false ]; then
@@ -411,7 +493,7 @@ current_required=""
 if [ "$create_app" = false ]; then
   app_sp_row=$(read_az "the service principal of application $app_id" \
     ad sp list --filter "appId eq '$app_id'" --query "$SP_ROW_QUERY" -o tsv)
-  app_sp_row=$(printf '%s\n' "$app_sp_row" | head -n 1)
+  app_sp_row=$(first_line "$app_sp_row")
   app_sp_id=$(none_to_empty "$(field 1 "$app_sp_row")")
   if [ -n "$app_sp_id" ]; then
     is_guid "$app_sp_id" || fail "the service principal of application $app_id has no readable object id."
@@ -440,9 +522,8 @@ owner_note=""
 if [ "$create_app" = true ]; then
   need_owner=true
 else
-  owners=$(read_az "the owners of application $app_id" \
-    rest --method GET --url "$GRAPH/applications/$app_obj_id/owners?\$select=id" \
-    --query "value[].id" -o tsv)
+  owners=$(read_pages "the owners of application $app_id" \
+    "$GRAPH/applications/$app_obj_id/owners?\$select=id" id)
   if [ -z "$owners" ]; then
     need_owner=true
   else
@@ -453,8 +534,8 @@ me_id=""
 me_upn=""
 if [ "$need_owner" = true ]; then
   me=$(read_az "the signed-in user" ad signed-in-user show --query "[id, userPrincipalName]" -o tsv)
-  me_id=$(printf '%s\n' "$me" | sed -n 1p)
-  me_upn=$(sanitize "$(printf '%s\n' "$me" | sed -n 2p)")
+  me_id=$(first_line "$me")
+  me_upn=$(sanitize "$(sed -n 2p <<<"$me")")
   is_guid "$me_id" || fail "the signed-in user has no readable object id; sign in to az as a user."
   me_id=$(lower "$me_id")
 fi
@@ -462,13 +543,12 @@ fi
 # Assignees: object ids, labels and whether each is already assigned.
 existing_assignments=""
 if [ "$create_app_sp" = false ] && [ "$restricted" = true ]; then
-  existing_assignments=$(read_az "the assignments of application $app_id" \
-    rest --method GET --url "$GRAPH/servicePrincipals/$app_sp_id/appRoleAssignedTo?\$top=999" \
-    --query "$ASSIGNMENTS_QUERY" -o tsv)
+  existing_assignments=$(read_pages "the assignments of application $app_id" \
+    "$GRAPH/servicePrincipals/$app_sp_id/appRoleAssignedTo?\$top=999" "principalId, appRoleId")
 fi
 is_assigned() {
-  printf '%s\n' "$existing_assignments" |
-    awk -F '\t' -v p="$1" -v r="$DEFAULT_APP_ROLE_ID" 'tolower($1) == p && tolower($2) == r { found = 1 } END { exit !found }'
+  awk -F '\t' -v p="$1" -v r="$DEFAULT_APP_ROLE_ID" \
+    'tolower($1) == p && tolower($2) == r { found = 1 } END { exit !found }' <<<"$existing_assignments"
 }
 
 a_ids=()
@@ -494,8 +574,8 @@ add_assignee() { # id label kind
 }
 for word in ${assign_words[@]+"${assign_words[@]}"}; do
   if user=$(az ad user show --id "$word" --query "[id, userPrincipalName]" -o tsv 2>"$err_file"); then
-    uid=$(printf '%s\n' "$user" | sed -n 1p)
-    upn=$(sanitize "$(printf '%s\n' "$user" | sed -n 2p)")
+    uid=$(first_line "$user")
+    upn=$(sanitize "$(sed -n 2p <<<"$user")")
     if is_guid "$uid"; then
       add_assignee "$(lower "$uid")" "$upn" user
       continue
@@ -507,8 +587,8 @@ done
 if [ -n "$GROUP_OBJECT_ID" ]; then
   if group=$(az rest --method GET --url "$GRAPH/groups/$GROUP_OBJECT_ID?\$select=id,displayName" \
     --query "[id, displayName]" -o tsv 2>"$err_file") &&
-    is_guid "$(printf '%s\n' "$group" | sed -n 1p)"; then
-    add_assignee "$GROUP_OBJECT_ID" "group $(sanitize "$(printf '%s\n' "$group" | sed -n 2p)")" group
+    is_guid "$(first_line "$group")"; then
+    add_assignee "$GROUP_OBJECT_ID" "group $(sanitize "$(sed -n 2p <<<"$group")")" group
   else
     unresolved=$((unresolved + 1))
     unresolved_lines+=("group $GROUP_OBJECT_ID: no group found")
@@ -516,14 +596,25 @@ if [ -n "$GROUP_OBJECT_ID" ]; then
 fi
 
 # Consent grants: one per resource, per assigned user or for all principals.
+grants_url() { printf '%s' "$GRAPH/oauth2PermissionGrants?\$filter=clientId%20eq%20'$app_sp_id'"; }
 existing_grants=""
 if [ "$create_app_sp" = false ]; then
-  existing_grants=$(read_az "the consent grants of application $app_id" \
-    rest --method GET --url "$GRAPH/oauth2PermissionGrants?\$filter=clientId%20eq%20'$app_sp_id'" \
-    --query "$GRANTS_QUERY" -o tsv)
+  existing_grants=$(read_pages "the consent grants of application $app_id" \
+    "$(grants_url)" "$GRANT_FIELDS")
 fi
 
-# find_grant RESOURCE_ID TYPE PRINCIPAL sets found_grant_id and
+# join_words TEXT prints the words of TEXT joined by single spaces. It
+# returns 1 if a word holds a character no scope name has.
+join_words() {
+  local word out=""
+  for word in $1; do
+    [[ "$word" =~ $SCOPE_WORD_RE ]] || return 1
+    out="$out${out:+ }$word"
+  done
+  printf '%s' "$out"
+}
+
+# find_grant RESOURCE_ID TYPE PRINCIPAL sets found_grant_id and the raw
 # found_grant_scope from existing_grants, or leaves them empty.
 find_grant() {
   local line
@@ -540,9 +631,20 @@ find_grant() {
     found_grant_id=$(field 1 "$line")
     found_grant_scope=$(none_to_empty "$(field 5- "$line")")
     return 0
-  done <<EOF
-$existing_grants
-EOF
+  done <<<"$existing_grants"
+}
+
+# grant_scope_by_id ID prints the raw scope of the grant with that id in
+# existing_grants, and returns 1 if there is none.
+grant_scope_by_id() {
+  local line
+  while IFS= read -r line; do
+    if [ -n "$line" ] && [ "$(field 1 "$line")" = "$1" ]; then
+      none_to_empty "$(field 5- "$line")"
+      return 0
+    fi
+  done <<<"$existing_grants"
+  return 1
 }
 
 # words_missing WANTED HAVE prints the words of WANTED that HAVE lacks.
@@ -564,10 +666,10 @@ g_principal=() # user object id, or empty
 g_who=()       # label for the plan
 g_action=()    # present, create or update
 g_grant_id=()
+g_old_scope=() # the existing scope, words joined by single spaces
 g_scope=()     # the scope the grant will hold
-g_extra=()     # scopes the grant holds beyond the intended ones
 plan_grant() { # res type principal label
-  local res_id wanted
+  local res_id wanted old missing scope
   if [ "$1" = graph ]; then
     res_id=$graph_sp_id
     wanted=$graph_grant_scope
@@ -583,24 +685,25 @@ plan_grant() { # res type principal label
   if [ -z "$found_grant_id" ]; then
     g_action+=(create)
     g_grant_id+=("")
+    g_old_scope+=("")
     g_scope+=("$wanted")
-    g_extra+=("")
     return 0
   fi
   [[ "$found_grant_id" =~ $GRANT_ID_RE ]] || fail "a consent grant of application $app_id has an id of unexpected characters."
-  local word missing
-  for word in $found_grant_scope; do
-    [[ "$word" =~ $SCOPE_WORD_RE ]] || fail "a consent grant of application $app_id holds a scope of unexpected characters."
-  done
+  old=$(join_words "$found_grant_scope") ||
+    fail "a consent grant of application $app_id holds a scope of unexpected characters."
+  missing=$(words_missing "$wanted" "$old")
+  scope="$old${old:+${missing:+ }}$missing"
+  if [ "${#scope}" -gt "$GRANT_SCOPE_LIMIT" ]; then
+    fail "the consent grant $found_grant_id would hold ${#scope} characters of scope, more than Graph's $GRANT_SCOPE_LIMIT. Remove unused scopes from it by hand first."
+  fi
   g_grant_id+=("$found_grant_id")
-  g_extra+=("$(words_missing "$found_grant_scope" "$wanted")")
-  missing=$(words_missing "$wanted" "$found_grant_scope")
+  g_old_scope+=("$old")
+  g_scope+=("$scope")
   if [ -z "$missing" ]; then
     g_action+=(present)
-    g_scope+=("$found_grant_scope")
   else
     g_action+=(update)
-    g_scope+=("$found_grant_scope${found_grant_scope:+ }$missing")
   fi
 }
 if [ "$CONSENT" = tenant ]; then
@@ -644,9 +747,75 @@ print_rra() {
     id=$(sanitize "$id")
     type=$(sanitize "$type")
     printf '      %-20s %-26s %s %s\n' "$(resource_name "$app")" "$(scope_name "$id")" "$id" "$type"
-  done <<EOF
-$1
-EOF
+  done <<<"$1"
+}
+
+# principal_label ID names an assignee in this plan, or gives the object id.
+principal_label() {
+  local i=0
+  while [ "$i" -lt "${#a_ids[@]}" ]; do
+    if [ "${a_ids[$i]}" = "$1" ]; then
+      printf '%s' "${a_labels[$i]}"
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  printf 'user %s (not in this plan)' "$(sanitize "$1")"
+}
+
+# print_existing_grants lists every grant the application already holds on
+# Graph and on the eDiscovery app, and warns about each one that gives more
+# than this plan asks for. It sets broader_grants to the number of warnings.
+broader_grants=0
+print_existing_grants() {
+  local line id res type principal scope res_label wanted who extra reasons
+  echo "  Existing consent grants of this application on these two resources:"
+  if [ -z "$existing_grants" ]; then
+    echo "    none"
+    return 0
+  fi
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    id=$(sanitize "$(field 1 "$line")")
+    res=$(lower "$(field 2 "$line")")
+    type=$(sanitize "$(field 3 "$line")")
+    principal=$(lower "$(none_to_empty "$(field 4 "$line")")")
+    scope=$(sanitize "$(tr '\t' ' ' <<<"$(none_to_empty "$(field 5- "$line")")")")
+    if [ "$res" = "$graph_sp_id" ]; then
+      res_label="Microsoft Graph"
+      wanted=$graph_grant_scope
+    elif [ -n "$edisc_sp_id" ] && [ "$res" = "$edisc_sp_id" ]; then
+      res_label="Purview eDiscovery"
+      wanted=$edisc_grant_scope
+    else
+      continue
+    fi
+    if [ "$type" = AllPrincipals ]; then
+      who="all users (AllPrincipals)"
+    else
+      who="$(principal_label "$principal") (Principal)"
+    fi
+    echo "    - $res_label, $who: $scope"
+    reasons=""
+    if [ "$type" = AllPrincipals ] && [ "$CONSENT" = principal ]; then
+      reasons="it covers every user in the tenant, but the plan asks for per-user consent"
+    fi
+    extra=$(words_missing "$scope" "$wanted")
+    if [ -n "$extra" ]; then
+      reasons="$reasons${reasons:+; }it also holds $extra, which the plan does not ask for"
+    fi
+    [ -n "$reasons" ] || continue
+    broader_grants=$((broader_grants + 1))
+    echo "      WARNING: this grant gives more than the plan asks for: $reasons."
+    echo "      The script never removes a grant or a scope, so this grant stays as it is."
+    if [[ "$id" =~ $GRANT_ID_RE ]]; then
+      echo "      To remove the whole grant by hand:"
+      echo "        az rest --method DELETE --url $GRAPH/oauth2PermissionGrants/$id"
+      echo "      To keep it with fewer scopes, PATCH the same URL with a body such as {\"scope\":\"$wanted\"}."
+    else
+      echo "      Its id holds unexpected characters; remove it in the Entra admin center."
+    fi
+  done <<<"$existing_grants"
 }
 
 changes=0
@@ -739,7 +908,8 @@ else
   echo "    appRoleAssignmentRequired: $intended_required (unchanged)"
 fi
 if [ "$restricted" = true ]; then
-  echo "    Who may sign in: only the assignees listed above, and any principals assigned earlier."
+  echo "    Who may sign in: only the assignees listed above, any principals assigned earlier, and"
+  echo "    Global Administrators, whom Microsoft does not hold to the assignment requirement."
 else
   echo "    Who may sign in: EVERY USER IN THE TENANT can sign in through this app."
 fi
@@ -754,23 +924,23 @@ i=0
 while [ "$i" -lt "${#g_res[@]}" ]; do
   if [ "${g_res[$i]}" = graph ]; then
     res_label="Microsoft Graph"
+    wanted=$graph_grant_scope
   else
     res_label="Purview eDiscovery"
+    wanted=$edisc_grant_scope
   fi
   case "${g_action[$i]}" in
     present) state="present" ;;
     create) state="will be granted" ;;
     update) state="will be extended to: ${g_scope[$i]}" ;;
   esac
-  echo "    - $res_label for ${g_who[$i]}: $(if [ "${g_res[$i]}" = graph ]; then echo "$graph_grant_scope"; else echo "$edisc_grant_scope"; fi) ($state)"
-  if [ -n "${g_extra[$i]}" ]; then
-    echo "      The grant also holds '${g_extra[$i]}'. This script never removes a scope; remove it by hand if it is not wanted."
-  fi
+  echo "    - $res_label for ${g_who[$i]}: $wanted ($state)"
   i=$((i + 1))
 done
 if [ "${#g_res[@]}" -eq 0 ]; then
   echo "    none"
 fi
+print_existing_grants
 
 count "$create_edisc_sp"
 count "$create_app"
@@ -793,6 +963,10 @@ done
 echo "  Changes: $changes"
 echo
 
+if [ "$broader_grants" -gt 0 ]; then
+  echo "warning: $broader_grants existing consent grant(s) give more than this plan asks for; see WARNING above." >&2
+fi
+
 if [ "$unresolved" -gt 0 ]; then
   echo "error: $unresolved assignee(s) could not be resolved; see UNRESOLVED above. Nothing was changed." >&2
   exit 1
@@ -809,9 +983,11 @@ fi
 # --- Apply ------------------------------------------------------------------
 
 print_login() {
+  local read_only_flag=""
+  [ "$READ_ONLY" != 1 ] || read_only_flag=" --read-only"
   echo
   echo "Sign in with:"
-  echo "    purview auth login --client-id $app_id --tenant-id $TENANT_ID"
+  echo "    purview auth login --client-id $app_id --tenant-id $TENANT_ID$read_only_flag"
   echo "Add --browser to sign in through a browser on this machine instead of with a device code."
   echo "Later runs of this script for this application need CLIENT_ID=$app_id."
   echo "Each user also needs the eDiscovery Manager or eDiscovery Administrator role group in the Purview portal."
@@ -845,7 +1021,7 @@ current_step=""
 # send STEP METHOD URL BODY [QUERY] sends one change, once. On success it
 # returns 0 with az's output in sent_output. A definite failure stops the
 # script. An unclear one returns 1 so that the caller reads the object back
-# and then calls stop_unclear.
+# and then stops with stop_found, stop_absent or stop_unverified.
 send() {
   local method=$2 url=$3 body=$4 query=${5:-}
   current_step=$1
@@ -870,16 +1046,37 @@ send() {
   return 1
 }
 
-# stop_unclear FINDING ends the run after an unclear outcome.
-stop_unclear() {
-  echo "error: the outcome of step '$current_step' was unclear. Read-back: $1." >&2
+# After an unclear outcome the read-back has one of three results, and each
+# ends the run with its own message.
+stop_found() {
+  echo "error: the outcome of step '$current_step' was unclear. Read-back: found: $1." >&2
   echo "Nothing else was sent. Running the script again is safe: it reads the current state and skips what already matches." >&2
   exit 1
 }
+stop_absent() {
+  echo "error: the outcome of step '$current_step' was unclear. Read-back: not found by a successful read: $1." >&2
+  echo "Nothing else was sent. Directory changes can take a few minutes to show, so wait, then run the dry run again and check its plan before --apply." >&2
+  exit 1
+}
+stop_unverified() {
+  echo "    The read-back failed too:" >&2
+  show_az_error
+  echo "error: the outcome of step '$current_step' was unclear, and the read-back could not check $1." >&2
+  echo "Nothing else was sent. Check the tenant, then run the dry run again before --apply." >&2
+  exit 1
+}
 
-# sp_object_id APP_ID prints the service principal's object id, or nothing.
-sp_object_id() {
-  az ad sp list --filter "appId eq '$1'" --query "[].id" -o tsv 2>"$err_file" | head -n 1
+# read_back_sp APP_ID LABEL reports whether the service principal exists
+# after an unclear create.
+read_back_sp() {
+  local out
+  if ! out=$(az ad sp list --filter "appId eq '$1'" --query "[].id" -o tsv 2>"$err_file"); then
+    stop_unverified "whether the $2 service principal exists"
+  fi
+  if is_guid "$(first_line "$out")"; then
+    stop_found "the $2 service principal exists"
+  fi
+  stop_absent "the $2 service principal"
 }
 
 # wait_for_sp APP_ID LABEL polls with reads until the service principal is
@@ -905,34 +1102,32 @@ wait_for_sp() {
 if [ "$create_edisc_sp" = true ]; then
   if ! send "create the Purview eDiscovery service principal" POST "$GRAPH/servicePrincipals" \
     "{\"appId\":\"$EDISCOVERY_APP_ID\"}"; then
-    if [ -n "$(sp_object_id "$EDISCOVERY_APP_ID")" ]; then
-      stop_unclear "the Purview eDiscovery service principal exists"
-    fi
-    stop_unclear "the Purview eDiscovery service principal does not exist"
+    read_back_sp "$EDISCOVERY_APP_ID" "Purview eDiscovery"
   fi
   edisc_sp_id=$(wait_for_sp "$EDISCOVERY_APP_ID" "Purview eDiscovery")
   echo "    object id $edisc_sp_id"
   edisc_scopes=$(read_az "the Purview eDiscovery delegated scopes" \
     ad sp show --id "$EDISCOVERY_APP_ID" --query "$SCOPES_QUERY" -o tsv)
-  found=$(lower "$(scope_id "$edisc_scopes" eDiscovery.Download.Read)")
-  if [ "$found" != "$EDISCOVERY_DOWNLOAD_SCOPE_ID" ]; then
-    fail "the new Purview eDiscovery service principal gives eDiscovery.Download.Read the id '$(sanitize "$found")', not $EDISCOVERY_DOWNLOAD_SCOPE_ID. Nothing else was changed; report this before running again."
-  fi
-  echo "    eDiscovery.Download.Read is $found, as planned"
+  check_download_scope "$edisc_scopes"
+  echo "    eDiscovery.Download.Read is $EDISCOVERY_DOWNLOAD_SCOPE_ID, as planned"
 fi
 
 # 2. The application.
+sent_redirects=""
 if [ "$create_app" = true ]; then
   body="{\"displayName\":\"$APP_NAME\",\"signInAudience\":\"AzureADMyOrg\",\"isFallbackPublicClient\":true,\"publicClient\":{\"redirectUris\":[\"$REDIRECT_URI\"]},\"requiredResourceAccess\":$(rra_json)}"
   if ! send "create application '$APP_NAME'" POST "$GRAPH/applications" "$body" "[id, appId]"; then
-    found=$(az ad app list --filter "displayName eq '$APP_NAME'" --query "[].appId" -o tsv 2>"$err_file" | head -n 1 || true)
-    if is_guid "$found"; then
-      stop_unclear "an application named '$APP_NAME' exists with appId $(lower "$found"); run again with CLIENT_ID=$(lower "$found")"
+    if ! found=$(az ad app list --filter "displayName eq '$APP_NAME'" --query "[].appId" -o tsv 2>"$err_file"); then
+      stop_unverified "whether an application named '$APP_NAME' exists"
     fi
-    stop_unclear "no application named '$APP_NAME' exists"
+    found=$(first_line "$found")
+    if is_guid "$found"; then
+      stop_found "an application named '$APP_NAME' exists with appId $(lower "$found"); run again with CLIENT_ID=$(lower "$found")"
+    fi
+    stop_absent "an application named '$APP_NAME'"
   fi
-  app_obj_id=$(printf '%s\n' "$sent_output" | sed -n 1p)
-  app_id=$(printf '%s\n' "$sent_output" | sed -n 2p)
+  app_obj_id=$(first_line "$sent_output")
+  app_id=$(sed -n 2p <<<"$sent_output")
   if ! is_guid "$app_obj_id" || ! is_guid "$app_id"; then
     fail "the application was created but az did not return its ids. Find it by the name '$APP_NAME' and run again with CLIENT_ID set."
   fi
@@ -940,6 +1135,15 @@ if [ "$create_app" = true ]; then
   app_id=$(lower "$app_id")
   echo "    appId $app_id, object id $app_obj_id"
 elif [ "$need_rra" = true ] || [ "$need_redirect" = true ] || [ "$need_fallback" = true ]; then
+  # The update replaces whole lists, so read them again just before it and
+  # stop if another change landed since planning.
+  now_rra=$(read_az "the API permissions of application $app_id" \
+    ad app show --id "$app_id" --query "$RRA_QUERY" -o tsv)
+  now_redirects=$(read_az "the redirect URIs of application $app_id" \
+    ad app show --id "$app_id" --query publicClient.redirectUris -o tsv)
+  if [ "$(normalize_rra "$now_rra")" != "$current_rra_lines" ] || [ "$now_redirects" != "$current_redirects" ]; then
+    fail "application $app_id changed after this run read it: its API permissions or redirect URIs differ. Nothing was sent to it; run the script again to plan from the new state."
+  fi
   parts=""
   if [ "$need_rra" = true ]; then
     parts="\"requiredResourceAccess\":$(rra_json)"
@@ -952,18 +1156,31 @@ elif [ "$need_rra" = true ] || [ "$need_redirect" = true ] || [ "$need_fallback"
     while IFS= read -r uri; do
       [ -n "$uri" ] || continue
       uris="$uris\"$uri\","
-    done <<EOF
-$current_redirects
-EOF
+      sent_redirects="$sent_redirects$uri"$'\n'
+    done <<<"$current_redirects"
+    sent_redirects="$sent_redirects$REDIRECT_URI"
     parts="$parts${parts:+,}\"publicClient\":{\"redirectUris\":[$uris\"$REDIRECT_URI\"]}"
   fi
   if ! send "update application $app_id" PATCH "$GRAPH/applications/$app_obj_id" "{$parts}"; then
-    now=$(az ad app show --id "$app_id" --query "$RRA_QUERY" -o tsv 2>"$err_file" || true)
-    redirects=$(az ad app show --id "$app_id" --query publicClient.redirectUris -o tsv 2>"$err_file" || true)
-    if [ "$(normalize_rra "$now")" = "$intended_rra" ] && printf '%s\n' "$redirects" | grep -qxF "$REDIRECT_URI"; then
-      stop_unclear "the application's permissions and redirect URI now match the plan"
+    if ! row=$(az ad app list --filter "appId eq '$app_id'" --query "$APP_ROW_QUERY" -o tsv 2>"$err_file") ||
+      ! now_rra=$(az ad app show --id "$app_id" --query "$RRA_QUERY" -o tsv 2>"$err_file") ||
+      ! now_redirects=$(az ad app show --id "$app_id" --query publicClient.redirectUris -o tsv 2>"$err_file"); then
+      stop_unverified "whether application $app_id matches the plan"
     fi
-    stop_unclear "the application does not yet match the plan"
+    matches=true
+    if [ "$need_rra" = true ] && [ "$(normalize_rra "$now_rra")" != "$intended_rra" ]; then
+      matches=false
+    fi
+    if [ "$need_fallback" = true ] && [ "$(lower "$(field 3 "$(first_line "$row")")")" != true ]; then
+      matches=false
+    fi
+    if [ "$need_redirect" = true ] && [ "$(sort <<<"$now_redirects")" != "$(sort <<<"$sent_redirects")" ]; then
+      matches=false
+    fi
+    if [ "$matches" = true ]; then
+      stop_found "every field of application $app_id that the update sets now matches the plan"
+    fi
+    stop_absent "the planned values in application $app_id"
   fi
 fi
 
@@ -971,12 +1188,13 @@ fi
 if [ "$need_owner" = true ]; then
   if ! send "add the signed-in user as owner" POST "$GRAPH/applications/$app_obj_id/owners/\$ref" \
     "{\"@odata.id\":\"$GRAPH/directoryObjects/$me_id\"}"; then
-    owners=$(az rest --method GET --url "$GRAPH/applications/$app_obj_id/owners?\$select=id" \
-      --query "value[].id" -o tsv 2>"$err_file" || true)
-    if printf '%s\n' "$owners" | grep -qixF "$me_id"; then
-      stop_unclear "the signed-in user is an owner"
+    if ! owners=$(get_pages "$GRAPH/applications/$app_obj_id/owners?\$select=id" id); then
+      stop_unverified "whether the signed-in user is an owner"
     fi
-    stop_unclear "the signed-in user is not an owner"
+    if grep -qixF "$me_id" <<<"$owners"; then
+      stop_found "the signed-in user is an owner"
+    fi
+    stop_absent "the signed-in user among the owners"
   fi
 fi
 
@@ -985,10 +1203,7 @@ fi
 if [ "$create_app_sp" = true ]; then
   if ! send "create the application's service principal" POST "$GRAPH/servicePrincipals" \
     "{\"appId\":\"$app_id\",\"appRoleAssignmentRequired\":$intended_required}"; then
-    if [ -n "$(sp_object_id "$app_id")" ]; then
-      stop_unclear "the application's service principal exists"
-    fi
-    stop_unclear "the application's service principal does not exist"
+    read_back_sp "$app_id" "application's"
   fi
   app_sp_id=$(wait_for_sp "$app_id" "application's")
   echo "    object id $app_sp_id"
@@ -998,11 +1213,13 @@ fi
 if [ "$need_required" = true ]; then
   if ! send "set appRoleAssignmentRequired to $intended_required" PATCH \
     "$GRAPH/servicePrincipals/$app_sp_id" "{\"appRoleAssignmentRequired\":$intended_required}"; then
-    now=$(az ad sp list --filter "appId eq '$app_id'" --query "$SP_ROW_QUERY" -o tsv 2>"$err_file" || true)
-    if [ "$(lower "$(field 2 "$(printf '%s\n' "$now" | head -n 1)")")" = "$intended_required" ]; then
-      stop_unclear "appRoleAssignmentRequired is $intended_required"
+    if ! now=$(az ad sp list --filter "appId eq '$app_id'" --query "$SP_ROW_QUERY" -o tsv 2>"$err_file"); then
+      stop_unverified "appRoleAssignmentRequired"
     fi
-    stop_unclear "appRoleAssignmentRequired is not yet $intended_required"
+    if [ "$(lower "$(field 2 "$(first_line "$now")")")" = "$intended_required" ]; then
+      stop_found "appRoleAssignmentRequired is $intended_required"
+    fi
+    stop_absent "appRoleAssignmentRequired set to $intended_required"
   fi
 fi
 
@@ -1013,12 +1230,14 @@ while [ "$i" -lt "${#a_ids[@]}" ]; do
     principal=${a_ids[$i]}
     if ! send "assign ${a_labels[$i]} ($principal)" POST "$GRAPH/servicePrincipals/$app_sp_id/appRoleAssignedTo" \
       "{\"principalId\":\"$principal\",\"resourceId\":\"$app_sp_id\",\"appRoleId\":\"$DEFAULT_APP_ROLE_ID\"}"; then
-      existing_assignments=$(az rest --method GET --url "$GRAPH/servicePrincipals/$app_sp_id/appRoleAssignedTo?\$top=999" \
-        --query "$ASSIGNMENTS_QUERY" -o tsv 2>"$err_file" || true)
-      if is_assigned "$principal"; then
-        stop_unclear "${a_labels[$i]} is assigned"
+      if ! existing_assignments=$(get_pages "$GRAPH/servicePrincipals/$app_sp_id/appRoleAssignedTo?\$top=999" \
+        "principalId, appRoleId"); then
+        stop_unverified "whether ${a_labels[$i]} is assigned"
       fi
-      stop_unclear "${a_labels[$i]} is not assigned"
+      if is_assigned "$principal"; then
+        stop_found "${a_labels[$i]} is assigned"
+      fi
+      stop_absent "an assignment for ${a_labels[$i]}"
     fi
   fi
   i=$((i + 1))
@@ -1046,20 +1265,26 @@ while [ "$i" -lt "${#g_res[@]}" ]; do
       send "grant $res_label consent for ${g_who[$i]}" POST "$GRAPH/oauth2PermissionGrants" "$body" || ok=false
       ;;
     update)
+      # The update replaces the scope, so read the grant again just before
+      # it and stop if its scope changed since planning.
+      existing_grants=$(read_pages "the consent grants of application $app_id" "$(grants_url)" "$GRANT_FIELDS")
+      if ! now_scope=$(grant_scope_by_id "${g_grant_id[$i]}") ||
+        [ "$(join_words "$now_scope" || true)" != "${g_old_scope[$i]}" ]; then
+        fail "consent grant ${g_grant_id[$i]} changed after this run read it. Nothing was sent to it; run the script again to plan from the new state."
+      fi
       send "extend $res_label consent for ${g_who[$i]}" PATCH \
         "$GRAPH/oauth2PermissionGrants/${g_grant_id[$i]}" "{\"scope\":\"$scope\"}" || ok=false
       ;;
   esac
   if [ "$ok" = false ]; then
-    existing_grants=$(az rest --method GET --url "$GRAPH/oauth2PermissionGrants?\$filter=clientId%20eq%20'$app_sp_id'" \
-      --query "$GRANTS_QUERY" -o tsv 2>"$err_file" || true)
-    find_grant "$res_id" "${g_type[$i]}" "${g_principal[$i]}"
-    if [ -z "$found_grant_id" ]; then
-      stop_unclear "no such grant exists"
-    elif [ -z "$(words_missing "$scope" "$found_grant_scope")" ]; then
-      stop_unclear "the grant exists with every planned scope"
+    if ! existing_grants=$(get_pages "$(grants_url)" "$GRANT_FIELDS"); then
+      stop_unverified "whether the $res_label grant for ${g_who[$i]} holds the planned scopes"
     fi
-    stop_unclear "the grant exists but lacks some planned scopes"
+    find_grant "$res_id" "${g_type[$i]}" "${g_principal[$i]}"
+    if [ -n "$found_grant_id" ] && [ -z "$(words_missing "$scope" "$found_grant_scope")" ]; then
+      stop_found "the $res_label grant for ${g_who[$i]} holds every planned scope"
+    fi
+    stop_absent "a $res_label grant for ${g_who[$i]} with every planned scope"
   fi
   i=$((i + 1))
 done

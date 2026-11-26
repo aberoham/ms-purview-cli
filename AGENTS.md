@@ -131,11 +131,16 @@ timeout. Later pull requests add the Graph
   contract in `docs/SPEC.md` section 5.2: a dry run by default, `--apply`
   to change anything, each change sent once and read back when its
   outcome is unclear. It must run under macOS's `/bin/bash` 3.2 and needs
-  only `az`. `tests/scripts/create-purview-app-test.sh` runs it against
-  the fake `az` in `tests/scripts/fake-bin/` (Python 3), which answers
-  only the commands and queries the script sends from a JSON state file
-  and logs every call; any other call exits 99. A change to a query in
-  the script needs the same change in the fake.
+  only `az`. Long `az` output goes to `awk`, `sed` and `grep` through
+  here-strings, never a pipe into a reader that can stop early: under
+  `pipefail` the writer's SIGPIPE would end the script without a message.
+  `tests/scripts/create-purview-app-test.sh` runs it against the fake
+  `az` in `tests/scripts/fake-bin/` (Python 3). The fake answers only the
+  command words, options, queries and body fields the script sends, from
+  a JSON state file. It refuses duplicates as Graph does and logs each
+  call as one JSON array; any other call exits 99. `tests/scripts/azlog.py`
+  reads that log for the harness. A change to a query or a body in the
+  script needs the same change in the fake.
 - `.github/workflows/release.yml` builds, signs, notarises, attests and
   publishes the release archives when a `v*` tag is pushed; the tag must
   equal `v` plus the `Cargo.toml` version. `.github/scripts/macos-signing.py`
@@ -288,7 +293,9 @@ shell changes, run `bash -n` and ShellCheck. For changes to
 `contrib/create-purview-app.sh` or its fake, run
 `tests/scripts/create-purview-app-test.sh`, and on macOS also
 `TEST_BASH=/bin/bash tests/scripts/create-purview-app-test.sh`; name test
-cases as arguments to run only those. For changes to the signing
+cases as arguments to run only those. `TEST_SCRIPT=<path>` runs the cases
+against a copy of the script, which is how to check that a test fails when
+the behaviour it covers is removed without editing the tracked file. For changes to the signing
 helper, run `python3 .github/scripts/test_macos_signing.py`.
 
 A passing suite does not show that the tenant behaves this way. Report live

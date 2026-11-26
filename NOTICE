@@ -7,7 +7,14 @@ from it so far:
 
 - `src/output.rs`: tables, tab-separated output, JSON envelopes, field
   selection and terminal sanitisation;
-- `src/config.rs`: configuration loading, atomic writes and file modes.
+- `src/config.rs`: configuration loading, atomic writes and file modes;
+- `.github/workflows/release.yml`: the tagged release workflow, with its
+  build matrix, macOS signing and notarisation, checksums and provenance
+  attestation;
+- `.github/scripts/macos-signing.py` and `.github/scripts/test_macos_signing.py`:
+  the macOS signing helper and its test;
+- `contrib/install.sh` and `contrib/resign.sh`: the source installer and the
+  local re-signing script.
 
 `ms-entra-cli` is distributed under the MIT License with this copyright
 notice:

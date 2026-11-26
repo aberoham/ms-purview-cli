@@ -759,6 +759,45 @@ async fn the_trace_and_verbose_log_hold_each_attempt_without_tokens() {
 }
 
 #[tokio::test]
+async fn the_verbose_log_shows_a_paging_link_without_its_other_query_values() {
+    let server = MockServer::start().await;
+    let next = format!(
+        "{}{CASES}?$skiptoken=page-0002&sig=canary-sig-0009",
+        server.uri()
+    );
+    Mock::given(method("GET"))
+        .and(query_param("$skiptoken", "page-0002"))
+        .respond_with(status(200, json!({"value": []})))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(status(200, json!({"value": [], "@odata.nextLink": next})))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    let setup = setup_with(
+        base_of(&server.uri()),
+        FakeTokens::default(),
+        Duration::from_secs(10),
+        true,
+        None,
+    );
+    let mut log = Vec::new();
+    setup
+        .client
+        .list(&ReadRoute::Cases, &Query::new(), &mut log)
+        .await
+        .unwrap();
+    let log = String::from_utf8(log).unwrap();
+    assert!(!log.contains("canary"), "{log}");
+    assert!(
+        log.contains("?%24skiptoken=page-0002&sig=REDACTED"),
+        "{log}"
+    );
+}
+
+#[tokio::test]
 async fn the_client_refuses_a_base_without_an_origin() {
     let error = GraphClient::new(
         GraphSettings {

@@ -317,6 +317,9 @@ mod tests {
         let dir = root.path().join("trace");
         let (sink, redactor, warnings) = sink(&dir);
         redactor.register("canary-graph-access-0001");
+        // JSON escapes the quote and the backslash, so only redaction of
+        // the value, before serialisation, can find this one.
+        redactor.register("canary\"escaped\\0001");
         let warnings = String::from_utf8(warnings).unwrap();
         assert!(
             warnings.starts_with("warning: trace files hold tenant data"),
@@ -338,6 +341,7 @@ mod tests {
         let body = serde_json::to_vec(&json!({
             "value": [{
                 "description": "canary-graph-access-0001",
+                "displayName": "canary\"escaped\\0001",
                 "downloadUrl": concat!(
                     "https://alpha.proxyservice.ediscovery.svc.cloud.microsoft/ediscovery/api/proxy/x",
                     "?downloadType=Report&sig=canary-sig-0002",
@@ -365,6 +369,10 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("canary"), "{text}");
         let record = read(&path);
+        assert_eq!(
+            record["response"]["body"]["value"][0]["displayName"],
+            "[redacted]"
+        );
         assert_eq!(
             record["request"]["url"],
             "https://graph.microsoft.com/v1.0/security/cases/ediscoveryCases?%24top=1&code=REDACTED"

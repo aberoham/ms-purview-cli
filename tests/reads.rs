@@ -1543,6 +1543,10 @@ async fn an_incomplete_or_null_source_list_is_not_given_as_a_list() {
     let harness = signed_in().await;
     let mut search = fixture_value(&harness, "search-get-mailboxes.json");
     search["custodianSources"] = Value::Null;
+    // An inline list Graph sends is replaced by the full read, or removed
+    // when that read does not finish.
+    search["noncustodialSources"] = json!([{"stale": true}]);
+    search["additionalSources"] = json!([{"stale": true}]);
     Mock::given(method("GET"))
         .and(path(case_path(&format!("/searches/{SEARCH}"))))
         .respond_with(json_response(200, search))
@@ -1576,6 +1580,7 @@ async fn an_incomplete_or_null_source_list_is_not_given_as_a_list() {
     assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
     let results = &run.json()["results"];
     assert_eq!(results["custodianSources"], json!([]));
+    assert_eq!(results["noncustodialSources"], json!([]));
     assert!(results.get("additionalSources").is_none(), "{results}");
     assert!(
         run.stderr()

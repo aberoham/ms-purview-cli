@@ -148,6 +148,10 @@ pub async fn get(
         let listing = match read {
             Ok(listing) => listing,
             Err(error) => {
+                if let Value::Object(object) = &mut record {
+                    object.remove(*key);
+                    object.remove(&format!("{key}@odata.context"));
+                }
                 let _ = writeln!(
                     session.env.stderr,
                     "warning: could not read the search's {key}: {}",
@@ -167,12 +171,16 @@ pub async fn get(
                 if complete { "" } else { " or more" }
             ),
         ));
-        // Graph's own list wins if the record already carries one; a
-        // null is taken as no list.
-        if let (true, Value::Object(object)) = (complete, &mut record) {
-            let slot = object.entry((*key).to_owned()).or_insert(Value::Null);
-            if slot.is_null() {
-                *slot = Value::Array(listing.items);
+        // The full read replaces any list Graph put on the record (it
+        // carries additionalSources inline, Observed); an incomplete read
+        // leaves no list, so the JSON never shows one that was not read to
+        // its end.
+        if let Value::Object(object) = &mut record {
+            if complete {
+                object.insert((*key).to_owned(), Value::Array(listing.items));
+            } else {
+                object.remove(*key);
+                object.remove(&format!("{key}@odata.context"));
             }
         }
     }

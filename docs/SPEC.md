@@ -330,9 +330,10 @@ in JSON).
 
 `search get` also reads the search's `custodianSources`, `noncustodialSources` and
 `additionalSources`, at once, because an action on the search would also collect from them
-(section 6.4). JSON adds each list to Graph's record under that name when the record lacks
-it or has `null` there. A source list that cannot be read, or that stops before its last
-page, is a warning, shown as `unknown` or "N or more", and is left out of the JSON; a token
+(section 6.4). JSON puts each list read in full on Graph's record under that name, replacing
+any list Graph sent inline (it sends `additionalSources` inline, Observed). A source list
+that cannot be read, or that stops before its last page, is a warning, shown as `unknown`
+or "N or more", and is removed from the JSON, inline value included; a token
 that cannot be had fails the command before any warning. `search get <case> <name>` reads
 the matched search again by its id.
 

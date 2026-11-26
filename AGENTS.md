@@ -250,8 +250,8 @@ check whether the other repository needs the same fix.
   changes. Keys the tool adds are ones Graph does not use on that record:
   `actionSource` on `operation list` entries, `collection` on `operation
   get`, and the three source lists that `search get` adds under Graph's
-  navigation property names when the record lacks them or has `null`
-  there, and only when the list reached its last page.
+  navigation property names, replacing any list Graph sent inline, when
+  the list reached its last page; otherwise the key is removed.
 - Diagnostics never repeat an argument value (`--select`, `<op>`, a case or
   search name) or tenant text: a pasted value could be a secret.
 - Every sink writes through the Redactor: stdout and stderr through `Env`,

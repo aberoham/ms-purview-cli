@@ -932,14 +932,32 @@ async fn read_request_head(stream: &mut TcpStream) -> std::io::Result<String> {
             break;
         }
         head.extend_from_slice(&buffer[..read]);
-        if head.windows(4).any(|window| window == b"\r\n\r\n")
-            || head.windows(2).any(|window| window == b"\n\n")
-        {
+        // Bytes after the blank line (a body, or a second request) are not
+        // part of the head and are dropped.
+        if let Some(end) = head_end(&head) {
+            head.truncate(end);
             break;
         }
     }
     head.truncate(MAX_CALLBACK_REQUEST);
     Ok(String::from_utf8_lossy(&head).into_owned())
+}
+
+/// Where a request head ends: just after its first blank line, `\r\n\r\n`
+/// or a bare `\n\n`, whichever comes first.
+fn head_end(bytes: &[u8]) -> Option<usize> {
+    let crlf = bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|start| start + 4);
+    let lf = bytes
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|start| start + 2);
+    match (crlf, lf) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (found, None) | (None, found) => found,
+    }
 }
 
 async fn respond(stream: &mut TcpStream, status: &str, body: &str) {
@@ -1442,6 +1460,16 @@ mod tests {
             "{}",
             message.len()
         );
+    }
+
+    #[test]
+    fn a_head_ends_at_its_first_blank_line() {
+        let request = b"GET /callback?state=x HTTP/1.1\r\nHost: localhost\r\n\r\nGET /other";
+        let end = head_end(request).unwrap();
+        assert!(request[..end].ends_with(b"\r\n\r\n"));
+        assert_eq!(&request[end..], b"GET /other");
+        assert_eq!(head_end(b"GET / HTTP/1.1\n\nrest"), Some(16));
+        assert_eq!(head_end(b"GET / HTTP/1.1\r\nHost: x\r\n"), None);
     }
 
     #[test]

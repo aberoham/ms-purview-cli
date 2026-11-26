@@ -1368,6 +1368,37 @@ mod tests {
         assert_eq!(stored["graph"]["scope"], "eDiscovery.ReadWrite.All openid");
         // No rotation came back, so the stored refresh token stays.
         assert_eq!(stored["refresh_token"], "canary-refresh-0001");
+        assert_eq!(
+            setup.provider.take_notes(),
+            ["refreshed the Graph token: returned scope none; refresh token rotated: no"]
+        );
+        assert!(setup.provider.take_notes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_notes_say_whether_a_redemption_rotated_the_refresh_token() {
+        let setup = setup(credential(0, None)).await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "canary-download-0002",
+                "refresh_token": "canary-refresh-0001",
+                "scope": "b26e684c-5068-4120-a679-64a5d2c909d9/eDiscovery.Download.Read",
+                "expires_in": 3600,
+            })))
+            .mount(&setup.server)
+            .await;
+        setup
+            .provider
+            .download(Duration::from_secs(300))
+            .await
+            .unwrap();
+        // The same refresh token handed back is not a rotation.
+        assert_eq!(
+            setup.provider.take_notes(),
+            ["redeemed the download token: returned scope \
+              b26e684c-5068-4120-a679-64a5d2c909d9/eDiscovery.Download.Read; refresh token \
+              rotated: no"]
+        );
     }
 
     #[test]

@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+"""A fake `az` for tests/scripts/create-purview-app-test.sh.
+
+It answers exactly the commands and JMESPath queries that
+contrib/create-purview-app.sh sends, from a JSON state file, and writes every
+change back so that a later read sees it. Anything else exits 99, so a change
+to the script that the fake does not know about fails the tests loudly.
+
+Environment:
+  FAKE_AZ_STATE  path of the state file (read and rewritten on every call)
+  FAKE_AZ_LOG    path of the call log; each call appends its arguments,
+                 joined by spaces, as one line
+
+State keys: tenant, signed_in, users, groups, sps, apps, assignments,
+grants, next_id, faults. A fault is
+  {"match": <regex over the logged line>, "nth": <1-based>,
+   "kind": "timeout" | "throttle" | "server" | "definite",
+   "applied": <whether the change takes effect before the failure>}
+and fires on the nth call whose logged line matches. A service principal
+with "hidden_polls": N is invisible to the next N `ad sp show` calls.
+"""
+
+import json
+import os
+import re
+import sys
+import urllib.parse
+
+EDISCOVERY_APP_ID = "b26e684c-5068-4120-a679-64a5d2c909d9"
+EDISCOVERY_SCOPES = [["eDiscovery.Download.Read", "c78f9c7e-bb5c-4125-b69a-5594d2f4ffc2"]]
+GRAPH = "https://graph.microsoft.com/v1.0"
+RRA_QUERY = (
+    "requiredResourceAccess[].[resourceAppId, join(',', resourceAccess[].join(':', [id, type]))]"
+)
+
+FAULT_MESSAGES = {
+    "timeout": "ERROR: HTTPSConnectionPool(host='graph.microsoft.com', port=443): "
+    "Read timed out. (read timeout=60)",
+    "throttle": 'ERROR: Too Many Requests({"error":{"code":"TooManyRequests",'
+    '"message":"Too many requests."}})',
+    "server": 'ERROR: Service Unavailable({"error":{"code":"serviceNotAvailable",'
+    '"message":"Service unavailable."}})',
+    "definite": 'ERROR: Forbidden({"error":{"code":"Authorization_RequestDenied",'
+    '"message":"Insufficient privileges to complete the operation."}})',
+}
+
+
+class AzError(Exception):
+    def __init__(self, message, code=1):
+        super().__init__(message)
+        self.message = message
+        self.code = code
+
+
+def not_found(what):
+    return AzError(
+        'ERROR: Not Found({"error":{"code":"Request_ResourceNotFound",'
+        f'"message":"{what} does not exist."}}}})',
+        3,
+    )
+
+
+def unsupported(detail):
+    return AzError(f"fake az: unsupported {detail}", 99)
+
+
+def parse(argv):
+    words, options, i = [], {}, 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg.startswith("-"):
+            if i + 1 >= len(argv):
+                raise unsupported(f"option without a value: {arg}")
+            options[arg] = argv[i + 1]
+            i += 2
+        else:
+            words.append(arg)
+            i += 1
+    return words, options
+
+
+def cell(value):
+    if isinstance(value, list):
+        return str(len(value))
+    if isinstance(value, dict):
+        return ""
+    return value if isinstance(value, str) else str(value)
+
+
+def tsv(result):
+    """Formats a result as knack's TSV output does."""
+    rows = result if isinstance(result, list) else [result]
+    lines = []
+    for row in rows:
+        if isinstance(row, list):
+            lines.append("\t".join(cell(value) for value in row))
+        elif isinstance(row, bool):
+            lines.append(str(row).lower())
+        else:
+            lines.append(cell(row))
+    return "".join(line + "\n" for line in lines)
+
+
+def rra_rows(app):
+    return [
+        [
+            entry["resourceAppId"],
+            ",".join(f"{access['id']}:{access['type']}" for access in entry["resourceAccess"]),
+        ]
+        for entry in app.get("requiredResourceAccess", [])
+    ]
+
+
+QUERIES = {
+    "id": lambda o: o["id"],
+    "tenantId": lambda o: o["tenantId"],
+    "[].id": lambda o: [x["id"] for x in o],
+    "[].appId": lambda o: [x["appId"] for x in o],
+    "[].[id, appRoleAssignmentRequired]": lambda o: [
+        [x["id"], x.get("appRoleAssignmentRequired", False)] for x in o
+    ],
+    "oauth2PermissionScopes[].[value, id]": lambda o: [list(s) for s in o.get("scopes", [])],
+    "[].[id, signInAudience, isFallbackPublicClient, displayName]": lambda o: [
+        [x["id"], x["signInAudience"], x.get("isFallbackPublicClient"), x["displayName"]] for x in o
+    ],
+    "publicClient.redirectUris": lambda o: o.get("publicClient", {}).get("redirectUris", []),
+    RRA_QUERY: rra_rows,
+    "[id, userPrincipalName]": lambda o: [o["id"], o["userPrincipalName"]],
+    "[id, displayName]": lambda o: [o["id"], o["displayName"]],
+    "[id, appId]": lambda o: [o["id"], o["appId"]],
+    "value[].id": lambda o: [x["id"] for x in o["value"]],
+    "value[].[principalId, appRoleId]": lambda o: [
+        [x["principalId"], x["appRoleId"]] for x in o["value"]
+    ],
+    "value[].[id, resourceId, consentType, principalId, scope]": lambda o: [
+        [x["id"], x["resourceId"], x["consentType"], x.get("principalId"), x["scope"]]
+        for x in o["value"]
+    ],
+}
+
+
+def emit(result, options):
+    output = options.get("-o", options.get("--output", "json"))
+    query = options.get("--query")
+    if query is not None:
+        if query not in QUERIES:
+            raise unsupported(f"query: {query}")
+        result = QUERIES[query](result)
+    if output == "none":
+        return
+    if output != "tsv":
+        raise unsupported(f"output format: {output}")
+    sys.stdout.write(tsv(result))
+
+
+def new_id(state):
+    state["next_id"] = state.get("next_id", 0x60) + 1
+    return f"00000000-0000-4000-8000-{state['next_id']:012x}"
+
+
+def filter_value(options, key):
+    match = re.fullmatch(key + r" eq '([^']*)'", options.get("--filter", ""))
+    if not match:
+        raise unsupported(f"filter: {options.get('--filter')}")
+    return match.group(1)
+
+
+def find_sp(state, app_or_id):
+    for sp in state["sps"]:
+        if app_or_id.lower() in (sp["appId"].lower(), sp["id"].lower()):
+            return sp
+    return None
+
+
+def command_ad(state, words, options):
+    noun, verb = words[1], words[2]
+    if noun == "signed-in-user" and verb == "show":
+        return user_by(state, state["signed_in"])
+    if noun == "user" and verb == "show":
+        return user_by(state, options["--id"])
+    if noun == "sp" and verb == "show":
+        sp = find_sp(state, options["--id"])
+        if sp is None:
+            raise AzError(f"ERROR: Service principal '{options['--id']}' doesn't exist", 3)
+        if sp.get("hidden_polls", 0) > 0:
+            sp["hidden_polls"] -= 1
+            raise AzError(f"ERROR: Service principal '{options['--id']}' doesn't exist", 3)
+        return sp
+    if noun == "sp" and verb == "list":
+        app_id = filter_value(options, "appId").lower()
+        return [sp for sp in state["sps"] if sp["appId"].lower() == app_id]
+    if noun == "app" and verb == "show":
+        app_id = options["--id"].lower()
+        for app in state["apps"]:
+            if app["appId"].lower() == app_id:
+                return app
+        raise AzError(f"ERROR: Resource '{options['--id']}' does not exist.", 3)
+    if noun == "app" and verb == "list":
+        if options.get("--filter", "").startswith("appId"):
+            app_id = filter_value(options, "appId").lower()
+            return [app for app in state["apps"] if app["appId"].lower() == app_id]
+        name = filter_value(options, "displayName")
+        return [app for app in state["apps"] if app["displayName"] == name]
+    raise unsupported(f"command: {' '.join(words)}")
+
+
+def user_by(state, key):
+    for user in state["users"]:
+        if key.lower() in (user["id"].lower(), user["userPrincipalName"].lower()):
+            return user
+    raise AzError(
+        f"ERROR: Resource '{key}' does not exist or one of its queried "
+        "reference-property objects are not present.",
+        3,
+    )
+
+
+def rest_get(state, path, query):
+    if m := re.fullmatch(r"/applications/([^/]+)/owners", path):
+        app = app_by_object(state, m.group(1))
+        return {"value": [{"id": owner} for owner in app.get("owners", [])]}
+    if m := re.fullmatch(r"/servicePrincipals/([^/]+)/appRoleAssignedTo", path):
+        sp_id = m.group(1).lower()
+        return {"value": [a for a in state["assignments"] if a["resourceId"].lower() == sp_id]}
+    if path == "/oauth2PermissionGrants":
+        m = re.fullmatch(r"clientId eq '([^']*)'", query.get("$filter", [""])[0])
+        if not m:
+            raise unsupported(f"grant filter: {query}")
+        client = m.group(1).lower()
+        return {"value": [g for g in state["grants"] if g["clientId"].lower() == client]}
+    if m := re.fullmatch(r"/groups/([^/]+)", path):
+        for group in state.get("groups", []):
+            if group["id"].lower() == m.group(1).lower():
+                return group
+        raise not_found("Group")
+    raise unsupported(f"GET {path}")
+
+
+def app_by_object(state, object_id):
+    for app in state["apps"]:
+        if app["id"].lower() == object_id.lower():
+            return app
+    raise not_found("Application")
+
+
+def rest_write(state, method, path, body):
+    if method == "POST" and path == "/servicePrincipals":
+        if find_sp(state, body["appId"]) is not None:
+            raise AzError('ERROR: Bad Request({"error":{"message":"already exists"}})')
+        sp = {
+            "id": new_id(state),
+            "appId": body["appId"],
+            "appRoleAssignmentRequired": body.get("appRoleAssignmentRequired", False),
+            "scopes": EDISCOVERY_SCOPES if body["appId"] == EDISCOVERY_APP_ID else [],
+            "hidden_polls": state.get("new_sp_hidden_polls", 0),
+        }
+        state["sps"].append(sp)
+        return sp
+    if method == "POST" and path == "/applications":
+        app = dict(body)
+        app.update({"id": new_id(state), "appId": new_id(state), "owners": []})
+        state["apps"].append(app)
+        return app
+    if method == "PATCH" and (m := re.fullmatch(r"/applications/([^/]+)", path)):
+        app_by_object(state, m.group(1)).update(body)
+        return {}
+    if method == "POST" and (m := re.fullmatch(r"/applications/([^/]+)/owners/\$ref", path)):
+        owner = body["@odata.id"].rsplit("/", 1)[1]
+        app_by_object(state, m.group(1))["owners"].append(owner)
+        return {}
+    if method == "PATCH" and (m := re.fullmatch(r"/servicePrincipals/([^/]+)", path)):
+        sp = find_sp(state, m.group(1))
+        if sp is None:
+            raise not_found("Service principal")
+        sp.update(body)
+        return {}
+    if method == "POST" and (
+        m := re.fullmatch(r"/servicePrincipals/([^/]+)/appRoleAssignedTo", path)
+    ):
+        assignment = dict(body)
+        assignment["id"] = new_id(state)
+        state["assignments"].append(assignment)
+        return assignment
+    if method == "POST" and path == "/oauth2PermissionGrants":
+        grant = {"principalId": None}
+        grant.update(body)
+        grant["id"] = f"grant{new_id(state)[-4:]}"
+        state["grants"].append(grant)
+        return grant
+    if method == "PATCH" and (m := re.fullmatch(r"/oauth2PermissionGrants/([^/]+)", path)):
+        for grant in state["grants"]:
+            if grant["id"] == m.group(1):
+                grant.update(body)
+                return {}
+        raise not_found("Grant")
+    raise unsupported(f"{method} {path}")
+
+
+def command_rest(state, options):
+    method = options["--method"]
+    url = urllib.parse.urlsplit(options["--url"])
+    if f"{url.scheme}://{url.netloc}" + "/v1.0" != GRAPH or not url.path.startswith("/v1.0/"):
+        raise unsupported(f"URL: {options['--url']}")
+    path = urllib.parse.unquote(url.path[len("/v1.0") :])
+    query = urllib.parse.parse_qs(url.query)
+    if method == "GET":
+        return rest_get(state, path, query)
+    return rest_write(state, method, path, json.loads(options["--body"]))
+
+
+def run(state, words, options):
+    if words[:2] == ["account", "show"]:
+        if not state.get("tenant"):
+            raise AzError("ERROR: Please run 'az login' to setup account.")
+        return {"tenantId": state["tenant"]}
+    if words[:1] == ["ad"] and len(words) == 3:
+        return command_ad(state, words, options)
+    if words == ["rest"]:
+        return command_rest(state, options)
+    raise unsupported(f"command: {' '.join(words)}")
+
+
+def fault_for(state, line):
+    counts = state.setdefault("fault_counts", {})
+    for index, fault in enumerate(state.get("faults", [])):
+        if re.search(fault["match"], line):
+            key = str(index)
+            counts[key] = counts.get(key, 0) + 1
+            if counts[key] == fault.get("nth", 1):
+                return fault
+    return None
+
+
+def main():
+    argv = sys.argv[1:]
+    line = " ".join(argv)
+    with open(os.environ["FAKE_AZ_LOG"], "a", encoding="utf-8") as log:
+        log.write(line + "\n")
+    state_path = os.environ["FAKE_AZ_STATE"]
+    with open(state_path, encoding="utf-8") as handle:
+        state = json.load(handle)
+    status = 0
+    try:
+        words, options = parse(argv)
+        fault = fault_for(state, line)
+        if fault is not None and not fault.get("applied", False):
+            raise AzError(FAULT_MESSAGES[fault["kind"]])
+        result = run(state, words, options)
+        if fault is not None:
+            raise AzError(FAULT_MESSAGES[fault["kind"]])
+        emit(result, options)
+    except AzError as error:
+        sys.stderr.write(error.message + "\n")
+        status = error.code
+    except (KeyError, IndexError, ValueError) as error:
+        sys.stderr.write(f"fake az: malformed call: {error!r}\n")
+        status = 99
+    with open(state_path, "w", encoding="utf-8") as handle:
+        json.dump(state, handle, indent=1)
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main())

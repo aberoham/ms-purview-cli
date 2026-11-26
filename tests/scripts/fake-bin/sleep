@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Polling in contrib/create-purview-app.sh must not wait in tests. Each call
+# is logged so that a test can count the polls.
+echo "sleep $*" >>"${FAKE_AZ_LOG:?}"

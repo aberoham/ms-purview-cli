@@ -394,25 +394,50 @@ pub const REDACTED_QUERY_VALUE: &str = "REDACTED";
 /// A URL as it may be shown or recorded: user information removed, the
 /// fragment removed unless the path ends in `/$metadata` (OData's
 /// `@odata.context` form, `…/$metadata#security/cases/…`, which names a
-/// type and holds no data), and every query value whose key is not in `KEPT_QUERY_KEYS`
-/// replaced with `REDACTED`. That covers storage signatures (`sig`, `se`,
-/// `sp`, `sv`) and any `code` or `token`. A key that is not a short plain
-/// name is replaced as well, since a bare `?<value>` is all key. The result
-/// still goes through the Redactor at its sink.
-pub fn url(value: &::url::Url) -> String {
+/// type and holds no data), and every query value whose key is not in
+/// `KEPT_QUERY_KEYS` replaced with `REDACTED`. That covers storage
+/// signatures (`sig`, `se`, `sp`, `sv`) and any `code` or `token`. A key
+/// that is not a short plain name is replaced as well, since a bare
+/// `?<value>` is all key.
+///
+/// The parts that are kept are checked against `redactor` decoded, before
+/// they are encoded again: a registered secret holding `+` or `/` would
+/// otherwise pass as `%2B` or `%2F`. A path segment, kept query value or
+/// fragment that holds a secret becomes `REDACTED`. The result still goes
+/// through the Redactor at its sink.
+pub fn url(value: &::url::Url, redactor: &Redactor) -> String {
     let mut clean = value.clone();
     // Both fail only for URLs that cannot hold credentials, which then
     // have none to remove.
     let _ = clean.set_username("");
     let _ = clean.set_password(None);
-    if !value.path().ends_with("/$metadata") {
+    let keep_fragment = value.path().ends_with("/$metadata")
+        && value
+            .fragment()
+            .is_some_and(|fragment| !redactor.recognises(&percent_decode(fragment)));
+    if !keep_fragment {
         clean.set_fragment(None);
+    }
+    if let Some(segments) = value.path_segments() {
+        let segments: Vec<String> = segments
+            .map(|segment| {
+                let decoded = percent_decode(segment);
+                if redactor.recognises(&decoded) || redactor.recognises(segment) {
+                    REDACTED_QUERY_VALUE.to_owned()
+                } else {
+                    decoded
+                }
+            })
+            .collect();
+        if let Ok(mut path) = clean.path_segments_mut() {
+            path.clear().extend(&segments);
+        }
     }
     if value.query().is_some() {
         let pairs: Vec<(String, String)> = value
             .query_pairs()
             .map(|(key, item)| {
-                if KEPT_QUERY_KEYS.contains(&key.as_ref()) {
+                if KEPT_QUERY_KEYS.contains(&key.as_ref()) && !redactor.recognises(&item) {
                     (key.into_owned(), item.into_owned())
                 } else if is_plain_key(&key) {
                     (key.into_owned(), REDACTED_QUERY_VALUE.to_owned())
@@ -432,6 +457,64 @@ pub fn url(value: &::url::Url) -> String {
     clean.to_string()
 }
 
+/// `text` with every `http://` or `https://` URL in it passed through
+/// `url`, for free text such as a Graph error message. A URL runs to the
+/// next space, quote, angle bracket or backslash, less any trailing
+/// punctuation. One that does not parse keeps nothing after its first `?`
+/// or `#`.
+pub fn urls_in_text(text: &str, redactor: &Redactor) -> String {
+    let lower = text.to_ascii_lowercase();
+    let mut output = String::with_capacity(text.len());
+    let mut position = 0;
+    while let Some(found) = ["https://", "http://"]
+        .iter()
+        .filter_map(|scheme| lower[position..].find(scheme))
+        .min()
+    {
+        let start = position + found;
+        let rest = &text[start..];
+        let mut length = rest
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '\\' | '`'))
+            .unwrap_or(rest.len());
+        while length > 0 && rest[..length].ends_with(['.', ',', ';', ':', ')', ']', '}', '!']) {
+            length -= 1;
+        }
+        let candidate = &rest[..length];
+        output.push_str(&text[position..start]);
+        match ::url::Url::parse(candidate) {
+            Ok(parsed) => output.push_str(&url(&parsed, redactor)),
+            Err(_) => output.push_str(candidate.split(['?', '#']).next().unwrap_or_default()),
+        }
+        position = start + length.max(1);
+        if length == 0 {
+            output.push_str(&text[start..position]);
+        }
+    }
+    output.push_str(&text[position..]);
+    output
+}
+
+/// Percent-decodes `text`, keeping any byte sequence that is not valid
+/// UTF-8 as replacement characters.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let hex = |byte: u8| (byte as char).to_digit(16);
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) = (hex(bytes[index + 1]), hex(bytes[index + 2])) {
+                decoded.push((high * 16 + low) as u8);
+                index += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
 /// A query key that names a parameter rather than carrying data: at most
 /// 16 characters, made only of letters and `$_-`. Parameter names such as
 /// `sig`, `skoid` or `code` pass; a value used as a bare key almost always
@@ -448,6 +531,11 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+
+    /// `url` with a Redactor that holds no secret.
+    fn url(value: &::url::Url) -> String {
+        super::url(value, &Redactor::new())
+    }
 
     // Built at run time so that no JWT-shaped literal sits in the source.
     fn jwt() -> String {
@@ -789,6 +877,60 @@ mod tests {
         assert_eq!(
             url(&parse("https://graph.microsoft.com/v1.0/x#canary-0001")),
             "https://graph.microsoft.com/v1.0/x"
+        );
+    }
+
+    #[test]
+    fn url_checks_kept_parts_against_registered_secrets_after_decoding() {
+        let redactor = Redactor::new();
+        redactor.register("canary+slash/0001");
+        let parse = |text: &str| ::url::Url::parse(text).unwrap();
+        let shown = super::url(
+            &parse(
+                "https://graph.microsoft.com/v1.0/x/canary%2Bslash%2F0001/y\
+                 ?$skiptoken=canary%2Bslash%2F0001&$top=1",
+            ),
+            &redactor,
+        );
+        assert_eq!(
+            shown,
+            "https://graph.microsoft.com/v1.0/x/REDACTED/y?%24skiptoken=REDACTED&%24top=1"
+        );
+        let fragment = super::url(
+            &parse("https://graph.microsoft.com/v1.0/$metadata#canary+slash/0001"),
+            &redactor,
+        );
+        assert_eq!(fragment, "https://graph.microsoft.com/v1.0/$metadata");
+    }
+
+    #[test]
+    fn urls_in_free_text_lose_their_secret_query_values() {
+        let redactor = Redactor::new();
+        let proxy = concat!(
+            "https://alpha.proxyservice.ediscovery.svc.cloud.microsoft/ediscovery/api/proxy/x",
+            "?sig=canary-sig-0001&downloadType=Report"
+        );
+        // An address the parser refuses, joined at run time so that the
+        // public-data lint does not read it.
+        let broken = ["https://", "[bad?token=canary-token-0001"].concat();
+        let text = format!(
+            "Download from {proxy}. Or \"HTTP://graph.microsoft.com/v1.0/y?code=canary-code-0001\", \
+             or {broken} now"
+        );
+        let shown = urls_in_text(&text, &redactor);
+        assert!(!shown.contains("canary"), "{shown}");
+        let kept = proxy.replace("canary-sig-0001", "REDACTED");
+        assert!(
+            shown.starts_with(&format!("Download from {kept}. Or \"")),
+            "{shown}"
+        );
+        assert!(
+            shown.ends_with(&format!(", or {} now", ["https://", "[bad"].concat())),
+            "{shown}"
+        );
+        assert_eq!(
+            urls_in_text("no address here", &redactor),
+            "no address here"
         );
     }
 }

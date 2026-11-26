@@ -3,8 +3,9 @@
 //!
 //! - Request headers are never written, so no token reaches a trace.
 //! - Of the response headers, only `KEPT_HEADERS` are written.
-//! - Every URL, in the request, in a `location` header and in any string of
-//!   a body, passes through `redact::url`.
+//! - Every URL, in the request, in a `location` header (resolved against
+//!   the request first) and anywhere in any string of a body, passes
+//!   through `redact::url`.
 //! - The whole record is redacted as a value, then checked again as bytes.
 //! - Token endpoint exchanges are never traced: only `GraphClient` (and,
 //!   later, the download client) records.
@@ -121,6 +122,7 @@ impl TraceSink {
                  .gitignore or choose a directory outside the repository"
             )?;
         }
+        probe_write(dir).map_err(|error| context(error.into()))?;
         Ok(Self {
             dir: dir.to_path_buf(),
             redactor,
@@ -153,16 +155,24 @@ impl TraceSink {
             "request".into(),
             json!({
                 "method": exchange.method,
-                "url": redact::url(exchange.url),
-                "body": exchange.request_body.map(redact_urls).unwrap_or(Value::Null),
+                "url": redact::url(exchange.url, &self.redactor),
+                "body": exchange
+                    .request_body
+                    .map(|body| redact_urls(body, &self.redactor))
+                    .unwrap_or(Value::Null),
             }),
         );
         record.insert(
             "response".into(),
-            exchange.response.map_or(Value::Null, response_value),
+            exchange.response.map_or(Value::Null, |response| {
+                response_value(response, exchange.url, &self.redactor)
+            }),
         );
         if let Some(error) = exchange.error {
-            record.insert("error".into(), Value::from(error));
+            record.insert(
+                "error".into(),
+                Value::from(redact::urls_in_text(error, &self.redactor)),
+            );
         }
         let safe = self.redactor.redact_value(&Value::Object(record));
         let mut bytes = serde_json::to_vec_pretty(&safe)?;
@@ -173,9 +183,12 @@ impl TraceSink {
         if self.redactor.recognises_bytes(&bytes) {
             bytes = self.redactor.redact_bytes(&bytes);
         }
-        let path = self
-            .dir
-            .join(file_name(nanos, exchange.method, exchange.url));
+        let path = self.dir.join(file_name(
+            nanos,
+            exchange.method,
+            exchange.url,
+            &self.redactor,
+        ));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -191,12 +204,16 @@ impl TraceSink {
 }
 
 /// `<unix-nanos>-<METHOD>-<last path segment, 40 chars>.json`, with every
-/// character outside `[A-Za-z0-9._-]` replaced by `_`.
-fn file_name(nanos: i64, method: &str, url: &Url) -> String {
-    let segment = url
+/// character outside `[A-Za-z0-9._-]` replaced by `_`. The segment is
+/// taken from the URL as `redact::url` shows it, so one that holds a
+/// registered secret, whole or encoded, is `REDACTED` before it is cut.
+fn file_name(nanos: i64, method: &str, url: &Url, redactor: &Redactor) -> String {
+    let shown = Url::parse(&redact::url(url, redactor)).unwrap_or_else(|_| url.clone());
+    let segment = shown
         .path_segments()
         .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
         .unwrap_or("root");
+    let segment = redactor.redact(segment);
     let segment: String = segment.chars().take(NAME_SEGMENT_CHARS).collect();
     let clean = |text: &str| -> String {
         text.chars()
@@ -212,7 +229,7 @@ fn file_name(nanos: i64, method: &str, url: &Url) -> String {
     format!("{nanos}-{}-{}.json", clean(method), clean(&segment))
 }
 
-fn response_value(response: TracedResponse<'_>) -> Value {
+fn response_value(response: TracedResponse<'_>, request: &Url, redactor: &Redactor) -> Value {
     let mut headers = Map::new();
     for name in KEPT_HEADERS {
         let values: Vec<String> = response
@@ -222,9 +239,9 @@ fn response_value(response: TracedResponse<'_>) -> Value {
             .filter_map(|value| value.to_str().ok())
             .map(|value| {
                 if *name == "location" {
-                    redact_url_text(value)
+                    location_text(request, value, redactor)
                 } else {
-                    value.to_owned()
+                    redact::urls_in_text(value, redactor)
                 }
             })
             .collect();
@@ -239,7 +256,7 @@ fn response_value(response: TracedResponse<'_>) -> Value {
         }
     }
     let body = serde_json::from_slice::<Value>(response.body)
-        .map(|value| redact_urls(&value))
+        .map(|value| redact_urls(&value, redactor))
         .unwrap_or(Value::Null);
     json!({
         "status": response.status,
@@ -249,35 +266,52 @@ fn response_value(response: TracedResponse<'_>) -> Value {
     })
 }
 
-/// A copy of `value` with every string that is an absolute `http` or
-/// `https` URL passed through `redact::url`, such as `downloadUrl` and
-/// `@odata.nextLink`.
-pub fn redact_urls(value: &Value) -> Value {
+/// A copy of `value` with every URL inside any string passed through
+/// `redact::url`: whole-string links such as `downloadUrl` and
+/// `@odata.nextLink`, and links quoted in free text such as an error
+/// message.
+pub fn redact_urls(value: &Value, redactor: &Redactor) -> Value {
     match value {
-        Value::String(text) => Value::String(redact_url_text(text)),
-        Value::Array(items) => Value::Array(items.iter().map(redact_urls).collect()),
+        Value::String(text) => Value::String(redact::urls_in_text(text, redactor)),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| redact_urls(item, redactor))
+                .collect(),
+        ),
         Value::Object(map) => Value::Object(
             map.iter()
-                .map(|(key, item)| (key.clone(), redact_urls(item)))
+                .map(|(key, item)| (key.clone(), redact_urls(item, redactor)))
                 .collect(),
         ),
         other => other.clone(),
     }
 }
 
-/// `text` through `redact::url` when it is an absolute `http` or `https`
-/// URL; any other text unchanged.
-fn redact_url_text(text: &str) -> String {
-    let lower = text.get(..8).unwrap_or(text).to_ascii_lowercase();
-    if !(lower.starts_with("https://") || lower.starts_with("http://")) {
-        return text.to_owned();
+/// A `location` header as a trace shows it: resolved against the request
+/// URL, so a relative, scheme-relative or query-only reference is
+/// redacted like an absolute one. A value that does not resolve is left
+/// out.
+fn location_text(request: &Url, value: &str, redactor: &Redactor) -> String {
+    match request.join(value.trim()) {
+        Ok(resolved) => redact::url(&resolved, redactor),
+        Err(_) => "[location that could not be read]".to_owned(),
     }
-    match Url::parse(text) {
-        Ok(url) => redact::url(&url),
-        // Not a URL the parser accepts, but it looked like one: keep none
-        // of its query.
-        Err(_) => text.split(['?', '#']).next().unwrap_or_default().to_owned(),
+}
+
+/// Creates and removes a file in `dir`, so a directory the tool cannot
+/// write to is refused before any request is sent.
+fn probe_write(dir: &Path) -> std::io::Result<()> {
+    let probe = dir.join(format!(".purview-trace-probe-{}", std::process::id()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+    drop(options.open(&probe)?);
+    std::fs::remove_file(&probe)
 }
 
 /// Whether `dir`, or any directory above it, holds a `.git` entry.
@@ -437,7 +471,7 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(
-            file_name(1, "GET", &long),
+            file_name(1, "GET", &long, &Redactor::new()),
             format!("1-GET-{}.json", "x".repeat(40))
         );
     }
@@ -482,5 +516,42 @@ mod tests {
         let warnings = String::from_utf8(warnings).unwrap();
         assert_eq!(warnings.lines().count(), 2, "{warnings}");
         assert!(warnings.contains("inside a git work tree"), "{warnings}");
+    }
+
+    #[test]
+    fn a_file_name_never_carries_a_registered_secret() {
+        let redactor = Redactor::new();
+        redactor.register("canary+name/0001");
+        let url = Url::parse(
+            "https://graph.microsoft.com/v1.0/security/canary%2Bname%2F0001-and-a-long-tail-0123456789",
+        )
+        .unwrap();
+        let name = file_name(1, "GET", &url, &redactor);
+        assert_eq!(name, "1-GET-REDACTED.json");
+        let url = Url::parse("https://graph.microsoft.com/v1.0/security/canary+name/0001").unwrap();
+        assert!(!file_name(1, "GET", &url, &redactor).contains("canary"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_that_cannot_be_written_is_refused_at_open() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("read-only");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = TraceSink::open(
+            &dir,
+            Arc::new(Redactor::new()),
+            Arc::new(ManualClock::new(test_epoch())),
+            &mut Vec::new(),
+        );
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("opening the trace directory"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
     }
 }

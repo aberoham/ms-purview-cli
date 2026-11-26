@@ -436,6 +436,18 @@ mod tests {
                 ReadRoute::SearchSources(case, search, SearchSources::Noncustodial),
                 format!("/{CASE}/searches/{SEARCH}/noncustodialSources"),
             ),
+            (
+                ReadRoute::SearchSources(case, search, SearchSources::Custodian),
+                format!("/{CASE}/searches/{SEARCH}/custodianSources"),
+            ),
+            (
+                ReadRoute::SearchSources(case, search, SearchSources::Additional),
+                format!("/{CASE}/searches/{SEARCH}/additionalSources"),
+            ),
+            (
+                ReadRoute::LegalHoldSources(case, HoldId::parse("h").unwrap(), HoldSources::User),
+                format!("/{CASE}/legalHolds/h/userSources"),
+            ),
             (ReadRoute::Operations(case), format!("/{CASE}/operations")),
             (
                 ReadRoute::Operation(case, operation.clone()),

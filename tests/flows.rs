@@ -2786,7 +2786,10 @@ async fn status_reports_denied_for_a_403_and_unknown_for_other_failures() {
         "{text}"
     );
     assert!(
-        text.contains("Download token expires: 2026-01-05T10:00:09Z"),
+        text.contains(
+            "Download scope: b26e684c-5068-4120-a679-64a5d2c909d9/eDiscovery.Download.Read\n\
+             Download token expires: 2026-01-05T10:00:09Z"
+        ),
         "{text}"
     );
 
@@ -2840,6 +2843,29 @@ async fn status_marks_an_expired_download_token_without_renewing_it() {
         "{}",
         run.stdout()
     );
+    assert_eq!(identity_requests(&harness).await, 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_trace_directory_that_cannot_be_written_stops_before_any_request() {
+    use std::os::unix::fs::PermissionsExt;
+    let harness = Harness::new().await;
+    sign_in_alex(&harness).await;
+    // Past the Graph token's expiry, so a request would start with a refresh.
+    harness.clock.advance(Duration::from_secs(5000));
+    let trace = harness.root.path().join("read-only");
+    std::fs::create_dir(&trace).unwrap();
+    std::fs::set_permissions(&trace, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let trace_arg = trace.display().to_string();
+    let run = harness
+        .run(&["--json", "--trace", &trace_arg, "auth", "status"])
+        .await;
+    std::fs::set_permissions(&trace, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(run.outcome.exit_code, 1);
+    let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
+    assert!(message.contains("opening the trace directory"), "{message}");
+    assert_eq!(graph_requests(&harness).await, 0);
     assert_eq!(identity_requests(&harness).await, 0);
 }
 

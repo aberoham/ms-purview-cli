@@ -34,6 +34,8 @@ struct FakeTokens {
     invalidated: AtomicUsize,
     calls: AtomicUsize,
     fail: bool,
+    /// Hand out a token that is not a valid header value.
+    malformed: bool,
     notes: Mutex<Vec<String>>,
 }
 
@@ -43,6 +45,9 @@ impl TokenProvider for FakeTokens {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if self.fail {
             return Err(PurviewError::message("the refresh was refused"));
+        }
+        if self.malformed {
+            return Ok(GraphToken::new(SecretString::new("canary-bad\ntoken-0001")));
         }
         let token = if self.invalidated.load(Ordering::SeqCst) == 0 {
             FIRST
@@ -812,4 +817,237 @@ async fn the_client_refuses_a_base_without_an_origin() {
     )
     .unwrap_err();
     assert!(error.to_string().contains("no origin"), "{error}");
+}
+
+/// Mounts `codes` in order, one response each, then 200.
+async fn mount_sequence(server: &MockServer, codes: &[u16]) {
+    for (index, code) in codes.iter().enumerate() {
+        Mock::given(method("GET"))
+            .respond_with(status(
+                *code,
+                json!({"error": {"code": format!("E{code}")}}),
+            ))
+            .up_to_n_times(1)
+            .with_priority(index as u8 + 1)
+            .mount(server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .respond_with(status(200, json!({"value": []})))
+        .with_priority(codes.len() as u8 + 1)
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn a_401_shares_the_three_attempt_budget() {
+    // 401 last: no attempt is left, so no refresh and no fourth GET.
+    let server = MockServer::start().await;
+    mount_sequence(&server, &[503, 503, 401]).await;
+    let fixture = setup(&server);
+    let error = fixture
+        .client
+        .get_page(&ReadRoute::Cases, &top1(), &mut Vec::new())
+        .await
+        .unwrap_err();
+    assert_eq!(error.graph_status(), Some(401));
+    assert_eq!(requests(&server).await, 3);
+    assert_eq!(fixture.tokens.invalidated.load(Ordering::SeqCst), 0);
+
+    // 401 first: one refresh, then the two attempts left.
+    let server = MockServer::start().await;
+    mount_sequence(&server, &[401, 503, 503]).await;
+    let fixture = setup(&server);
+    let error = fixture
+        .client
+        .get_page(&ReadRoute::Cases, &top1(), &mut Vec::new())
+        .await
+        .unwrap_err();
+    assert_eq!(error.graph_status(), Some(503));
+    assert_eq!(requests(&server).await, 3);
+    assert_eq!(fixture.tokens.invalidated.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn an_error_whose_body_cannot_be_read_keeps_its_status() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(403).set_body_string("x".repeat(8 * 1024 * 1024 + 1)))
+        .mount(&server)
+        .await;
+    let error = setup(&server)
+        .client
+        .get_page(&ReadRoute::Cases, &top1(), &mut Vec::new())
+        .await
+        .unwrap_err();
+    assert_eq!(error.graph_status(), Some(403));
+    assert_eq!(requests(&server).await, 1);
+
+    // A 503 cut off part way keeps its Retry-After, which is over the
+    // limit, so there is no retry.
+    let cut = b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 61\r\nContent-Length: 100\r\n\r\n{\"error\""
+        .to_vec();
+    let (uri, connections) = raw_server(vec![cut]).await;
+    let fixture = setup_with(
+        base_of(&uri),
+        FakeTokens::default(),
+        Duration::from_secs(10),
+        false,
+        None,
+    );
+    let error = fixture
+        .client
+        .get_page(&ReadRoute::Cases, &top1(), &mut Vec::new())
+        .await
+        .unwrap_err();
+    assert_eq!(error.graph_status(), Some(503));
+    assert!(
+        error.to_string().contains("retry after 61 seconds"),
+        "{error}"
+    );
+    assert_eq!(connections.load(Ordering::SeqCst), 1);
+    assert!(fixture.clock.sleeps().is_empty());
+}
+
+#[tokio::test]
+async fn a_request_that_cannot_be_built_is_not_retried_or_sent() {
+    let server = MockServer::start().await;
+    let fixture = setup_with(
+        base_of(&server.uri()),
+        FakeTokens {
+            malformed: true,
+            ..FakeTokens::default()
+        },
+        Duration::from_secs(10),
+        false,
+        None,
+    );
+    let error = fixture
+        .client
+        .get_page(&ReadRoute::Cases, &top1(), &mut Vec::new())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("could not be built"), "{error}");
+    assert!(!error.to_string().contains("canary"), "{error}");
+    assert_eq!(requests(&server).await, 0);
+    assert!(fixture.clock.sleeps().is_empty());
+}
+
+#[tokio::test]
+async fn a_url_quoted_in_a_graph_error_loses_its_secret_query_values() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(status(
+            403,
+            json!({"error": {
+                "code": "Forbidden",
+                "message": format!(
+                    "see {}/v1.0/x?sig=canary-sig-0005&$top=1.",
+                    server.uri()
+                ),
+            }}),
+        ))
+        .mount(&server)
+        .await;
+    let error = setup(&server)
+        .client
+        .get_page(&ReadRoute::Cases, &top1(), &mut Vec::new())
+        .await
+        .unwrap_err();
+    let text = error.to_string();
+    assert!(!text.contains("canary"), "{text}");
+    assert!(text.contains("/v1.0/x?sig=REDACTED&%24top=1."), "{text}");
+}
+
+#[tokio::test]
+async fn a_redirect_s_location_is_resolved_and_redacted_in_the_trace() {
+    for location in [
+        "/next?code=canary-code-0002",
+        "//foreign.example/x?sig=canary-sig-0003",
+        "?token=canary-token-0004",
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", location))
+            .mount(&server)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let trace = root.path().join("trace");
+        let fixture = setup_with(
+            base_of(&server.uri()),
+            FakeTokens::default(),
+            Duration::from_secs(10),
+            true,
+            Some(&trace),
+        );
+        let mut log = Vec::new();
+        let error = fixture
+            .client
+            .get_page(&ReadRoute::Cases, &top1(), &mut log)
+            .await
+            .unwrap_err();
+        assert_eq!(error.graph_status(), Some(302), "{location}");
+        let log = String::from_utf8(log).unwrap();
+        assert!(!log.contains("canary"), "{location}: {log}");
+        let file = std::fs::read_dir(&trace)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(!text.contains("canary"), "{location}: {text}");
+        let record: Value = serde_json::from_str(&text).unwrap();
+        let shown = record["response"]["headers"]["location"].as_str().unwrap();
+        assert!(shown.starts_with("http"), "{location}: {shown}");
+        assert!(shown.ends_with("=REDACTED"), "{location}: {shown}");
+    }
+}
+
+#[tokio::test]
+async fn a_timed_out_page_shows_its_link_redacted_in_the_log_and_trace() {
+    let server = MockServer::start().await;
+    let next = format!(
+        "{}{CASES}?$skiptoken=page-0002&sig=canary-sig-0006",
+        server.uri()
+    );
+    Mock::given(method("GET"))
+        .and(query_param("$skiptoken", "page-0002"))
+        .respond_with(status(200, json!({"value": []})).set_delay(Duration::from_secs(5)))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(status(200, json!({"value": [], "@odata.nextLink": next})))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    let root = tempfile::tempdir().unwrap();
+    let trace = root.path().join("trace");
+    let fixture = setup_with(
+        base_of(&server.uri()),
+        FakeTokens::default(),
+        Duration::from_millis(200),
+        true,
+        Some(&trace),
+    );
+    let mut log = Vec::new();
+    let error = fixture
+        .client
+        .list(&ReadRoute::Cases, &Query::new(), &mut log)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("timed out (3 attempts)"),
+        "{error}"
+    );
+    let log = String::from_utf8(log).unwrap();
+    assert!(!log.contains("canary"), "{log}");
+    assert!(log.contains("sig=REDACTED"), "{log}");
+    let files: Vec<_> = std::fs::read_dir(&trace).unwrap().collect();
+    assert_eq!(files.len(), 4);
+    for file in files {
+        let text = std::fs::read_to_string(file.unwrap().path()).unwrap();
+        assert!(!text.contains("canary"), "{text}");
+    }
 }

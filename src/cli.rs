@@ -86,8 +86,8 @@ case (default: the default account) [env: PURVIEW_ACCOUNT]"
         short,
         long,
         global = true,
-        help = "Log each Microsoft Graph request and token redemption on stderr, through the \
-redactor [env: PURVIEW_VERBOSE=true]"
+        help = "Log each Microsoft Graph request, and each token refresh made for it or by 'auth \
+refresh', on stderr through the redactor [env: PURVIEW_VERBOSE=true]"
     )]
     verbose: bool,
     #[arg(
@@ -1438,12 +1438,13 @@ async fn auth_status(env: &mut Env, output: &OutputOptions, globals: &Globals) -
     }
     writeln!(
         env.stdout,
-        "Account: {}\nTenant: {}\nGraph scope: {}\nGraph token expires: {}\nDownload token \
-         expires: {}\nPurview role: {role}{}",
+        "Account: {}\nTenant: {}\nGraph scope: {}\nGraph token expires: {}\nDownload scope: \
+         {}\nDownload token expires: {}\nPurview role: {role}{}",
         sanitize(&account.email),
         sanitize(&credential.tenant_id),
         sanitize(&credential.graph.scope),
         credential.graph.expires_at_text(),
+        download.map_or_else(|| "not issued".to_owned(), |token| sanitize(&token.scope)),
         download.map_or_else(
             || "not issued".to_owned(),
             |token| {

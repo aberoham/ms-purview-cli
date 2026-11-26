@@ -7,11 +7,12 @@
 //! - Requests are built from `routes::ReadRoute` only. Every read is a
 //!   `GET`. `send_write`, for the six `routes::WriteRoute` POSTs, arrives
 //!   with the first write command.
-//! - A GET makes at most `MAX_GET_ATTEMPTS` attempts. It is retried after
-//!   a connection error, a timeout, a truncated body, or HTTP 429, 500,
-//!   502, 503 or 504, waiting for `Retry-After` (seconds or an HTTP date)
-//!   or else 250 ms × 2^(attempt − 1), at most 30 s. A 401 makes the token
-//!   provider refresh once, and the GET is sent once more.
+//! - A GET makes at most `MAX_GET_ATTEMPTS` attempts, every send counted.
+//!   It is retried after a connection error, a timeout, a truncated body,
+//!   or HTTP 429, 500, 502, 503 or 504, waiting for `Retry-After` (seconds
+//!   or an HTTP date) or else 250 ms × 2^(attempt − 1), at most 30 s. The
+//!   first 401 makes the token provider refresh, and the GET is sent again
+//!   if an attempt is left.
 //! - The client holds no token: each attempt asks the `TokenProvider`.
 //! - Responses are read up to `MAX_RESPONSE_BYTES`.
 
@@ -272,7 +273,7 @@ impl GraphClient {
         if !self.admits(&url) {
             return Err(PurviewError::ForeignOrigin {
                 what,
-                url: sanitize(&self.redactor.redact(&redact::url(&url))),
+                url: sanitize(&self.redactor.redact(&redact::url(&url, &self.redactor))),
             });
         }
         Ok(url)
@@ -287,10 +288,10 @@ impl GraphClient {
         if !self.admits(url) {
             return Err(PurviewError::ForeignOrigin {
                 what: "request URL",
-                url: sanitize(&self.redactor.redact(&redact::url(url))),
+                url: sanitize(&self.redactor.redact(&redact::url(url, &self.redactor))),
             });
         }
-        let shown = sanitize(&self.redactor.redact(&redact::url(url)));
+        let shown = sanitize(&self.redactor.redact(&redact::url(url, &self.redactor)));
         let mut attempt = 1;
         let mut refreshed_after_401 = false;
         loop {
@@ -346,10 +347,14 @@ impl GraphClient {
                     )),
                 };
             }
-            if status == StatusCode::UNAUTHORIZED && !refreshed_after_401 {
+            if status == StatusCode::UNAUTHORIZED
+                && !refreshed_after_401
+                && attempt < MAX_GET_ATTEMPTS
+            {
                 refreshed_after_401 = true;
                 self.log(log, "refreshing the Graph token after HTTP 401");
                 self.tokens.invalidate_graph().await;
+                attempt += 1;
                 continue;
             }
             if is_retryable(status) && attempt < MAX_GET_ATTEMPTS {
@@ -374,7 +379,11 @@ impl GraphClient {
         }
     }
 
-    /// Sends one GET and reads its body.
+    /// Sends one GET and reads its body. For a success, a body that is cut
+    /// off or times out is transient and one over the limit is refused. For
+    /// any other status the status and headers are what matter (a 403
+    /// stays a 403, and a 503 keeps its `Retry-After`), so a body that
+    /// cannot be read in full is dropped and the response kept.
     async fn attempt(&self, url: &Url, token: &str) -> Attempt {
         let response = match self
             .http
@@ -385,15 +394,33 @@ impl GraphClient {
             .await
         {
             Ok(response) => response,
+            // A request that cannot be built (in practice, a stored token
+            // that is not a valid header value) fails the same way again.
+            Err(error) if error.is_builder() => {
+                return Attempt::Refused(PurviewError::message(
+                    "the Graph request could not be built: the stored Graph token is not a valid \
+                     header value; run 'purview auth login' again",
+                ))
+            }
             Err(error) => return Attempt::Transient(transport_failure(&error)),
         };
         let status = response.status();
         let headers = response.headers().clone();
+        let success = status.is_success();
+        let kept = |status, headers| Attempt::Response {
+            status,
+            headers,
+            body: Vec::new(),
+        };
         if response
             .content_length()
             .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
         {
-            return Attempt::Refused(too_large());
+            return if success {
+                Attempt::Refused(too_large())
+            } else {
+                kept(status, headers)
+            };
         }
         let mut response = response;
         let mut body = Vec::new();
@@ -401,11 +428,16 @@ impl GraphClient {
             match response.chunk().await {
                 Ok(Some(chunk)) => {
                     if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
-                        return Attempt::Refused(too_large());
+                        return if success {
+                            Attempt::Refused(too_large())
+                        } else {
+                            kept(status, headers)
+                        };
                     }
                     body.extend_from_slice(&chunk);
                 }
                 Ok(None) => break,
+                Err(_) if !success => return kept(status, headers),
                 Err(error) if error.is_timeout() => {
                     return Attempt::Transient("the response timed out".to_owned())
                 }
@@ -460,10 +492,18 @@ impl GraphClient {
             date: Option<Value>,
         }
         let parsed: Envelope = serde_json::from_slice(body).unwrap_or_default();
+        // A message can quote a URL with a signature in it; the URL's
+        // query is redacted as it would be anywhere else.
         let clean = |value: Option<&Value>| -> String {
             value
                 .and_then(Value::as_str)
-                .map(|text| sanitize(&self.redactor.redact(text)))
+                .map(|text| {
+                    sanitize(
+                        &self
+                            .redactor
+                            .redact(&redact::urls_in_text(text, &self.redactor)),
+                    )
+                })
                 .unwrap_or_default()
         };
         let inner = parsed.error.inner_error.unwrap_or_default();

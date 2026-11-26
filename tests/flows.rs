@@ -2632,6 +2632,11 @@ async fn a_refused_code_exchange_keeps_the_code_and_verifier_out_of_output() {
     args.extend(browser_login_args(&[]));
     let run = harness.run_with(&args, with_browser(&browser)).await;
     assert_eq!(run.outcome.exit_code, 1);
+    // The scan comes first, so that no failure message below can show a
+    // value the command failed to redact.
+    let requests = harness.identity.received_requests().await.unwrap();
+    let verifier = form_field(&form_of(&requests[0]), "code_verifier");
+    harness.assert_absent(&run, &[AUTH_CODE, verifier.as_str()]);
     let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
     assert!(
         message.contains(
@@ -2640,9 +2645,6 @@ async fn a_refused_code_exchange_keeps_the_code_and_verifier_out_of_output() {
         ),
         "{message}"
     );
-    let requests = harness.identity.received_requests().await.unwrap();
-    let verifier = form_field(&form_of(&requests[0]), "code_verifier");
-    harness.assert_absent(&run, &[AUTH_CODE, verifier.as_str()]);
     harness.assert_store_empty();
     harness.assert_no_canaries(&run);
 }

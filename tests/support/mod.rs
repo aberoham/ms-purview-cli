@@ -247,13 +247,13 @@ impl Harness {
         ];
         // Names too, of files and directories: a name built from an
         // account claim could carry a token.
-        for path in paths_under(self.root.path()) {
+        for (index, path) in paths_under(self.root.path()).into_iter().enumerate() {
             sources.push((
-                format!("the name of {}", path.display()),
+                format!("the name of file {index}"),
                 path.display().to_string().into_bytes(),
             ));
             if path.is_file() {
-                sources.push((path.display().to_string(), std::fs::read(&path).unwrap()));
+                sources.push((format!("file {index}"), std::fs::read(&path).unwrap()));
             }
         }
         for (name, bytes) in sources {
@@ -418,7 +418,9 @@ impl BrowserOpener for ScriptedBrowser {
         };
         if self.fail_open {
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(200));
+                // Long enough for the opener's failure to reach the command
+                // before the answer does, however loaded the runner.
+                std::thread::sleep(Duration::from_millis(1000));
                 play();
             });
             return Err(std::io::Error::other("no browser found"));

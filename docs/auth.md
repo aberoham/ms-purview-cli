@@ -211,8 +211,9 @@ Exchange (PKCE, RFC 7636) on a loopback redirect:
 2. After sign-in, the identity platform sends the browser to
    `http://localhost:<port>/callback` with an authorization code. The listener
    accepts only an answer that carries the random `state` of this sign-in.
-   Any other request gets an error page, a connection that sends nothing is
-   closed after 10 seconds, and it keeps waiting. Connections are served side
+   Any other complete request gets an error page; a connection that sends no
+   complete request within 10 seconds, or that arrives while 16 others are
+   being served, is closed without one. Either way it keeps waiting. Connections are served side
    by side, so one the browser opens and never uses holds nothing up.
 3. It redeems the code with the PKCE verifier, which never left the process,
    then redeems the refresh token for the download token, as the device-code
@@ -227,9 +228,8 @@ platform ignores the port when it compares a loopback redirect with the
 registration (Docs), so any port the listener gets is accepted. The redirect
 uses `localhost`, not the `127.0.0.1` that Microsoft recommends, because the
 observed registration lists `localhost`, and a `127.0.0.1` redirect would need
-its own entry, which the portal cannot add (Docs). An IPv6 literal (`[::1]`) cannot be registered (Docs). That the
-observed registration accepts a redirect with a port is an Assumption until
-the PR 1.2 live check is recorded in `docs/api-notes.md`.
+its own entry, which the portal cannot add (Docs). An IPv6 literal (`[::1]`) cannot be registered (Docs). The observed
+registration accepted a redirect with a port (Observed, `docs/api-notes.md`).
 
 ### Choosing the account
 

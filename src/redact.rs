@@ -412,9 +412,10 @@ pub fn url(value: &::url::Url, redactor: &Redactor) -> String {
     let _ = clean.set_username("");
     let _ = clean.set_password(None);
     let keep_fragment = value.path().ends_with("/$metadata")
-        && value
-            .fragment()
-            .is_some_and(|fragment| !redactor.recognises(&percent_decode(fragment)));
+        && value.fragment().is_some_and(|fragment| {
+            let decoded = percent_decode(fragment);
+            !redactor.recognises(&decoded) && !decoded.contains(['?', '=', '&', ':'])
+        });
     if !keep_fragment {
         clean.set_fragment(None);
     }
@@ -973,6 +974,17 @@ mod tests {
                 &redactor
             ),
             "https://graph.microsoft.com/v1.0/x?%24skiptoken=page-0002&sig=REDACTED"
+        );
+        // A context fragment that holds another URL is not kept.
+        assert_eq!(
+            super::url(
+                &::url::Url::parse(
+                    "https://graph.microsoft.com/v1.0/$metadata#https://two.example/y?sig=canary-sig-0009"
+                )
+                .unwrap(),
+                &redactor
+            ),
+            "https://graph.microsoft.com/v1.0/$metadata"
         );
         // A kept value that holds another URL is not kept.
         let joined = urls_in_text(

@@ -6,6 +6,7 @@ mod support;
 
 use std::time::Duration;
 
+use ms_purview_cli::env::LoginWrite;
 use serde_json::Value;
 use support::*;
 use wiremock::matchers::{method, path};
@@ -264,7 +265,7 @@ async fn any_other_download_refusal_fails_login_and_stores_nothing() {
     let message = error["message"].as_str().unwrap();
     assert!(message.contains("AADSTS65002"), "{message}");
     assert!(message.contains("error codes 65002"), "{message}");
-    assert!(harness.credentials().is_empty());
+    harness.assert_store_empty();
     assert!(!harness.config_dir().join("accounts").exists());
     harness.assert_no_canaries(&run);
 }
@@ -359,7 +360,7 @@ async fn an_id_token_with_no_account_claim_stores_nothing() {
         .await;
     assert_eq!(run.outcome.exit_code, 1);
     assert_eq!(run.json()["error"]["code"], "NoAccountClaim");
-    assert!(harness.credentials().is_empty());
+    harness.assert_store_empty();
     harness.assert_no_canaries(&run);
 }
 
@@ -407,7 +408,7 @@ async fn slow_down_lengthens_the_interval_and_an_expired_code_stops() {
     );
     let stderr = run.stderr();
     assert!(stderr.contains("the device code expired"), "{stderr}");
-    assert!(harness.credentials().is_empty());
+    harness.assert_store_empty();
     harness.assert_no_canaries(&run);
 }
 
@@ -998,189 +999,227 @@ async fn an_account_that_matches_several_upns_is_refused() {
     assert_eq!(harness.credentials().len(), 2);
 }
 
-/// Signs in Alex with one write made to fail, then checks what the next
-/// `auth list`, `auth refresh` and `auth logout` see.
-#[tokio::test]
-async fn a_failed_config_write_stores_nothing() {
-    let harness = Harness::new().await;
+/// Runs `auth login` for Alex with one of its writes made to fail.
+async fn login_with_fault(harness: &Harness, write: LoginWrite, client: &str) -> Run {
     mount_login(
-        &harness,
+        harness,
         "id-claims-preferred.json",
         json_response(200, fixture("token-download.json")),
     )
     .await;
-    // A value in config.json that the sign-in's tokens make recognisable
-    // as a secret: Config::save refuses it, so the first write fails.
-    std::fs::create_dir_all(harness.config_dir()).unwrap();
-    std::fs::write(
-        harness.config_dir().join("config.json"),
-        br#"{"note": "canary-refresh-0001"}"#,
-    )
-    .unwrap();
-    let run = harness
-        .run(&[
+    let (mut env, captured) = harness.env();
+    env.login_write_fault = Some(write);
+    let outcome = ms_purview_cli::cli::execute_with(
+        env,
+        [
+            "purview",
             "auth",
             "login",
             "--client-id",
-            CLIENT_ID,
+            client,
             "--tenant-id",
             TENANT_ID,
-        ])
-        .await;
-    assert_eq!(run.outcome.exit_code, 1);
-    assert!(
-        run.stderr()
-            .contains("saving config.json; nothing was stored"),
-        "{}",
-        run.stderr()
-    );
-    assert!(harness.credentials().is_empty());
-    assert!(!harness.config_dir().join("accounts").exists());
-    assert_eq!(
-        harness.config(),
-        serde_json::json!({"note": "canary-refresh-0001"})
-    );
-    // The canary planted in config.json is the only copy anywhere.
-    for text in [run.stdout(), run.stderr()] {
-        assert!(!text.contains("canary"), "{text}");
+        ],
+    )
+    .await;
+    harness.identity.reset().await;
+    Run { outcome, captured }
+}
+
+#[tokio::test]
+async fn a_first_sign_in_that_fails_at_the_credential_or_account_file_keeps_nothing() {
+    for write in [LoginWrite::Credential, LoginWrite::AccountFile] {
+        let harness = Harness::new().await;
+        let run = login_with_fault(&harness, write, CLIENT_ID).await;
+        assert_eq!(run.outcome.exit_code, 1, "{write:?}");
+        assert!(
+            run.stderr().contains("injected failure"),
+            "{}",
+            run.stderr()
+        );
+        harness.assert_store_empty();
+        assert!(!harness.account_file(ALEX).exists(), "{write:?}");
+        assert!(
+            !harness.config_dir().join("config.json").exists(),
+            "{write:?}"
+        );
+        harness.assert_no_canaries(&run);
+        let list = harness.run(&["--json", "auth", "list"]).await;
+        assert_eq!(list.json()["count"], 0, "{write:?}");
     }
 }
 
 #[tokio::test]
-async fn a_failed_account_file_write_leaves_only_the_registration() {
+async fn a_first_sign_in_that_fails_at_config_json_leaves_a_working_account() {
     let harness = Harness::new().await;
-    mount_login(
-        &harness,
-        "id-claims-preferred.json",
-        json_response(200, fixture("token-download.json")),
-    )
-    .await;
-    // A directory where the account file goes makes its write fail.
-    std::fs::create_dir_all(harness.account_file(ALEX)).unwrap();
-    let run = harness
-        .run(&[
-            "auth",
-            "login",
-            "--client-id",
-            CLIENT_ID,
-            "--tenant-id",
-            TENANT_ID,
-        ])
-        .await;
+    let run = login_with_fault(&harness, LoginWrite::Config, CLIENT_ID).await;
     assert_eq!(run.outcome.exit_code, 1);
     assert!(
-        run.stderr().contains("no token was stored"),
+        run.stderr().contains("saving config.json"),
         "{}",
         run.stderr()
     );
-    assert!(harness.credentials().is_empty());
-    assert_eq!(harness.config()["clients"][ALEX]["client_id"], CLIENT_ID);
-    harness.assert_no_canaries(&run);
-
-    let list = harness.run(&["--json", "auth", "list"]).await;
-    assert_eq!(list.json()["count"], 0);
-    let refresh = harness.run(&["auth", "refresh"]).await;
-    assert!(refresh.stderr().contains("no account is signed in"));
-    // Once the obstacle is gone, a new sign-in reuses the registration.
-    std::fs::remove_dir(harness.account_file(ALEX)).unwrap();
-    harness.identity.reset().await;
-    mount_login(
-        &harness,
-        "id-claims-preferred.json",
-        json_response(200, fixture("token-download.json")),
-    )
-    .await;
-    let again = harness.run(&["auth", "login"]).await;
-    assert_eq!(again.outcome.exit_code, 0, "{}", again.stderr());
     assert_eq!(harness.credentials(), [ALEX]);
-}
-
-#[tokio::test]
-async fn a_failed_credential_write_leaves_a_listed_account_logout_removes() {
-    let harness = Harness::new().await;
-    mount_login(
-        &harness,
-        "id-claims-preferred.json",
-        json_response(200, fixture("token-download.json")),
-    )
-    .await;
-    harness.store.fail_writes(true);
-    let run = harness
-        .run(&[
-            "auth",
-            "login",
-            "--client-id",
-            CLIENT_ID,
-            "--tenant-id",
-            TENANT_ID,
-        ])
-        .await;
-    harness.store.fail_writes(false);
-    assert_eq!(run.outcome.exit_code, 1);
-    assert!(
-        run.stderr().contains("the tokens were not"),
-        "{}",
-        run.stderr()
-    );
+    assert!(harness.account_file(ALEX).exists());
     harness.assert_no_canaries(&run);
-    assert!(harness.credentials().is_empty());
 
     let list = harness.run(&["--json", "auth", "list"]).await;
     assert_eq!(list.json()["results"][0]["email"], ALEX);
+    // No default was saved, so the account is named; it refreshes through
+    // the registration its credential records.
     let refresh = harness.run(&["auth", "refresh"]).await;
-    assert_eq!(refresh.outcome.exit_code, 1);
-    assert!(
-        refresh.stderr().contains("no stored credential"),
-        "{}",
-        refresh.stderr()
-    );
-    let logout = harness.run(&["auth", "logout"]).await;
+    assert!(refresh.stderr().contains("no default account is set"));
+    mount_any_refresh(&harness).await;
+    let refresh = harness.run(&["auth", "refresh", "--account", ALEX]).await;
+    assert_eq!(refresh.outcome.exit_code, 0, "{}", refresh.stderr());
+    let logout = harness.run(&["auth", "logout", "--account", ALEX]).await;
     assert_eq!(logout.outcome.exit_code, 0, "{}", logout.stderr());
-    assert!(!harness.account_file(ALEX).exists());
+    harness.assert_store_empty();
 }
 
-#[tokio::test]
-async fn signing_in_with_a_new_registration_drops_the_old_tokens_first() {
-    let harness = Harness::new().await;
-    sign_in_alex(&harness).await;
-    let other_client = "00000000-0000-4000-8000-000000000003";
-    // The mocks match any client id except where the form says otherwise.
-    Mock::given(method("POST"))
-        .and(path(token_path("devicecode")))
-        .respond_with(json_response(200, fixture("device-code.json")))
-        .mount(&harness.identity)
-        .await;
-    Mock::given(method("POST"))
-        .and(path(token_path("token")))
-        .and(Form::new(&[(
-            "grant_type",
-            "urn:ietf:params:oauth:grant-type:device_code",
-        )]))
-        .respond_with(json_response(200, graph_token("id-claims-preferred.json")))
-        .mount(&harness.identity)
-        .await;
+/// Answers every refresh-token redemption, for any registration.
+async fn mount_any_refresh(harness: &Harness) {
     Mock::given(method("POST"))
         .and(path(token_path("token")))
         .and(Form::new(&[("grant_type", "refresh_token")]))
-        .respond_with(json_response(200, fixture("token-download.json")))
+        .respond_with(json_response(
+            200,
+            token(
+                "canary-graph-access-0002",
+                "canary-refresh-0003",
+                "https://graph.microsoft.com/eDiscovery.ReadWrite.All openid profile",
+            ),
+        ))
         .mount(&harness.identity)
         .await;
+}
+
+const OTHER_CLIENT: &str = "00000000-0000-4000-8000-000000000003";
+
+/// The client id every refresh-token redemption since the last reset used.
+async fn refresh_clients(harness: &Harness) -> Vec<String> {
+    harness
+        .identity
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(form_of)
+        .filter(|form| form.contains(&("grant_type".into(), "refresh_token".into())))
+        .filter_map(|form| {
+            form.into_iter()
+                .find(|(name, _)| name == "client_id")
+                .map(|(_, value)| value)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_re_sign_in_through_a_new_registration_that_fails_at_the_credential_keeps_the_old() {
+    let harness = Harness::new().await;
+    sign_in_alex(&harness).await;
+    let run = login_with_fault(&harness, LoginWrite::Credential, OTHER_CLIENT).await;
+    assert_eq!(run.outcome.exit_code, 1);
+    assert_eq!(harness.stored(ALEX).unwrap()["client_id"], CLIENT_ID);
+    // Everything still names the first registration, and refresh uses it.
+    mount_any_refresh(&harness).await;
+    let refresh = harness.run(&["auth", "refresh"]).await;
+    assert_eq!(refresh.outcome.exit_code, 0, "{}", refresh.stderr());
+    assert_eq!(refresh_clients(&harness).await, [CLIENT_ID, CLIENT_ID]);
+}
+
+#[tokio::test]
+async fn a_re_sign_in_through_a_new_registration_that_stops_later_makes_refresh_refuse() {
+    for (write, named_by) in [
+        (LoginWrite::AccountFile, "its account file"),
+        (LoginWrite::Config, "config.json"),
+    ] {
+        let harness = Harness::new().await;
+        sign_in_alex(&harness).await;
+        let run = login_with_fault(&harness, write, OTHER_CLIENT).await;
+        assert_eq!(run.outcome.exit_code, 1, "{write:?}");
+        // The new tokens replaced the old ones in place, stamped with the
+        // registration that issued them.
+        assert_eq!(harness.credentials(), [ALEX], "{write:?}");
+        assert_eq!(harness.stored(ALEX).unwrap()["client_id"], OTHER_CLIENT);
+        harness.assert_no_canaries(&run);
+
+        mount_any_refresh(&harness).await;
+        let refresh = harness.run(&["--json", "auth", "refresh"]).await;
+        assert_eq!(refresh.outcome.exit_code, 1, "{write:?}");
+        let message = refresh.json()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            message.contains("issued through another app registration than"),
+            "{message}"
+        );
+        assert!(message.contains(named_by), "{write:?}: {message}");
+        assert!(message.contains("purview auth login"), "{message}");
+        assert!(refresh_clients(&harness).await.is_empty(), "{write:?}");
+
+        // Signing in again through the new registration repairs it.
+        harness.identity.reset().await;
+        mount_login(
+            &harness,
+            "id-claims-preferred.json",
+            json_response(200, fixture("token-download.json")),
+        )
+        .await;
+        let again = harness
+            .run(&[
+                "auth",
+                "login",
+                "--client-id",
+                OTHER_CLIENT,
+                "--tenant-id",
+                TENANT_ID,
+            ])
+            .await;
+        assert_eq!(again.outcome.exit_code, 0, "{}", again.stderr());
+        harness.identity.reset().await;
+        mount_any_refresh(&harness).await;
+        let refresh = harness.run(&["auth", "refresh"]).await;
+        assert_eq!(refresh.outcome.exit_code, 0, "{}", refresh.stderr());
+        assert_eq!(
+            refresh_clients(&harness).await,
+            [OTHER_CLIENT, OTHER_CLIENT]
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_credential_store_refusal_on_first_sign_in_stores_nothing() {
+    let harness = Harness::new().await;
+    mount_login(
+        &harness,
+        "id-claims-preferred.json",
+        json_response(200, fixture("token-download.json")),
+    )
+    .await;
     harness.store.fail_writes(true);
     let run = harness
         .run(&[
             "auth",
             "login",
             "--client-id",
-            other_client,
+            CLIENT_ID,
             "--tenant-id",
             TENANT_ID,
         ])
         .await;
     harness.store.fail_writes(false);
     assert_eq!(run.outcome.exit_code, 1);
-    // The old tokens, issued to the old app, are gone with it.
-    assert!(harness.credentials().is_empty());
-    assert_eq!(harness.config()["clients"][ALEX]["client_id"], other_client);
+    assert!(
+        run.stderr()
+            .contains("nothing from this sign-in was stored"),
+        "{}",
+        run.stderr()
+    );
+    harness.assert_store_empty();
+    assert!(!harness.account_file(ALEX).exists());
+    harness.assert_no_canaries(&run);
 }
 
 #[tokio::test]
@@ -1356,4 +1395,175 @@ async fn a_token_in_an_error_body_is_redacted_where_the_body_quotes_it() {
     let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
     assert!(message.contains("AADSTS90000: [redacted]"), "{message}");
     harness.assert_no_canaries(&run);
+}
+
+#[tokio::test]
+async fn an_account_bound_by_its_ids_refuses_an_identity_that_shares_its_upn() {
+    let harness = Harness::new().await;
+    sign_in_alex(&harness).await;
+    sign_in_sam_too(&harness).await;
+    // Alex's recorded upn is Sam's address: a name collision.
+    let path = harness.account_file(ALEX);
+    let mut record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    record["upn"] = "sam.taylor@contoso.example".into();
+    std::fs::write(&path, record.to_string()).unwrap();
+    let alex_before = harness.stored(ALEX).unwrap();
+    let sam_before = harness.stored("sam.taylor@contoso.example").unwrap();
+    // Alex is asked for by key; the browser signs in as Sam.
+    mount_login(
+        &harness,
+        "id-claims-upn-only.json",
+        json_response(200, fixture("token-download.json")),
+    )
+    .await;
+    let run = harness
+        .run(&["--json", "auth", "login", "--account", ALEX])
+        .await;
+    assert_eq!(run.outcome.exit_code, 1, "{}", run.stdout());
+    let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
+    assert!(message.contains("nothing was stored"), "{message}");
+    assert_eq!(harness.stored(ALEX).unwrap(), alex_before);
+    assert_eq!(
+        harness.stored("sam.taylor@contoso.example").unwrap(),
+        sam_before
+    );
+}
+
+#[tokio::test]
+async fn a_name_that_matches_no_stored_account_needs_the_same_key_or_upn() {
+    let harness = Harness::new().await;
+    for (requested, accepted) in [
+        ("alex.w@contoso.example", true),
+        ("ALEX.WILBER@contoso.example", true),
+        ("alex@contoso.example", false),
+    ] {
+        harness.identity.reset().await;
+        mount_login(
+            &harness,
+            "id-claims-preferred.json",
+            json_response(200, fixture("token-download.json")),
+        )
+        .await;
+        let run = harness
+            .run(&[
+                "auth",
+                "login",
+                "--account",
+                requested,
+                "--client-id",
+                CLIENT_ID,
+                "--tenant-id",
+                TENANT_ID,
+            ])
+            .await;
+        assert_eq!(
+            run.outcome.exit_code == 0,
+            accepted,
+            "{requested}: {}",
+            run.stderr()
+        );
+        harness.run(&["auth", "logout", "--account", ALEX]).await;
+        harness.assert_store_empty();
+    }
+}
+
+#[tokio::test]
+async fn a_stalled_poll_with_time_left_is_a_transport_failure() {
+    let harness = Harness::new().await;
+    Mock::given(method("POST"))
+        .and(path(token_path("devicecode")))
+        .respond_with(json_response(200, fixture("device-code.json")))
+        .mount(&harness.identity)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(token_path("token")))
+        .respond_with(
+            json_response(400, fixture("authorization-pending.json"))
+                .set_delay(Duration::from_secs(5)),
+        )
+        .mount(&harness.identity)
+        .await;
+    let (mut env, captured) = harness.env();
+    env.identity_timeout = Duration::from_millis(200);
+    let outcome = ms_purview_cli::cli::execute_with(
+        env,
+        [
+            "purview",
+            "auth",
+            "login",
+            "--client-id",
+            CLIENT_ID,
+            "--tenant-id",
+            TENANT_ID,
+        ],
+    )
+    .await;
+    assert_eq!(outcome.exit_code, 1);
+    let stderr = captured.stderr.text();
+    assert!(
+        stderr.contains("could not reach the identity platform: the request timed out"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("expired"), "{stderr}");
+}
+
+#[tokio::test]
+async fn a_permission_change_error_names_no_scope_even_with_an_escaped_canary() {
+    // A rotated refresh token with a backslash, which JSON escapes, also
+    // reflected in the scope the response claims.
+    let escaped = "canary\\escaped-0001";
+    for json in [false, true] {
+        let harness = Harness::new().await;
+        sign_in_alex(&harness).await;
+        Mock::given(method("POST"))
+            .and(path(token_path("token")))
+            .respond_with(json_response(
+                200,
+                serde_json::json!({
+                    "access_token": "canary-graph-access-0002",
+                    "refresh_token": escaped,
+                    "expires_in": 3599,
+                    "scope": format!("eDiscovery.Read.All {escaped}"),
+                }),
+            ))
+            .mount(&harness.identity)
+            .await;
+        let mut args = vec!["auth", "refresh"];
+        if json {
+            args.insert(0, "--json");
+        }
+        let run = harness.run(&args).await;
+        assert_eq!(run.outcome.exit_code, 1);
+        let text = format!("{}{}", run.stdout(), run.stderr());
+        assert!(text.contains("different set of permissions"), "{text}");
+        assert!(text.contains("purview auth login"), "{text}");
+        for fragment in ["escaped-0001", "Read.All", "ReadWrite.All"] {
+            assert!(!text.contains(fragment), "{fragment} in {text}");
+        }
+        // Nothing was stored.
+        assert_eq!(
+            harness.stored(ALEX).unwrap()["refresh_token"],
+            "canary-refresh-0002"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_explicit_blank_select_is_an_error_and_an_empty_variable_is_unset() {
+    let harness = Harness::new().await;
+    sign_in_alex(&harness).await;
+    let run = harness.run(&["--select", "", "auth", "list"]).await;
+    assert_eq!(run.outcome.exit_code, 1);
+    assert!(
+        run.stderr()
+            .starts_with("Error: --select was given an empty value"),
+        "{}",
+        run.stderr()
+    );
+    let (mut env, captured) = harness.env();
+    env.vars.insert("PURVIEW_SELECT".into(), "".into());
+    env.vars.insert("PURVIEW_PLAIN".into(), "true".into());
+    let outcome = ms_purview_cli::cli::execute_with(env, ["purview", "auth", "list"]).await;
+    assert_eq!(outcome.exit_code, 0);
+    assert_eq!(captured.stdout.text(), format!("{ALEX}\tAlex Wilber\t*\n"));
 }

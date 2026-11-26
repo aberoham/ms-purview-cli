@@ -170,6 +170,22 @@ pub struct Env {
     /// `MemoryStore` in tests.
     pub credentials: Arc<dyn CredentialStore>,
     pub clock: Arc<dyn Clock>,
+    /// The timeout for each identity-platform request: `auth::REQUEST_TIMEOUT`
+    /// in production; tests shorten it to exercise a stalled request.
+    pub identity_timeout: Duration,
+    /// Makes one of `auth login`'s writes fail before it is made, for tests
+    /// of a sign-in that stops part way. Always `None` in production.
+    #[doc(hidden)]
+    pub login_write_fault: Option<LoginWrite>,
+}
+
+/// One of the writes that store a sign-in, in the order they are made.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginWrite {
+    Credential,
+    AccountFile,
+    Config,
 }
 
 /// The environment variables that give flags their defaults.
@@ -221,6 +237,8 @@ impl Env {
             identity_base: production_identity_base(),
             credentials: Arc::new(KeyringStore),
             clock: Arc::new(SystemClock::default()),
+            identity_timeout: crate::auth::REQUEST_TIMEOUT,
+            login_write_fault: None,
         }
     }
 
@@ -256,6 +274,8 @@ impl Env {
             identity_base: unreachable_identity_base(),
             credentials: Arc::new(MemoryStore::default()),
             clock: Arc::new(ManualClock::new(test_epoch())),
+            identity_timeout: crate::auth::REQUEST_TIMEOUT,
+            login_write_fault: None,
         }
     }
 }

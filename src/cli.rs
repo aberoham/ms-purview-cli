@@ -11,13 +11,13 @@ use serde_json::{json, Value};
 
 use crate::auth::{self, IdentityClient};
 use crate::config::{self, AccountRecord, ClientConfig, Config};
-use crate::env::Env;
+use crate::env::{Env, LoginWrite};
 use crate::error::{PurviewError, Result};
 use crate::output::{
     error_value, sanitize, sanitize_multiline, write_rows, OutputFormat, OutputOptions,
 };
 use crate::secrets::{delete_value, token_key};
-use crate::token::{Credential, StoredTokenProvider};
+use crate::token::{Credential, IdentityEndpoint, StoredTokenProvider};
 
 /// The command line. Clap never reads the process environment here: flag
 /// defaults come from `Env::vars` (see `FlagDefaults`).
@@ -325,11 +325,13 @@ where
     let mut printer = Printer::default();
     let mut outcome = match (Cli::try_parse_from(&args), defaults) {
         (Ok(cli), Ok(defaults)) => {
-            let options = output_options(&cli, &defaults);
-            let json_mode = options.format == OutputFormat::Json;
-            let result = match Globals::new(&cli, &defaults) {
-                Ok(globals) => run(&mut env, &options, &globals, cli.command).await,
-                Err(error) => Err(error),
+            let json_mode = cli.json || defaults.json;
+            let result = match (
+                output_options(&cli, &defaults),
+                Globals::new(&cli, &defaults),
+            ) {
+                (Ok(options), Ok(globals)) => run(&mut env, &options, &globals, cli.command).await,
+                (Err(error), _) | (_, Err(error)) => Err(error),
             };
             match result {
                 Ok(outcome) => printer.deliver(&mut env, outcome),
@@ -365,10 +367,14 @@ where
     outcome
 }
 
-fn output_options(cli: &Cli, defaults: &FlagDefaults) -> OutputOptions {
+fn output_options(cli: &Cli, defaults: &FlagDefaults) -> Result<OutputOptions> {
     let json = cli.json || defaults.json;
     let plain = cli.plain || defaults.plain;
-    OutputOptions {
+    let select = match cli.select.as_deref() {
+        Some(value) => explicit("--select", value)?,
+        None => defaults.select.clone().unwrap_or_default(),
+    };
+    Ok(OutputOptions {
         format: if json {
             OutputFormat::Json
         } else if plain {
@@ -376,13 +382,9 @@ fn output_options(cli: &Cli, defaults: &FlagDefaults) -> OutputOptions {
         } else {
             OutputFormat::Table
         },
-        select: cli
-            .select
-            .clone()
-            .or_else(|| defaults.select.clone())
-            .unwrap_or_default(),
+        select,
         results_only: cli.results_only || defaults.results_only,
-    }
+    })
 }
 
 /// Writes results and errors, and remembers whether stdout has already
@@ -593,6 +595,7 @@ async fn auth_login(
         env.identity_base.clone(),
         &registration.client_id,
         &registration.tenant_id,
+        env.identity_timeout,
         env.redactor.clone(),
     )?;
     let outcome = auth::login_device_code(
@@ -615,14 +618,7 @@ async fn auth_login(
             )));
         }
     }
-    store_login(
-        env,
-        &dir,
-        &accounts,
-        &record,
-        &outcome.credential,
-        &registration,
-    )?;
+    store_login(env, &dir, &record, &outcome.credential, &registration)?;
     let download_ready = outcome.credential.download.is_some();
     if let Some(refusal) = &outcome.download_refused {
         writeln!(
@@ -674,30 +670,41 @@ async fn auth_login(
 struct WantedAccount {
     requested: String,
     key: String,
-    upn: Option<String>,
+    /// The stored account the name resolved to, if any.
+    stored: Option<AccountRecord>,
 }
 
 impl WantedAccount {
-    /// Whether the signed-in identity is the one asked for.
+    /// Whether the signed-in identity is the one asked for. A stored
+    /// account is bound by its stable identifiers, the tenant and object
+    /// ids recorded at its sign-in, because a name can match more than one
+    /// identity (one account's `upn` can be another's address). A stored
+    /// account recorded without them, and a name that matched no stored
+    /// account, need the returned key or `upn` to be that name exactly.
     fn is(&self, record: &AccountRecord) -> bool {
-        record.email.eq_ignore_ascii_case(&self.key)
-            || record.matches(&self.requested)
-            || self.upn.as_deref().is_some_and(|upn| record.matches(upn))
+        match &self.stored {
+            Some(stored) if !stored.oid.is_empty() && !stored.tenant_id.is_empty() => {
+                stored.oid.eq_ignore_ascii_case(&record.oid)
+                    && stored.tenant_id.eq_ignore_ascii_case(&record.tenant_id)
+            }
+            Some(stored) => record.email.eq_ignore_ascii_case(&stored.email),
+            None => record.matches(&self.requested),
+        }
     }
 }
 
 fn wanted_account(accounts: &[AccountRecord], requested: &str) -> Result<WantedAccount> {
-    let found = match matching_accounts(accounts, requested)?.as_slice() {
+    let stored = match matching_accounts(accounts, requested)?.as_slice() {
         [only] => Some((*only).clone()),
         _ => None,
     };
     Ok(WantedAccount {
         requested: requested.to_owned(),
-        key: found.as_ref().map_or_else(
+        key: stored.as_ref().map_or_else(
             || requested.to_ascii_lowercase(),
             |account| account.email.clone(),
         ),
-        upn: found.and_then(|account| account.upn),
+        stored,
     })
 }
 
@@ -733,32 +740,58 @@ fn matching_accounts<'a>(
     Ok(matches)
 }
 
-/// Stores a completed sign-in. The order makes every partial result one
-/// that `auth list`, `auth refresh` and `auth logout` handle:
+/// Stores a completed sign-in. The credential records the registration
+/// that issued it, and every refresh uses that registration, so no order of
+/// writes can pair tokens with the wrong app. The writes:
 ///
-/// 1. `config.json`: the registration, and the account as default when the
-///    default names no stored account. A failure here writes nothing else.
-/// 2. `accounts/<email>.json`. If this fails, the config names an account
-///    with no file: `auth list` does not show it and a new sign-in
-///    replaces the default.
-/// 3. The credential. When the registration changed, the older tokens are
-///    deleted first, so they are never used with the new registration. If
-///    the store then refuses the new tokens, the account is listed,
-///    `auth refresh` reports that it has no stored credential (or, when the
-///    registration did not change, keeps working with the older tokens),
-///    and `auth logout` removes it.
+/// 1. The credential, replaced in place under its key. The old item is not
+///    deleted first: on macOS that would discard its access list, and the
+///    user would have to allow access again. A failure here leaves the
+///    previous sign-in exactly as it was.
+/// 2. `accounts/<email>.json`. If this fails on a first sign-in, the new
+///    credential is removed again, so nothing is left that `auth list`
+///    cannot show. On a later sign-in the old account file stays; if it
+///    names another registration, `auth refresh` refuses and asks for a new
+///    sign-in.
+/// 3. `config.json`: the registration to offer at the next sign-in, and
+///    the account as default when the default names no stored account. If
+///    this fails, the account works, but a registration left in
+///    `config.json` that differs makes `auth refresh` ask for a new
+///    sign-in.
 fn store_login(
     env: &mut Env,
     dir: &Path,
-    accounts: &[AccountRecord],
     record: &AccountRecord,
     credential: &Credential,
     registration: &LoginRegistration,
 ) -> Result<()> {
     config::account_file_path(dir, &record.email)?;
-    // Read again: the sign-in may have taken minutes.
+    let first_sign_in = Credential::load(env.credentials.as_ref(), &record.email, &env.redactor)
+        .map(|existing| existing.is_none())
+        .unwrap_or(false);
+    fault(env, LoginWrite::Credential)
+        .and_then(|()| credential.save(env.credentials.as_ref()))
+        .map_err(|error| error.context("nothing from this sign-in was stored"))?;
+    if let Err(error) = fault(env, LoginWrite::AccountFile)
+        .and_then(|()| config::save_account(dir, record, &env.redactor))
+    {
+        if first_sign_in {
+            // Best effort; the error reported is the account file's.
+            let _ = delete_value(env.credentials.as_ref(), &token_key(&record.email));
+            return Err(error.context(
+                "saving the account file; nothing from this sign-in was kept. Run 'purview \
+                 auth login' again",
+            ));
+        }
+        return Err(error.context(
+            "saving the account file; the new tokens were stored, but the account file still \
+             describes the previous sign-in. Run 'purview auth login' again",
+        ));
+    }
+    // Read again, with the account list: the sign-in may have taken
+    // minutes, and another command may have changed either.
     let mut stored = load_config(env, dir)?;
-    let previous = stored.client(&record.email).cloned();
+    let accounts = config::list_accounts(dir, &mut env.stderr)?;
     stored.set_client(
         &record.email,
         &registration.client_id,
@@ -770,34 +803,56 @@ fn store_login(
     if !default_is_stored {
         stored.default_account = record.email.clone();
     }
-    stored
-        .save(dir, &env.redactor)
-        .map_err(|error| error.context("saving config.json; nothing was stored"))?;
-    config::save_account(dir, record, &env.redactor).map_err(|error| {
-        error.context(
-            "saving the account file; the app registration was saved, but no token was \
-             stored. Run 'purview auth login' again",
-        )
-    })?;
-    let registration_changed = previous.is_some_and(|previous| {
-        !previous
-            .client_id
-            .eq_ignore_ascii_case(&registration.client_id)
-            || !previous
-                .tenant_id
-                .eq_ignore_ascii_case(&registration.tenant_id)
-    });
-    if registration_changed {
-        delete_value(env.credentials.as_ref(), &token_key(&record.email)).map_err(|error| {
-            error.context("removing the tokens of the previous app registration")
-        })?;
+    fault(env, LoginWrite::Config)
+        .and_then(|()| stored.save(dir, &env.redactor))
+        .map_err(|error| {
+            error.context(
+                "saving config.json; the tokens and account file were stored, but config.json \
+                 still names the previous registration or default. Run 'purview auth login' \
+                 again",
+            )
+        })
+}
+
+/// The failure a test asked `Env` to inject at this write, if any.
+fn fault(env: &Env, write: LoginWrite) -> Result<()> {
+    if env.login_write_fault == Some(write) {
+        return Err(PurviewError::message(format!(
+            "injected failure at the {write:?} write"
+        )));
     }
-    credential.save(env.credentials.as_ref()).map_err(|error| {
-        error.context(
-            "the account file and app registration were saved, but the tokens were not; run \
-             'purview auth login' again",
-        )
-    })
+    Ok(())
+}
+
+/// Refuses a credential whose recorded app registration differs from the
+/// one the account file or `config.json` names: a sign-in stopped part
+/// way, and the account needs a new one.
+fn check_registration(
+    credential: &Credential,
+    account: &AccountRecord,
+    saved: Option<&ClientConfig>,
+) -> Result<()> {
+    let differs = |client_id: &str, tenant_id: &str| {
+        (!client_id.trim().is_empty() && !client_id.eq_ignore_ascii_case(&credential.client_id))
+            || (!tenant_id.trim().is_empty()
+                && !tenant_id.eq_ignore_ascii_case(&credential.tenant_id))
+    };
+    let named_by = if differs(&account.client_id, &account.tenant_id) {
+        Some("its account file")
+    } else if saved.is_some_and(|client| differs(&client.client_id, &client.tenant_id)) {
+        Some("config.json")
+    } else {
+        None
+    };
+    match named_by {
+        Some(source) => Err(PurviewError::message(format!(
+            "the tokens stored for {} were issued through another app registration than \
+             {source} names, so an earlier sign-in did not finish; run 'purview auth login' \
+             again",
+            sanitize(&account.email)
+        ))),
+        None => Ok(()),
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -995,28 +1050,17 @@ async fn auth_refresh(env: &mut Env, output: &OutputOptions, globals: &Globals) 
                 sanitize(&account.email)
             ))
         })?;
-    let saved = stored.client(&account.email);
-    let client_id = saved
-        .map(|client| client.client_id.as_str())
-        .and_then(|id| non_empty(Some(id)))
-        .unwrap_or(&account.client_id);
-    let tenant_id = saved
-        .map(|client| client.tenant_id.as_str())
-        .and_then(|id| non_empty(Some(id)))
-        .unwrap_or(&account.tenant_id);
-    let identity = IdentityClient::new(
-        env.identity_base.clone(),
-        client_id,
-        tenant_id,
-        env.redactor.clone(),
-    )?;
+    check_registration(&credential, &account, stored.client(&account.email))?;
     let provider = StoredTokenProvider::new(
-        identity,
+        &IdentityEndpoint {
+            base: env.identity_base.clone(),
+            request_timeout: env.identity_timeout,
+        },
         env.credentials.clone(),
         env.redactor.clone(),
         env.clock.clone(),
         credential,
-    );
+    )?;
     let credential = provider
         .refresh_all()
         .await

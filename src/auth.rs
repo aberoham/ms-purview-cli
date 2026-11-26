@@ -39,7 +39,8 @@ const RESOURCELESS_SCOPES: &[&str] = &["offline_access", "openid", "profile", "e
 const SIGN_IN_EXTRAS: &str = "offline_access openid profile";
 
 const MAX_OAUTH_RESPONSE: usize = 100 * 1024;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// The timeout for each request to the identity platform.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEVICE_CODE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
 /// The Graph scopes for `auth login` (`docs/SPEC.md` section 5.1).
@@ -102,6 +103,15 @@ pub fn graph_permissions(scope: &str) -> std::collections::BTreeSet<String> {
         })
         .filter(|item| !item.is_empty())
         .collect()
+}
+
+/// Whether a scope list holds at least one Microsoft Graph permission. A
+/// list with only OpenID Connect entries, or only permissions for another
+/// resource, cannot be refreshed into a Graph token.
+pub fn has_graph_permission(scope: &str) -> bool {
+    graph_permissions(scope)
+        .iter()
+        .any(|permission| !permission.contains('/') && !permission.contains(':'))
 }
 
 /// An application (client) id must be a GUID.
@@ -229,11 +239,12 @@ impl IdentityClient {
         base: Url,
         client_id: &str,
         tenant_id: &str,
+        request_timeout: Duration,
         redactor: Arc<Redactor>,
     ) -> Result<Self> {
         Ok(Self {
             http: reqwest::Client::builder()
-                .timeout(REQUEST_TIMEOUT)
+                .timeout(request_timeout)
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             base,
@@ -292,18 +303,20 @@ impl IdentityClient {
 
     /// Polls the token endpoint until the user finishes signing in, the
     /// code expires, or the identity platform refuses.
+    ///
+    /// `deadline` is on the clock's monotonic scale, taken when the code
+    /// arrived, so neither a slow prompt nor a change to the wall clock can
+    /// extend it. It bounds every sleep and request, and a success that
+    /// arrives after it is refused. Each request also has the client's own
+    /// timeout, which reports a stalled request as a transport failure.
     async fn poll_device_code(
         &self,
         code: &DeviceCodeResponse,
+        deadline: Duration,
         clock: &dyn Clock,
     ) -> Result<TokenResponse> {
         let operation = "signing in with the device code";
         let mut interval = code.interval.unwrap_or(5).clamp(1, 120);
-        let lifetime = Duration::from_secs(code.expires_in.unwrap_or(900).clamp(1, 3_600));
-        // A monotonic deadline from the moment the code arrived: a change
-        // to the wall clock cannot extend it, and it bounds every sleep and
-        // request, so a success that arrives after it is refused.
-        let deadline = clock.elapsed() + lifetime;
         let remaining = || deadline.saturating_sub(clock.elapsed());
         loop {
             clock
@@ -317,8 +330,7 @@ impl IdentityClient {
                 ("grant_type", DEVICE_CODE_GRANT),
                 ("device_code", code.device_code.expose()),
             ];
-            let bound = remaining().min(REQUEST_TIMEOUT);
-            let (status, body) = tokio::time::timeout(bound, self.post("token", &form))
+            let (status, body) = tokio::time::timeout(remaining(), self.post("token", &form))
                 .await
                 .map_err(|_| expired_device_code())??;
             if remaining().is_zero() {
@@ -541,6 +553,8 @@ pub async fn login_device_code(
 ) -> Result<LoginOutcome> {
     let scope = login_scope(read_only);
     let code = identity.request_device_code(&scope).await?;
+    let lifetime = Duration::from_secs(code.expires_in.unwrap_or(900).clamp(1, 3_600));
+    let deadline = clock.elapsed() + lifetime;
     writeln!(
         prompt,
         "To sign in, open {} in a browser and enter the code {}\nWaiting for sign-in...",
@@ -548,7 +562,7 @@ pub async fn login_device_code(
         sanitize(&code.user_code)
     )?;
     prompt.flush()?;
-    let token = identity.poll_device_code(&code, clock).await?;
+    let token = identity.poll_device_code(&code, deadline, clock).await?;
     let claims = account_claims(token.id_token.as_ref())?;
     let refresh_token = token
         .refresh_token
@@ -562,6 +576,8 @@ pub async fn login_device_code(
         })?;
     let mut credential = Credential {
         email: claims.account.clone(),
+        client_id: identity.client_id().to_owned(),
+        tenant_id: identity.tenant_id().to_owned(),
         refresh_token,
         graph: AccessToken::from_response(&token, clock.now(), &scope),
         download: None,

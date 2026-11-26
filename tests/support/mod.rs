@@ -149,8 +149,14 @@ impl Harness {
     /// The stored credential for an account, parsed.
     pub fn stored(&self, email: &str) -> Option<Value> {
         let key = format!("purview:token:{email}");
-        let text = ms_purview_cli::secrets::find_value(self.store.as_ref(), &key).ok()??;
-        serde_json::from_str(&text).ok()
+        // A read or parse failure fails the test: it must never pass for
+        // "nothing stored".
+        let text = ms_purview_cli::secrets::find_value(self.store.as_ref(), &key)
+            .unwrap_or_else(|error| panic!("reading {key}: {error}"))?;
+        Some(
+            serde_json::from_str(&text)
+                .unwrap_or_else(|error| panic!("parsing the credential under {key}: {error}")),
+        )
     }
 
     /// The accounts with a stored credential: the store's logical entries,
@@ -166,11 +172,20 @@ impl Harness {
             // Chunk keys add `:<n>` or `:s<slot>:<n>`; an account name can
             // never hold a colon (it is refused as a file name).
             .filter(|account| !account.contains(':'))
-            .filter(|account| self.stored(account).is_some_and(|v| v["version"] == 1))
+            .filter(|account| {
+                let stored = self.stored(account).expect("a credential under its key");
+                assert_eq!(stored["version"], 1, "{stored}");
+                true
+            })
             .map(str::to_owned)
             .collect();
         accounts.sort();
         accounts
+    }
+
+    /// Fails unless the store holds nothing at all: no header, no chunk.
+    pub fn assert_store_empty(&self) {
+        assert!(self.store.keys().is_empty(), "{:?}", self.store.keys());
     }
 
     pub fn config(&self) -> Value {

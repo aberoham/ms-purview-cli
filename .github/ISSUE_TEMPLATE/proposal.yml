@@ -1,0 +1,42 @@
+name: Change proposal
+description: Propose a feature or a change before starting work larger than a bug fix.
+labels: ["proposal"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not paste secrets or real tenant data in this public issue.**
+        Remove access tokens, refresh tokens, device codes, tenant and application (client) identifiers, real email addresses, case names, search queries and exported content. Replace identifiers with placeholders such as `<tenant-id>` and `<application-client-id>`, and use synthetic addresses such as `alex@contoso.example`.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or need
+      description: Describe the problem to solve or the capability needed.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: Describe the change you want to make and any design trade-offs.
+    validations:
+      required: true
+
+  - type: input
+    id: spec-item
+    attributes:
+      label: "Related item in `docs/SPEC.md` section 11"
+      description: Name the phased implementation plan item this relates to, if any.
+      placeholder: "e.g. PR 1.3: Transport, trace and auth status"
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: redaction-check
+    attributes:
+      label: Data check
+      options:
+        - label: I have removed tokens, device codes, tenant and client identifiers, real addresses, case names and search content.
+          required: true

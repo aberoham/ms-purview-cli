@@ -1,6 +1,6 @@
 # purview
 
-**Drive Microsoft Purview eDiscovery (Premium) through Microsoft Graph v1.0 from a terminal: manage cases, search every mailbox and Teams chat in a tenant, run estimates, item reports and exports, and download and parse the results.**
+**Drive Microsoft Purview eDiscovery (Premium) through Microsoft Graph v1.0 from a terminal. Today's binary signs in and stores credentials; case, search, download, export and parsing commands are planned.**
 
 [![Latest release](https://img.shields.io/github/v/release/aberoham/ms-purview-cli?include_prereleases)](https://github.com/aberoham/ms-purview-cli/releases)
 [![CI](https://img.shields.io/github/actions/workflow/status/aberoham/ms-purview-cli/ci.yml?branch=main&label=CI)](https://github.com/aberoham/ms-purview-cli/actions/workflows/ci.yml)
@@ -12,7 +12,7 @@ Sibling project of [ms-entra-cli](https://github.com/aberoham/ms-entra-cli), sha
 
 ## What it will do
 
-`purview` is a command-line interface (CLI) for security, compliance and records staff holding the Purview eDiscovery Manager or eDiscovery Administrator role, and for AI coding agents running under a skill file. Rules that an agent skill would otherwise state in prose are enforced in code.
+`purview` is a command-line interface (CLI) for security, compliance and records staff holding the Purview eDiscovery Manager or eDiscovery Administrator role, and for artificial intelligence (AI) coding agents running under a skill file. Rules that an agent skill would otherwise state in prose are to be enforced in code by the write commands as they arrive.
 
 Planned scope from [docs/SPEC.md](docs/SPEC.md):
 
@@ -23,26 +23,26 @@ Planned scope from [docs/SPEC.md](docs/SPEC.md):
 - join an item export to its report and stream message headers and body text from the zip archive;
 - list old cases with their hold policies and ages, read-only.
 
-None of the commands below exist in the current binary; they show the planned command shape from [docs/SPEC.md](docs/SPEC.md):
+None of the commands below exist in the current binary; each line is an independent example of the planned shape from [docs/SPEC.md](docs/SPEC.md), not a sequence:
 
 ```bash
-# Planned command shape (not yet implemented)
+# Independent examples of the planned shape (not yet implemented)
 purview kql --term orders-api --participant alex@contoso.example
-purview case create --topic "Orders API review" --dry-run
-purview search create "Records research - Orders API review 2026-11" \
+purview case create --topic "Orders review" --dry-run
+purview search create "Records research - Orders review 2026-11" \
   --name "orders-api-mail" --term orders-api --participant alex@contoso.example --dry-run
-purview estimate "Records research - Orders API review 2026-11" "orders-api-mail" --strict
+purview estimate <existing-case> <existing-search> --strict
 ```
 
 ## Why it exists
 
 Existing tools leave gaps across the eDiscovery workflow (recorded in [docs/SPEC.md](docs/SPEC.md) and [docs/api-notes.md](docs/api-notes.md)):
 
-- **Purview portal:** supports every operation, but only by hand; per-location hit counts and failure details live inside zip files handed back one at a time.
-- **Security & Compliance PowerShell:** creates and runs searches, but cannot download exports (Microsoft documentation).
-- **Azure CLI:** in live observations against a tenant, requesting a token for the Purview eDiscovery download API failed with `AADSTS65002`, because first-party applications require pre-authorisation by the API owner.
-- **Microsoft Graph Command Line Tools:** in live observations, this client obtained a Microsoft Graph token after consent, but received `AADSTS65001` for the download API, so it could search without being able to download.
-- **A tenant-owned public-client app registration:** with no client secret, one refresh token was observed to obtain both the Microsoft Graph token and the Purview download token. `purview` is built on this flow.
+- **Purview portal:** supports every operation, but only by hand; per-location hit counts and failure details live inside zip files handed back one at a time (Observed).
+- **Security & Compliance PowerShell:** creates and runs searches, but cannot download exports (Docs).
+- **Azure CLI:** in live observations against a tenant, requesting a token for the Purview eDiscovery download application programming interface (API) failed with `AADSTS65002`, because first-party applications require pre-authorisation by the API owner (Observed).
+- **Microsoft Graph Command Line Tools:** in live observations, this client obtained a Microsoft Graph token after consent, but received `AADSTS65001` for the download API, so it could search without being able to download (Observed).
+- **A tenant-owned public-client app registration:** with no client secret, one refresh token was observed to obtain both the Microsoft Graph token and the Purview download token; `purview` is built on this flow (Observed).
 
 ## Status and roadmap
 
@@ -63,8 +63,8 @@ Existing tools leave gaps across the eDiscovery workflow (recorded in [docs/SPEC
 
 **Planned roadmap (not yet built, no dates):**
 
-- **v0.1 (remaining items):** `auth status` and the Microsoft Graph transport; read commands for cases, searches and operations with `--wait`; `download`; the Keyword Query Language (KQL) guard and `purview kql`.
-- **v0.2:** write commands (`case create`, `search create`, `estimate`, `report`, `case close`) with preflight checks and explicit approval.
+- **v0.1 (remaining items):** `auth status` and the Microsoft Graph transport; `case list`, `case get`, `search list`, `search get`, `operation list`, and `operation get` with `--wait`; `download`; the Keyword Query Language (KQL) guard and `purview kql`.
+- **v0.2:** write commands (`case create`, `search create`, `estimate`, `report`, and `case close` if its live checks complete) with preflight checks and explicit approval, plus estimate report parsing (`parse locations`, `parse failures`, `parse summary`).
 - **v0.3:** item report parsing (`parse items`, `parse profile`).
 - **v0.4:** `export create` and `export index`.
 - **v0.5:** reading message bodies from export zips (`export read`).
@@ -72,18 +72,18 @@ Existing tools leave gaps across the eDiscovery workflow (recorded in [docs/SPEC
 
 ## Safety
 
-Design rules enforced in code as the transport and write commands arrive:
+Design rules enforced in code as the transport, download and write commands arrive:
 
 - **No holds:** `purview` never places, changes or releases a hold.
 - **No destructive case changes:** `purview` never deletes or reopens a case.
 - **Plan before every write:** a Purview write is sent only after its plan is shown and approved (`--dry-run` previews without writing; interactive runs prompt for confirmation, and non-interactive runs require `--yes`).
-- **Fixed origins:** requests go only to fixed origins, and Microsoft Graph redirects are disabled (from the transport pull request onwards).
+- **Origin and redirect rules:** Microsoft Graph requests go only to `https://graph.microsoft.com`, with redirects disabled, and the download token goes only to the one download origin named by each operation (design rules from the transport and download pull requests onwards).
 
 Protections active today:
 
 - **Credential storage:** tokens persist only in the operating system's credential store (macOS Keychain, Windows Credential Manager or Linux kernel keyring). `config.json` and account files hold no secrets.
-- **Redaction:** everything the tool prints passes through a redactor that removes tokens it has seen; JSON is redacted as a value before serialisation, and `config.json` refuses to save a value the redactor recognises.
-- **No tenant data in the repository:** a public-data lint (`tests/fixture_lint.rs`) runs in continuous integration (CI) on every push and pull request. It refuses real-looking globally unique identifiers (GUIDs), email addresses outside `*.example`, unapproved URLs and home-directory paths across code, documentation and tests. Tests use synthetic `contoso.example` and `fabrikam.example` data only.
+- **Redaction:** everything the tool prints passes through a redactor that removes tokens it has seen; JavaScript Object Notation (JSON) is redacted as a value before serialisation, and `config.json` refuses to save a value the redactor recognises.
+- **No tenant data in the repository:** a public-data lint (`tests/fixture_lint.rs`) runs in continuous integration (CI) on every pull request and every push to `main`. It refuses real-looking globally unique identifiers (GUIDs), email addresses outside `*.example`, unapproved URLs and home-directory paths across code, documentation and tests. Tests use synthetic `contoso.example` and `fabrikam.example` data only.
 
 ## Platforms
 
@@ -101,17 +101,17 @@ The macOS binaries are signed with a Developer ID (`TeamIdentifier=2VLHJGU477`, 
 
 ### Windows
 
-1. Download `purview-<version>-x86_64-pc-windows-msvc.zip` and `checksums-sha256.txt`
-   from the [latest release](https://github.com/aberoham/ms-purview-cli/releases/latest).
+1. Download `purview-v<version>-x86_64-pc-windows-msvc.zip` and `checksums-sha256.txt`
+   from the [releases page](https://github.com/aberoham/ms-purview-cli/releases).
 2. Check the download against the published checksum. In PowerShell:
 
    ```powershell
-   (Get-FileHash .\purview-<version>-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash.ToLower()
+   (Get-FileHash .\purview-v<version>-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash.ToLower()
    Select-String x86_64-pc-windows-msvc .\checksums-sha256.txt
    ```
 
    The two hashes must be identical.
-3. Extract the archive. It holds one folder, `purview-<version>-x86_64-pc-windows-msvc`;
+3. Extract the archive. It holds one folder, `purview-v<version>-x86_64-pc-windows-msvc`;
    copy `bin\purview.exe` from inside it to a folder on your `PATH`.
 4. Run `purview --help`.
 
@@ -120,9 +120,9 @@ Microsoft Defender SmartScreen may warn on the first run. Select **More info**, 
 
 ### Other platforms, or from source
 
-Release archives for macOS (Apple silicon and Intel), Linux (x86-64 and Arm64, statically linked) and Windows are on the [releases page](https://github.com/aberoham/ms-purview-cli/releases). Each archive contains `bin/purview` and the documentation under `share/doc/purview/`. Gatekeeper accepts a browser-downloaded macOS copy after an online check the first time it runs. Check the archive against `checksums-sha256.txt`.
+Release archives for macOS (Apple silicon and Intel), Linux (x86-64 and Arm64, statically linked) and Windows are on the [releases page](https://github.com/aberoham/ms-purview-cli/releases). Each archive contains `bin/purview` on macOS and Linux (or `bin\purview.exe` on Windows) and the documentation under `share/doc/purview/`. Gatekeeper accepts a browser-downloaded macOS copy after an online check the first time it runs. Check the archive against `checksums-sha256.txt`.
 
-Every release archive also carries a build provenance attestation, which shows that this repository's release workflow built it from the tagged commit. With the GitHub CLI:
+Every release archive also carries a build provenance attestation, which shows that this repository's release workflow built it from the tagged commit. With the GitHub CLI (for Unix archives; Windows archives end in `.zip`):
 
 ```bash
 TAG=v<version>
@@ -140,13 +140,13 @@ cargo build --release --locked
 ./target/release/purview --help
 ```
 
-`cargo build` produces an ad-hoc-signed binary, whose identity changes with every build. On macOS, `./contrib/install.sh` runs the tests, builds, signs the binary with your own stable local certificate, and installs it as `~/.local/bin/purview`. See [troubleshooting](docs/troubleshooting.md#a-source-build-on-macos).
+On macOS, `cargo build` produces an ad-hoc-signed binary, whose identity changes with every build. `./contrib/install.sh` runs the tests, builds, signs the binary with your own stable local certificate, and installs it as `~/.local/bin/purview`. See [troubleshooting](docs/troubleshooting.md#a-source-build-on-macos).
 
 ## Set up
 
 `purview` has no app registration of its own. Create a single-tenant public-client registration in your Microsoft Entra ID tenant before signing in.
 
-1. **Create the app registration.** With the Azure CLI (signed in as a Cloud Application Administrator, Application Administrator or higher), run `contrib/create-purview-app.sh` from a checkout of `main`. It performs a dry run by default and changes nothing until you pass `--apply`:
+1. **Create the app registration.** With the Azure CLI (signed in as a Cloud Application Administrator, Application Administrator or higher), run `contrib/create-purview-app.sh` from a checkout of `main`. It performs a dry run by default and changes nothing until you pass `--apply`. The script grants `eDiscovery.ReadWrite.All` by default, and `auth login --read-only` alone does not narrow the registration's grant. For a read-only setup, add `READ_ONLY=1` to both the dry run and the `--apply` run (for example `READ_ONLY=1 TENANT_ID=<tenant-id> ASSIGN_USERS="alex@contoso.example" ./contrib/create-purview-app.sh`) and then sign in with `purview auth login --read-only`.
 
    ```bash
    az login --tenant <tenant-id>
@@ -172,16 +172,16 @@ cargo build --release --locked
 - [docs/macos-signing.md](docs/macos-signing.md): how macOS releases are signed and notarised
 - [docs/api-notes.md](docs/api-notes.md): observed Microsoft Graph and Purview service behaviour
 - [docs/SPEC.md](docs/SPEC.md): design, safety model and phased implementation plan
-- [AGENTS.md](AGENTS.md): repository rules, contracts and verification steps for contributors and AI agents
-- [CHANGELOG.md](CHANGELOG.md): release history and unreleased changes
+- [AGENTS.md](https://github.com/aberoham/ms-purview-cli/blob/main/AGENTS.md): repository rules, contracts and verification steps for contributors and AI agents
+- [CHANGELOG.md](https://github.com/aberoham/ms-purview-cli/blob/main/CHANGELOG.md): release history and unreleased changes
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for pull request scope, public-data rules and verification commands.
+See [CONTRIBUTING.md](https://github.com/aberoham/ms-purview-cli/blob/main/CONTRIBUTING.md) for pull request scope, public-data rules and verification commands.
 
 ## Security
 
-Report vulnerabilities privately; see [SECURITY.md](SECURITY.md).
+Report vulnerabilities privately; see [SECURITY.md](https://github.com/aberoham/ms-purview-cli/blob/main/SECURITY.md).
 
 ## Licence
 

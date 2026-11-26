@@ -14,12 +14,16 @@ Include what is affected, the steps to reproduce the issue and the impact you ex
 
 Never include access tokens, refresh tokens, device codes, tenant or application (client) identifiers, real email addresses, case names, search queries or exported content in a vulnerability report. Replace identifiers with placeholders such as `<tenant-id>` and `<application-client-id>`, and use synthetic addresses under `contoso.example` or `fabrikam.example`.
 
-## Security boundaries
+## Protections in the current binary
 
-- Tokens are kept only in the operating system's credential store (macOS Keychain, Windows Credential Manager or Linux kernel keyring); `config.json` and account files hold no secrets.
-- Everything `purview` prints passes through a redactor that removes tokens it has seen; JSON is redacted as a value before serialisation, and `config.json` refuses to save a value the redactor recognises.
-- From the transport pull request onwards, requests go only to fixed origins with Microsoft Graph redirects disabled.
-- The tool never places, changes or releases a hold, never deletes or reopens a case, and sends a Purview write only after plan approval.
+- Tokens are kept only in the operating system's credential store (macOS Keychain, Windows Credential Manager or Linux kernel keyring). `config.json` and account files hold no secrets, and saving `config.json` refuses any value the redactor recognises.
+- Everything `purview` prints passes through a redactor that removes tokens it has seen; JavaScript Object Notation (JSON) is redacted as a value before serialisation.
+- A public-data lint (`tests/fixture_lint.rs`) runs in continuous integration (CI) on every pull request and every push to `main` to keep real tenant identifiers, addresses, URLs and home-directory paths out of the repository.
+
+## Design rules for later pull requests
+
+- Microsoft Graph requests go only to `https://graph.microsoft.com`, with redirects disabled, and the download token goes only to the one download origin named by each operation (from the transport and download pull requests onwards).
+- The tool never places, changes or releases a hold, never deletes or reopens a case, and sends a Purview write only after a plan has been shown and approved. No Purview write command exists yet.
 
 ## Verifying releases
 

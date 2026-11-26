@@ -74,7 +74,7 @@ Existing tools leave gaps across the eDiscovery workflow (recorded in [docs/SPEC
 - Global options `--verbose`, `--timeout SECS` and `--trace DIR` (trace files hold tenant data; keep them out of version control).
 - `purview case list` (filters `--status`, `--name`, `--created-before`, `--created-after`, `--mine`) and `purview case get`. A case is named by its id or its exact display name; names are not unique, and several matches fail with `AmbiguousCase`.
 - `purview search list` and `purview search get`, which also reads the search's custodian, non-custodial and additional sources.
-- `purview operation list` (filters `--action`, `--status`; `--resolve` reads each operation for its true action, because the list shows item reports and exports alike) and `purview operation get`, with `--wait`, `--wait-timeout` and `--poll-interval`. A finished operation that did not succeed exits 4, the wait deadline exits 5 and Ctrl-C exits 130, each with a resume command.
+- `purview operation list` (filters `--action`, `--status`; `--resolve` reads each operation for its true action, because the list shows item reports and exports alike) and `purview operation get`, with `--wait`, `--wait-timeout` and `--poll-interval`. A finished operation that did not succeed exits 4 with the reasons; the wait deadline exits 5 and Ctrl-C exits 130, each with the command that resumes the wait.
 - Global option `--wrap-untrusted`: in JSON, wrap names, descriptions, queries and file names that tenant users wrote in `[UNTRUSTED:<id>]` markers.
 
 **Planned roadmap (not yet built, no dates):**

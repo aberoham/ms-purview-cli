@@ -5,8 +5,8 @@ use std::io::Write;
 use serde_json::Value;
 
 use super::{
-    case_id, cut, date_text, resolve_search, time_text, warn_incomplete, warn_unreadable, Produced,
-    Session,
+    case_id, cut, date_text, resolve_search, shown, shown_fields, shown_rows, time_text,
+    warn_incomplete, warn_unreadable, Produced, Session,
 };
 use crate::error::Result;
 use crate::model::valid::{CaseKey, SearchKey};
@@ -63,7 +63,7 @@ pub async fn list(session: &mut Session<'_>, case: &CaseKey) -> Result<Produced>
         return Ok(Produced::success(Some(
             session
                 .output
-                .untrusted_json_value(Value::Array(raw), count)?,
+                .untrusted_json_value(Value::Array(raw), count, &session.env.redactor)?,
         )));
     }
     let rows: Vec<Vec<String>> = searches
@@ -78,15 +78,20 @@ pub async fn list(session: &mut Session<'_>, case: &CaseKey) -> Result<Produced>
                     .unwrap_or_else(|| "?".to_owned()),
                 search.data_source_scopes.clone().unwrap_or_default(),
                 date_text(search.created_date_time),
-                // Sanitised before it is cut, so that the cut counts what
-                // the terminal shows.
+                // Redacted and sanitised before it is cut, so that no part
+                // of a secret survives the cut and the cut counts what the
+                // terminal shows.
                 cut(
-                    &sanitize(search.content_query.as_deref().unwrap_or_default()),
+                    &sanitize(&shown(
+                        session,
+                        search.content_query.as_deref().unwrap_or_default(),
+                    )),
                     QUERY_WIDTH,
                 ),
             ]
         })
         .collect();
+    let rows = shown_rows(session, rows);
     write_rows(&mut session.env.stdout, session.output, LIST_COLUMNS, &rows)?;
     Ok(Produced::success(None))
 }
@@ -94,9 +99,11 @@ pub async fn list(session: &mut Session<'_>, case: &CaseKey) -> Result<Produced>
 /// `search get <case> <search>`: the search, and its custodian,
 /// non-custodial and additional sources, which an action on the search
 /// would also collect from (`docs/SPEC.md` section 6.4). The three source
-/// lists are read at once. A source list that cannot be read is a
-/// warning, and the record shows it as unknown; a token that cannot be had
-/// is the command's error.
+/// lists are read at once. A source list that cannot be read, or that
+/// stops before its last page, is a warning: the human view shows it as
+/// unknown or as "N or more", and the JSON leaves it out rather than give
+/// a partial list. A token that cannot be had is the command's error,
+/// before any warning.
 pub async fn get(
     session: &mut Session<'_>,
     case: &CaseKey,
@@ -122,12 +129,18 @@ pub async fn get(
     for log in &logs {
         session.env.stderr.write_all(log)?;
     }
+    let mut reads = vec![custodian, noncustodial, additional];
+    if let Some(position) = reads.iter().position(|read| {
+        read.as_ref()
+            .is_err_and(|error| error.is_token_unavailable())
+    }) {
+        reads.swap_remove(position)?;
+    }
     let mut record = search.record.raw.clone();
     let mut counts: Vec<(&str, String)> = Vec::new();
-    for ((_, key, label), read) in SOURCES.iter().zip([custodian, noncustodial, additional]) {
+    for ((_, key, label), read) in SOURCES.iter().zip(reads) {
         let listing = match read {
             Ok(listing) => listing,
-            Err(error) if error.is_token_unavailable() => return Err(error),
             Err(error) => {
                 let _ = writeln!(
                     session.env.stderr,
@@ -148,16 +161,20 @@ pub async fn get(
                 if complete { "" } else { " or more" }
             ),
         ));
-        // Graph's own value wins if the record already carries the list.
-        if let Value::Object(object) = &mut record {
-            object
-                .entry((*key).to_owned())
-                .or_insert(Value::Array(listing.items));
+        // Graph's own list wins if the record already carries one; a
+        // null is taken as no list.
+        if let (true, Value::Object(object)) = (complete, &mut record) {
+            let slot = object.entry((*key).to_owned()).or_insert(Value::Null);
+            if slot.is_null() {
+                *slot = Value::Array(listing.items);
+            }
         }
     }
     if session.output.format == OutputFormat::Json {
         return Ok(Produced::success(Some(
-            session.output.untrusted_json_value(record, 1)?,
+            session
+                .output
+                .untrusted_json_value(record, 1, &session.env.redactor)?,
         )));
     }
     let search = &search.record;
@@ -186,6 +203,7 @@ pub async fn get(
     ];
     fields.extend(counts);
     fields.push(("Query", search.content_query.clone().unwrap_or_default()));
+    let fields = shown_fields(session, fields);
     write_fields(&mut session.env.stdout, &fields)?;
     Ok(Produced::success(None))
 }

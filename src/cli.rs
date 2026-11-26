@@ -919,6 +919,16 @@ enum ReadCommand {
 }
 
 impl ReadCommand {
+    /// The table columns of a list command, which `--select` must name.
+    fn columns(&self) -> Option<&'static [&'static str]> {
+        match self {
+            Self::CaseList(_) => Some(commands::case::LIST_COLUMNS),
+            Self::SearchList(_) => Some(commands::search::LIST_COLUMNS),
+            Self::OperationList(..) => Some(commands::operation::LIST_COLUMNS),
+            Self::CaseGet(_) | Self::SearchGet(..) | Self::OperationGet(..) => None,
+        }
+    }
+
     fn case(command: CaseCommand) -> Result<Self> {
         Ok(match command {
             CaseCommand::List(list) => Self::CaseList(commands::case::ListFilters {
@@ -1008,6 +1018,9 @@ async fn read_command(
     globals: &Globals,
     command: ReadCommand,
 ) -> Result<Outcome> {
+    if let (Some(columns), true) = (command.columns(), output.format != OutputFormat::Json) {
+        crate::output::selected_indices(&output.select, columns)?;
+    }
     let (account, credential) = signed_in(env, globals)?;
     let email = account.email.clone();
     let provider = Arc::new(token_provider(env, credential)?);

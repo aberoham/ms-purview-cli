@@ -6,7 +6,10 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use super::{case_id, date_text, time_text, warn_incomplete, warn_unreadable, Produced, Session};
+use super::{
+    case_id, date_text, shown, shown_fields, shown_rows, time_text, warn_incomplete,
+    warn_unreadable, Produced, Session,
+};
 use crate::error::{PurviewError, Result};
 use crate::graph::GraphClient;
 use crate::model::valid::{CaseKey, PollTarget};
@@ -162,7 +165,7 @@ pub async fn list(
         return Ok(Produced::success(Some(
             session
                 .output
-                .untrusted_json_value(Value::Array(raw), count)?,
+                .untrusted_json_value(Value::Array(raw), count, &session.env.redactor)?,
         )));
     }
     let rows: Vec<Vec<String>> = entries
@@ -193,6 +196,7 @@ pub async fn list(
             ]
         })
         .collect();
+    let rows = shown_rows(session, rows);
     write_rows(&mut session.env.stdout, session.output, LIST_COLUMNS, &rows)?;
     if entries
         .iter()
@@ -209,11 +213,14 @@ pub async fn list(
 
 /// Replaces each list entry with a single GET of the operation, at most
 /// `RESOLVE_CONCURRENCY` at a time. An entry without a valid id keeps its
-/// list record, with a warning. Any failed read fails the command.
+/// list record, with a warning. Any failed read fails the command: reads
+/// not yet sent are skipped, and a token that cannot be had is reported in
+/// preference to Graph's answers.
 async fn resolve(session: &mut Session<'_>, case: CaseId, entries: &mut [Entry]) -> Result<()> {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(RESOLVE_CONCURRENCY));
     let mut tasks = tokio::task::JoinSet::new();
     let mut unresolvable = 0;
+    let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     for (index, entry) in entries.iter().enumerate() {
         let Some(id) = entry.record.id.as_deref().and_then(OperationId::parse) else {
             unresolvable += 1;
@@ -221,13 +228,20 @@ async fn resolve(session: &mut Session<'_>, case: CaseId, entries: &mut [Entry])
         };
         let graph: Arc<GraphClient> = session.graph.clone();
         let semaphore = semaphore.clone();
+        let failed = failed.clone();
         tasks.spawn(async move {
             let _permit = semaphore.acquire_owned().await;
             let mut log = Vec::new();
+            if failed.load(std::sync::atomic::Ordering::SeqCst) {
+                return (index, None, log);
+            }
             let read = graph
                 .get(&ReadRoute::Operation(case, id), &Query::new(), &mut log)
                 .await;
-            (index, read, log)
+            if read.is_err() {
+                failed.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            (index, Some(read), log)
         });
     }
     let mut results = Vec::new();
@@ -237,9 +251,12 @@ async fn resolve(session: &mut Session<'_>, case: CaseId, entries: &mut [Entry])
         );
     }
     results.sort_by_key(|(index, _, _)| *index);
-    let mut failure = None;
+    let mut failure: Option<PurviewError> = None;
     for (index, read, log) in results {
         session.env.stderr.write_all(&log)?;
+        let Some(read) = read else {
+            continue;
+        };
         match read.and_then(|body| {
             OperationRecord::from_value(body).ok_or_else(|| {
                 PurviewError::message("Graph returned an operation that is not an object")
@@ -252,7 +269,12 @@ async fn resolve(session: &mut Session<'_>, case: CaseId, entries: &mut [Entry])
                 };
             }
             Err(error) => {
-                failure.get_or_insert(error);
+                let keep = failure
+                    .as_ref()
+                    .is_some_and(|kept| kept.is_token_unavailable());
+                if !keep {
+                    failure = Some(error);
+                }
             }
         }
     }
@@ -397,7 +419,12 @@ fn show(session: &mut Session<'_>, record: &OperationRecord) -> Result<Produced>
         action,
         Action::Estimate | Action::ExportReport | Action::ExportResult
     );
-    let reason = incomplete_reason(record);
+    // The reason quotes Graph's result message, which can hold a URL.
+    let reason = incomplete_reason(record).map(|mut reason| {
+        let message = shown(session, reason["message"].as_str().unwrap_or_default());
+        reason["message"] = json!(message);
+        reason
+    });
     let exit_code = if reason.is_some() { 4 } else { 0 };
     if session.output.format == OutputFormat::Json {
         let mut raw = record.raw.clone();
@@ -405,13 +432,15 @@ fn show(session: &mut Session<'_>, record: &OperationRecord) -> Result<Produced>
             object.insert("collection".into(), json!("unchecked"));
         }
         let document = match &reason {
-            None => session.output.untrusted_json_value(raw, 1)?,
+            None => session
+                .output
+                .untrusted_json_value(raw, 1, &session.env.redactor)?,
             // Exit 4 prints the whole envelope, whatever --results-only
             // says, so that the outcome has somewhere to go.
             Some(reason) => {
                 let mut output = session.output.clone();
                 output.results_only = false;
-                let mut document = output.untrusted_json_value(raw, 1)?;
+                let mut document = output.untrusted_json_value(raw, 1, &session.env.redactor)?;
                 if let Value::Object(object) = &mut document {
                     object.insert(
                         "outcome".into(),
@@ -499,13 +528,17 @@ fn show(session: &mut Session<'_>, record: &OperationRecord) -> Result<Produced>
     if collects {
         fields.push(("Collection", "unchecked".to_owned()));
     }
+    let fields = shown_fields(session, fields);
     write_fields(&mut session.env.stdout, &fields)?;
     if let Some(reason) = reason {
         let _ = writeln!(
             session.env.stderr,
             "warning: operation {}: {}",
             sanitize(record.id.as_deref().unwrap_or("?")),
-            sanitize(reason["message"].as_str().unwrap_or_default())
+            sanitize(&shown(
+                session,
+                reason["message"].as_str().unwrap_or_default()
+            ))
         );
     }
     Ok(Produced {
@@ -527,7 +560,12 @@ fn stopped(
     let status = last
         .as_ref()
         .map(|record| record.status.as_str().to_owned());
-    let resume = format!("purview operation get {case} {operation} --wait");
+    // The account is named, so that the command resumes as the same
+    // identity whatever the default is then.
+    let resume = format!(
+        "purview --account {} operation get {case} {operation} --wait",
+        shell_word(&session.account.email)
+    );
     let (exit_code, code, message) = if interrupted {
         (
             130,
@@ -572,4 +610,35 @@ fn stopped(
         exit_code,
         document: None,
     })
+}
+
+/// `text` as one shell word: as it is when it holds only characters no
+/// shell treats specially, else in single quotes.
+fn shell_word(text: &str) -> String {
+    if !text.is_empty()
+        && text
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "@._+-=:/,".contains(character))
+    {
+        return text.to_owned();
+    }
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_words_are_quoted_only_when_needed() {
+        assert_eq!(
+            shell_word("alex.w@contoso.example"),
+            "alex.w@contoso.example"
+        );
+        assert_eq!(
+            shell_word("o'neil@contoso.example"),
+            "'o'\\''neil@contoso.example'"
+        );
+        assert_eq!(shell_word("a b"), "'a b'");
+    }
 }

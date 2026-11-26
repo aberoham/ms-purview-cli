@@ -18,6 +18,7 @@ use std::time::Duration;
 use crate::env::{Clock, Interrupt};
 use crate::error::{PurviewError, Result};
 use crate::graph::GraphClient;
+use crate::model::valid::PollTarget;
 use crate::model::wire::OperationRecord;
 use crate::output::sanitize;
 use crate::routes::{Query, ReadRoute};
@@ -112,6 +113,23 @@ impl Poller<'_> {
                     let record = OperationRecord::from_value(body).ok_or_else(|| {
                         PurviewError::message("Graph returned an operation that is not an object")
                     })?;
+                    // Every record read is checked, not only the last: one
+                    // without an id or status, or for another operation,
+                    // ends the wait.
+                    let target = PollTarget::new(&record)?;
+                    if let ReadRoute::Operation(_, wanted) = route {
+                        if target.id != *wanted {
+                            return Err(PurviewError::message(format!(
+                                "Graph answered the read of operation {wanted} with operation {}",
+                                target.id
+                            )));
+                        }
+                    }
+                    // A read that ended after the deadline does not count:
+                    // the deadline covers the whole wait.
+                    if self.clock.elapsed() >= deadline {
+                        return Ok(PollEnd::TimedOut { last: Some(record) });
+                    }
                     if record.status.is_terminal() {
                         return Ok(PollEnd::Finished(record));
                     }

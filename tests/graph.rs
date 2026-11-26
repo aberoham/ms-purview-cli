@@ -1253,6 +1253,43 @@ mod polling {
     }
 
     #[tokio::test]
+    async fn a_graph_that_cannot_be_reached_is_waited_for_until_the_deadline() {
+        // A port nothing listens on: every attempt fails to connect.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = base_of(&format!("http://{}", closed.local_addr().unwrap()));
+        drop(closed);
+        let setup = setup_with(
+            base,
+            FakeTokens::default(),
+            Duration::from_secs(10),
+            false,
+            None,
+        );
+        let interrupt = ManualInterrupt::default();
+        let poller = Poller {
+            graph: &setup.client,
+            clock: setup.clock.as_ref(),
+            interrupt: &interrupt,
+            timing: Timing {
+                timeout: Duration::from_secs(15),
+                interval: None,
+            },
+            not_found_grace: None,
+        };
+        let mut log = Vec::new();
+        let end = poller
+            .wait(&route(), &mut log, &mut |_, _, _| {})
+            .await
+            .unwrap();
+        assert_eq!(end, PollEnd::TimedOut { last: None });
+        let log = String::from_utf8(log).unwrap();
+        assert!(
+            log.contains("warning: reading the operation failed (could not reach Microsoft Graph"),
+            "{log}"
+        );
+    }
+
+    #[tokio::test]
     async fn the_interval_steps_up_after_two_minutes() {
         let server = MockServer::start().await;
         answer(&server, 1, Some(14), status("running")).await;

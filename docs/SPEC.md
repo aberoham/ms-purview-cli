@@ -148,7 +148,9 @@ nothing else on stdout, whatever the exit code; their summary and any reasons go
 | 5 | Wait deadline reached | Operation waits: `{"caseId", "operationId", "status", "elapsedSeconds", "resume": [ … ], "error": {"code": "WaitTimeout", …}}`. Case-close waits: `{"caseId", "caseStatus", "elapsedSeconds", "resume": ["purview case get <case>"], "error": {"code": "WaitTimeout", …}}` |
 | 130 | Interrupted (Ctrl-C) while waiting | As exit 5, with code `Interrupted` |
 
-`resume` lists only commands that exist in the running release: `purview operation get <case>
+`resume` names the account the command ran as (`purview --account <email> …`), so that it
+resumes as the same identity whatever the default is then. It lists only commands that exist
+in the running release: `purview operation get <case>
 <op> --wait` from v0.1; `--check` added from v0.2; then `purview download <case> <op>`, which
 skips files already downloaded and verified (section 4.7).
 
@@ -162,7 +164,8 @@ Human output for 3, 4, 5 and 130 goes to stderr, apart from tables already writt
   `AmbiguousCase`, listing id, status and creation date but not the name; none fails with
   `CaseNotFound`. A name match prints `notice:` on stderr with the id it matched. An id is
   used as given, with no read of the case: a command that reads below the case gets Graph's
-  answer to that read.
+  answer to that read. `case get` reads a matched case again by its id, so a name and an id
+  give the same record. Diagnostics never repeat the argument, a name or other tenant text.
 - `<search>`: a search id or an exact display name within the case, with the same ambiguity
   rule (`AmbiguousSearch`, or `SearchNotFound`).
 - `<op>`: an operation id, 32 hexadecimal characters with no hyphens (Observed).
@@ -324,8 +327,16 @@ in JSON).
 `search get` also reads the search's `custodianSources`, `noncustodialSources` and
 `additionalSources`, at once, because an action on the search would also collect from them
 (section 6.4). JSON adds each list to Graph's record under that name when the record lacks
-it. A source list that cannot be read is a warning, shown as `unknown`, and is left out of
-the JSON; a token that cannot be had fails the command.
+it or has `null` there. A source list that cannot be read, or that stops before its last
+page, is a warning, shown as `unknown` or "N or more", and is left out of the JSON; a token
+that cannot be had fails the command before any warning. `search get <case> <name>` reads
+the matched search again by its id.
+
+In tables and record views, tenant text has registered secrets removed and URLs redacted as
+in free text before it is sanitised or cut. In JSON, a string that is one URL (a
+`downloadUrl`) keeps only its OData options, and a URL in other text keeps only scheme, host
+and path, as in the trace (section 4.9). `--select` is checked against a list command's
+columns before sign-in.
 
 #### `purview search create <case> --name NAME [query flags]` (write: create)
 
@@ -774,7 +785,10 @@ States, from the Graph documentation for `caseOperationStatus`:
   and requests in flight: each read runs under `tokio::time::timeout` for the time left, and
   each sleep is cut to the time left. When it passes, the command exits 5 without a further
   read.
-- **Failed reads.** A read that gets no response, or 429 or 5xx after `GraphClient`'s own
+- **Each read** is checked: a record without a valid id or status, or for another
+  operation, ends the command. A read that ends after the deadline does not count, even if it
+  shows the operation finished; the command exits 5 with that status.
+- **Failed reads.** A read that gets no response, or 429 or any 5xx after `GraphClient`'s own
   three attempts, does not end the wait; a warning goes to stderr. That includes a
   `Retry-After` longer than the 60 seconds `GraphClient` waits for (section 4.3): the poll
   waits the interval or the `Retry-After`, whichever is longer, cut to the deadline. Any

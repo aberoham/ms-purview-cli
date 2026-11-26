@@ -479,6 +479,13 @@ pub fn url(value: &::url::Url, redactor: &Redactor) -> String {
     clean.to_string()
 }
 
+/// Tenant text as a human view shows it: registered secrets removed, then
+/// every URL in it redacted as `urls_in_text` does. Applied before text is
+/// cut or sanitised, so that no part of a secret survives a cut.
+pub fn shown(text: &str, redactor: &Redactor) -> String {
+    urls_in_text(&redactor.redact(text), redactor)
+}
+
 /// What `urls_in_text` writes in place of a URL in free text that does not
 /// parse.
 pub const UNREADABLE_URL: &str = "[unreadable URL]";

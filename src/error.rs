@@ -303,12 +303,12 @@ impl PurviewError {
     }
 
     /// Whether a Graph read failed in a way that a later read may not:
-    /// no complete response, or HTTP 429, 500, 502, 503 or 504. Polling
-    /// keeps waiting after such a failure.
+    /// no complete response, HTTP 429, or any 5xx. Polling keeps waiting
+    /// after such a failure.
     pub fn is_transient_graph_failure(&self) -> bool {
         match self {
             Self::GraphUnreachable { .. } => true,
-            Self::Graph(details) => matches!(details.status, 429 | 500 | 502 | 503 | 504),
+            Self::Graph(details) => details.status == 429 || (500..=599).contains(&details.status),
             Self::Context { source, .. } => source.is_transient_graph_failure(),
             _ => false,
         }

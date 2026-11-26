@@ -44,7 +44,19 @@ impl OutputOptions {
     /// `UNTRUSTED_KEYS`, at any depth, is wrapped in markers with one random
     /// id for the whole document, and the envelope gains `untrustedNotice`
     /// explaining them. `--results-only` prints the wrapped results alone.
-    pub fn untrusted_json_value(&self, mut results: Value, count: usize) -> Result<Value> {
+    ///
+    /// Every URL is redacted first, as the trace does it: a string that is
+    /// one URL, such as a `downloadUrl`, keeps only its OData query options,
+    /// and a URL in free text keeps only scheme, host and path. That comes
+    /// before the wrapping, which would otherwise run on from a URL in the
+    /// text.
+    pub fn untrusted_json_value(
+        &self,
+        results: Value,
+        count: usize,
+        redactor: &crate::redact::Redactor,
+    ) -> Result<Value> {
+        let mut results = crate::trace::redact_urls(&results, redactor);
         let notice = if self.wrap_untrusted {
             let id = untrusted_id()?;
             wrap_untrusted(&mut results, &id);
@@ -83,13 +95,10 @@ pub fn wrap_untrusted(value: &mut Value, id: &str) {
     match value {
         Value::Object(object) => {
             for (key, member) in object.iter_mut() {
-                match member {
-                    Value::String(text)
-                        if !text.is_empty() && UNTRUSTED_KEYS.contains(&key.as_str()) =>
-                    {
-                        *text = format!("[UNTRUSTED:{id}]{text}[/UNTRUSTED:{id}]");
-                    }
-                    other => wrap_untrusted(other, id),
+                if UNTRUSTED_KEYS.contains(&key.as_str()) {
+                    wrap_every_string(member, id);
+                } else {
+                    wrap_untrusted(member, id);
                 }
             }
         }
@@ -98,6 +107,23 @@ pub fn wrap_untrusted(value: &mut Value, id: &str) {
                 wrap_untrusted(item, id);
             }
         }
+        _ => {}
+    }
+}
+
+/// Wraps every non-empty string in `value`, at any depth: a field in
+/// `UNTRUSTED_KEYS` whose value is not the expected string stays covered.
+fn wrap_every_string(value: &mut Value, id: &str) {
+    match value {
+        Value::String(text) if !text.is_empty() => {
+            *text = format!("[UNTRUSTED:{id}]{text}[/UNTRUSTED:{id}]");
+        }
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| wrap_every_string(item, id)),
+        Value::Object(object) => object
+            .values_mut()
+            .for_each(|item| wrap_every_string(item, id)),
         _ => {}
     }
 }
@@ -126,7 +152,7 @@ fn untrusted_notice(id: &str) -> String {
 
 /// Writes `label: value` lines for one record, the labels padded to one
 /// width. Values are sanitised; an empty value prints nothing after the
-/// label.
+/// label. Tenant text should already have been through `redact::shown`.
 pub fn write_fields(mut writer: impl Write, fields: &[(&str, String)]) -> Result<()> {
     let width = fields
         .iter()
@@ -335,6 +361,7 @@ pub fn sanitize_multiline(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::redact::Redactor;
 
     fn options(format: OutputFormat, select: &str, results_only: bool) -> OutputOptions {
         OutputOptions {
@@ -353,6 +380,7 @@ mod tests {
             "description": "",
             "createdBy": {"user": {"displayName": "Alex", "userPrincipalName": "a@contoso.example"}},
             "files": [{"fileName": "a.zip", "size": 3}],
+            "contentQuery": ["odd", {"shape": "x"}],
             "status": "active",
         });
         wrap_untrusted(&mut value, "abcd");
@@ -367,6 +395,10 @@ mod tests {
                     "userPrincipalName": "a@contoso.example",
                 }},
                 "files": [{"fileName": "[UNTRUSTED:abcd]a.zip[/UNTRUSTED:abcd]", "size": 3}],
+                "contentQuery": [
+                    "[UNTRUSTED:abcd]odd[/UNTRUSTED:abcd]",
+                    {"shape": "[UNTRUSTED:abcd]x[/UNTRUSTED:abcd]"},
+                ],
                 "status": "active",
             })
         );
@@ -377,7 +409,7 @@ mod tests {
         let mut wrapping = options(OutputFormat::Json, "", false);
         wrapping.wrap_untrusted = true;
         let value = wrapping
-            .untrusted_json_value(json!([{"displayName": "x"}]), 1)
+            .untrusted_json_value(json!([{"displayName": "x"}]), 1, &Redactor::new())
             .unwrap();
         let name = value["results"][0]["displayName"].as_str().unwrap();
         let id = &name["[UNTRUSTED:".len()..name.find(']').unwrap()];
@@ -388,11 +420,21 @@ mod tests {
             .contains(&format!("[UNTRUSTED:{id}]")));
         assert_eq!(value["count"], 1);
         let plain = options(OutputFormat::Json, "", false)
-            .untrusted_json_value(json!([{"displayName": "x"}]), 1)
+            .untrusted_json_value(
+                json!([{
+                    "displayName": "x",
+                    "downloadUrl": "https://h.example/p?sig=s&downloadType=Report",
+                }]),
+                1,
+                &Redactor::new(),
+            )
             .unwrap();
         assert_eq!(
             plain,
-            json!({"results": [{"displayName": "x"}], "count": 1})
+            json!({"results": [{
+                "displayName": "x",
+                "downloadUrl": "https://h.example/p?sig=REDACTED&downloadType=Report",
+            }], "count": 1})
         );
     }
 

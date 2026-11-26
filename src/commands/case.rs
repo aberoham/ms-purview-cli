@@ -4,7 +4,8 @@ use chrono::NaiveDate;
 use serde_json::Value;
 
 use super::{
-    date_text, resolve_case, time_text, warn_incomplete, warn_unreadable, Produced, Session,
+    date_text, resolve_case, shown_fields, shown_rows, time_text, warn_incomplete, warn_unreadable,
+    Produced, Session,
 };
 use crate::error::Result;
 use crate::model::valid::CaseKey;
@@ -129,7 +130,12 @@ pub async fn list(session: &mut Session<'_>, filters: &ListFilters) -> Result<Pr
     if incomplete > 0 {
         let _ = writeln!(
             session.env.stderr,
-            "warning: {incomplete} cases have no id or no name; '?' stands in for it"
+            "warning: {incomplete} cases have no id or no name{}",
+            if session.output.format == OutputFormat::Json {
+                ""
+            } else {
+                "; '?' stands in for it"
+            }
         );
     }
     if session.output.format == OutputFormat::Json {
@@ -138,7 +144,7 @@ pub async fn list(session: &mut Session<'_>, filters: &ListFilters) -> Result<Pr
         return Ok(Produced::success(Some(
             session
                 .output
-                .untrusted_json_value(Value::Array(raw), count)?,
+                .untrusted_json_value(Value::Array(raw), count, &session.env.redactor)?,
         )));
     }
     let now = session.env.clock.now();
@@ -157,6 +163,7 @@ pub async fn list(session: &mut Session<'_>, filters: &ListFilters) -> Result<Pr
             ]
         })
         .collect();
+    let rows = shown_rows(session, rows);
     write_rows(&mut session.env.stdout, session.output, LIST_COLUMNS, &rows)?;
     Ok(Produced::success(None))
 }
@@ -177,13 +184,15 @@ pub async fn get(session: &mut Session<'_>, key: &CaseKey) -> Result<Produced> {
     let case = resolve_case(&session.graph, key, &mut session.env.stderr).await?;
     if session.output.format == OutputFormat::Json {
         return Ok(Produced::success(Some(
-            session.output.untrusted_json_value(case.record.raw, 1)?,
+            session
+                .output
+                .untrusted_json_value(case.record.raw, 1, &session.env.redactor)?,
         )));
     }
     let record = &case.record;
-    write_fields(
-        &mut session.env.stdout,
-        &[
+    let fields = shown_fields(
+        session,
+        vec![
             ("ID", case.id.to_string()),
             ("Name", shown(&record.display_name)),
             ("Status", record.status.as_str().to_owned()),
@@ -205,6 +214,7 @@ pub async fn get(session: &mut Session<'_>, key: &CaseKey) -> Result<Produced> {
             ("Closed", time_text(record.closed_date_time)),
             ("Closed by", identity::shown(record.closed_by.as_ref())),
         ],
-    )?;
+    );
+    write_fields(&mut session.env.stdout, &fields)?;
     Ok(Produced::success(None))
 }

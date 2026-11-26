@@ -4,7 +4,6 @@
 
 use crate::error::{PurviewError, Result};
 use crate::model::wire::{CaseRecord, OperationRecord, OperationStatus, SearchRecord};
-use crate::output::sanitize;
 use crate::routes::{CaseId, OperationId, SearchId};
 
 /// A `<case>` argument: a case id, or else an exact display name.
@@ -54,12 +53,13 @@ impl SearchKey {
 
 /// An `<op>` argument: 32 hexadecimal characters (Observed).
 pub fn operation_id(text: &str) -> Result<OperationId> {
+    // The value is not repeated: a pasted URL or token would land in the
+    // error.
     OperationId::parse(text).ok_or_else(|| {
-        PurviewError::message(format!(
-            "{:?} is not an operation id: an operation id is 32 hexadecimal characters with no \
+        PurviewError::message(
+            "<op> is not an operation id: an operation id is 32 hexadecimal characters with no \
              hyphens",
-            sanitize(text)
-        ))
+        )
     })
 }
 

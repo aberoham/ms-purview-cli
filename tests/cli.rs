@@ -13,10 +13,21 @@ const VARIABLES: &[&str] = &[
     "PURVIEW_SELECT",
     "PURVIEW_ACCOUNT",
     "PURVIEW_NO_INPUT",
+    "PURVIEW_VERBOSE",
+    "PURVIEW_TIMEOUT",
+    "PURVIEW_TRACE_DIR",
+    "PURVIEW_WRAP_UNTRUSTED",
     "PURVIEW_CLIENT_ID",
     "PURVIEW_TENANT_ID",
     "PURVIEW_CONFIG_DIR",
 ];
+
+#[test]
+fn the_scrubbed_variables_cover_every_flag_variable() {
+    for name in ms_purview_cli::env::FLAG_VARIABLES {
+        assert!(VARIABLES.contains(name), "{name}");
+    }
+}
 
 fn purview() -> Command {
     let mut command = Command::new(assert_cmd::cargo::cargo_bin!("purview"));

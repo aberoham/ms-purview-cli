@@ -1038,6 +1038,15 @@ mod tests {
             assert!(!shown.contains("canary"), "{text}: {shown}");
             assert!(!shown.contains("slash"), "{text}: {shown}");
         }
+        // A secret that looks like a parameter name is not kept as a key.
+        redactor.register("canarysecretkey");
+        assert_eq!(
+            urls_in_text(
+                "https://graph.microsoft.com/v1.0/x?canarysecretkey=1",
+                &redactor
+            ),
+            "https://graph.microsoft.com/v1.0/x?REDACTED=REDACTED"
+        );
         // A URL run into a kept value, after a comma or in compact JSON.
         for text in [
             "https://one.example/x?$top=1,https://two.example/y?sig=canary-sig-0011",

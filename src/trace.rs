@@ -298,12 +298,14 @@ fn location_text(request: &Url, value: &str, redactor: &Redactor) -> String {
     }
 }
 
+/// Counts probe files, so each name is new within the process.
+static PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Creates and removes a file in `dir`, so a directory the tool cannot
 /// write to is refused before any request is sent.
 /// The name is unique to the process and the call, and a name already
 /// taken (a stale probe, another open) moves on to the next.
 fn probe_write(dir: &Path) -> std::io::Result<()> {
-    static PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let mut last = None;
     for _ in 0..8 {
         let count = PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -532,12 +534,19 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("is a link"), "{error}");
-        // A stale probe of this process does not block the next open.
-        std::fs::write(
-            dir.join(format!(".purview-trace-probe-{}-0", std::process::id())),
-            b"",
-        )
-        .unwrap();
+        // Stale probes of this process under the next names do not block
+        // the next open.
+        let next = PROBES.load(std::sync::atomic::Ordering::Relaxed);
+        for count in next..next + 3 {
+            std::fs::write(
+                dir.join(format!(
+                    ".purview-trace-probe-{}-{count}",
+                    std::process::id()
+                )),
+                b"",
+            )
+            .unwrap();
+        }
         TraceSink::open(
             &dir,
             Arc::new(Redactor::new()),

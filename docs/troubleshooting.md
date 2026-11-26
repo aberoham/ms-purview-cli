@@ -32,8 +32,14 @@ this repository's release workflow built it from the tagged commit. With the
 GitHub CLI:
 
 ```bash
-gh attestation verify purview-<version>-<target>.tar.gz --repo aberoham/ms-purview-cli
+TAG=v<version>
+gh attestation verify "purview-${TAG}-<target>.tar.gz" --repo aberoham/ms-purview-cli \
+  --signer-workflow aberoham/ms-purview-cli/.github/workflows/release.yml \
+  --source-ref "refs/tags/$TAG"
 ```
+
+`--signer-workflow` requires the release workflow as the signer, and
+`--source-ref` requires the build to come from that tag.
 
 The README's Windows install steps show the same checksum check in
 PowerShell.

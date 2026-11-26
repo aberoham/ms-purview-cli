@@ -60,8 +60,14 @@ Every release archive also carries a build provenance attestation, which shows t
 repository's release workflow built it from the tagged commit. With the GitHub CLI:
 
 ```bash
-gh attestation verify purview-<version>-<target>.tar.gz --repo aberoham/ms-purview-cli
+TAG=v<version>
+gh attestation verify "purview-${TAG}-<target>.tar.gz" --repo aberoham/ms-purview-cli \
+  --signer-workflow aberoham/ms-purview-cli/.github/workflows/release.yml \
+  --source-ref "refs/tags/$TAG"
 ```
+
+`--signer-workflow` requires the release workflow as the signer, and
+`--source-ref` requires the build to come from that tag.
 
 To build from source you need Rust 1.100 or later. Under rustup, `rust-toolchain.toml`
 selects the release CI uses:

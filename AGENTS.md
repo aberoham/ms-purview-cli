@@ -84,12 +84,22 @@ that the test files pass their own scan.
   workflow sets `PURVIEW_BUILD_COMMIT`.
 - `tests/cli.rs` holds offline process contracts (`assert_cmd`);
   `tests/fixture_lint.rs` is the public-data lint.
+- `contrib/resign.sh` gives local macOS builds a stable signing identity.
+  `contrib/install.sh` tests, builds, signs and installs the per-user
+  `~/.local/bin/purview`.
+- `.github/workflows/release.yml` builds, signs, notarises, attests and
+  publishes the release archives when a `v*` tag is pushed; the tag must
+  equal `v` plus the `Cargo.toml` version. `.github/scripts/macos-signing.py`
+  is its signing helper, and `docs/macos-signing.md` lists the GitHub
+  settings it depends on. The Homebrew formula lives in the separate
+  `aberoham/homebrew-tap` repository, which reads new releases by itself.
 
 `docs/SPEC.md` section 4.1 lists the modules later pull requests add. Put new
 code where that layout says.
 
-Code copied from `aberoham/ms-entra-cli` (today `output.rs` and the
-`config.rs` file handling; later `secrets.rs` and parts of `auth.rs`) is
+Code copied from `aberoham/ms-entra-cli` (today `output.rs`, the
+`config.rs` file handling, `release.yml`, the signing helper and its test,
+and the two `contrib/` scripts; later `secrets.rs` and parts of `auth.rs`) is
 maintained separately in each repository. When fixing a bug in copied code,
 check whether the other repository needs the same fix.
 
@@ -213,7 +223,8 @@ cargo build --release
 
 The public-data lint alone is `cargo test --test fixture_lint`. For workflow
 changes, also run `actionlint` and `zizmor --offline .github/workflows`. For
-shell changes, run `bash -n` and ShellCheck.
+shell changes, run `bash -n` and ShellCheck. For changes to the signing
+helper, run `python3 .github/scripts/test_macos_signing.py`.
 
 A passing suite does not show that the tenant behaves this way. Report live
 checks separately, and update `docs/api-notes.md` with what they observed.

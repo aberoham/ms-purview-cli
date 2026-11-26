@@ -59,6 +59,9 @@ jobs:
           "${RUNNER_TEMP}/actionlint" -color
       - name: zizmor
         run: pipx run "zizmor==${ZIZMOR_VERSION}" --offline .github/workflows
+      # The release depends on these scripts, but nothing else runs them.
+      - run: shellcheck contrib/*.sh
+      - run: python3 .github/scripts/test_macos_signing.py
 
   test:
     name: Test (${{ matrix.os }})

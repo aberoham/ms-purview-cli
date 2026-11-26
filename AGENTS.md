@@ -9,8 +9,8 @@ downloads, and offline parsing of the resulting zips.
 
 `docs/SPEC.md` is the design and the phased plan. Each pull request
 implements one item of its section 11 and nothing from later items. Today
-the binary has `purview version` and the device-code `purview auth login`,
-`auth refresh`, `auth list` and `auth logout`. Do not add stubs for commands
+the binary has `purview version`, `purview auth login` (device code, or
+`--browser`), `auth refresh`, `auth list` and `auth logout`. Do not add stubs for commands
 that a later pull request owns.
 
 The tool never places, changes or releases a hold, never deletes or reopens a
@@ -75,11 +75,18 @@ that the test files pass their own scan.
   always `None` in production, that makes one of `auth login`'s writes
   fail, and the per-account locks (`AccountLocks`) that serialise login,
   logout and refresh commits across processes; `Env::in_memory()` has none
-  until a test sets them. Later pull requests add the Graph
+  until a test sets them. It carries the `BrowserOpener` that
+`auth login --browser` uses (the system browser in production, `NoBrowser`
+in `Env::in_memory()`, and the harness's `ScriptedBrowser`, which plays the
+redirect against the loopback listener, in flows) and that sign-in's
+timeout. Later pull requests add the Graph
   origin and the download host rule. `Env::production()` reads no
   environment variable that could change an endpoint, so the release binary
   has no test path that could send a token to another host.
-- `src/auth.rs` holds the device-code flow, refresh-token redemption for
+- `src/auth.rs` holds the device-code flow, the browser flow (authorization
+  code with PKCE on a `http://localhost:<port>/callback` listener bound on
+  `127.0.0.1` and, when possible, `::1`; only an answer carrying the sign-in's
+  `state` ends the wait), refresh-token redemption for
   Graph and for the Purview eDiscovery app (the download token), and the
   account claims from the id token. OAuth errors keep only the
   allow-listed fields of `docs/SPEC.md` section 6.8, redacted.

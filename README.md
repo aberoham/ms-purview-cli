@@ -4,9 +4,9 @@
 eDiscovery from the terminal: create cases and searches, run estimates, item reports and
 exports, download and read the results, and close cases.**
 
-Status: early development. The binary signs in with a device code (`purview auth login`,
-`auth refresh`, `auth list`, `auth logout`) and prints its version; nothing is released
-yet, and the install steps below apply from the first release. The design and phased plan
+Status: early development. The binary signs in with a device code or, with `--browser`,
+in the system browser (`purview auth login`, `auth refresh`, `auth list`, `auth logout`)
+and prints its version. Only release candidates are published so far. The design and phased plan
 are in [docs/SPEC.md](docs/SPEC.md).
 
 Sibling of [ms-entra-cli](https://github.com/aberoham/ms-entra-cli).
@@ -86,6 +86,7 @@ stable local certificate, and installs it as `~/.local/bin/purview`. See
 ## Documentation
 
 - [docs/SPEC.md](docs/SPEC.md): design and phased plan
+- [docs/auth.md](docs/auth.md): permissions, the app registration and its setup script, sign-in
 - [docs/troubleshooting.md](docs/troubleshooting.md): installing and checking the binary
 - [docs/macos-signing.md](docs/macos-signing.md): how releases are signed and notarized
 

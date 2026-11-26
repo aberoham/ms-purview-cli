@@ -58,6 +58,46 @@ pub struct ClientConfig {
 }
 
 impl Config {
+    /// The registration saved for an account, matching the key without
+    /// regard to case.
+    pub fn client(&self, email: &str) -> Option<&ClientConfig> {
+        self.clients
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(email.trim()))
+            .map(|(_, client)| client)
+    }
+
+    /// Saves a registration under the lowercased address. Every key that
+    /// names the same account in another case is folded into it, keeping
+    /// their unknown fields (the existing lowercase entry's win), so no
+    /// stale entry can shadow the new one.
+    pub fn set_client(&mut self, email: &str, client_id: &str, tenant_id: &str) {
+        let key = email.trim().to_ascii_lowercase();
+        let same: Vec<String> = self
+            .clients
+            .keys()
+            .filter(|existing| existing.eq_ignore_ascii_case(&key))
+            .cloned()
+            .collect();
+        let mut extra = BTreeMap::new();
+        // The exact lowercase key goes last, so its fields win.
+        let mut ordered = same;
+        ordered.sort_by_key(|existing| *existing == key);
+        for existing in ordered {
+            if let Some(client) = self.clients.remove(&existing) {
+                extra.extend(client.extra);
+            }
+        }
+        self.clients.insert(
+            key,
+            ClientConfig {
+                client_id: client_id.to_owned(),
+                tenant_id: tenant_id.to_owned(),
+                extra,
+            },
+        );
+    }
+
     /// Loads `config.json` from `dir`. A missing directory or file is the
     /// default configuration. A linked directory or file is refused. Modes
     /// readable by others are tightened, with a warning written to
@@ -212,13 +252,20 @@ pub fn save_account(config_dir: &Path, record: &AccountRecord, redactor: &Redact
 }
 
 /// Every account file, sorted by address. A missing directory means no
-/// accounts. A linked accounts directory is refused; a linked, unreadable
-/// or malformed file is skipped with a warning.
+/// accounts. The configuration and accounts directories get the checks
+/// `Config::load` makes: a link is refused, a mode open to others is
+/// tightened with a warning, and each directory must still be the one
+/// inspected after the files are read. A linked, unreadable or malformed
+/// file is skipped with a warning.
 pub fn list_accounts(config_dir: &Path, warnings: &mut dyn Write) -> Result<Vec<AccountRecord>> {
-    let dir = accounts_dir(&normalise(config_dir));
-    if check_dir_kind(&dir)?.is_none() {
+    let config_dir = normalise(config_dir);
+    let Some(config_checked) = check_existing_dir(&config_dir, warnings)? else {
         return Ok(Vec::new());
-    }
+    };
+    let dir = accounts_dir(&config_dir);
+    let Some(accounts_checked) = check_existing_dir(&dir, warnings)? else {
+        return Ok(Vec::new());
+    };
     let mut accounts = Vec::new();
     for entry in fs::read_dir(&dir)? {
         let path = entry?.path();
@@ -236,6 +283,8 @@ pub fn list_accounts(config_dir: &Path, warnings: &mut dyn Write) -> Result<Vec<
             )?,
         }
     }
+    accounts_checked.still_the_same()?;
+    config_checked.still_the_same()?;
     accounts.sort_by_key(|record: &AccountRecord| record.email.to_ascii_lowercase());
     Ok(accounts)
 }
@@ -252,15 +301,35 @@ fn read_account(path: &Path, warnings: &mut dyn Write) -> Result<Option<AccountR
     Ok(Some(serde_json::from_slice(&contents)?))
 }
 
-/// Removes an account's file. A missing file is not an error; a link is
-/// refused rather than followed.
+/// Removes an account's file. A missing file is not an error. A link at
+/// the file, the accounts directory or the configuration directory is
+/// refused rather than followed; the directories are checked before and
+/// after the file is inspected, just before it is removed.
 pub fn remove_account(config_dir: &Path, email: &str) -> Result<()> {
-    let path = account_file_path(config_dir, email)?;
+    let config_dir = normalise(config_dir);
+    let path = account_file_path(&config_dir, email)?;
+    let parents = [config_dir.clone(), accounts_dir(&config_dir)];
+    let check_parents = || -> Result<bool> {
+        for parent in &parents {
+            if check_dir_kind(parent)?.is_none() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    };
+    if !check_parents()? {
+        return Ok(());
+    }
     match fs::symlink_metadata(&path) {
         Ok(metadata) if is_link_like(&metadata) => {
             Err(refusal(&path, "is a link, refusing to remove it"))
         }
-        Ok(_) => Ok(fs::remove_file(&path)?),
+        Ok(_) => {
+            if !check_parents()? {
+                return Ok(());
+            }
+            Ok(fs::remove_file(&path)?)
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
@@ -790,6 +859,74 @@ mod tests {
             list_accounts(dir.path(), &mut no_warnings()).unwrap(),
             [sam]
         );
+    }
+
+    #[test]
+    fn a_registration_is_saved_under_one_lowercase_key_keeping_unknown_fields() {
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "clients": {
+                "Alex@Contoso.Example": {"client_id": "old", "tenant_id": "old", "note": 1},
+                "alex@contoso.example": {"client_id": "older", "later": 2},
+                "sam@contoso.example": {"client_id": "sam"}
+            }
+        }))
+        .unwrap();
+        config.set_client("ALEX@contoso.example", "new-client", "new-tenant");
+        let saved = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            saved["clients"],
+            serde_json::json!({
+                "alex@contoso.example": {
+                    "client_id": "new-client", "tenant_id": "new-tenant", "note": 1, "later": 2
+                },
+                "sam@contoso.example": {"client_id": "sam"}
+            })
+        );
+        assert_eq!(
+            config.client("Alex@Contoso.Example").unwrap().client_id,
+            "new-client"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listing_tightens_a_loose_accounts_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("purview");
+        save_account(
+            &root,
+            &record("alex@contoso.example", None),
+            &Redactor::new(),
+        )
+        .unwrap();
+        fs::set_permissions(accounts_dir(&root), fs::Permissions::from_mode(0o755)).unwrap();
+        let mut warnings = Vec::new();
+        assert_eq!(list_accounts(&root, &mut warnings).unwrap().len(), 1);
+        let text = String::from_utf8(warnings).unwrap();
+        assert!(text.contains("has permissions 755"), "{text}");
+        let mode = fs::metadata(accounts_dir(&root))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_accounts_directory_is_refused_for_listing_and_removal() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("purview");
+        fs::create_dir(&root).unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        let victim = elsewhere.join(format!("{}.json", "alex@contoso.example"));
+        fs::write(&victim, b"{}").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, accounts_dir(&root)).unwrap();
+        assert!(list_accounts(&root, &mut no_warnings()).is_err());
+        assert!(remove_account(&root, "alex@contoso.example").is_err());
+        assert!(victim.exists());
     }
 
     #[test]

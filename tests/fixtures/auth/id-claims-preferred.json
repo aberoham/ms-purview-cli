@@ -1,0 +1,10 @@
+{
+  "aud": "00000000-0000-4000-8000-000000000001",
+  "iss": "https://login.microsoftonline.com/00000000-0000-4000-8000-000000000002/v2.0",
+  "name": "Alex Wilber",
+  "oid": "00000000-0000-4000-8000-000000000011",
+  "preferred_username": "Alex.Wilber@contoso.example",
+  "upn": "alex.w@contoso.example",
+  "tid": "00000000-0000-4000-8000-000000000002",
+  "ver": "2.0"
+}

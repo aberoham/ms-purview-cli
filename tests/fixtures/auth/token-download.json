@@ -1,0 +1,8 @@
+{
+  "token_type": "Bearer",
+  "scope": "b26e684c-5068-4120-a679-64a5d2c909d9/eDiscovery.Download.Read",
+  "expires_in": 3599,
+  "ext_expires_in": 3599,
+  "access_token": "canary-download-access-0001",
+  "refresh_token": "canary-refresh-0002"
+}

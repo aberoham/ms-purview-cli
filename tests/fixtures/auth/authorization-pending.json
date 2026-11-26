@@ -1,0 +1,8 @@
+{
+  "error": "authorization_pending",
+  "error_description": "AADSTS70016: OAuth 2.0 device flow error. Authorization is pending. Continue polling. Trace ID: 00000000-0000-4000-8000-000000000025 Correlation ID: 00000000-0000-4000-8000-000000000026 Timestamp: 2026-01-05 09:00:05Z",
+  "error_codes": [70016],
+  "timestamp": "2026-01-05 09:00:05Z",
+  "trace_id": "00000000-0000-4000-8000-000000000025",
+  "correlation_id": "00000000-0000-4000-8000-000000000026"
+}

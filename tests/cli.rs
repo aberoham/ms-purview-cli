@@ -4,9 +4,22 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use serde_json::Value;
 
+/// Every variable the binary reads, removed so the shell running the tests
+/// cannot change the result.
+const VARIABLES: &[&str] = &[
+    "PURVIEW_JSON",
+    "PURVIEW_RESULTS_ONLY",
+    "PURVIEW_PLAIN",
+    "PURVIEW_ACCOUNT",
+    "PURVIEW_NO_INPUT",
+    "PURVIEW_CLIENT_ID",
+    "PURVIEW_TENANT_ID",
+    "PURVIEW_CONFIG_DIR",
+];
+
 fn purview() -> Command {
     let mut command = Command::new(assert_cmd::cargo::cargo_bin!("purview"));
-    for name in ["PURVIEW_JSON", "PURVIEW_RESULTS_ONLY", "PURVIEW_PLAIN"] {
+    for name in VARIABLES {
         command.env_remove(name);
     }
     command
@@ -205,14 +218,11 @@ fn a_failed_stdout_write_exits_1() {
     ] {
         let (reader, writer) = std::io::pipe().unwrap();
         drop(reader);
-        let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("purview"))
-            .env_remove("PURVIEW_JSON")
-            .env_remove("PURVIEW_RESULTS_ONLY")
-            .env_remove("PURVIEW_PLAIN")
-            .args(args)
-            .stdout(writer)
-            .output()
-            .unwrap();
+        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("purview"));
+        for name in VARIABLES {
+            command.env_remove(name);
+        }
+        let output = command.args(args).stdout(writer).output().unwrap();
         assert_eq!(output.status.code(), Some(1), "{args:?}");
         let stderr = String::from_utf8(output.stderr).unwrap();
         assert!(
@@ -241,5 +251,94 @@ fn help_is_success_and_lists_exactly_the_shipped_commands() {
         .take_while(|line| !line.trim().is_empty())
         .filter_map(|line| line.split_whitespace().next())
         .collect();
-    assert_eq!(commands, ["version", "help"], "{text}");
+    assert_eq!(commands, ["auth", "version", "help"], "{text}");
+}
+
+#[test]
+fn auth_help_lists_exactly_the_shipped_auth_commands() {
+    let output = purview()
+        .args(["auth", "--help"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).unwrap();
+    let commands: Vec<&str> = text
+        .lines()
+        .skip_while(|line| *line != "Commands:")
+        .skip(1)
+        .take_while(|line| !line.trim().is_empty())
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
+    assert_eq!(
+        commands,
+        ["login", "refresh", "list", "logout", "help"],
+        "{text}"
+    );
+}
+
+/// `--no-input` refuses sign-in before any network call or credential
+/// access, so this runs offline against an empty configuration directory
+/// and leaves it empty.
+#[test]
+fn login_under_no_input_is_refused_before_any_work() {
+    let temporary = tempfile::tempdir().unwrap();
+    for (args, variable) in [
+        (&["auth", "login", "--no-input", "--json"][..], None),
+        (&["--json", "auth", "login"][..], Some("true")),
+    ] {
+        let mut command = purview();
+        command.env("PURVIEW_CONFIG_DIR", temporary.path());
+        if let Some(value) = variable {
+            command.env("PURVIEW_NO_INPUT", value);
+        }
+        let output = command.args(args).assert().code(1).get_output().clone();
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(message.contains("--no-input"), "{message}");
+        assert!(output.stderr.is_empty(), "{args:?}");
+    }
+    assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn a_malformed_client_id_is_refused_before_no_input_or_network() {
+    purview()
+        .env("PURVIEW_CONFIG_DIR", tempfile::tempdir().unwrap().path())
+        .args(["auth", "login", "--no-input", "--client-id", "not-a-guid"])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::starts_with("Error: invalid client id"));
+}
+
+#[test]
+fn listing_with_no_accounts_is_empty_and_writes_nothing() {
+    let temporary = tempfile::tempdir().unwrap();
+    let output = purview()
+        .env("PURVIEW_CONFIG_DIR", temporary.path().join("purview"))
+        .args(["auth", "list", "--json"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty())
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(value, serde_json::json!({"results": [], "count": 0}));
+    assert!(!temporary.path().join("purview").exists());
+}
+
+#[test]
+fn logout_with_no_accounts_fails_without_touching_the_store() {
+    let temporary = tempfile::tempdir().unwrap();
+    purview()
+        .env("PURVIEW_CONFIG_DIR", temporary.path().join("purview"))
+        .args(["auth", "logout"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::starts_with(
+            "Error: no account is signed in; run 'purview auth login' first",
+        ));
 }

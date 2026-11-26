@@ -1,0 +1,8 @@
+{
+  "error": "invalid_grant",
+  "error_description": "AADSTS65002: Consent between first party application '00000000-0000-4000-8000-000000000001' and first party resource 'b26e684c-5068-4120-a679-64a5d2c909d9' must be configured via preauthorization. Trace ID: 00000000-0000-4000-8000-000000000023 Correlation ID: 00000000-0000-4000-8000-000000000024 Timestamp: 2026-01-05 09:00:10Z",
+  "error_codes": [65002],
+  "timestamp": "2026-01-05 09:00:10Z",
+  "trace_id": "00000000-0000-4000-8000-000000000023",
+  "correlation_id": "00000000-0000-4000-8000-000000000024"
+}

@@ -1,0 +1,9 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#security/cases/ediscoveryCases",
+  "value": [
+    {
+      "displayName": "an entry without an id",
+      "status": "closing"
+    }
+  ]
+}

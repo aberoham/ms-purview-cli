@@ -5,6 +5,10 @@
 - Add `purview auth login --browser` using the authorisation code flow with Proof Key for Code Exchange (PKCE) on a loopback redirect (`http://localhost:<port>/callback`), opening the system browser with none of the command's output streams attached.
 - Add `contrib/create-purview-app.sh` to create or update the tenant app registration, service principals, assignments and consent grants: dry run by default, `--apply` to make changes, each change sent once and read back on an unclear outcome, and reporting of existing consent grants broader than the plan.
 - Add `docs/auth.md` covering permissions, app registration by script or by hand, consent choices, sign-in flows and token storage.
+- Add the Microsoft Graph transport: requests only to the exact origin `https://graph.microsoft.com:443` and below `/v1.0/`, paging links checked the same way, redirects disabled, at most three attempts per read with `Retry-After` honoured up to 60 seconds, and one token refresh after a 401.
+- Add `purview auth status`, which checks the Graph token and the Purview role with one read and reports `purviewRole` as `ok`, `denied` (HTTP 403) or `unknown`; a refresh the identity platform refuses is an error (exit 1).
+- Add the global options `--verbose` (Graph requests and the token refreshes made for them or by `auth refresh`, on stderr through the redactor), `--timeout` (per-request Graph timeout, 0 to 600 seconds) and `--trace DIR` (one JSON file per Graph exchange, with no request headers, only allow-listed response headers and every URL's query values redacted except the OData options).
+- Add a test that fails if `PATCH`, `PUT` or `DELETE` appears anywhere in the crate's source.
 - On macOS and Linux, create lock folders with mode 0700 and lock files with mode 0600, and refuse a linked lock folder; `v0.1.0-rc.1` created them with the default modes.
 
 ## v0.1.0-rc.1 - 2026-11-26

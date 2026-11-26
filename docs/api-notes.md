@@ -213,3 +213,33 @@ local code-signing identity, against the same tenant and registration as the PR 
   `openid` and `profile` to `requiredResourceAccess`, which held only the Graph eDiscovery
   permission and the eDiscovery download scope. (Observed) Reading the registration back
   afterwards showed it unchanged. (Observed)
+
+### PR 1.3: `auth status` through the Graph transport
+
+Status: **run on 26 November 2026** from a local build of the PR 1.3 branch, signed with the
+same local code-signing identity as the PR 1.2 check, against the same tenant, registration
+and account. The stored Graph token had expired, so the read began with a refresh.
+
+- **Purview role:** `auth status --json --verbose --trace <dir>` exited 0 with
+  `purviewRole: ok`; the human form gave the same answer. (Observed) The account holds the
+  eDiscovery Administrator role group, so `denied` was not exercised; whether a missing role
+  gives 403 is checked in PR 1.4.
+- **The read:** `GET /v1.0/security/cases/ediscoveryCases?$top=1` returned 200 with one case
+  and no `@odata.nextLink`, in about five seconds (one sample). (Observed) The response
+  headers within the trace's kept list were `client-request-id`, `content-type`, `date`,
+  `request-id` and `x-ms-ags-diagnostic`; there was no `content-length`. (Observed (trace))
+- **Case record fields** in the list: `closedBy`, `closedDateTime`, `createdDateTime`,
+  `description`, `displayName`, `externalId`, `id`, `lastModifiedBy`,
+  `lastModifiedDateTime` and `status`. (Observed (trace))
+- **Graph refresh:** returned scope `openid profile email
+  https://graph.microsoft.com/eDiscovery.ReadWrite.All`, as at sign-in, and a new refresh
+  token. (Observed)
+- **Download redemption** (`auth refresh --verbose`): returned scope
+  `b26e684c-5068-4120-a679-64a5d2c909d9/eDiscovery.Download.Read
+  b26e684c-5068-4120-a679-64a5d2c909d9/.default`, and a new refresh token, so the download
+  redemption rotates the refresh token too. (Observed) This answers the two items PR 1.1
+  left unobserved.
+- **Trace files:** the trace directory was created 0700 and its file 0600, and neither the
+  trace nor stderr held a JSON Web Token or any request header. (Observed)
+- **Keychain:** no prompt; the branch build read and updated the item the earlier builds
+  wrote. (Observed)

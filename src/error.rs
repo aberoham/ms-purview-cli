@@ -50,6 +50,26 @@ pub enum PurviewError {
     #[error("could not reach the identity platform: {0}")]
     Http(#[from] reqwest::Error),
 
+    /// A refusal from Microsoft Graph. Only the allow-listed fields of the
+    /// error body are kept (`docs/SPEC.md` section 6.8), and the message has
+    /// been through the Redactor.
+    #[error("{0}")]
+    Graph(Box<GraphErrorDetails>),
+
+    /// The token provider could not supply a token for a request: the
+    /// refresh was refused or failed, or its result could not be stored.
+    /// Kept apart from the request's own failures, so that `auth status`
+    /// can tell a broken sign-in from Graph's answer. The code and status
+    /// are the source's.
+    #[error("{0}")]
+    TokenUnavailable(Box<PurviewError>),
+
+    /// A URL from a response, such as a paging link, whose origin is not
+    /// the one the client may send to. The URL has been through
+    /// `redact::url`.
+    #[error("Microsoft Graph returned a {what} on another origin ({url}); refusing to follow it")]
+    ForeignOrigin { what: &'static str, url: String },
+
     /// A credential-store failure, kept as its rendered message only:
     /// `keyring::Error`'s `Debug` form can hold the stored bytes (as in
     /// `BadEncoding`), and this enum derives `Debug`.
@@ -88,6 +108,41 @@ pub struct OAuthDetails {
     pub trace_id: String,
     pub correlation_id: String,
     pub timestamp: String,
+}
+
+/// The allow-listed fields of a Graph error body: `error.code`,
+/// `error.message`, `error.innerError.request-id` and
+/// `error.innerError.date`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GraphErrorDetails {
+    pub status: u16,
+    pub code: String,
+    pub message: String,
+    pub request_id: String,
+    pub date: String,
+}
+
+/// The status and Graph's code and message, then the identifiers a support
+/// case needs.
+impl std::fmt::Display for GraphErrorDetails {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Microsoft Graph returned HTTP {}", self.status)?;
+        if !self.code.is_empty() {
+            write!(formatter, ": {}", self.code)?;
+        }
+        if !self.message.is_empty() {
+            write!(formatter, ": {}", self.message)?;
+        }
+        let details: Vec<String> = [("request id", &self.request_id), ("date", &self.date)]
+            .into_iter()
+            .filter(|(_, value)| !value.is_empty())
+            .map(|(label, value)| format!("{label} {value}"))
+            .collect();
+        if !details.is_empty() {
+            write!(formatter, " ({})", details.join("; "))?;
+        }
+        Ok(())
+    }
 }
 
 /// The operation, the status, the OAuth error and its description, then
@@ -141,8 +196,15 @@ impl PurviewError {
     pub fn metadata(&self) -> (&str, u16) {
         match self {
             Self::Context { source, .. } => source.metadata(),
+            Self::TokenUnavailable(source) => source.metadata(),
             // The OAuth error itself, such as `invalid_grant`, as in `entra`.
             Self::OAuth(details) => (details.error.as_str(), details.status),
+            // Graph's own code, such as `Forbidden`, and the HTTP status.
+            Self::Graph(details) if !details.code.is_empty() => {
+                (details.code.as_str(), details.status)
+            }
+            Self::Graph(details) => ("GraphError", details.status),
+            Self::ForeignOrigin { .. } => ("ForeignOrigin", 0),
             Self::NoAccountClaim { .. } => ("NoAccountClaim", 0),
             Self::DownloadNotConsented { .. } => ("DownloadNotConsented", 0),
             Self::CredentialLockBusy { .. } => ("CredentialLockBusy", 0),
@@ -167,7 +229,9 @@ impl PurviewError {
                         .strip_prefix("AADSTS65001")
                         .is_some_and(|rest| !rest.starts_with(|c: char| c.is_ascii_digit()))
             }
-            Self::Context { source, .. } => source.is_consent_required(),
+            Self::Context { source, .. } | Self::TokenUnavailable(source) => {
+                source.is_consent_required()
+            }
             _ => false,
         }
     }
@@ -179,6 +243,24 @@ impl PurviewError {
             Self::CredentialEncoding(_) => true,
             Self::Context { source, .. } => source.is_credential_encoding(),
             _ => false,
+        }
+    }
+
+    /// Whether a request failed because no token could be had.
+    pub fn is_token_unavailable(&self) -> bool {
+        match self {
+            Self::TokenUnavailable(_) => true,
+            Self::Context { source, .. } => source.is_token_unavailable(),
+            _ => false,
+        }
+    }
+
+    /// The HTTP status of a Graph refusal, through any context.
+    pub fn graph_status(&self) -> Option<u16> {
+        match self {
+            Self::Graph(details) => Some(details.status),
+            Self::Context { source, .. } => source.graph_status(),
+            _ => None,
         }
     }
 
@@ -274,6 +356,32 @@ mod tests {
         // Debug of a Vec<u8> would print.
         let numbers = format!("{:?}", b"canary-bytes-0001".to_vec());
         assert!(!format!("{error:?}").contains(numbers.trim_matches(['[', ']'])));
+    }
+
+    #[test]
+    fn a_graph_refusal_keeps_graph_s_code_and_the_status_through_context() {
+        let error = PurviewError::Graph(Box::new(GraphErrorDetails {
+            status: 403,
+            code: "Forbidden".into(),
+            message: "no role".into(),
+            request_id: "request-0001".into(),
+            date: "2026-01-05T09:00:00".into(),
+        }))
+        .context("checking the Purview role");
+        assert_eq!(error.metadata(), ("Forbidden", 403));
+        assert_eq!(error.graph_status(), Some(403));
+        assert_eq!(
+            error.to_string(),
+            "checking the Purview role: Microsoft Graph returned HTTP 403: Forbidden: no role \
+             (request id request-0001; date 2026-01-05T09:00:00)"
+        );
+        let bare = PurviewError::Graph(Box::new(GraphErrorDetails {
+            status: 502,
+            ..GraphErrorDetails::default()
+        }));
+        assert_eq!(bare.metadata(), ("GraphError", 502));
+        assert_eq!(bare.to_string(), "Microsoft Graph returned HTTP 502");
+        assert_eq!(PurviewError::message("x").graph_status(), None);
     }
 
     #[test]

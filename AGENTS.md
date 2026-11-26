@@ -10,7 +10,8 @@ downloads, and offline parsing of the resulting zips.
 `docs/SPEC.md` is the design and the phased plan. Each pull request
 implements one item of its section 11 and nothing from later items. Today
 the binary has `purview version`, `purview auth login` (device code, or
-`--browser`), `auth refresh`, `auth list` and `auth logout`. Do not add stubs for commands
+`--browser`), `auth refresh`, `auth status`, `auth list` and `auth logout`,
+and the global options `--verbose`, `--timeout` and `--trace`. Do not add stubs for commands
 that a later pull request owns.
 
 The tool never places, changes or releases a hold, never deletes or reopens a
@@ -80,8 +81,10 @@ that the test files pass their own scan.
 `auth login --browser` uses (the system browser in production, `NoBrowser`
 in `Env::in_memory()`, and the harness's `ScriptedBrowser`, which plays the
 redirect against the loopback listener, in flows) and that sign-in's
-timeout. Later pull requests add the Graph
-  origin and the download host rule. `Env::production()` reads no
+timeout. It carries the Graph base URL (`origin::GRAPH_BASE` in production,
+  an unreachable `.example` host in `Env::in_memory()`, and the harness's
+  Graph mock in flows), whose origin is the only one Graph requests go to.
+  A later pull request adds the download host rule. `Env::production()` reads no
   environment variable that could change an endpoint, so the release binary
   has no test path that could send a token to another host.
 - `src/auth.rs` holds the device-code flow, the browser flow (authorization
@@ -116,14 +119,35 @@ timeout. Later pull requests add the Graph
   also reads, lists and removes the `accounts/<email>.json` files with the
   same link and mode checks, and resolves the data directory for
   downloads.
-- `src/redact.rs` defines the `Redactor` and `RedactingWriter`.
+- `src/redact.rs` defines the `Redactor`, `RedactingWriter` and
+  `redact::url`, which keeps only the query values of `$top`, `$select`,
+  `$filter`, `$expand`, `$skiptoken` and `downloadType`.
+- `src/origin.rs` defines `Origin` (scheme, host, effective port; no
+  origin for a URL with user information or a trailing-dot host) and
+  `GRAPH_BASE`.
+- `src/routes.rs` defines the id types, `ReadRoute` (every Graph read,
+  each a `GET`), `WriteRoute` with `WriteRoute::ALL`, `Query` and
+  `build_url`, which encodes each path segment on its own and refuses
+  `.`, `..` and empty segments.
+- `src/graph.rs` is `GraphClient`, the only Graph transport: `get`,
+  `get_page` and `list` (paging), the origin and base-path check on every
+  request and paging link, the retry loop of `docs/SPEC.md` section 4.3
+  (with `Retry-After` honoured up to 60 seconds; a longer one ends the read
+  with Graph's error), the 8 MiB body limit and the Graph error allow-list.
+  Every request method takes the command's stderr for `--verbose` lines.
+  A token the provider cannot supply is `PurviewError::TokenUnavailable`,
+  so a caller can tell a broken sign-in from Graph's answer.
+- `src/trace.rs` is `TraceSink` (`docs/SPEC.md` section 4.9). Only
+  `GraphClient` records; token-endpoint exchanges are never traced.
 - `build.rs` records the target triple for `purview version`. The release
   workflow sets `PURVIEW_BUILD_COMMIT`.
 - `tests/cli.rs` holds offline process contracts (`assert_cmd`);
   `tests/flows.rs` runs whole commands in-process through `execute_with`
   against wiremock, with the harness and canary scanner in
   `tests/support/` and hand-written fixtures in `tests/fixtures/`;
-  `tests/fixture_lint.rs` is the public-data lint.
+  `tests/graph.rs` drives `GraphClient` against wiremock with a fake token
+  provider; `tests/write_allow_list.rs` scans `src/` and `build.rs` for
+  HTTP write methods; `tests/fixture_lint.rs` is the public-data lint.
 - `contrib/resign.sh` gives local macOS builds a stable signing identity.
   `contrib/install.sh` tests, builds, signs and installs the per-user
   `~/.local/bin/purview`.
@@ -207,15 +231,16 @@ check whether the other repository needs the same fix.
 
 ## Transport guarantees
 
-These apply from the pull requests that add the Graph and download clients.
-Do not weaken them.
+The Graph rules apply now; the download rules apply from the pull request
+that adds the download client. Do not weaken them.
 
 - Requests go only to an exact origin: scheme, host and effective port. The
-  Graph origin is `https://graph.microsoft.com:443`. Paging links and polling
-  URLs are checked against it too.
+  Graph origin is `https://graph.microsoft.com:443`, and Graph requests must
+  also lie below `/v1.0/`. Paging links and polling URLs are checked
+  against both too.
 - Graph redirects are disabled. Downloads follow only same-origin redirects,
   at most 3, and refuse any other with `CrossOriginRedirect`.
-- A GET is retried at most 3 times, on the conditions in `docs/SPEC.md`
+- A GET makes at most 3 attempts, on the conditions in `docs/SPEC.md`
   section 4.3. A POST is never retried automatically, whatever the status;
   an unclear outcome runs the reconciliation and exits with
   `WriteOutcomeUnknown`.
@@ -226,13 +251,14 @@ Do not weaken them.
 
 ## Write allow list
 
-The crate sends no Graph request today, only identity-platform requests.
-From the transport pull request (1.3) on, every Purview write is a
-`WriteRoute` variant, and `WriteRoute::ALL` is the six POSTs in
+The crate sends Graph `GET`s only; no write is sent yet. Every Purview
+write is a `WriteRoute` variant, and `WriteRoute::ALL` is the six POSTs in
 `docs/SPEC.md` section 4.3: create case, close case, create search,
-estimate statistics, export report and export result. No
-`PATCH`, `PUT` or `DELETE` may exist in the crate, and from that pull
-request a test scans the source tree for them. Adding a write needs a
+estimate statistics, export report and export result. The transport that
+sends them, `GraphClient::send_write`, arrives in pull request 2.1. No
+`PATCH`, `PUT` or `DELETE` may exist in the crate, in code, strings or
+comments, and `tests/write_allow_list.rs` scans the source tree for them
+and for calls that would choose a method at run time. Adding a write needs a
 reviewed design, a change to that test and an update to `docs/safety.md`.
 No route may add custodians, data sources or holds.
 

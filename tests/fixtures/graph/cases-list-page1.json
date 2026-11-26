@@ -1,0 +1,16 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#security/cases/ediscoveryCases",
+  "@odata.nextLink": "https://graph.microsoft.com/v1.0/security/cases/ediscoveryCases?$skiptoken=page-0002",
+  "value": [
+    {
+      "id": "00000000-0000-4000-8000-000000000031",
+      "displayName": "Records research - Orders review",
+      "status": "active"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000032",
+      "displayName": null,
+      "status": "closed"
+    }
+  ]
+}

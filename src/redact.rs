@@ -376,11 +376,212 @@ impl Drop for RedactingWriter {
     }
 }
 
+/// The query keys `url` keeps with their values (`docs/SPEC.md` section
+/// 4.9).
+pub const KEPT_QUERY_KEYS: &[&str] = &[
+    "$top",
+    "$select",
+    "$filter",
+    "$expand",
+    "$skiptoken",
+    "downloadType",
+];
+
+/// What `url` writes in place of a query value it does not keep, and of a
+/// query key that is not a plain name.
+pub const REDACTED_QUERY_VALUE: &str = "REDACTED";
+
+/// A URL as it may be shown or recorded: user information removed, the
+/// fragment removed unless the path ends in `/$metadata` (OData's
+/// `@odata.context` form, `…/$metadata#security/cases/…`, which names a
+/// type and holds no data), and every query value whose key is not in
+/// `KEPT_QUERY_KEYS` replaced with `REDACTED`. That covers storage
+/// signatures (`sig`, `se`, `sp`, `sv`) and any `code` or `token`. A key
+/// that is not a short plain name is replaced as well, since a bare
+/// `?<value>` is all key.
+///
+/// The parts that are kept are checked against `redactor` decoded, before
+/// they are encoded again: a registered secret holding `+` or `/` would
+/// otherwise pass as `%2B` or `%2F`. A path segment, kept query value or
+/// fragment that holds a secret becomes `REDACTED`. The result still goes
+/// through the Redactor at its sink.
+pub fn url(value: &::url::Url, redactor: &Redactor) -> String {
+    let mut clean = value.clone();
+    // Both fail only for URLs that cannot hold credentials, which then
+    // have none to remove.
+    let _ = clean.set_username("");
+    let _ = clean.set_password(None);
+    let keep_fragment = value.path().ends_with("/$metadata")
+        && value.fragment().is_some_and(|fragment| {
+            let decoded = percent_decode(fragment);
+            !redactor.recognises(&decoded) && !decoded.contains(['?', '=', '&', ':'])
+        });
+    if !keep_fragment {
+        clean.set_fragment(None);
+    }
+    if let Some(segments) = value.path_segments() {
+        let segments: Vec<String> = segments
+            .map(|segment| {
+                let decoded = percent_decode(segment);
+                if redactor.recognises(&decoded) || redactor.recognises(segment) {
+                    REDACTED_QUERY_VALUE.to_owned()
+                } else {
+                    decoded
+                }
+            })
+            .collect();
+        if let Ok(mut path) = clean.path_segments_mut() {
+            path.clear().extend(&segments);
+        }
+    }
+    if let Some(query) = value.query() {
+        // Each pair is read raw as well as decoded: form decoding turns `+`
+        // into a space, so a secret holding `+` would pass a check of the
+        // decoded value alone.
+        let holds_secret = |raw: &str, decoded: &str| {
+            redactor.recognises(raw)
+                || redactor.recognises(&percent_decode(raw))
+                || redactor.recognises(decoded)
+        };
+        let pairs: Vec<(String, String)> = query
+            .split('&')
+            .filter(|pair| !pair.is_empty())
+            .map(|pair| {
+                let (raw_key, raw_item) = pair.split_once('=').unwrap_or((pair, ""));
+                let (key, item) = ::url::form_urlencoded::parse(pair.as_bytes())
+                    .next()
+                    .map(|(key, item)| (key.into_owned(), item.into_owned()))
+                    .unwrap_or_default();
+                let secret_key = holds_secret(raw_key, &key);
+                // A kept value that holds another URL is not an OData
+                // option but text run together with one.
+                if KEPT_QUERY_KEYS.contains(&key.as_str())
+                    && !secret_key
+                    && !holds_secret(raw_item, &item)
+                    && !item.contains("://")
+                {
+                    (key, item)
+                } else if is_plain_key(&key) && !secret_key {
+                    (key, REDACTED_QUERY_VALUE.to_owned())
+                } else {
+                    (
+                        REDACTED_QUERY_VALUE.to_owned(),
+                        REDACTED_QUERY_VALUE.to_owned(),
+                    )
+                }
+            })
+            .collect();
+        clean.set_query(None);
+        if !pairs.is_empty() {
+            clean.query_pairs_mut().extend_pairs(pairs);
+        }
+    }
+    clean.to_string()
+}
+
+/// What `urls_in_text` writes in place of a URL in free text that does not
+/// parse.
+pub const UNREADABLE_URL: &str = "[unreadable URL]";
+
+/// `text` as it may be shown or recorded. A string that is one URL and
+/// nothing else (a `downloadUrl` or `@odata.nextLink` field) goes through
+/// `url`, which keeps the OData query options. In any other text, such as
+/// a Graph error message, a URL keeps only its scheme, host and path, as
+/// `url` shows them: everything from its first `?` or `#` to the next
+/// whitespace becomes `?REDACTED`, and a URL that does not parse becomes
+/// `[unreadable URL]`. Free text gives no reliable end to a URL (quotes, brackets
+/// and a second URL can all run on from it), so no part of a query in it
+/// is kept.
+pub fn urls_in_text(text: &str, redactor: &Redactor) -> String {
+    if let Some(parsed) = single_url(text) {
+        return url(&parsed, redactor);
+    }
+    let lower = text.to_ascii_lowercase();
+    let mut output = String::with_capacity(text.len());
+    let mut position = 0;
+    while let Some(found) = ["https://", "http://"]
+        .iter()
+        .filter_map(|scheme| lower[position..].find(scheme))
+        .min()
+    {
+        let start = position + found;
+        let rest = &text[start..];
+        let token = rest
+            .find(char::is_whitespace)
+            .map_or(rest, |end| &rest[..end]);
+        output.push_str(&text[position..start]);
+        let cut = token.find(['?', '#']);
+        let prefix = cut.map_or(token, |cut| &token[..cut]);
+        // The part kept still goes through `url`, which removes user
+        // information and any path segment holding a secret, encoded or not.
+        match ::url::Url::parse(prefix) {
+            Ok(parsed) => output.push_str(&url(&parsed, redactor)),
+            Err(_) => output.push_str(UNREADABLE_URL),
+        }
+        if cut.is_some() {
+            output.push('?');
+            output.push_str(REDACTED_QUERY_VALUE);
+        }
+        // The scheme alone is at least seven bytes, so this always moves.
+        position = start + token.len().max(1);
+    }
+    output.push_str(&text[position..]);
+    output
+}
+
+/// `text` as a URL when it is exactly one: no whitespace, an `http` or
+/// `https` scheme at the start, and no second `://` anywhere.
+fn single_url(text: &str) -> Option<::url::Url> {
+    let lower = text.to_ascii_lowercase();
+    let starts = lower.starts_with("https://") || lower.starts_with("http://");
+    if !starts || text.contains(char::is_whitespace) || lower.matches("://").count() != 1 {
+        return None;
+    }
+    ::url::Url::parse(text).ok()
+}
+
+/// Percent-decodes `text`, keeping any byte sequence that is not valid
+/// UTF-8 as replacement characters.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let hex = |byte: u8| (byte as char).to_digit(16);
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) = (hex(bytes[index + 1]), hex(bytes[index + 2])) {
+                decoded.push((high * 16 + low) as u8);
+                index += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+/// A query key that names a parameter rather than carrying data: at most
+/// 16 characters, made only of letters and `$_-`. Parameter names such as
+/// `sig`, `skoid` or `code` pass; a value used as a bare key almost always
+/// holds a digit or is longer.
+fn is_plain_key(key: &str) -> bool {
+    (1..=16).contains(&key.len())
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphabetic() || matches!(byte, b'$' | b'_' | b'-'))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
 
     use super::*;
+
+    /// `url` with a Redactor that holds no secret.
+    fn url(value: &::url::Url) -> String {
+        super::url(value, &Redactor::new())
+    }
 
     // Built at run time so that no JWT-shaped literal sits in the source.
     fn jwt() -> String {
@@ -662,5 +863,204 @@ mod tests {
         redactor.register("canary-access-0002");
         writeln!(writer, "canary-access-0002").unwrap();
         assert_eq!(sink.text(), "[redacted]\n");
+    }
+
+    #[test]
+    fn url_keeps_only_the_allowed_query_keys() {
+        let parse = |text: &str| ::url::Url::parse(text).unwrap();
+        assert_eq!(
+            url(&parse(
+                "https://graph.microsoft.com/v1.0/security/cases/ediscoveryCases?$top=1&$select=id\
+                 &$filter=x&$expand=search&$skiptoken=next-0001&downloadType=Report"
+            )),
+            "https://graph.microsoft.com/v1.0/security/cases/ediscoveryCases?%24top=1&%24select=id\
+             &%24filter=x&%24expand=search&%24skiptoken=next-0001&downloadType=Report"
+        );
+        let redacted = url(&parse(
+            "https://alpha.proxyservice.ediscovery.svc.cloud.microsoft/ediscovery/api/proxy/x\
+             ?downloadType=Report&sig=canary-sig-0001&se=2026&sp=r&sv=1&code=canary-code-0001\
+             &token=canary-token-0001&Top=1",
+        ));
+        assert!(!redacted.contains("canary"), "{redacted}");
+        assert!(redacted.ends_with(
+            "?downloadType=Report&sig=REDACTED&se=REDACTED&sp=REDACTED&sv=REDACTED\
+             &code=REDACTED&token=REDACTED&Top=REDACTED"
+        ));
+    }
+
+    #[test]
+    fn url_drops_credentials_fragments_and_keys_that_carry_data() {
+        let parse = |text: &str| ::url::Url::parse(text).unwrap();
+        // Joined at run time so that the public-data lint does not read
+        // the user information as an address.
+        let redacted = url(&parse(&format!(
+            "{}{}{}{}",
+            "https:",
+            "//user:canary-pass-0001",
+            '@',
+            "graph.microsoft.com/v1.0/?canary-bare-key-0001&x%20y=1#canary-fragment-0001"
+        )));
+        assert!(!redacted.contains("canary"), "{redacted}");
+        assert!(!redacted.contains("user"), "{redacted}");
+        assert_eq!(
+            redacted,
+            "https://graph.microsoft.com/v1.0/?REDACTED=REDACTED&REDACTED=REDACTED"
+        );
+        assert_eq!(
+            url(&parse("https://graph.microsoft.com/v1.0/x")),
+            "https://graph.microsoft.com/v1.0/x"
+        );
+        assert_eq!(
+            url(&parse(
+                "https://graph.microsoft.com/v1.0/$metadata#security/cases/ediscoveryCases"
+            )),
+            "https://graph.microsoft.com/v1.0/$metadata#security/cases/ediscoveryCases"
+        );
+        let implicit = url(&parse(
+            "https://graph.microsoft.com/v1.0/x#access_token=canary-0001&state=s",
+        ));
+        assert_eq!(implicit, "https://graph.microsoft.com/v1.0/x");
+        assert_eq!(
+            url(&parse("https://graph.microsoft.com/v1.0/x#canary-0001")),
+            "https://graph.microsoft.com/v1.0/x"
+        );
+    }
+
+    #[test]
+    fn url_checks_kept_parts_against_registered_secrets_after_decoding() {
+        let redactor = Redactor::new();
+        redactor.register("canary+slash/0001");
+        let parse = |text: &str| ::url::Url::parse(text).unwrap();
+        let shown = super::url(
+            &parse(
+                "https://graph.microsoft.com/v1.0/x/canary%2Bslash%2F0001/y\
+                 ?$skiptoken=canary%2Bslash%2F0001&$top=1",
+            ),
+            &redactor,
+        );
+        assert_eq!(
+            shown,
+            "https://graph.microsoft.com/v1.0/x/REDACTED/y?%24skiptoken=REDACTED&%24top=1"
+        );
+        let fragment = super::url(
+            &parse("https://graph.microsoft.com/v1.0/$metadata#canary+slash/0001"),
+            &redactor,
+        );
+        assert_eq!(fragment, "https://graph.microsoft.com/v1.0/$metadata");
+    }
+
+    #[test]
+    fn urls_in_free_text_lose_their_whole_query() {
+        let redactor = Redactor::new();
+        let proxy = concat!(
+            "https://alpha.proxyservice.ediscovery.svc.cloud.microsoft/ediscovery/api/proxy/x",
+            "?sig=canary-sig-0001&downloadType=Report"
+        );
+        let path_only = proxy.split('?').next().unwrap();
+        // An address the parser refuses, joined at run time so that the
+        // public-data lint does not read it.
+        let broken = ["https://", "[bad?token=canary-token-0001"].concat();
+        let text = format!(
+            "Download from {proxy}. Or \"HTTP://graph.microsoft.com/v1.0/y?code=canary-code-0001\", \
+             or {broken} now"
+        );
+        let shown = urls_in_text(&text, &redactor);
+        assert_eq!(
+            shown,
+            format!(
+                "Download from {path_only}?REDACTED Or \"http://graph.microsoft.com/v1.0/y?REDACTED \
+                 or [unreadable URL]?REDACTED now"
+            )
+        );
+        for text in [
+            "see https://graph.microsoft.com/v1.0/O'Brien.pdf?sig=canary-sig-0002 now",
+            "see 'https://graph.microsoft.com/v1.0/a\"b(c)?sig=canary-sig-0003'.",
+            // Two URLs run together, with no space between them.
+            "[\"https://one.example/x?$top=1\",\"https://two.example/y?sig=canary-sig-0004\"]",
+            "https://one.example/x?$top=1https://two.example/y?sig=canary-sig-0005",
+            "https://one.example/x#https://two.example/y?sig=canary-sig-0006",
+        ] {
+            let shown = urls_in_text(text, &redactor);
+            assert!(!shown.contains("canary"), "{text}: {shown}");
+        }
+        assert_eq!(
+            urls_in_text("no address here", &redactor),
+            "no address here"
+        );
+    }
+
+    #[test]
+    fn a_url_in_free_text_loses_user_information_and_secret_path_segments() {
+        let redactor = Redactor::new();
+        redactor.register("canary+slash/0001");
+        let text = format!(
+            "see https:{}{}{} and https://one.example/x/canary%2Bslash%2F0001?sig=value now",
+            "//user:canary-pass-0002", '@', "graph.microsoft.com/v1.0/y"
+        );
+        let shown = urls_in_text(&text, &redactor);
+        assert_eq!(
+            shown,
+            "see https://graph.microsoft.com/v1.0/y and https://one.example/x/REDACTED?REDACTED now"
+        );
+    }
+
+    #[test]
+    fn a_string_that_is_one_url_keeps_its_odata_options() {
+        let redactor = Redactor::new();
+        assert_eq!(
+            urls_in_text(
+                "https://graph.microsoft.com/v1.0/x?$skiptoken=page-0002&sig=canary-sig-0007",
+                &redactor
+            ),
+            "https://graph.microsoft.com/v1.0/x?%24skiptoken=page-0002&sig=REDACTED"
+        );
+        // A context fragment that holds another URL is not kept.
+        assert_eq!(
+            super::url(
+                &::url::Url::parse(
+                    "https://graph.microsoft.com/v1.0/$metadata#https://two.example/y?sig=canary-sig-0009"
+                )
+                .unwrap(),
+                &redactor
+            ),
+            "https://graph.microsoft.com/v1.0/$metadata"
+        );
+        // A registered secret holding `+`, raw or encoded, in a kept value
+        // or as a key.
+        redactor.register("canary+slash/0010");
+        for text in [
+            "https://graph.microsoft.com/v1.0/x?$skiptoken=canary+slash/0010",
+            "https://graph.microsoft.com/v1.0/x?$skiptoken=canary+slash%2F0010",
+            "https://graph.microsoft.com/v1.0/x?$skiptoken=canary%2Bslash%2F0010",
+            "https://graph.microsoft.com/v1.0/x?canary+slash/0010=1",
+        ] {
+            let shown = urls_in_text(text, &redactor);
+            assert!(!shown.contains("canary"), "{text}: {shown}");
+            assert!(!shown.contains("slash"), "{text}: {shown}");
+        }
+        // A secret that looks like a parameter name is not kept as a key.
+        redactor.register("canarysecretkey");
+        assert_eq!(
+            urls_in_text(
+                "https://graph.microsoft.com/v1.0/x?canarysecretkey=1",
+                &redactor
+            ),
+            "https://graph.microsoft.com/v1.0/x?REDACTED=REDACTED"
+        );
+        // A URL run into a kept value, after a comma or in compact JSON.
+        for text in [
+            "https://one.example/x?$top=1,https://two.example/y?sig=canary-sig-0011",
+            "https://one.example/x?$filter=a%20eq%20%27https://two.example/y?sig=canary-sig-0012%27",
+            "{\"a\":\"https://one.example/x?$top=1\",\"b\":\"https://two.example/y?sig=canary-sig-0013\"}",
+        ] {
+            let shown = urls_in_text(text, &redactor);
+            assert!(!shown.contains("canary"), "{text}: {shown}");
+        }
+        // A kept value that holds another URL is not kept.
+        let joined = urls_in_text(
+            "https://one.example/x?$top=1%22,%22https%3A//two.example/y?sig=canary-sig-0008",
+            &redactor,
+        );
+        assert!(!joined.contains("canary"), "{joined}");
     }
 }

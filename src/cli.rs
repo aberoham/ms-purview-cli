@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{error::ErrorKind, Args, CommandFactory, Parser, Subcommand};
 use serde_json::{json, Value};
@@ -13,11 +15,14 @@ use crate::auth::{self, IdentityClient};
 use crate::config::{self, AccountRecord, ClientConfig, Config};
 use crate::env::{Env, LoginWrite};
 use crate::error::{PurviewError, Result};
+use crate::graph::{GraphClient, GraphSettings, DEFAULT_TIMEOUT, MAX_TIMEOUT_SECONDS};
 use crate::output::{
     error_value, sanitize, sanitize_multiline, write_rows, OutputFormat, OutputOptions,
 };
+use crate::routes::{Query, ReadRoute};
 use crate::secrets::{delete_value, entry_exists, token_key, CredentialLock};
 use crate::token::{Credential, IdentityEndpoint, StoredPrincipal, StoredTokenProvider};
+use crate::trace::TraceSink;
 
 /// The command line. Clap never reads the process environment here: flag
 /// defaults come from `Env::vars` (see `FlagDefaults`).
@@ -30,6 +35,7 @@ use crate::token::{Credential, IdentityEndpoint, StoredPrincipal, StoredTokenPro
     after_help = "\
 Examples:
   purview auth login --client-id <application-client-id> --tenant-id <tenant-id>
+  purview auth status
   purview auth list
   purview version --json",
     next_help_heading = "Global Options"
@@ -76,6 +82,30 @@ case (default: the default account) [env: PURVIEW_ACCOUNT]"
         help = "Never prompt; a command that needs input fails instead [env: PURVIEW_NO_INPUT=true]"
     )]
     no_input: bool,
+    #[arg(
+        short,
+        long,
+        global = true,
+        help = "Log each Microsoft Graph request, and each token refresh made for it or by 'auth \
+refresh', on stderr through the redactor [env: PURVIEW_VERBOSE=true]"
+    )]
+    verbose: bool,
+    #[arg(
+        long,
+        global = true,
+        value_name = "SECS",
+        help = "Timeout for each Microsoft Graph request; 0 means 60, at most 600 \
+[env: PURVIEW_TIMEOUT]"
+    )]
+    timeout: Option<String>,
+    #[arg(
+        long,
+        global = true,
+        value_name = "DIR",
+        help = "Record each Microsoft Graph exchange as a JSON file in DIR, without tokens or \
+request headers; the files hold tenant data [env: PURVIEW_TRACE_DIR]"
+    )]
+    trace: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -83,14 +113,15 @@ case (default: the default account) [env: PURVIEW_ACCOUNT]"
 #[derive(Debug, Clone, Subcommand)]
 enum Command {
     #[command(
-        about = "Sign in, refresh, list and sign out accounts",
+        about = "Sign in, refresh, check, list and sign out accounts",
         long_about = "\
-Sign in, refresh, list and sign out accounts. Tokens are kept only in the \
-operating system's credential store.",
+Sign in, refresh, check, list and sign out accounts. Tokens are kept only in \
+the operating system's credential store.",
         after_help = "\
 Examples:
   purview auth login --client-id <application-client-id> --tenant-id <tenant-id>
   purview auth refresh
+  purview auth status
   purview auth list
   purview auth logout --account alex@contoso.example"
     )]
@@ -155,6 +186,24 @@ Examples:
     )]
     Refresh,
     #[command(
+        about = "Check the Graph token and the Purview role with one read",
+        long_about = "\
+Check the account's Graph token and Purview role with one read of Microsoft \
+Graph (the first case in the case list), refreshing the token first if it is \
+about to expire. purviewRole is ok when Graph answers, denied when it refuses \
+with HTTP 403, and unknown when the read fails any other way. A sign-in that \
+no longer works (a refused refresh) is an error, not unknown; run 'purview \
+auth login' again.
+
+The download token's expiry comes from the stored credential; the download \
+token is never sent.",
+        after_help = "\
+Examples:
+  purview auth status
+  purview auth status --account alex@contoso.example --json"
+    )]
+    Status,
+    #[command(
         about = "List the signed-in accounts; * marks the default",
         after_help = "\
 Examples:
@@ -208,8 +257,11 @@ struct FlagDefaults {
     results_only: bool,
     plain: bool,
     no_input: bool,
+    verbose: bool,
     select: Option<String>,
     account: Option<String>,
+    timeout: Option<String>,
+    trace_dir: Option<String>,
     client_id: Option<String>,
     tenant_id: Option<String>,
 }
@@ -235,8 +287,11 @@ impl FlagDefaults {
             results_only: flag("PURVIEW_RESULTS_ONLY")?,
             plain: flag("PURVIEW_PLAIN")?,
             no_input: flag("PURVIEW_NO_INPUT")?,
+            verbose: flag("PURVIEW_VERBOSE")?,
             select: text("PURVIEW_SELECT")?,
             account: text("PURVIEW_ACCOUNT")?,
+            timeout: text("PURVIEW_TIMEOUT")?,
+            trace_dir: text("PURVIEW_TRACE_DIR")?,
             client_id: text("PURVIEW_CLIENT_ID")?,
             tenant_id: text("PURVIEW_TENANT_ID")?,
         })
@@ -249,6 +304,10 @@ impl FlagDefaults {
 struct Globals {
     account: Option<String>,
     no_input: bool,
+    verbose: bool,
+    /// The per-request Graph timeout, already resolved (`0` is 60 s).
+    timeout: Duration,
+    trace_dir: Option<PathBuf>,
     client_id: Option<String>,
     tenant_id: Option<String>,
 }
@@ -264,9 +323,38 @@ impl Globals {
                 None => defaults.account.clone(),
             },
             no_input: cli.no_input || defaults.no_input,
+            verbose: cli.verbose || defaults.verbose,
+            timeout: match cli.timeout.as_deref() {
+                Some(value) => graph_timeout("--timeout", &explicit("--timeout", value)?)?,
+                None => match defaults.timeout.as_deref() {
+                    Some(value) => graph_timeout("PURVIEW_TIMEOUT", value)?,
+                    None => DEFAULT_TIMEOUT,
+                },
+            },
+            trace_dir: match cli.trace.as_deref() {
+                Some(dir) => Some(PathBuf::from(explicit(
+                    "--trace",
+                    dir.to_str().ok_or_else(|| {
+                        PurviewError::message("--trace was given a path that is not UTF-8")
+                    })?,
+                )?)),
+                None => defaults.trace_dir.as_deref().map(PathBuf::from),
+            },
             client_id: defaults.client_id.clone(),
             tenant_id: defaults.tenant_id.clone(),
         })
+    }
+}
+
+/// A per-request Graph timeout in whole seconds: `0` means the default of
+/// 60, and at most `MAX_TIMEOUT_SECONDS`.
+fn graph_timeout(name: &str, value: &str) -> Result<Duration> {
+    match value.trim().parse::<u64>() {
+        Ok(0) => Ok(DEFAULT_TIMEOUT),
+        Ok(seconds) if seconds <= MAX_TIMEOUT_SECONDS => Ok(Duration::from_secs(seconds)),
+        _ => Err(PurviewError::message(format!(
+            "{name} must be a whole number of seconds from 0 to {MAX_TIMEOUT_SECONDS}"
+        ))),
     }
 }
 
@@ -528,6 +616,7 @@ async fn run(
         Command::Auth(auth) => match auth.command {
             AuthCommand::Login(login) => auth_login(env, output, globals, login).await,
             AuthCommand::Refresh => auth_refresh(env, output, globals).await,
+            AuthCommand::Status => auth_status(env, output, globals).await,
             AuthCommand::List => auth_list(env, output),
             AuthCommand::Logout => auth_logout(env, output, globals).await,
         },
@@ -1189,8 +1278,9 @@ fn select_account(
         })
 }
 
-/// `auth refresh`: both resources, with the scopes already stored.
-async fn auth_refresh(env: &mut Env, output: &OutputOptions, globals: &Globals) -> Result<Outcome> {
+/// The account a command acts as and its stored credential, checked
+/// against the account file and `config.json` before anything is sent.
+fn signed_in(env: &mut Env, globals: &Globals) -> Result<(AccountRecord, Credential)> {
     let dir = configuration_dir(env)?;
     let stored = load_config(env, &dir)?;
     let accounts = config::list_accounts(&dir, &mut env.stderr)?;
@@ -1211,7 +1301,13 @@ async fn auth_refresh(env: &mut Env, output: &OutputOptions, globals: &Globals) 
              key, then sign in again"
         )));
     }
-    let provider = StoredTokenProvider::new(
+    Ok((account, credential))
+}
+
+/// A token provider for `credential`, redeeming through the registration
+/// it records.
+fn token_provider(env: &Env, credential: Credential) -> Result<StoredTokenProvider> {
+    Ok(StoredTokenProvider::new(
         &IdentityEndpoint {
             base: env.identity_base.clone(),
             request_timeout: env.identity_timeout,
@@ -1221,10 +1317,55 @@ async fn auth_refresh(env: &mut Env, output: &OutputOptions, globals: &Globals) 
         env.clock.clone(),
         credential,
     )?
-    .with_account_locks(env.account_locks.clone());
-    let credential = provider
-        .refresh_all()
-        .await
+    .with_account_locks(env.account_locks.clone()))
+}
+
+/// The Graph client for a command, opening the trace directory first when
+/// `--trace` was given, which prints its warnings.
+fn graph_client(
+    env: &mut Env,
+    globals: &Globals,
+    tokens: Arc<dyn crate::token::TokenProvider>,
+) -> Result<GraphClient> {
+    let trace = match &globals.trace_dir {
+        Some(dir) => Some(Arc::new(TraceSink::open(
+            dir,
+            env.redactor.clone(),
+            env.clock.clone(),
+            &mut env.stderr,
+        )?)),
+        None => None,
+    };
+    GraphClient::new(
+        GraphSettings {
+            base: env.graph_base.clone(),
+            timeout: globals.timeout,
+            verbose: globals.verbose,
+            trace,
+        },
+        tokens,
+        env.redactor.clone(),
+        env.clock.clone(),
+    )
+}
+
+/// Writes the provider's notes under `--verbose`.
+fn log_token_notes(env: &mut Env, globals: &Globals, provider: &StoredTokenProvider) {
+    use crate::token::TokenProvider;
+    for note in provider.take_notes() {
+        if globals.verbose {
+            let _ = writeln!(env.stderr, "[verbose] {}", sanitize(&note));
+        }
+    }
+}
+
+/// `auth refresh`: both resources, with the scopes already stored.
+async fn auth_refresh(env: &mut Env, output: &OutputOptions, globals: &Globals) -> Result<Outcome> {
+    let (account, credential) = signed_in(env, globals)?;
+    let provider = token_provider(env, credential)?;
+    let refreshed = provider.refresh_all().await;
+    log_token_notes(env, globals, &provider);
+    let credential = refreshed
         .map_err(|error| error.context(format!("refreshing {}", sanitize(&account.email))))?;
     let download_expires = credential
         .download
@@ -1246,6 +1387,80 @@ async fn auth_refresh(env: &mut Env, output: &OutputOptions, globals: &Globals) 
         credential.graph.expires_at_text(),
         download_expires.as_deref().unwrap_or("not issued"),
         sanitize(&credential.graph.scope)
+    )?;
+    Ok(Outcome::success(None))
+}
+
+/// `auth status`: one Graph read, `GET /security/cases/ediscoveryCases?$top=1`,
+/// proves the Graph token and the Purview role (`docs/SPEC.md` section
+/// 3.5). Graph answering is `ok`, a 403 is `denied`, and any other failure
+/// of the read is `unknown`, each with exit 0. A Graph token that cannot be
+/// had (a refused refresh, a store write that failed) is the command's
+/// error: the sign-in itself is broken, and a script that checks only the
+/// exit code must see that. The download token's expiry is read from the
+/// stored credential; that token is never sent.
+async fn auth_status(env: &mut Env, output: &OutputOptions, globals: &Globals) -> Result<Outcome> {
+    let (account, credential) = signed_in(env, globals)?;
+    let provider = Arc::new(token_provider(env, credential)?);
+    let graph = graph_client(env, globals, provider.clone())?;
+    let probe = graph
+        .get_page(&ReadRoute::Cases, &Query::new().top(1), &mut env.stderr)
+        .await;
+    log_token_notes(env, globals, &provider);
+    let (role, detail) = match probe {
+        Ok(_) => ("ok", None),
+        Err(error) if error.is_token_unavailable() => {
+            return Err(error.context(format!(
+                "getting a Graph token for {} (if the identity platform refused the refresh, \
+                 sign in again with 'purview auth login')",
+                sanitize(&account.email)
+            )));
+        }
+        Err(error) if error.graph_status() == Some(403) => ("denied", Some(error.to_string())),
+        Err(error) => ("unknown", Some(error.to_string())),
+    };
+    let credential = provider.credential().await;
+    let download = credential.download.as_ref();
+    if output.format == OutputFormat::Json {
+        let result = json!({
+            "account": account.email,
+            "upn": account.upn,
+            "tenantId": credential.tenant_id,
+            "clientId": credential.client_id,
+            "graphScope": credential.graph.scope,
+            "graphExpiresAt": credential.graph.expires_at_text(),
+            "downloadScope": download.map(|token| token.scope.clone()),
+            "downloadExpiresAt": download.map(|token| token.expires_at_text()),
+            "purviewRole": role,
+            "purviewRoleDetail": detail,
+        });
+        return Ok(Outcome::success(Some(output.json_value(&result, 1)?)));
+    }
+    writeln!(
+        env.stdout,
+        "Account: {}\nTenant: {}\nGraph scope: {}\nGraph token expires: {}\nDownload scope: \
+         {}\nDownload token expires: {}\nPurview role: {role}{}",
+        sanitize(&account.email),
+        sanitize(&credential.tenant_id),
+        sanitize(&credential.graph.scope),
+        credential.graph.expires_at_text(),
+        download.map_or_else(|| "not issued".to_owned(), |token| sanitize(&token.scope)),
+        download.map_or_else(
+            || "not issued".to_owned(),
+            |token| {
+                if token.expires_at <= env.clock.now() {
+                    format!(
+                        "{} (expired; 'purview auth refresh' renews it)",
+                        token.expires_at_text()
+                    )
+                } else {
+                    token.expires_at_text()
+                }
+            }
+        ),
+        detail
+            .map(|detail| format!(" ({})", sanitize(&detail)))
+            .unwrap_or_default()
     )?;
     Ok(Outcome::success(None))
 }

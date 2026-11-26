@@ -2695,3 +2695,444 @@ async fn browser_login_under_no_input_is_refused_before_the_browser_opens() {
         .unwrap()
         .is_empty());
 }
+
+const CASES_PATH: &str = "/v1.0/security/cases/ediscoveryCases";
+const GRAPH_SCOPE: &str = "https://graph.microsoft.com/eDiscovery.ReadWrite.All openid profile";
+
+/// Mounts the `auth status` read for `token`, answered by `answer`.
+async fn mount_probe(harness: &Harness, token: &str, answer: ResponseTemplate) {
+    Mock::given(method("GET"))
+        .and(path(CASES_PATH))
+        .and(wiremock::matchers::query_param("$top", "1"))
+        .and(wiremock::matchers::header(
+            "authorization",
+            format!("Bearer {token}").as_str(),
+        ))
+        .respond_with(answer)
+        .mount(&harness.graph)
+        .await;
+}
+
+async fn graph_requests(harness: &Harness) -> usize {
+    harness.graph.received_requests().await.unwrap().len()
+}
+
+async fn identity_requests(harness: &Harness) -> usize {
+    harness.identity.received_requests().await.unwrap().len()
+}
+
+#[tokio::test]
+async fn status_reads_one_case_with_the_stored_token_and_never_sends_the_download_token() {
+    let harness = Harness::new().await;
+    sign_in_alex(&harness).await;
+    mount_probe(
+        &harness,
+        "canary-graph-access-0001",
+        json_response(
+            200,
+            graph_fixture("cases-list-top1.json", &harness.graph.uri()),
+        ),
+    )
+    .await;
+    let run = harness.run(&["--json", "auth", "status"]).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
+    assert_eq!(
+        run.json(),
+        serde_json::json!({
+            "results": {
+                "account": ALEX,
+                "upn": "alex.w@contoso.example",
+                "tenantId": TENANT_ID,
+                "clientId": CLIENT_ID,
+                "graphScope": GRAPH_SCOPE,
+                "graphExpiresAt": "2026-01-05T10:11:21Z",
+                "downloadScope": "b26e684c-5068-4120-a679-64a5d2c909d9/eDiscovery.Download.Read",
+                "downloadExpiresAt": "2026-01-05T10:00:09Z",
+                "purviewRole": "ok",
+                "purviewRoleDetail": null,
+            },
+            "count": 1,
+        })
+    );
+    assert_eq!(graph_requests(&harness).await, 1);
+    // No refresh and no download redemption.
+    assert_eq!(identity_requests(&harness).await, 0);
+    assert!(run.stderr().is_empty(), "{}", run.stderr());
+    harness.assert_no_canaries(&run);
+}
+
+#[tokio::test]
+async fn status_reports_denied_for_a_403_and_unknown_for_other_failures() {
+    let harness = Harness::new().await;
+    sign_in_alex(&harness).await;
+    mount_probe(
+        &harness,
+        "canary-graph-access-0001",
+        json_response(403, graph_fixture("error-403.json", &harness.graph.uri())),
+    )
+    .await;
+    let run = harness.run(&["auth", "status"]).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
+    let text = run.stdout();
+    assert!(
+        text.contains(
+            "Purview role: denied (Microsoft Graph returned HTTP 403: Forbidden: Caller does not \
+             have the required eDiscovery role."
+        ),
+        "{text}"
+    );
+    assert!(
+        text.starts_with(&format!("Account: {ALEX}\nTenant: {TENANT_ID}\n")),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "Download scope: b26e684c-5068-4120-a679-64a5d2c909d9/eDiscovery.Download.Read\n\
+             Download token expires: 2026-01-05T10:00:09Z"
+        ),
+        "{text}"
+    );
+
+    for (answer, attempts) in [
+        (
+            json_response(
+                500,
+                serde_json::json!({"error": {"code": "InternalServerError"}}),
+            ),
+            3,
+        ),
+        (
+            json_response(404, serde_json::json!({"error": {"code": "NotFound"}})),
+            1,
+        ),
+        (ResponseTemplate::new(200).set_body_string("not json"), 1),
+    ] {
+        harness.graph.reset().await;
+        mount_probe(&harness, "canary-graph-access-0001", answer).await;
+        let run = harness.run(&["--json", "auth", "status"]).await;
+        assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
+        let results = &run.json()["results"];
+        assert_eq!(results["purviewRole"], "unknown", "{results}");
+        assert!(results["purviewRoleDetail"].is_string(), "{results}");
+        assert_eq!(graph_requests(&harness).await, attempts);
+    }
+}
+
+#[tokio::test]
+async fn status_marks_an_expired_download_token_without_renewing_it() {
+    let harness = Harness::new().await;
+    sign_in_alex(&harness).await;
+    // Past the download token's expiry, inside the Graph token's.
+    harness.clock.advance(Duration::from_secs(3700));
+    mount_probe(
+        &harness,
+        "canary-graph-access-0001",
+        json_response(
+            200,
+            graph_fixture("cases-list-top1.json", &harness.graph.uri()),
+        ),
+    )
+    .await;
+    let run = harness.run(&["auth", "status"]).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
+    assert!(
+        run.stdout().contains(
+            "Download token expires: 2026-01-05T10:00:09Z (expired; 'purview auth refresh' \
+             renews it)"
+        ),
+        "{}",
+        run.stdout()
+    );
+    assert_eq!(identity_requests(&harness).await, 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_trace_directory_that_cannot_be_written_stops_before_any_request() {
+    use std::os::unix::fs::PermissionsExt;
+    let harness = Harness::new().await;
+    sign_in_alex(&harness).await;
+    // Past the Graph token's expiry, so a request would start with a refresh.
+    harness.clock.advance(Duration::from_secs(5000));
+    let trace = harness.root.path().join("read-only");
+    std::fs::create_dir(&trace).unwrap();
+    std::fs::set_permissions(&trace, std::fs::Permissions::from_mode(0o500)).unwrap();
+    // A privileged runner can write regardless of the mode; there is
+    // nothing to test then.
+    if std::fs::write(trace.join("probe"), b"").is_ok() {
+        return;
+    }
+    let trace_arg = trace.display().to_string();
+    let run = harness
+        .run(&["--json", "--trace", &trace_arg, "auth", "status"])
+        .await;
+    std::fs::set_permissions(&trace, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(run.outcome.exit_code, 1);
+    let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
+    assert!(message.contains("opening the trace directory"), "{message}");
+    // Under --json a failure leaves stderr empty, warnings included.
+    assert!(run.stderr().is_empty(), "{}", run.stderr());
+    assert_eq!(graph_requests(&harness).await, 0);
+    assert_eq!(identity_requests(&harness).await, 0);
+}
+
+#[tokio::test]
+async fn a_signed_url_in_a_graph_error_reaches_no_output_or_trace_with_its_signature() {
+    let harness = Harness::new().await;
+    sign_in_alex(&harness).await;
+    let signed = format!(
+        "{}/v1.0/files/O'Brien.pdf?sig=canary-sig-0007&se=2026",
+        harness.graph.uri()
+    );
+    mount_probe(
+        &harness,
+        "canary-graph-access-0001",
+        json_response(
+            403,
+            serde_json::json!({"error": {
+                "code": "Forbidden",
+                "message": format!("no role; see '{signed}'."),
+                "target": signed,
+            }}),
+        ),
+    )
+    .await;
+    let trace = harness.root.path().join("trace");
+    let trace_arg = trace.display().to_string();
+    for args in [
+        vec!["auth", "status"],
+        vec!["--json", "--trace", &trace_arg, "auth", "status"],
+    ] {
+        let run = harness.run(&args).await;
+        assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
+        if args[0] == "--json" {
+            let detail = run.json()["results"]["purviewRoleDetail"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(detail.contains("O'Brien.pdf?REDACTED"), "{detail}");
+        } else {
+            assert!(
+                run.stdout().contains("Purview role: denied"),
+                "{}",
+                run.stdout()
+            );
+        }
+        harness.assert_absent(&run, &["canary-sig-0007"]);
+    }
+    assert_eq!(std::fs::read_dir(&trace).unwrap().count(), 1);
+}
+
+#[tokio::test]
+async fn status_with_a_refresh_the_identity_platform_refuses_is_an_error() {
+    let harness = Harness::new().await;
+    sign_in_alex(&harness).await;
+    // Past the Graph token's expiry, so the read needs a refresh.
+    harness.clock.advance(Duration::from_secs(5000));
+    Mock::given(method("POST"))
+        .and(path(token_path("token")))
+        .respond_with(json_response(
+            400,
+            serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "AADSTS70043: The refresh token has expired.",
+                "error_codes": [70043],
+            }),
+        ))
+        .expect(1)
+        .mount(&harness.identity)
+        .await;
+    let run = harness.run(&["--json", "auth", "status"]).await;
+    assert_eq!(run.outcome.exit_code, 1);
+    let error = &run.json()["error"];
+    assert_eq!(error["code"], "invalid_grant");
+    assert_eq!(error["status"], 400);
+    let message = error["message"].as_str().unwrap();
+    assert!(message.contains("purview auth login"), "{message}");
+    assert!(message.contains("AADSTS70043"), "{message}");
+    assert_eq!(graph_requests(&harness).await, 0);
+    harness.assert_no_canaries(&run);
+}
+
+#[tokio::test]
+async fn graph_flags_are_checked_before_any_network_call() {
+    let harness = Harness::new().await;
+    sign_in_alex(&harness).await;
+    for (args, vars, expected) in [
+        (
+            &["--timeout", "601"][..],
+            &[][..],
+            "--timeout must be a whole number",
+        ),
+        (
+            &["--timeout", "x"][..],
+            &[][..],
+            "--timeout must be a whole number",
+        ),
+        (
+            &["--timeout", " "][..],
+            &[][..],
+            "--timeout was given an empty value",
+        ),
+        (
+            &["--trace", " "][..],
+            &[][..],
+            "--trace was given an empty value",
+        ),
+        (
+            &["--trace", ""][..],
+            &[][..],
+            "a value is required for '--trace <DIR>'",
+        ),
+        (
+            &[][..],
+            &[("PURVIEW_TIMEOUT", "-1")][..],
+            "PURVIEW_TIMEOUT must be a whole number",
+        ),
+        (
+            &[][..],
+            &[("PURVIEW_VERBOSE", "yes")][..],
+            "PURVIEW_VERBOSE must be true or false",
+        ),
+    ] {
+        let mut argv = vec!["--json"];
+        argv.extend_from_slice(args);
+        argv.extend_from_slice(&["auth", "status"]);
+        let run = harness
+            .run_with(&argv, |env, _| {
+                for (name, value) in vars {
+                    env.vars.insert((*name).to_owned(), (*value).into());
+                }
+            })
+            .await;
+        assert_eq!(run.outcome.exit_code, 1, "{args:?}");
+        let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
+        assert!(message.contains(expected), "{args:?}: {message}");
+    }
+    assert_eq!(graph_requests(&harness).await, 0);
+    assert_eq!(identity_requests(&harness).await, 0);
+}
+
+/// The first canary sweep (`docs/SPEC.md` section 8.5, item 10) for the
+/// transport: a refresh rotation, a 401 whose body reflects the
+/// superseded tokens, a second refresh, a 503 retry and a success whose
+/// body carries a token, all under `--trace` and `--verbose`. Afterwards
+/// no canary is in stdout, stderr, the trace directory or the
+/// configuration directory.
+#[tokio::test]
+async fn the_canary_sweep_finds_no_token_in_output_trace_or_config() {
+    let harness = Harness::new().await;
+    sign_in_alex(&harness).await;
+    harness.clock.advance(Duration::from_secs(5000));
+    for (old_refresh, access, new_refresh) in [
+        (
+            "canary-refresh-0002",
+            "canary-graph-access-0002",
+            "canary-refresh-0003",
+        ),
+        (
+            "canary-refresh-0003",
+            "canary-graph-access-0003",
+            "canary-refresh-0004",
+        ),
+    ] {
+        Mock::given(method("POST"))
+            .and(path(token_path("token")))
+            .and(Form::new(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", old_refresh),
+            ]))
+            .respond_with(json_response(200, token(access, new_refresh, GRAPH_SCOPE)))
+            .expect(1)
+            .mount(&harness.identity)
+            .await;
+    }
+    // Each answer reflects every token the run holds by then, superseded
+    // ones included. A token is reflected only after the process has
+    // received it: a value it has not yet seen (or never sees, such as the
+    // device code) it cannot know to remove.
+    let held_at_401 = [
+        "canary-graph-access-0001",
+        "canary-graph-access-0002",
+        "canary-download-access-0001",
+        "canary-refresh-0002",
+        "canary-refresh-0003",
+    ]
+    .join(" ");
+    let reflected = format!("{held_at_401} canary-graph-access-0003 canary-refresh-0004");
+    mount_probe(
+        &harness,
+        "canary-graph-access-0002",
+        json_response(
+            401,
+            serde_json::json!({"error": {"code": "InvalidAuthenticationToken", "message": held_at_401}}),
+        ),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path(CASES_PATH))
+        .and(wiremock::matchers::header(
+            "authorization",
+            "Bearer canary-graph-access-0003",
+        ))
+        .respond_with(
+            json_response(
+                503,
+                serde_json::json!({"error": {"code": "ServiceUnavailable", "message": reflected}}),
+            )
+            .insert_header("request-id", "canary-refresh-0002"),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&harness.graph)
+        .await;
+    let mut body = graph_fixture("cases-list-top1.json", &harness.graph.uri());
+    body["value"][0]["description"] = Value::from(reflected.clone());
+    body["value"][0]["downloadUrl"] = Value::from(format!(
+        "{}/v1.0/x?sig=canary-sig-0001&code=canary-auth-code-0001",
+        harness.graph.uri()
+    ));
+    mount_probe(
+        &harness,
+        "canary-graph-access-0003",
+        json_response(200, body),
+    )
+    .await;
+    let trace = harness.root.path().join("trace");
+    let trace_arg = trace.display().to_string();
+    let run = harness
+        .run(&[
+            "--json",
+            "--verbose",
+            "--trace",
+            &trace_arg,
+            "auth",
+            "status",
+        ])
+        .await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
+    assert_eq!(run.json()["results"]["purviewRole"], "ok");
+    assert_eq!(graph_requests(&harness).await, 3);
+    let stderr = run.stderr();
+    assert!(
+        stderr.starts_with("warning: trace files hold tenant data"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "[verbose] refreshed the Graph token: returned scope {GRAPH_SCOPE}; refresh token \
+             rotated: yes"
+        )),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("[verbose] refreshing the Graph token after HTTP 401"),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read_dir(&trace).unwrap().count(), 3);
+    let stored = harness.stored(ALEX).unwrap();
+    assert_eq!(stored["refresh_token"], "canary-refresh-0004");
+    let mut values: Vec<&str> = CANARIES.to_vec();
+    values.extend(["canary-sig-0001"]);
+    harness.assert_absent(&run, &values);
+}

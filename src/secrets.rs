@@ -86,7 +86,12 @@ impl CredentialLock {
             path: path.display().to_string(),
             source,
         };
-        if let Some(parent) = path.parent() {
+        // A bare file name has an empty parent: there is no folder to create,
+        // and the working directory is not the tool's to narrow.
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             create_private_dir(parent).map_err(|error| failed("create the folder for", error))?;
         }
         let deadline = Instant::now() + wait;
@@ -103,6 +108,21 @@ impl CredentialLock {
                 Err(error) => return Err(failed("open", error)),
             }
         };
+        // The creation mode applies only to a new file; one an earlier
+        // release created more open is narrowed through its handle.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = file
+                .metadata()
+                .map_err(|error| failed("inspect", error))?
+                .permissions()
+                .mode();
+            if mode & 0o077 != 0 {
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .map_err(|error| failed("narrow", error))?;
+            }
+        }
         loop {
             match file.try_lock() {
                 Ok(()) => return Ok(Self { _file: file }),
@@ -143,7 +163,19 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
             ));
         }
         if metadata.permissions().mode() & 0o077 != 0 {
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+            // Narrow through a handle that is checked to be the folder just
+            // inspected, so a swap for a link in between is refused, as
+            // config.rs does for its own folders.
+            use std::os::unix::fs::MetadataExt;
+            let handle = File::open(dir)?;
+            let opened = handle.metadata()?;
+            if !opened.is_dir() || opened.dev() != metadata.dev() || opened.ino() != metadata.ino()
+            {
+                return Err(std::io::Error::other(
+                    "the lock folder changed while it was being opened; refusing to use it",
+                ));
+            }
+            handle.set_permissions(std::fs::Permissions::from_mode(0o700))?;
         }
         Ok(())
     }
@@ -963,14 +995,16 @@ mod tests {
         assert_eq!(mode(&app), 0o700);
         assert_eq!(mode(&app.join("account-locks")), 0o700);
         assert_eq!(mode(&path), 0o600);
-        // A lock folder an earlier release left open is narrowed.
+        // A lock folder and lock file an earlier release left open are narrowed.
         std::fs::set_permissions(
             app.join("account-locks"),
             std::fs::Permissions::from_mode(0o755),
         )
         .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         drop(CredentialLock::acquire(&path, Duration::ZERO).unwrap());
         assert_eq!(mode(&app.join("account-locks")), 0o700);
+        assert_eq!(mode(&path), 0o600);
     }
 
     #[cfg(unix)]

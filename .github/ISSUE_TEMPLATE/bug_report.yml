@@ -1,0 +1,60 @@
+name: Bug report
+description: Report a bug in purview.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not paste secrets or real tenant data in this public issue.**
+        Remove access tokens, refresh tokens, device codes, tenant and application (client) identifiers, real email addresses, case names, search queries and exported content. Replace identifiers with placeholders such as `<tenant-id>` and `<application-client-id>`, and use synthetic addresses such as `alex@contoso.example`.
+
+  - type: input
+    id: version
+    attributes:
+      label: "`purview version` output"
+      description: Run `purview version` and paste the output.
+      placeholder: "purview 0.1.0-rc.1 <commit> aarch64-apple-darwin"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: Operating system, version and architecture.
+      placeholder: "macOS 15 (Apple silicon), Ubuntu 24.04 (x86-64), or Windows 11 (x86-64)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command run
+      description: The exact command you ran, with identifiers replaced by placeholders.
+      placeholder: "purview auth login --client-id <application-client-id> --tenant-id <tenant-id>"
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened
+      description: Describe the behaviour and paste any redacted error output.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What was expected
+      description: Describe what you expected to happen instead.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: redaction-check
+    attributes:
+      label: Data check
+      options:
+        - label: I have removed tokens, device codes, tenant and client identifiers, real addresses, case names and search content.
+          required: true

@@ -668,6 +668,9 @@ fn url_allowed(url: &str) -> bool {
         "login.microsoftonline.com" | "learn.microsoft.com" | "aka.ms" => true,
         "github.com" => first("aberoham"),
         "img.shields.io" => is_own_shields_badge(&segments),
+        // Apple's public Developer ID G2 intermediate, which the release
+        // signer imports (docs/macos-signing.md). Only that one file.
+        "www.apple.com" => segments == ["certificateauthority", "DeveloperIDG2CA.cer"],
         _ if is_proxy_host(&host) => {
             segments.len() > 3
                 && segments[0] == "ediscovery"
@@ -851,6 +854,7 @@ fn urls_pass_only_on_allowed_host_and_path_pairs() {
         "eur.proxyservice.ediscovery.svc.cloud.microsoft/ediscovery/api/proxy/exportaedblobFileResult",
         "learn.microsoft.com/graph/api/resources/ediscovery-ediscoverycase",
         "aka.ms/anything",
+        "www.apple.com/certificateauthority/DeveloperIDG2CA.cer",
         "github.com/aberoham/ms-purview-cli",
         "github.com/Aberoham/ms-purview-cli",
         "img.shields.io/github/actions/workflow/status/aberoham/ms-purview-cli/ci.yml",
@@ -877,6 +881,11 @@ fn urls_pass_only_on_allowed_host_and_path_pairs() {
         "graph.microsoft.com/v1.0/%252e%252e/beta",
         "graph.microsoft.com/..",
         "github.com/someone-else/repo",
+        "www.apple.com/",
+        "www.apple.com/certificateauthority/",
+        "www.apple.com/certificateauthority/AppleWWDRCAG3.cer",
+        "www.apple.com/certificateauthority/DeveloperIDG2CA.cer/x",
+        "apple.com/certificateauthority/DeveloperIDG2CA.cer",
         "github.com/aberoham/../someone-else",
         "img.shields.io/badge/x",
         "img.shields.io/github/stars/other-owner/aberoham",

@@ -1051,3 +1051,83 @@ async fn a_timed_out_page_shows_its_link_redacted_in_the_log_and_trace() {
         assert!(!text.contains("canary"), "{text}");
     }
 }
+
+#[tokio::test]
+async fn the_verbose_log_redacts_the_request_id_and_keeps_notes_before_a_token_failure() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(status(200, json!({"value": []})).insert_header("request-id", FIRST))
+        .mount(&server)
+        .await;
+    let fixture = setup_with(
+        base_of(&server.uri()),
+        FakeTokens::default(),
+        Duration::from_secs(10),
+        true,
+        None,
+    );
+    let mut log = Vec::new();
+    fixture
+        .client
+        .get_page(&ReadRoute::Cases, &top1(), &mut log)
+        .await
+        .unwrap();
+    let log = String::from_utf8(log).unwrap();
+    assert!(log.contains("request-id [redacted]"), "{log}");
+    assert!(!log.contains("canary"), "{log}");
+
+    let fixture = setup_with(
+        base_of(&server.uri()),
+        FakeTokens {
+            fail: true,
+            ..FakeTokens::default()
+        },
+        Duration::from_secs(10),
+        true,
+        None,
+    );
+    fixture
+        .tokens
+        .notes
+        .lock()
+        .unwrap()
+        .push("refreshed the Graph token: returned scope none".to_owned());
+    let mut log = Vec::new();
+    let error = fixture
+        .client
+        .get_page(&ReadRoute::Cases, &top1(), &mut log)
+        .await
+        .unwrap_err();
+    assert!(error.is_token_unavailable());
+    assert_eq!(
+        String::from_utf8(log).unwrap(),
+        "[verbose] refreshed the Graph token: returned scope none\n"
+    );
+}
+
+#[tokio::test]
+async fn a_fractional_wait_over_the_limit_is_reported_rounded_up() {
+    let server = MockServer::start().await;
+    // 60.5 seconds from the clock once it has moved half a second.
+    Mock::given(method("GET"))
+        .respond_with(
+            status(429, graph_fixture("error-429.json", &server.uri()))
+                .insert_header("retry-after", "Mon, 05 Jan 2026 09:01:01 GMT"),
+        )
+        .mount(&server)
+        .await;
+    let fixture = setup(&server);
+    fixture.clock.advance(Duration::from_millis(500));
+    let error = fixture
+        .client
+        .get_page(&ReadRoute::Cases, &top1(), &mut Vec::new())
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("retry after 61 seconds, longer than the 60-second"),
+        "{error}"
+    );
+    assert_eq!(requests(&server).await, 1);
+}

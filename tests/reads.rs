@@ -1823,6 +1823,15 @@ async fn mine_warns_when_graph_names_no_creator() {
     assert!(run.stdout().is_empty());
     assert_eq!(
         run.stderr(),
-        "warning: Graph's case records carry no createdBy, so --mine matches no case\n"
+        "warning: none of the 5 case records read carries createdBy, so --mine matches none \
+         of them\n"
     );
+    harness.graph.reset().await;
+    Mock::given(method("GET"))
+        .and(path(CASES))
+        .respond_with(json_response(200, json!({"value": []})))
+        .mount(&harness.graph)
+        .await;
+    let empty = harness.run(&["--plain", "case", "list", "--mine"]).await;
+    assert!(empty.stderr().is_empty(), "{}", empty.stderr());
 }

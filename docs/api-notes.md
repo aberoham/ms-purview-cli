@@ -273,7 +273,8 @@ repository.
   carried `cloudAttachmentVersion`, `documentVersion` and `exportSingleItems`, which the
   tool keeps in JSON without reading. (Observed)
 - **Download URLs:** the `downloadUrl` of each export file had no query string. (Observed)
-  The tool still redacts any query value but `downloadType` in its output.
+  The tool still redacts query values in its output, apart from `downloadType` and the
+  OData options `$top`, `$select`, `$filter`, `$expand` and `$skiptoken`.
 - **`$expand=search` on operations:** refused on both the list and a single `GET` with HTTP
   400 `BadRequest` ("Could not find a property named 'search'"). (Observed) The tool does
   not send it; an operation's search cannot be read from the operation.

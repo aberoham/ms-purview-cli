@@ -121,10 +121,12 @@ pub async fn list(session: &mut Session<'_>, filters: &ListFilters) -> Result<Pr
     warn_unreadable(&mut session.env.stderr, "case", total - cases.len());
     // The observed tenant's case records carried no createdBy, in the list
     // or in a single read (Observed), so --mine can match nothing.
-    if filters.mine && !cases.iter().any(|case| case.created_by.is_some()) {
+    if filters.mine && !cases.is_empty() && !cases.iter().any(|case| case.created_by.is_some()) {
         let _ = writeln!(
             session.env.stderr,
-            "warning: Graph's case records carry no createdBy, so --mine matches no case"
+            "warning: none of the {} case records read carries createdBy, so --mine matches \
+             none of them",
+            cases.len()
         );
     }
     let cases: Vec<CaseRecord> = cases

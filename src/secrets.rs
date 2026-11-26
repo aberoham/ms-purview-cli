@@ -353,12 +353,21 @@ impl AccountLocks {
         })
     }
 
+    /// The lock file for `email`: the SHA-256 of the normalised key, in
+    /// hexadecimal. The key itself never becomes a file name, since an
+    /// account name comes from the identity platform and could hold
+    /// anything, a path separator or a token included.
+    pub fn path(&self, email: &str) -> std::path::PathBuf {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(email.trim().to_ascii_lowercase().as_bytes());
+        let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        self.dir.join(format!("{hex}.lock"))
+    }
+
     /// Takes the lock for `email`, waiting up to `wait` for another holder.
     /// The wait runs on a blocking thread.
     pub async fn lock(&self, email: &str) -> Result<CredentialLock> {
-        let path = self
-            .dir
-            .join(format!("{}.lock", email.trim().to_ascii_lowercase()));
+        let path = self.path(email);
         let wait = self.wait;
         tokio::task::spawn_blocking(move || CredentialLock::acquire(&path, wait))
             .await
@@ -460,9 +469,14 @@ fn parse_chunk_header(value: &str) -> Result<Option<ChunkHeader>> {
 
 /// The current header, or `None` when there is no entry, the entry is a
 /// legacy single value, or its header is unusable and will be overwritten.
+/// A primary entry that is not UTF-8 or not a valid header counts as no
+/// header: the write replaces it. Store-access errors still fail, which is
+/// why the entry is read raw rather than through `get_password`.
 fn stored_header(store: &dyn CredentialStore, key: &str) -> Result<Option<ChunkHeader>> {
-    match store.get_password(key)? {
-        Some(primary) => Ok(parse_chunk_header(&primary).ok().flatten()),
+    match store.get_secret(key)? {
+        Some(bytes) => Ok(String::from_utf8(bytes)
+            .ok()
+            .and_then(|primary| parse_chunk_header(&primary).ok().flatten())),
         None => Ok(None),
     }
 }
@@ -503,7 +517,6 @@ pub fn token_key(email: &str) -> String {
 /// operating-system store. Writes can be made to fail, to test that a
 /// command reports a credential the store did not accept.
 #[doc(hidden)]
-#[derive(Default)]
 pub struct MemoryStore {
     values: Mutex<BTreeMap<String, Vec<u8>>>,
     locks: AtomicUsize,
@@ -511,6 +524,21 @@ pub struct MemoryStore {
     fail_deletes: AtomicBool,
     fail_headers: AtomicBool,
     chunk_bytes: Option<usize>,
+}
+
+/// The platform's layout: chunked on Windows, as the real store is, so
+/// every in-memory flow runs on the layout of the platform under test.
+impl Default for MemoryStore {
+    fn default() -> Self {
+        Self {
+            values: Mutex::default(),
+            locks: AtomicUsize::default(),
+            fail_writes: AtomicBool::default(),
+            fail_deletes: AtomicBool::default(),
+            fail_headers: AtomicBool::default(),
+            chunk_bytes: CHUNK_BYTES,
+        }
+    }
 }
 
 /// Names the stored keys and counts, never the stored values.

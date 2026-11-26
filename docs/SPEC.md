@@ -2301,7 +2301,8 @@ The `aberoham/homebrew-tap` formula `purview` reads releases, as it does for `en
 | `url`, `uuid`, `chrono` | (default features); add `serde` only where a later PR serialises one of these types | 1.1 |
 | `base64` | | 1.1 |
 | `async-trait` | | 1.1 |
-| `sha2`, `getrandom` | | 1.2 (PKCE) |
+| `sha2` | | 1.1 (account lock file names) |
+| `getrandom` | | 1.2 (PKCE) |
 | `webbrowser` | | 1.2 |
 | `futures-util` | | 1.5 |
 | `zip` | `deflate` (plus `deflate64` only if PR 4.1 finds it) | 1.5 |

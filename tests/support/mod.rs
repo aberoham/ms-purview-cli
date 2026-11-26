@@ -141,7 +141,7 @@ impl Harness {
 
     /// The lock file `AccountLocks` uses for `email`.
     pub fn lock_path(&self, email: &str) -> PathBuf {
-        self.account_locks().dir.join(format!("{email}.lock"))
+        self.account_locks().path(email)
     }
 
     pub fn config_dir(&self) -> PathBuf {
@@ -226,8 +226,16 @@ impl Harness {
             ("stdout".to_owned(), run.captured.stdout.bytes()),
             ("stderr".to_owned(), run.captured.stderr.bytes()),
         ];
-        for path in files_under(self.root.path()) {
-            sources.push((path.display().to_string(), std::fs::read(&path).unwrap()));
+        // Names too, of files and directories: a name built from an
+        // account claim could carry a token.
+        for path in paths_under(self.root.path()) {
+            sources.push((
+                format!("the name of {}", path.display()),
+                path.display().to_string().into_bytes(),
+            ));
+            if path.is_file() {
+                sources.push((path.display().to_string(), std::fs::read(&path).unwrap()));
+            }
         }
         for (name, bytes) in sources {
             for canary in CANARIES {
@@ -276,4 +284,20 @@ fn files_under(dir: &Path) -> Vec<PathBuf> {
         }
     }
     files
+}
+
+/// Every file and directory under `dir`, not following links.
+fn paths_under(dir: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return paths;
+    };
+    for entry in entries {
+        let path = entry.unwrap().path();
+        paths.push(path.clone());
+        if std::fs::symlink_metadata(&path).unwrap().is_dir() {
+            paths.extend(paths_under(&path));
+        }
+    }
+    paths
 }

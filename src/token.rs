@@ -23,7 +23,7 @@ use crate::secrets::{
 };
 
 /// What the entry under an account key says about its owner.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum StoredPrincipal {
     /// Nothing is stored under the key.
     Absent,
@@ -31,6 +31,22 @@ pub enum StoredPrincipal {
     Recorded { tid: String, oid: String },
     /// Something is stored, but it cannot be read as a credential.
     Unreadable,
+}
+
+/// Names the case and whether each id is recorded, never the ids: a
+/// damaged entry could hold anything in them, a token included.
+impl fmt::Debug for StoredPrincipal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Absent => formatter.write_str("Absent"),
+            Self::Unreadable => formatter.write_str("Unreadable"),
+            Self::Recorded { tid, oid } => formatter
+                .debug_struct("Recorded")
+                .field("tid_recorded", &!tid.is_empty())
+                .field("oid_recorded", &!oid.is_empty())
+                .finish(),
+        }
+    }
 }
 
 /// The version of the stored credential's JSON shape.
@@ -696,9 +712,14 @@ impl StoredTokenProvider {
     /// store holds now, so the next redemption uses the newest refresh
     /// token it has, and reconciles against what that write was doing.
     fn reconcile(&self, state: &mut State) -> Result<()> {
-        let Some(uncertain) = state.uncertain.take() else {
+        // The pending write stays recorded until the store has been read,
+        // checked and reconciled, so a failed read is retried next time
+        // rather than leaving the cached tokens in use.
+        let Some(uncertain) = state.uncertain.as_ref() else {
             return Ok(());
         };
+        let kind = uncertain.kind;
+        let written_download = uncertain.written.download.as_ref().map(|t| t.token.clone());
         let email = state.credential.email.clone();
         let loaded =
             Credential::load(self.store.as_ref(), &email, &self.redactor)?.ok_or_else(|| {
@@ -710,7 +731,6 @@ impl StoredTokenProvider {
             })?;
         if !loaded.same_owner(&state.credential) {
             // Refused before any redemption with someone else's tokens.
-            state.uncertain = Some(uncertain);
             return Err(PurviewError::message(
                 "the stored credential now belongs to another app registration or identity; \
                  nothing was sent. Run 'purview auth logout' for this account, then sign in \
@@ -718,10 +738,9 @@ impl StoredTokenProvider {
             ));
         }
         let mut loaded = loaded;
-        match uncertain.kind {
+        match kind {
             WriteKind::StoreDownload => {
-                let granted = uncertain.written.download.as_ref();
-                if loaded.download.as_ref().map(|token| &token.token) == granted.map(|t| &t.token) {
+                if loaded.download.as_ref().map(|token| &token.token) == written_download.as_ref() {
                     state.download_refused = false;
                 }
             }
@@ -740,6 +759,7 @@ impl StoredTokenProvider {
             }
         }
         state.credential = loaded;
+        state.uncertain = None;
         Ok(())
     }
 
@@ -1687,5 +1707,46 @@ mod tests {
             "{error}"
         );
         assert_eq!(stored(&setup)["refresh_token"], "canary-refresh-0099");
+    }
+
+    #[test]
+    fn a_stored_principal_debug_names_no_id() {
+        let principal = StoredPrincipal::Recorded {
+            tid: "canary-tid-0001".into(),
+            oid: String::new(),
+        };
+        assert_eq!(
+            format!("{principal:?}"),
+            "Recorded { tid_recorded: true, oid_recorded: false }"
+        );
+        assert_eq!(format!("{:?}", StoredPrincipal::Unreadable), "Unreadable");
+    }
+
+    #[tokio::test]
+    async fn a_failed_reload_is_retried_and_the_cached_token_is_never_returned() {
+        for damage in ["remove", "corrupt"] {
+            let memory = Arc::new(MemoryStore::default());
+            let store = Arc::new(CommitsThenFails::new(memory.clone()));
+            let setup = setup_with(credential(0, None), store.clone(), memory.clone()).await;
+            Mock::given(method("POST"))
+                .respond_with(response("canary-graph-0002", "canary-refresh-0002"))
+                .expect(1)
+                .mount(&setup.server)
+                .await;
+            store.fail_write(1);
+            assert!(setup.provider.graph(Duration::from_secs(60)).await.is_err());
+            if damage == "remove" {
+                crate::secrets::delete_value(memory.as_ref(), &token_key(EMAIL)).unwrap();
+            } else {
+                crate::secrets::store_value(memory.as_ref(), &token_key(EMAIL), "{damaged")
+                    .unwrap();
+            }
+            for _ in 0..2 {
+                assert!(
+                    setup.provider.graph(Duration::from_secs(60)).await.is_err(),
+                    "{damage}: a cached token was returned"
+                );
+            }
+        }
     }
 }

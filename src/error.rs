@@ -50,8 +50,11 @@ pub enum PurviewError {
     #[error("could not reach the identity platform: {0}")]
     Http(#[from] reqwest::Error),
 
+    /// A credential-store failure, kept as its rendered message only:
+    /// `keyring::Error`'s `Debug` form can hold the stored bytes (as in
+    /// `BadEncoding`), and this enum derives `Debug`.
     #[error("credential store operation failed: {0}")]
-    Keyring(#[from] keyring::Error),
+    Keyring(String),
 
     #[error(
         "another purview process kept the credential lock {path} busy for over {seconds} \
@@ -150,7 +153,10 @@ impl PurviewError {
         match self {
             Self::OAuth(details) => {
                 details.error_codes.contains(&65001)
-                    || details.description.starts_with("AADSTS65001")
+                    || details
+                        .description
+                        .strip_prefix("AADSTS65001")
+                        .is_some_and(|rest| !rest.starts_with(|c: char| c.is_ascii_digit()))
             }
             Self::Context { source, .. } => source.is_consent_required(),
             _ => false,
@@ -163,6 +169,12 @@ impl PurviewError {
             Self::Context { source, .. } => source.is_credential_lock_busy(),
             _ => false,
         }
+    }
+}
+
+impl From<keyring::Error> for PurviewError {
+    fn from(error: keyring::Error) -> Self {
+        Self::Keyring(error.to_string())
     }
 }
 
@@ -225,6 +237,17 @@ mod tests {
             .context("signing in")
             .is_consent_required());
         assert!(!PurviewError::message("AADSTS65001").is_consent_required());
+        // A longer code that begins with the same digits is another error.
+        assert!(!oauth(vec![650011], "AADSTS650011: other").is_consent_required());
+        assert!(oauth(Vec::new(), "AADSTS65001").is_consent_required());
+    }
+
+    #[test]
+    fn a_keyring_error_keeps_no_stored_bytes() {
+        let error = PurviewError::from(keyring::Error::BadEncoding(b"canary-bytes-0001".to_vec()));
+        for shown in [format!("{error:?}"), error.to_string()] {
+            assert!(!shown.contains("canary"), "{shown}");
+        }
     }
 
     #[test]

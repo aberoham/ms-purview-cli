@@ -173,7 +173,7 @@ fn absent_as_none<T>(result: keyring::Result<T>, operation: &str) -> Result<Opti
     match result {
         Ok(value) => Ok(Some(value)),
         Err(keyring::Error::NoEntry) => Ok(None),
-        Err(error) => Err(PurviewError::Keyring(error).context(operation)),
+        Err(error) => Err(PurviewError::from(error).context(operation)),
     }
 }
 
@@ -299,11 +299,19 @@ pub fn find_value(store: &dyn CredentialStore, key: &str) -> Result<Option<Strin
 
 pub fn delete_value(store: &dyn CredentialStore, key: &str) -> Result<()> {
     let _lock = store.lock()?;
+    delete_value_with_chunk_size(store, key, CHUNK_BYTES)
+}
+
+fn delete_value_with_chunk_size(
+    store: &dyn CredentialStore,
+    key: &str,
+    chunk_bytes: Option<usize>,
+) -> Result<()> {
     // The header goes first: if deletion stops part way, readers find no
     // credential rather than a header pointing at missing chunks, and the
     // next sign-in sweeps any chunks left behind.
     store.delete(key)?;
-    if CHUNK_BYTES.is_some() {
+    if chunk_bytes.is_some() {
         delete_all_chunks(store, key)?;
     }
     Ok(())
@@ -429,11 +437,22 @@ pub fn token_key(email: &str) -> String {
 /// operating-system store. Writes can be made to fail, to test that a
 /// command reports a credential the store did not accept.
 #[doc(hidden)]
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MemoryStore {
     values: Mutex<BTreeMap<String, Vec<u8>>>,
     locks: AtomicUsize,
     fail_writes: AtomicBool,
+}
+
+/// Names the stored keys and counts, never the stored values.
+impl std::fmt::Debug for MemoryStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MemoryStore")
+            .field("keys", &self.keys())
+            .field("locks", &self.locks())
+            .finish_non_exhaustive()
+    }
 }
 
 #[doc(hidden)]
@@ -529,6 +548,17 @@ mod tests {
                 "purview (Microsoft Purview eDiscovery CLI)"
             );
         }
+    }
+
+    #[test]
+    fn the_memory_store_debug_form_shows_no_value() {
+        let store = MemoryStore::default();
+        store.set_password("account", "canary-secret-0001").unwrap();
+        let shown = format!("{store:?}");
+        assert!(
+            shown.contains("account") && !shown.contains("canary"),
+            "{shown}"
+        );
     }
 
     #[test]
@@ -710,9 +740,12 @@ mod tests {
         }
         let store = HeaderFirst(MemoryStore::default(), Default::default());
         store_value_with_chunk_size(&store, "account", "0123456789", Some(4)).unwrap();
+        // A header and three chunks: the layout Windows writes.
+        assert_eq!(store.0.keys().len(), 4, "{:?}", store.0.keys());
         store.1.store(true, std::sync::atomic::Ordering::SeqCst);
-        delete_value(&store, "account").unwrap();
-        assert!(store.0.get_password("account").unwrap().is_none());
+        delete_value_with_chunk_size(&store, "account", Some(4)).unwrap();
+        // Every chunk went, so the order check above ran for each of them.
+        assert!(store.0.keys().is_empty(), "{:?}", store.0.keys());
     }
 
     #[test]

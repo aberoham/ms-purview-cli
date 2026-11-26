@@ -6,7 +6,7 @@ mod support;
 
 use std::time::Duration;
 
-use ms_purview_cli::env::LoginWrite;
+use ms_purview_cli::env::{Captured, Env, LoginWrite};
 use ms_purview_cli::secrets::{CredentialStore, MemoryStore};
 use serde_json::Value;
 use support::*;
@@ -2248,4 +2248,110 @@ async fn a_damaged_credential_is_repaired_when_the_account_file_vouches_for_the_
     let stored = harness.stored(ALEX).unwrap();
     assert_eq!(stored["oid"], "00000000-0000-4000-8000-000000000011");
     assert_eq!(stored["refresh_token"], "canary-refresh-0002");
+}
+
+#[tokio::test]
+async fn a_lock_file_name_never_carries_an_account_claim() {
+    // An account name holding a value the sign-in registers as a secret:
+    // the account file is refused, the sign-in is rolled back, and the lock
+    // file taken for that key must not carry the value in its name.
+    let harness = Harness::new().await;
+    mount_login_as(&harness, "id-claims-preferred.json", |claims| {
+        claims["preferred_username"] = "canary-refresh-0001@contoso.example".into();
+    })
+    .await;
+    let run = harness
+        .run(&[
+            "auth",
+            "login",
+            "--client-id",
+            CLIENT_ID,
+            "--tenant-id",
+            TENANT_ID,
+        ])
+        .await;
+    assert_eq!(run.outcome.exit_code, 1);
+    harness.assert_store_empty();
+    let locks: Vec<_> = std::fs::read_dir(harness.account_locks().dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(locks.len(), 1, "{locks:?}");
+    assert_eq!(locks[0].len(), 64 + ".lock".len(), "{locks:?}");
+    harness.assert_no_canaries(&run);
+}
+
+/// Holds Alex's account lock, and gives commands a short wait for it.
+fn hold_alex_lock(harness: &Harness) -> (ms_purview_cli::secrets::CredentialLock, Env, Captured) {
+    std::fs::create_dir_all(harness.account_locks().dir).unwrap();
+    let held =
+        ms_purview_cli::secrets::CredentialLock::acquire(&harness.lock_path(ALEX), Duration::ZERO)
+            .unwrap();
+    let (mut env, captured) = harness.env();
+    env.account_locks = Some(ms_purview_cli::secrets::AccountLocks {
+        wait: Duration::from_millis(300),
+        ..harness.account_locks()
+    });
+    (held, env, captured)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn logout_cannot_delete_while_the_account_lock_is_held() {
+    let harness = Harness::new().await;
+    sign_in_alex(&harness).await;
+    let before = Snapshot::take(&harness, &[ALEX]);
+    let (_held, env, captured) = hold_alex_lock(&harness);
+    let outcome =
+        ms_purview_cli::cli::execute_with(env, ["purview", "--json", "auth", "logout"]).await;
+    assert_eq!(outcome.exit_code, 1);
+    let printed: Value = serde_json::from_str(&captured.stdout.text()).unwrap();
+    assert_eq!(printed["error"]["code"], "CredentialLockBusy");
+    before.assert_unchanged(&harness);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refresh_cannot_commit_while_the_account_lock_is_held() {
+    let harness = Harness::new().await;
+    sign_in_alex(&harness).await;
+    let before = Snapshot::take(&harness, &[ALEX]);
+    mount_any_refresh(&harness).await;
+    let (_held, env, captured) = hold_alex_lock(&harness);
+    let outcome =
+        ms_purview_cli::cli::execute_with(env, ["purview", "--json", "auth", "refresh"]).await;
+    assert_eq!(outcome.exit_code, 1);
+    let printed: Value = serde_json::from_str(&captured.stdout.text()).unwrap();
+    assert_eq!(printed["error"]["code"], "CredentialLockBusy");
+    before.assert_unchanged(&harness);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn exact_key_logout_refuses_a_linked_account_file_before_deleting() {
+    let harness = Harness::new().await;
+    sign_in_alex(&harness).await;
+    let path = harness.account_file(ALEX);
+    let elsewhere = harness.root.path().join("elsewhere.json");
+    std::fs::rename(&path, &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+    let run = harness.run(&["auth", "logout", "--account", ALEX]).await;
+    assert_eq!(run.outcome.exit_code, 1);
+    assert!(run.stderr().contains("is a link"), "{}", run.stderr());
+    assert_eq!(harness.credentials(), [ALEX]);
+    assert!(elsewhere.exists());
+}
+
+#[tokio::test]
+async fn an_undecodable_primary_is_repaired_when_the_account_file_vouches() {
+    let harness = Harness::with_store(MemoryStore::chunked(64)).await;
+    harness
+        .store
+        .set_secret(&format!("purview:token:{ALEX}"), &[0xff, 0xfe, 0x00])
+        .unwrap();
+    let run = sign_in_over(&harness, None, Some(alex_file())).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
+    assert_eq!(harness.credentials(), [ALEX]);
+    assert_eq!(
+        harness.stored(ALEX).unwrap()["refresh_token"],
+        "canary-refresh-0002"
+    );
 }

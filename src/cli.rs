@@ -1265,8 +1265,21 @@ async fn auth_logout(env: &mut Env, output: &OutputOptions, globals: &Globals) -
     let exact = match globals.account.as_deref() {
         Some(requested) => {
             let key = requested.to_ascii_lowercase();
-            let exists = config::account_file_path(&dir, &key)?.exists()
-                || entry_exists(env.credentials.as_ref(), &token_key(&key))?;
+            let path = config::account_file_path(&dir, &key)?;
+            // Inspected without following links: a link is refused here,
+            // before anything is deleted.
+            let file_exists = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(PurviewError::message(format!(
+                        "the account file for {} is a link; refusing to sign it out",
+                        sanitize(&key)
+                    )));
+                }
+                Ok(_) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error.into()),
+            };
+            let exists = file_exists || entry_exists(env.credentials.as_ref(), &token_key(&key))?;
             exists.then_some(key)
         }
         None => None,
@@ -1275,9 +1288,12 @@ async fn auth_logout(env: &mut Env, output: &OutputOptions, globals: &Globals) -
         Some(key) => key,
         None => select_account(&stored, &accounts, globals.account.as_deref())?.email,
     };
-    let _lock = account_lock(env, &email).await?;
-    // Checked before anything is removed.
+    // Checked before the lock is taken and before anything is removed.
     config::account_file_path(&dir, &email)?;
+    let _lock = account_lock(env, &email).await?;
+    // Read again under the lock: another command may have changed either.
+    let stored = load_config(env, &dir)?;
+    let accounts = config::list_accounts(&dir, &mut env.stderr)?;
     delete_value(env.credentials.as_ref(), &token_key(&email)).map_err(|error| {
         error.context(format!("deleting the credential for {}", sanitize(&email)))
     })?;

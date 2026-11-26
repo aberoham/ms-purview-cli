@@ -1,0 +1,311 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+# Never cancel a release half way; a second push of the same tag waits.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify-tag:
+    name: Verify tag
+    runs-on: ubuntu-latest
+    outputs:
+      prerelease: ${{ steps.check.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # rustup installs the release named in rust-toolchain.toml, which the
+      # cargo call below selects.
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install
+          rustc --version
+
+      # The Homebrew tap trusts the tag, so a tag that disagrees with the
+      # binary's own version must never produce a release.
+      - name: Check tag against the package version
+        id: check
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_version="$(cargo metadata --no-deps --format-version 1 --locked | jq -r '.packages[0].version')"
+          if [[ "$RELEASE_TAG" != "v${package_version}" ]]; then
+            echo "Tag ${RELEASE_TAG} does not match Cargo.toml version ${package_version}" >&2
+            exit 1
+          fi
+          # Semantic Versioning: a hyphen before any build metadata marks a
+          # prerelease, such as 0.2.0-rc.1. Build metadata after "+" does not.
+          core="${package_version%%+*}"
+          if [[ "$core" == *-* ]]; then
+            echo "prerelease=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >>"$GITHUB_OUTPUT"
+          fi
+
+  ci:
+    name: CI
+    # actionlint does not yet accept the "$/" self-repository form.
+    uses: ./.github/workflows/ci.yml # zizmor: ignore[self-repository]
+
+  # The archives carry docs/, so the tagged tree must pass the same check
+  # that keeps tenant data and review history out of this public repository.
+  public-data:
+    name: Public data
+    uses: ./.github/workflows/public-data.yml # zizmor: ignore[self-repository]
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [verify-tag, ci, public-data]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            archive: tar.gz
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            archive: zip
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      TARGET: ${{ matrix.target }}
+    # No build cache: a release artifact must not depend on state that an
+    # earlier, less trusted workflow run could have written.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # rustup installs the release named in rust-toolchain.toml.
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install
+          rustup target add "$TARGET"
+          rustc --version
+
+      - name: Install musl-tools
+        if: endsWith(matrix.target, '-linux-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # `purview version` reports the commit; build.rs adds the target.
+      - name: Record build metadata
+        shell: bash
+        run: echo "PURVIEW_BUILD_COMMIT=${GITHUB_SHA}" >>"$GITHUB_ENV"
+
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked --target "$TARGET"
+
+      - name: Package (unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="purview-${RELEASE_TAG}-${TARGET}"
+          mkdir -p "dist/${package}/bin" "dist/${package}/share/doc/purview/contrib"
+          cp "target/${TARGET}/release/purview" "dist/${package}/bin/purview"
+          cp README.md LICENSE NOTICE "dist/${package}/share/doc/purview/"
+          cp -R docs "dist/${package}/share/doc/purview/docs"
+          # For source builds. Signed releases must not be re-signed; see
+          # docs/troubleshooting.md.
+          cp contrib/resign.sh "dist/${package}/share/doc/purview/contrib/"
+          tar czf "${package}.tar.gz" -C dist "${package}"
+
+      - name: Package (windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $package = "purview-$env:RELEASE_TAG-$env:TARGET"
+          New-Item -ItemType Directory -Force -Path "dist/$package/bin", "dist/$package/share/doc/purview" | Out-Null
+          Copy-Item "target/$env:TARGET/release/purview.exe" "dist/$package/bin/purview.exe"
+          Copy-Item -Path @("README.md", "LICENSE", "NOTICE") -Destination "dist/$package/share/doc/purview/"
+          Copy-Item -Recurse "docs" "dist/$package/share/doc/purview/docs"
+          Compress-Archive -Path "dist/$package" -DestinationPath "$package.zip"
+
+      # Unpack the archive that will be published and run what is inside it,
+      # so a packaging mistake fails here rather than on a user's machine.
+      - name: Smoke-test the archive (unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="purview-${RELEASE_TAG}-${TARGET}"
+          mkdir smoke
+          tar xzf "${package}.tar.gz" -C smoke
+          reported="$("smoke/${package}/bin/purview" version)"
+          echo "$reported"
+          expected="purview ${RELEASE_TAG#v} ${GITHUB_SHA} ${TARGET}"
+          if [[ "$reported" != "$expected" ]]; then
+            echo "purview version printed '${reported}', expected '${expected}'" >&2
+            exit 1
+          fi
+          "smoke/${package}/bin/purview" --help >/dev/null
+          test -f "smoke/${package}/share/doc/purview/LICENSE"
+          test -f "smoke/${package}/share/doc/purview/docs/macos-signing.md"
+          test -x "smoke/${package}/share/doc/purview/contrib/resign.sh"
+
+      # The Linux archives promise a static binary that runs on any
+      # distribution, so it must have no program interpreter and no shared
+      # library dependencies.
+      - name: Check the Linux binary is statically linked
+        if: endsWith(matrix.target, '-linux-musl')
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/${TARGET}/release/purview"
+          if readelf --program-headers --wide "$binary" | grep -q INTERP; then
+            echo "${binary} requests a program interpreter" >&2
+            exit 1
+          fi
+          if readelf --dynamic --wide "$binary" | grep -q NEEDED; then
+            echo "${binary} depends on shared libraries" >&2
+            exit 1
+          fi
+
+      - name: Smoke-test the archive (windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          $package = "purview-$env:RELEASE_TAG-$env:TARGET"
+          Expand-Archive -Path "$package.zip" -DestinationPath smoke
+          $reported = & "smoke/$package/bin/purview.exe" version
+          Write-Output $reported
+          $expected = "purview $($env:RELEASE_TAG.Substring(1)) $env:GITHUB_SHA $env:TARGET"
+          if ($reported -cne $expected) { throw "purview version printed '$reported', expected '$expected'" }
+          & "smoke/$package/bin/purview.exe" --help | Out-Null
+          if (-not (Test-Path "smoke/$package/share/doc/purview/docs/macos-signing.md")) { throw "docs missing from $package.zip" }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: purview-${{ matrix.target }}
+          path: purview-${{ github.ref_name }}-${{ matrix.target }}.${{ matrix.archive }}
+          if-no-files-found: error
+
+  sign-macos:
+    name: Sign macOS ${{ matrix.target }}
+    needs: build
+    runs-on: macos-latest
+    # Defense in depth; the environment reviewer and tag ruleset are the boundary.
+    if: github.repository_owner_id == 586805 && github.actor == 'aberoham' && github.triggering_actor == 'aberoham'
+    environment: release
+    # One notarization wait of up to 45 minutes per architecture.
+    timeout-minutes: 60
+    strategy:
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: purview-${{ matrix.target }}
+      - name: Prepare signing identity
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ vars.MACOS_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+        run: python3 .github/scripts/macos-signing.py prepare
+      - name: Sign, notarize and verify the packaged binary
+        env:
+          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="purview-${RELEASE_TAG}-${TARGET}"
+          unpacked="$RUNNER_TEMP/signed-package"
+          mkdir -p "$unpacked"
+          tar xzf "${package}.tar.gz" -C "$unpacked"
+          python3 .github/scripts/macos-signing.py sign "$unpacked/$package/bin/purview" com.aberoham.purview --notarize
+          tar czf "${package}.tar.gz" -C "$unpacked" "$package"
+      - name: Replace the unsigned artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: purview-${{ matrix.target }}
+          path: purview-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          overwrite: true
+      - name: Remove signing credentials
+        if: always()
+        run: python3 .github/scripts/macos-signing.py cleanup
+
+  release:
+    name: Create release
+    needs: [verify-tag, build, sign-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release and upload its assets
+      id-token: write # sign the provenance attestation through Sigstore
+      attestations: write # store the attestation against the repository
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum purview-* > checksums-sha256.txt
+          cat checksums-sha256.txt
+          test "$(wc -l < checksums-sha256.txt)" -eq 5
+
+      # Attests the archives as published, after the macOS ones were signed,
+      # so `gh attestation verify` ties each download to this workflow run.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: artifacts/checksums-sha256.txt
+
+      - name: Create GitHub release
+        working-directory: artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.verify-tag.outputs.prerelease }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          flags=(--repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --title "$RELEASE_TAG")
+          if [[ "$PRERELEASE" == true ]]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" "${flags[@]}" purview-* checksums-sha256.txt

@@ -2552,13 +2552,15 @@ async fn an_idle_connection_does_not_hold_up_the_answer() {
         .run_with(&browser_login_args(&[]), with_browser(&browser))
         .await;
     assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
-    assert_eq!(browser.answers(1), ["HTTP/1.1 200 OK"]);
     // Served one at a time, each idle connection would hold the answer
     // back for the 10-second read timeout: 20 seconds for the two, which
     // the 20-second sign-in timeout would cut off first. Only the answer
     // is timed, not the token exchange after it.
-    let answered = browser.answer_times.lock().unwrap()[0];
-    assert!(answered < Duration::from_secs(9), "{answered:?}");
+    let answers = browser.timed_answers(1);
+    assert_eq!(answers.len(), 1, "{answers:?}");
+    let (status, answered) = &answers[0];
+    assert_eq!(status, "HTTP/1.1 200 OK");
+    assert!(*answered < Duration::from_secs(9), "{answered:?}");
 }
 
 #[tokio::test]

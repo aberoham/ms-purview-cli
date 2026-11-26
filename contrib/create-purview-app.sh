@@ -775,6 +775,8 @@ print_rra() {
 }
 
 # principal_label ID names an assignee in this plan, or gives the object id.
+# While an assignee lookup is unresolved, an unmatched user may still be one
+# of the assignees, so it is not called outside the plan.
 principal_label() {
   local i=0
   while [ "$i" -lt "${#a_ids[@]}" ]; do
@@ -784,7 +786,11 @@ principal_label() {
     fi
     i=$((i + 1))
   done
-  printf 'user %s (not in this plan)' "$(sanitize "$1")"
+  if [ "$unresolved" -gt 0 ]; then
+    printf 'user %s' "$(sanitize "$1")"
+  else
+    printf 'user %s (not in this plan)' "$(sanitize "$1")"
+  fi
 }
 
 # is_planned_user ID reports whether ID is one of the users this plan assigns.

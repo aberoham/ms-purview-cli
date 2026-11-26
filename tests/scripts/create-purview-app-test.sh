@@ -1239,6 +1239,7 @@ test_failed_lookup_gives_no_removal_commands() {
   expect_out "NOTE: this grant's user is not among the assignees that resolved. An assignee"
   expect_out "could not be checked."
   reject_out "it is for a user this plan does not assign"
+  reject_out "(not in this plan)"
   expect_out "it covers every user in the tenant, but the plan asks for per-user consent."
   expect_out "No removal command is given while an assignee lookup is unresolved."
   reject_out "az rest --method DELETE"

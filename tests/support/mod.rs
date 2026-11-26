@@ -344,9 +344,9 @@ pub struct ScriptedBrowser {
     /// The command's stderr, which a `fail_open` browser watches.
     pub stderr: Mutex<Option<ms_purview_cli::env::SharedBuffer>>,
     pub opened: Mutex<Vec<url::Url>>,
-    pub answers: Arc<Mutex<Vec<String>>>,
-    /// How long after the browser opened each answer arrived.
-    pub answer_times: Arc<Mutex<Vec<Duration>>>,
+    /// Each answer's status line, and how long after the browser opened it
+    /// arrived, recorded together.
+    pub answers: Arc<Mutex<Vec<(String, Duration)>>>,
 }
 
 impl ScriptedBrowser {
@@ -368,6 +368,14 @@ impl ScriptedBrowser {
     /// arrived. The browser runs on its own thread, and a command that
     /// fails at once can return before the browser has read its page.
     pub fn answers(&self, count: usize) -> Vec<String> {
+        self.timed_answers(count)
+            .into_iter()
+            .map(|(status, _)| status)
+            .collect()
+    }
+
+    /// `answers`, each with how long after the browser opened it arrived.
+    pub fn timed_answers(&self, count: usize) -> Vec<(String, Duration)> {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             let answers = self.answers.lock().unwrap().clone();
@@ -398,7 +406,6 @@ impl BrowserOpener for ScriptedBrowser {
         let state = query_value(url, "state");
         let visits = self.visits.clone();
         let answers = self.answers.clone();
-        let answer_times = self.answer_times.clone();
         let opened_at = std::time::Instant::now();
         let play = move || {
             let mut idle = Vec::new();
@@ -422,11 +429,10 @@ impl BrowserOpener for ScriptedBrowser {
                 .unwrap();
                 let mut answer = String::new();
                 stream.read_to_string(&mut answer).unwrap();
-                answers
-                    .lock()
-                    .unwrap()
-                    .push(answer.lines().next().unwrap_or_default().to_owned());
-                answer_times.lock().unwrap().push(opened_at.elapsed());
+                answers.lock().unwrap().push((
+                    answer.lines().next().unwrap_or_default().to_owned(),
+                    opened_at.elapsed(),
+                ));
             }
         };
         if self.fail_open {

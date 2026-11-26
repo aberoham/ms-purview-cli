@@ -158,20 +158,30 @@ From the queries sampled in one tenant (Observed):
 
 ### PR 1.1: device-code sign-in with both tokens stored
 
-Status: **not yet run.**
+Status: **run on 26 November 2026**, with the signed and notarised `v0.1.0-rc.1` build
+installed from the Homebrew tap, against a production tenant through a single-tenant
+public-client registration whose only assignee was the signing-in account.
 
-To run it, sign in with `purview auth login --client-id <application-client-id> --tenant-id
-<tenant-id>` on a test tenant, then `purview auth list` and `purview auth refresh --json`.
-Record here, without identifiers:
-
-- the date, and whether the device-code sign-in succeeded;
-- whether `downloadReady` was `true`, or the warning that names `AADSTS65001`;
-- the `scope` strings the token endpoint returned for Graph and for the download resource,
-  with any tenant-specific part replaced by a placeholder;
-- whether the download redemption returned a new refresh token;
-- whether `auth refresh` succeeded with the stored scopes, and both expiry times moved.
-  The tool refuses a Graph refresh whose permission set differs from the stored one
-  (`docs/SPEC.md` section 4.5), so record whether the refresh response's `scope` named the
-  same permissions as the sign-in response, in short or prefixed form;
-- that the operating-system credential store held one item, named `purview — <email>`
-  on macOS.
+- **Sign-in:** the device-code flow succeeded on the first attempt. Login printed
+  `downloadReady: true`; no `AADSTS65001` warning appeared.
+- **Graph scope returned:** `openid profile email https://graph.microsoft.com/eDiscovery.ReadWrite.All`
+  for both the sign-in and each refresh. The request named `offline_access`, which the
+  response omits, and did not name `email`, which the response adds. A refresh token was
+  issued all the same. The permission set compared by the tool did not change between
+  sign-in and refresh, so the refresh was accepted.
+- **Account claims:** the id token carried `preferred_username`, `tid`, `oid` and `name`,
+  and no `upn`; login printed `upn: null`.
+- **Refresh:** two `auth refresh --json` runs a few seconds apart both succeeded, and both
+  `graphExpiresAt` and `downloadExpiresAt` moved later. The download token's lifetime
+  differed from the Graph token's.
+- **Credential store (macOS):** one generic-password item, service `purview`, account
+  `purview:token:<email>`, label `purview — <email>`, description
+  `Microsoft Purview eDiscovery token`.
+- **Not observed:** the `scope` string of the download-resource response, and whether the
+  download redemption returned a new refresh token. The tool does not print either, and
+  reading the stored credential with another program would need a credential-store
+  prompt and expose the tokens.
+- **Found and fixed:** on macOS the local data directory is the configuration directory,
+  and the per-account lock created `account-locks/` and its parent with mode 0755 before
+  the configuration was first saved. Login then warned and narrowed the configuration
+  directory to 0700. Lock folders are now created 0700 and lock files 0600.

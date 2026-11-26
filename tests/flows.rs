@@ -2816,6 +2816,34 @@ async fn status_reports_denied_for_a_403_and_unknown_for_other_failures() {
 }
 
 #[tokio::test]
+async fn status_marks_an_expired_download_token_without_renewing_it() {
+    let harness = Harness::new().await;
+    sign_in_alex(&harness).await;
+    // Past the download token's expiry, inside the Graph token's.
+    harness.clock.advance(Duration::from_secs(3700));
+    mount_probe(
+        &harness,
+        "canary-graph-access-0001",
+        json_response(
+            200,
+            graph_fixture("cases-list-top1.json", &harness.graph.uri()),
+        ),
+    )
+    .await;
+    let run = harness.run(&["auth", "status"]).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
+    assert!(
+        run.stdout().contains(
+            "Download token expires: 2026-01-05T10:00:09Z (expired; 'purview auth refresh' \
+             renews it)"
+        ),
+        "{}",
+        run.stdout()
+    );
+    assert_eq!(identity_requests(&harness).await, 0);
+}
+
+#[tokio::test]
 async fn status_with_a_refresh_the_identity_platform_refuses_is_an_error() {
     let harness = Harness::new().await;
     sign_in_alex(&harness).await;

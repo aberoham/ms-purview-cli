@@ -391,8 +391,10 @@ pub const KEPT_QUERY_KEYS: &[&str] = &[
 /// query key that is not a plain name.
 pub const REDACTED_QUERY_VALUE: &str = "REDACTED";
 
-/// A URL as it may be shown or recorded: user information and fragment
-/// removed, and every query value whose key is not in `KEPT_QUERY_KEYS`
+/// A URL as it may be shown or recorded: user information removed, the
+/// fragment removed unless the path ends in `/$metadata` (OData's
+/// `@odata.context` form, `…/$metadata#security/cases/…`, which names a
+/// type and holds no data), and every query value whose key is not in `KEPT_QUERY_KEYS`
 /// replaced with `REDACTED`. That covers storage signatures (`sig`, `se`,
 /// `sp`, `sv`) and any `code` or `token`. A key that is not a short plain
 /// name is replaced as well, since a bare `?<value>` is all key. The result
@@ -403,7 +405,9 @@ pub fn url(value: &::url::Url) -> String {
     // have none to remove.
     let _ = clean.set_username("");
     let _ = clean.set_password(None);
-    clean.set_fragment(None);
+    if !value.path().ends_with("/$metadata") {
+        clean.set_fragment(None);
+    }
     if value.query().is_some() {
         let pairs: Vec<(String, String)> = value
             .query_pairs()
@@ -770,6 +774,20 @@ mod tests {
         );
         assert_eq!(
             url(&parse("https://graph.microsoft.com/v1.0/x")),
+            "https://graph.microsoft.com/v1.0/x"
+        );
+        assert_eq!(
+            url(&parse(
+                "https://graph.microsoft.com/v1.0/$metadata#security/cases/ediscoveryCases"
+            )),
+            "https://graph.microsoft.com/v1.0/$metadata#security/cases/ediscoveryCases"
+        );
+        let implicit = url(&parse(
+            "https://graph.microsoft.com/v1.0/x#access_token=canary-0001&state=s",
+        ));
+        assert_eq!(implicit, "https://graph.microsoft.com/v1.0/x");
+        assert_eq!(
+            url(&parse("https://graph.microsoft.com/v1.0/x#canary-0001")),
             "https://graph.microsoft.com/v1.0/x"
         );
     }

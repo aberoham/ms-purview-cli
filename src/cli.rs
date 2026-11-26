@@ -1444,7 +1444,19 @@ async fn auth_status(env: &mut Env, output: &OutputOptions, globals: &Globals) -
         sanitize(&credential.tenant_id),
         sanitize(&credential.graph.scope),
         credential.graph.expires_at_text(),
-        download.map_or_else(|| "not issued".to_owned(), |token| token.expires_at_text()),
+        download.map_or_else(
+            || "not issued".to_owned(),
+            |token| {
+                if token.expires_at <= env.clock.now() {
+                    format!(
+                        "{} (expired; 'purview auth refresh' renews it)",
+                        token.expires_at_text()
+                    )
+                } else {
+                    token.expires_at_text()
+                }
+            }
+        ),
         detail
             .map(|detail| format!(" ({})", sanitize(&detail)))
             .unwrap_or_default()

@@ -4,12 +4,13 @@
 
 #![allow(dead_code)]
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use base64::Engine;
 use ms_purview_cli::cli::{execute_with, Outcome};
-use ms_purview_cli::env::{test_epoch, Captured, Env, ManualClock};
+use ms_purview_cli::env::{test_epoch, BrowserOpener, Captured, Env, ManualClock};
 use ms_purview_cli::secrets::{AccountLocks, MemoryStore};
 use serde_json::Value;
 use std::time::Duration;
@@ -24,6 +25,7 @@ pub const ALEX: &str = "alex.wilber@contoso.example";
 /// in a file under the configuration directory.
 pub const CANARIES: &[&str] = &[
     "canary-device-code-0001",
+    "canary-auth-code-0001",
     "canary-graph-access-0001",
     "canary-graph-access-0002",
     "canary-graph-access-0003",
@@ -159,7 +161,13 @@ impl Harness {
     }
 
     pub async fn run(&self, args: &[&str]) -> Run {
-        let (env, captured) = self.env();
+        self.run_with(args, |_| {}).await
+    }
+
+    /// `run`, with the `Env` changed first, to set a browser or a timeout.
+    pub async fn run_with(&self, args: &[&str], configure: impl FnOnce(&mut Env)) -> Run {
+        let (mut env, captured) = self.env();
+        configure(&mut env);
         let mut argv = vec!["purview"];
         argv.extend_from_slice(args);
         let outcome = execute_with(env, argv).await;
@@ -300,4 +308,98 @@ fn paths_under(dir: &Path) -> Vec<PathBuf> {
         }
     }
     paths
+}
+
+/// Plays the browser for `auth login --browser`: given the sign-in
+/// address, it sends each visit to the loopback listener that the
+/// address's `redirect_uri` names, over IPv4, as a browser following the
+/// identity platform's redirect would. `{state}` in a visit becomes the
+/// address's `state`. It records the address and the status line of each
+/// answer.
+#[derive(Default)]
+pub struct ScriptedBrowser {
+    pub visits: Vec<String>,
+    /// Report that the browser could not be opened, then make the visits a
+    /// moment later, as a person who opened the printed address would.
+    pub fail_open: bool,
+    pub opened: Mutex<Vec<url::Url>>,
+    pub answers: Arc<Mutex<Vec<String>>>,
+}
+
+impl ScriptedBrowser {
+    pub fn new(visits: &[&str]) -> Arc<Self> {
+        Arc::new(Self {
+            visits: visits.iter().map(|visit| (*visit).to_owned()).collect(),
+            ..Self::default()
+        })
+    }
+
+    /// The one address the command asked the browser to open.
+    pub fn opened(&self) -> url::Url {
+        let opened = self.opened.lock().unwrap();
+        assert_eq!(opened.len(), 1, "{opened:?}");
+        opened[0].clone()
+    }
+
+    /// The status lines the listener answered with, once `count` have
+    /// arrived. The browser runs on its own thread, and a command that
+    /// fails at once can return before the browser has read its page.
+    pub fn answers(&self, count: usize) -> Vec<String> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let answers = self.answers.lock().unwrap().clone();
+            if answers.len() >= count || std::time::Instant::now() > deadline {
+                return answers;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// A query parameter of a URL, which must appear exactly once.
+pub fn query_value(url: &url::Url, name: &str) -> String {
+    let values: Vec<String> = url
+        .query_pairs()
+        .filter(|(key, _)| key == name)
+        .map(|(_, value)| value.into_owned())
+        .collect();
+    assert_eq!(values.len(), 1, "{name} in {url}");
+    values[0].clone()
+}
+
+impl BrowserOpener for ScriptedBrowser {
+    fn open(&self, url: &url::Url) -> std::io::Result<()> {
+        self.opened.lock().unwrap().push(url.clone());
+        let redirect = url::Url::parse(&query_value(url, "redirect_uri")).unwrap();
+        let port = redirect.port().expect("a loopback redirect names its port");
+        let state = query_value(url, "state");
+        let visits = self.visits.clone();
+        let answers = self.answers.clone();
+        let play = move || {
+            for visit in visits {
+                let target = visit.replace("{state}", &state);
+                let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+                write!(
+                    stream,
+                    "GET {target} HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n"
+                )
+                .unwrap();
+                let mut answer = String::new();
+                stream.read_to_string(&mut answer).unwrap();
+                answers
+                    .lock()
+                    .unwrap()
+                    .push(answer.lines().next().unwrap_or_default().to_owned());
+            }
+        };
+        if self.fail_open {
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                play();
+            });
+            return Err(std::io::Error::other("no browser found"));
+        }
+        play();
+        Ok(())
+    }
 }

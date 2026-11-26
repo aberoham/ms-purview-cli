@@ -2,8 +2,8 @@
 //! arguments, injected so that `cli::execute_with` can run a whole command
 //! in-process under test.
 //!
-//! It carries the identity-platform base URL, the credential store and the
-//! clock. Later releases add the Graph origin and the download host rule.
+//! It carries the identity-platform base URL, the credential store, the
+//! clock and the browser opener. Later releases add the Graph origin and the download host rule.
 //! The production `Env` reads no environment variable that could change an
 //! endpoint, so the release binary has no path that could send a token to
 //! another host.
@@ -38,6 +38,36 @@ pub trait Clock: Send + Sync {
     /// to the wall clock must not move.
     fn elapsed(&self) -> Duration;
     async fn sleep(&self, duration: Duration);
+}
+
+/// Opens an address in a web browser, for `auth login --browser`.
+pub trait BrowserOpener: Send + Sync {
+    fn open(&self, url: &Url) -> io::Result<()>;
+}
+
+/// The system's default browser, or the one `$BROWSER` names.
+#[derive(Debug, Default)]
+pub struct SystemBrowser;
+
+impl BrowserOpener for SystemBrowser {
+    fn open(&self, url: &Url) -> io::Result<()> {
+        webbrowser::open(url.as_str())
+    }
+}
+
+/// The opener of an in-memory `Env`: it opens nothing and fails, until a
+/// test replaces it with one that plays the browser's part.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct NoBrowser;
+
+impl BrowserOpener for NoBrowser {
+    fn open(&self, _url: &Url) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no browser in this environment",
+        ))
+    }
 }
 
 /// The system clock and tokio's timer.
@@ -173,6 +203,13 @@ pub struct Env {
     /// The timeout for each identity-platform request: `auth::REQUEST_TIMEOUT`
     /// in production; tests shorten it to exercise a stalled request.
     pub identity_timeout: Duration,
+    /// Opens the sign-in address for `auth login --browser`: the system
+    /// browser in production, `NoBrowser` in `in_memory()` until a test
+    /// sets one that answers the loopback redirect.
+    pub browser: Arc<dyn BrowserOpener>,
+    /// How long `auth login --browser` waits for the browser:
+    /// `auth::BROWSER_TIMEOUT` in production; tests shorten it.
+    pub browser_timeout: Duration,
     /// Makes one of `auth login`'s writes fail before it is made, for tests
     /// of a sign-in that stops part way. Always `None` in production.
     #[doc(hidden)]
@@ -242,6 +279,8 @@ impl Env {
             credentials: Arc::new(KeyringStore),
             clock: Arc::new(SystemClock::default()),
             identity_timeout: crate::auth::REQUEST_TIMEOUT,
+            browser: Arc::new(SystemBrowser),
+            browser_timeout: crate::auth::BROWSER_TIMEOUT,
             login_write_fault: None,
             account_locks: crate::secrets::AccountLocks::production(),
         }
@@ -280,6 +319,8 @@ impl Env {
             credentials: Arc::new(MemoryStore::default()),
             clock: Arc::new(ManualClock::new(test_epoch())),
             identity_timeout: crate::auth::REQUEST_TIMEOUT,
+            browser: Arc::new(NoBrowser),
+            browser_timeout: crate::auth::BROWSER_TIMEOUT,
             login_write_fault: None,
             account_locks: None,
         }

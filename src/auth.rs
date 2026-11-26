@@ -1,4 +1,5 @@
 //! Sign-in against the Microsoft identity platform: the device-code flow,
+//! the browser flow (authorization code with PKCE on a loopback redirect),
 //! refresh-token redemption for the two resources, and the account claims
 //! read from the id token.
 //!
@@ -11,6 +12,7 @@
 
 use std::fmt;
 use std::io::Write;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,11 +20,14 @@ use base64::Engine;
 use reqwest::StatusCode;
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use url::Url;
 use uuid::Uuid;
 
 use crate::config::AccountRecord;
-use crate::env::Clock;
+use crate::env::{BrowserOpener, Clock};
 use crate::error::{OAuthDetails, PurviewError, Result};
 use crate::output::sanitize;
 use crate::redact::Redactor;
@@ -572,6 +577,18 @@ pub async fn login_device_code(
     )?;
     prompt.flush()?;
     let token = identity.poll_device_code(&code, deadline, clock).await?;
+    complete_login(identity, clock, token, &scope).await
+}
+
+/// The part of a sign-in after the Graph token arrives, whichever flow
+/// obtained it: the account claims, the principal check, then the
+/// refresh token redeemed for the download token.
+async fn complete_login(
+    identity: &IdentityClient,
+    clock: &dyn Clock,
+    token: TokenResponse,
+    scope: &str,
+) -> Result<LoginOutcome> {
     let claims = account_claims(token.id_token.as_ref())?;
     let refresh_token = token
         .refresh_token
@@ -598,7 +615,7 @@ pub async fn login_device_code(
         client_id: identity.client_id().to_owned(),
         tenant_id: identity.tenant_id().to_owned(),
         refresh_token,
-        graph: AccessToken::from_response(&token, clock.now(), &scope),
+        graph: AccessToken::from_response(&token, clock.now(), scope),
         download: None,
     };
     let download_scope = download_scope();
@@ -641,6 +658,423 @@ pub async fn login_device_code(
         record,
         download_refused,
     })
+}
+
+/// The path of the redirect the app registration lists,
+/// `http://localhost/callback` (`docs/SPEC.md` section 5.2). The identity
+/// platform ignores the port of a loopback redirect when it compares it with
+/// the registration (Docs), so the listener's port is added at run time.
+/// That this registration accepts it is an Assumption checked live in PR 1.2.
+const REDIRECT_PATH: &str = "/callback";
+/// The most of one request to the loopback listener that is read.
+const MAX_CALLBACK_REQUEST: usize = 16 * 1024;
+/// How long one connection to the listener may take to send its request, so
+/// that a connection that sends nothing cannot hold up the sign-in.
+const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long `auth login --browser` waits for the browser to come back.
+pub const BROWSER_TIMEOUT: Duration = Duration::from_secs(900);
+/// How long a refusal's description from the browser may be when quoted.
+const MAX_CALLBACK_DESCRIPTION: usize = 1_000;
+
+/// A Proof Key for Code Exchange (PKCE, RFC 7636) pair with the `S256`
+/// method: the verifier stays in this process, and the authorization
+/// request carries only the challenge.
+struct Pkce {
+    verifier: SecretString,
+    challenge: String,
+}
+
+impl Pkce {
+    /// A verifier of 32 random bytes, which is 43 base64url characters
+    /// (RFC 7636 allows 43 to 128).
+    fn generate() -> Result<Self> {
+        let verifier = random_urlsafe(32)?;
+        Ok(Self {
+            challenge: pkce_challenge(&verifier),
+            verifier: SecretString::new(verifier),
+        })
+    }
+}
+
+/// `BASE64URL(SHA256(verifier))` without padding (RFC 7636 section 4.2).
+fn pkce_challenge(verifier: &str) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+}
+
+/// `bytes` random bytes from the operating system, as base64url text.
+fn random_urlsafe(bytes: usize) -> Result<String> {
+    let mut buffer = vec![0_u8; bytes];
+    getrandom::fill(&mut buffer).map_err(|error| {
+        PurviewError::message(format!("could not generate a random value: {error}"))
+    })?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buffer))
+}
+
+impl IdentityClient {
+    /// The authorization request for the browser. `prompt=select_account`
+    /// lets the person choose the account rather than reuse whichever one
+    /// the browser is signed in as.
+    fn authorization_url(
+        &self,
+        redirect_uri: &str,
+        scope: &str,
+        state: &str,
+        challenge: &str,
+    ) -> Result<Url> {
+        let mut url = self.endpoint("authorize")?;
+        url.query_pairs_mut()
+            .append_pair("client_id", &self.client_id)
+            .append_pair("response_type", "code")
+            .append_pair("redirect_uri", redirect_uri)
+            .append_pair("response_mode", "query")
+            .append_pair("scope", scope)
+            .append_pair("state", state)
+            .append_pair("code_challenge", challenge)
+            .append_pair("code_challenge_method", "S256")
+            .append_pair("prompt", "select_account");
+        Ok(url)
+    }
+
+    /// Redeems the authorization code with the PKCE verifier. The redirect
+    /// and scope must be the ones the authorization request named.
+    async fn exchange_code(
+        &self,
+        code: &SecretString,
+        redirect_uri: &str,
+        verifier: &SecretString,
+        scope: &str,
+    ) -> Result<TokenResponse> {
+        let operation = "redeeming the browser sign-in's authorization code";
+        let form = [
+            ("client_id", self.client_id.as_str()),
+            ("grant_type", "authorization_code"),
+            ("code", code.expose()),
+            ("redirect_uri", redirect_uri),
+            ("code_verifier", verifier.expose()),
+            ("scope", scope),
+        ];
+        let (status, body) = self.post("token", &form).await?;
+        if status != StatusCode::OK {
+            return Err(self.oauth_error(operation, status, &body));
+        }
+        self.token_response(&body, operation)
+    }
+}
+
+/// The listener for the browser's redirect: `127.0.0.1` on a port the
+/// system picks, and `::1` on the same port, because a browser may try
+/// `localhost` over IPv6 first. A port whose IPv6 side another process
+/// holds is given up for another, so that a redirect to `localhost` cannot
+/// reach that process. Where IPv6 is unavailable, IPv4 alone is used.
+struct Loopback {
+    v4: TcpListener,
+    v6: Option<TcpListener>,
+    port: u16,
+}
+
+impl Loopback {
+    async fn bind() -> Result<Self> {
+        let unavailable = |error: std::io::Error| {
+            PurviewError::Io(error).context(
+                "could not listen on the loopback address for the browser sign-in; run \
+                 'purview auth login' without --browser to use a device code",
+            )
+        };
+        for _ in 0..8 {
+            let v4 = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .map_err(unavailable)?;
+            let port = v4.local_addr().map_err(unavailable)?.port();
+            match TcpListener::bind((Ipv6Addr::LOCALHOST, port)).await {
+                Ok(v6) => {
+                    return Ok(Self {
+                        v4,
+                        v6: Some(v6),
+                        port,
+                    })
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+                Err(_) => return Ok(Self { v4, v6: None, port }),
+            }
+        }
+        Err(PurviewError::message(
+            "could not find a free loopback port for the browser sign-in; run 'purview auth \
+             login' without --browser to use a device code",
+        ))
+    }
+
+    fn redirect_uri(&self) -> String {
+        format!("http://localhost:{}{REDIRECT_PATH}", self.port)
+    }
+
+    async fn accept(&self) -> std::io::Result<TcpStream> {
+        let accepted = match &self.v6 {
+            Some(v6) => tokio::select! {
+                accepted = self.v4.accept() => accepted,
+                accepted = v6.accept() => accepted,
+            },
+            None => self.v4.accept().await,
+        };
+        accepted.map(|(stream, _)| stream)
+    }
+}
+
+/// What one request to the loopback listener means for the sign-in.
+#[derive(Debug)]
+enum Callback {
+    /// Not the redirect: another path, another method, or not HTTP. A
+    /// browser asks for `/favicon.ico`, for instance. Answered 404.
+    Unrelated,
+    /// The redirect path without this sign-in's `state`: a response meant
+    /// for another sign-in, or a request from something other than the
+    /// identity platform. Answered 400; the sign-in keeps waiting.
+    Foreign,
+    /// The identity platform's answer to this sign-in.
+    Answer(Result<SecretString>),
+}
+
+/// Reads one request head: the request line, as the identity platform
+/// puts the answer in the query string (`response_mode=query`).
+fn classify_callback(head: &str, expected_state: &str, redactor: &Redactor) -> Callback {
+    let mut words = head.lines().next().unwrap_or_default().split_whitespace();
+    let (Some(method), Some(target), Some(version)) = (words.next(), words.next(), words.next())
+    else {
+        return Callback::Unrelated;
+    };
+    if method != "GET" || !target.starts_with('/') || !version.starts_with("HTTP/") {
+        return Callback::Unrelated;
+    }
+    let Ok(url) = Url::parse(&format!("http://localhost{target}")) else {
+        return Callback::Unrelated;
+    };
+    if url.path() != REDIRECT_PATH {
+        return Callback::Unrelated;
+    }
+    let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
+    let values = |name: &str| -> Vec<&str> {
+        pairs
+            .iter()
+            .filter(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+            .collect()
+    };
+    // A code is a secret from the moment it arrives, whatever else the
+    // request holds.
+    for code in values("code") {
+        redactor.register(code);
+    }
+    // The identity platform returns `state` with errors as well as codes, so
+    // it is checked first, and exactly one copy is accepted.
+    if values("state") != [expected_state] {
+        return Callback::Foreign;
+    }
+    let (codes, errors) = (values("code"), values("error"));
+    let answer = match (codes.as_slice(), errors.as_slice()) {
+        ([], [error]) => {
+            let clean = |text: &str| {
+                let text = sanitize(&redactor.redact(text));
+                match text.char_indices().nth(MAX_CALLBACK_DESCRIPTION) {
+                    Some((end, _)) => format!("{}…", &text[..end]),
+                    None => text,
+                }
+            };
+            let description = values("error_description")
+                .first()
+                .map(|text| format!(": {}", clean(text)))
+                .unwrap_or_default();
+            Err(PurviewError::message(format!(
+                "the browser sign-in was refused: {}{description}",
+                clean(error)
+            )))
+        }
+        ([code], []) if !code.is_empty() => Ok(SecretString::new(*code)),
+        ([], []) => Err(PurviewError::message(
+            "the browser came back without an authorization code",
+        )),
+        _ => Err(PurviewError::message(
+            "the browser came back with an unreadable answer: it held more than one code or \
+             error, or an empty code",
+        )),
+    };
+    Callback::Answer(answer)
+}
+
+/// Reads a request head, up to the blank line that ends it, the size
+/// limit, or the end of the stream.
+async fn read_request_head(stream: &mut TcpStream) -> std::io::Result<String> {
+    let mut head = Vec::new();
+    let mut buffer = [0_u8; 2048];
+    while head.len() < MAX_CALLBACK_REQUEST {
+        let read = stream.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        head.extend_from_slice(&buffer[..read]);
+        if head.windows(4).any(|window| window == b"\r\n\r\n")
+            || head.windows(2).any(|window| window == b"\n\n")
+        {
+            break;
+        }
+    }
+    head.truncate(MAX_CALLBACK_REQUEST);
+    Ok(String::from_utf8_lossy(&head).into_owned())
+}
+
+async fn respond(stream: &mut TcpStream, status: &str, body: &str) {
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\n\
+         Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n\
+         {body}",
+        body.len()
+    );
+    // The browser page is a courtesy; a failure to write it changes nothing.
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.shutdown().await;
+}
+
+/// Answers requests to the listener until one carries this sign-in's
+/// `state`, and returns its authorization code or refusal.
+async fn receive_callback(
+    loopback: &Loopback,
+    expected_state: &str,
+    redactor: &Redactor,
+) -> Result<SecretString> {
+    loop {
+        let mut stream = match loopback.accept().await {
+            Ok(stream) => stream,
+            // A connection that went away before it was accepted.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                continue
+            }
+            Err(error) => {
+                return Err(PurviewError::Io(error)
+                    .context("the loopback listener for the browser sign-in failed"))
+            }
+        };
+        let head = match tokio::time::timeout(CALLBACK_READ_TIMEOUT, read_request_head(&mut stream))
+            .await
+        {
+            Ok(Ok(head)) => head,
+            _ => continue,
+        };
+        match classify_callback(&head, expected_state, redactor) {
+            Callback::Unrelated => respond(&mut stream, "404 Not Found", "Not found.").await,
+            Callback::Foreign => {
+                respond(
+                    &mut stream,
+                    "400 Bad Request",
+                    "This answer does not belong to the purview sign-in in progress.",
+                )
+                .await
+            }
+            Callback::Answer(answer) => {
+                let (status, body) = match &answer {
+                    Ok(_) => (
+                        "200 OK",
+                        "Signed in. You can close this window and return to the terminal.",
+                    ),
+                    Err(_) => (
+                        "400 Bad Request",
+                        "The sign-in did not finish. Return to the terminal for the reason.",
+                    ),
+                };
+                respond(&mut stream, status, body).await;
+                return answer;
+            }
+        }
+    }
+}
+
+/// Signs in through the system browser with the authorization code flow
+/// and PKCE on a loopback redirect (`docs/SPEC.md` section 3.5, `auth
+/// login --browser`), then redeems the refresh token for the download
+/// token as the device-code flow does. The address and any warning go to
+/// `prompt` (the command's redacted stderr). Nothing is stored here.
+pub async fn login_browser(
+    identity: &IdentityClient,
+    clock: &dyn Clock,
+    read_only: bool,
+    opener: Arc<dyn BrowserOpener>,
+    timeout: Duration,
+    prompt: &mut dyn Write,
+) -> Result<LoginOutcome> {
+    let scope = login_scope(read_only);
+    let pkce = Pkce::generate()?;
+    identity.redactor.register(pkce.verifier.expose());
+    let state = random_urlsafe(24)?;
+    let loopback = Loopback::bind().await?;
+    let redirect_uri = loopback.redirect_uri();
+    let authorize = identity.authorization_url(&redirect_uri, &scope, &state, &pkce.challenge)?;
+    writeln!(
+        prompt,
+        "Opening the browser to sign in. If it does not open, open this address in a browser \
+         on this computer:\n{authorize}\nWaiting for sign-in..."
+    )?;
+    prompt.flush()?;
+    // A browser named in $BROWSER can be a text browser that holds the
+    // call until it exits, so the opener runs on its own thread while the
+    // listener waits.
+    let mut opening = Some(tokio::task::spawn_blocking({
+        let authorize = authorize.clone();
+        move || opener.open(&authorize)
+    }));
+    let received = {
+        let receiving = tokio::time::timeout(
+            timeout,
+            receive_callback(&loopback, &state, &identity.redactor),
+        );
+        tokio::pin!(receiving);
+        loop {
+            tokio::select! {
+                received = &mut receiving => break received,
+                opened = async { opening.as_mut().expect("guarded").await }, if opening.is_some() => {
+                    opening = None;
+                    let failure = match opened {
+                        Ok(Ok(())) => None,
+                        Ok(Err(error)) => Some(error.to_string()),
+                        Err(error) => Some(error.to_string()),
+                    };
+                    if let Some(failure) = failure {
+                        writeln!(
+                            prompt,
+                            "warning: could not open the browser ({}); open the address above",
+                            sanitize(&failure)
+                        )?;
+                        prompt.flush()?;
+                    }
+                }
+            }
+        }
+    };
+    let code = received.map_err(|_| {
+        PurviewError::message(format!(
+            "the browser sign-in did not finish within {}; run 'purview auth login --browser' \
+             again, or leave out --browser to sign in with a device code",
+            describe_duration(timeout)
+        ))
+    })??;
+    // The listener closes before the code is redeemed.
+    drop(loopback);
+    let token = identity
+        .exchange_code(&code, &redirect_uri, &pkce.verifier, &scope)
+        .await?;
+    complete_login(identity, clock, token, &scope).await
+}
+
+fn describe_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds == 60 {
+        "1 minute".to_owned()
+    } else if seconds > 60 && seconds.is_multiple_of(60) {
+        format!("{} minutes", seconds / 60)
+    } else {
+        format!("{seconds} seconds")
+    }
 }
 
 #[cfg(test)]
@@ -789,5 +1223,170 @@ mod tests {
         .unwrap();
         let shown = format!("{code:?}");
         assert!(!shown.contains("canary"), "{shown}");
+    }
+
+    #[test]
+    fn the_pkce_challenge_matches_the_rfc_7636_example() {
+        // RFC 7636 appendix B.
+        assert_eq!(
+            pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
+
+    #[test]
+    fn a_pkce_verifier_is_43_unreserved_characters_and_never_repeats() {
+        let first = Pkce::generate().unwrap();
+        let second = Pkce::generate().unwrap();
+        for pkce in [&first, &second] {
+            let verifier = pkce.verifier.expose();
+            assert_eq!(verifier.len(), 43, "{verifier}");
+            assert!(verifier
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+            assert_eq!(pkce.challenge, pkce_challenge(verifier));
+        }
+        assert_ne!(first.verifier.expose(), second.verifier.expose());
+        assert_ne!(random_urlsafe(24).unwrap(), random_urlsafe(24).unwrap());
+    }
+
+    fn callback(target: &str, redactor: &Redactor) -> Callback {
+        classify_callback(
+            &format!("GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+            "expected",
+            redactor,
+        )
+    }
+
+    #[test]
+    fn a_callback_with_this_state_gives_its_code_and_registers_it() {
+        let redactor = Redactor::new();
+        match callback("/callback?code=canary-code-0001&state=expected", &redactor) {
+            Callback::Answer(Ok(code)) => assert_eq!(code.expose(), "canary-code-0001"),
+            other => panic!("{other:?}"),
+        }
+        assert!(!redactor.redact("canary-code-0001").contains("canary"));
+    }
+
+    #[test]
+    fn requests_that_are_not_the_redirect_are_unrelated() {
+        let redactor = Redactor::new();
+        for target in [
+            "/favicon.ico",
+            "/callback/extra?code=abc&state=expected",
+            "/",
+            "http://localhost/callback?code=abc&state=expected",
+        ] {
+            assert!(
+                matches!(callback(target, &redactor), Callback::Unrelated),
+                "{target}"
+            );
+        }
+        for head in [
+            "POST /callback?code=abc&state=expected HTTP/1.1\r\n\r\n",
+            "GET /callback?code=abc&state=expected\r\n\r\n",
+            "",
+            "\u{16}\u{3}\u{1}",
+        ] {
+            assert!(
+                matches!(
+                    classify_callback(head, "expected", &redactor),
+                    Callback::Unrelated
+                ),
+                "{head:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_callback_without_exactly_this_state_is_foreign_whatever_it_holds() {
+        let redactor = Redactor::new();
+        for target in [
+            "/callback?code=canary-code-0002&state=other",
+            "/callback?code=abc",
+            "/callback?error=access_denied&state=other",
+            "/callback?code=abc&state=expected&state=other",
+            "/callback?code=abc&state=expected&state=expected",
+            "/callback?code=abc&state=Expected",
+        ] {
+            assert!(
+                matches!(callback(target, &redactor), Callback::Foreign),
+                "{target}"
+            );
+        }
+        // Even a foreign code is kept out of output.
+        assert!(!redactor.redact("canary-code-0002").contains("canary"));
+    }
+
+    #[test]
+    fn a_refusal_with_this_state_reports_the_platforms_reason_cleaned() {
+        let redactor = Redactor::new();
+        redactor.register("canary-secret-0001");
+        let target = "/callback?state=expected&error=access_denied\
+            &error_description=AADSTS65004%3A+declined%1b%5B31m+canary-secret-0001";
+        let message = match callback(target, &redactor) {
+            Callback::Answer(Err(error)) => error.to_string(),
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            message.starts_with("the browser sign-in was refused: access_denied: AADSTS65004"),
+            "{message}"
+        );
+        assert!(!message.contains('\u{1b}'), "{message}");
+        assert!(!message.contains("canary"), "{message}");
+
+        let long = format!(
+            "/callback?state=expected&error=x&error_description={}",
+            "a".repeat(5_000)
+        );
+        let message = match callback(&long, &redactor) {
+            Callback::Answer(Err(error)) => error.to_string(),
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            message.len() < MAX_CALLBACK_DESCRIPTION + 100,
+            "{}",
+            message.len()
+        );
+    }
+
+    #[test]
+    fn a_callback_with_this_state_but_no_single_code_is_an_error() {
+        let redactor = Redactor::new();
+        for target in [
+            "/callback?state=expected",
+            "/callback?state=expected&code=",
+            "/callback?state=expected&code=a&code=b",
+            "/callback?state=expected&code=a&error=x",
+            "/callback?state=expected&error=x&error=y",
+        ] {
+            assert!(
+                matches!(callback(target, &redactor), Callback::Answer(Err(_))),
+                "{target}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_loopback_listener_takes_one_port_on_both_loopback_addresses() {
+        let loopback = Loopback::bind().await.unwrap();
+        assert_eq!(loopback.v4.local_addr().unwrap().port(), loopback.port);
+        if let Some(v6) = &loopback.v6 {
+            let address = v6.local_addr().unwrap();
+            assert!(address.ip().is_loopback());
+            assert_eq!(address.port(), loopback.port);
+        }
+        assert_eq!(
+            loopback.redirect_uri(),
+            format!("http://localhost:{}/callback", loopback.port)
+        );
+    }
+
+    #[test]
+    fn durations_are_described_in_minutes_when_whole() {
+        assert_eq!(describe_duration(BROWSER_TIMEOUT), "15 minutes");
+        assert_eq!(describe_duration(Duration::from_secs(60)), "1 minute");
+        assert_eq!(describe_duration(Duration::from_millis(200)), "0 seconds");
+        assert_eq!(describe_duration(Duration::from_secs(90)), "90 seconds");
     }
 }

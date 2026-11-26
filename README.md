@@ -38,7 +38,7 @@ purview estimate <existing-case> <existing-search> --strict
 
 Existing tools leave gaps across the eDiscovery workflow (recorded in [docs/SPEC.md](docs/SPEC.md) and [docs/api-notes.md](docs/api-notes.md)):
 
-- **Purview portal:** supports every operation, but only by hand; per-location hit counts and failure details live inside zip files handed back one at a time (Observed).
+- **Purview portal:** supports every operation, but only by hand; per-location hit counts and failure details are inside the report zip files it returns (Observed).
 - **Security & Compliance PowerShell:** creates and runs searches, but cannot download exports (Docs).
 - **Azure CLI:** in live observations against a tenant, requesting a token for the Purview eDiscovery download application programming interface (API) failed with `AADSTS65002`, because first-party applications require pre-authorisation by the API owner (Observed).
 - **Microsoft Graph Command Line Tools:** in live observations, this client obtained a Microsoft Graph token after consent, but received `AADSTS65001` for the download API, so it could search without being able to download (Observed).
@@ -125,7 +125,7 @@ Release archives for macOS (Apple silicon and Intel), Linux (x86-64 and Arm64, s
 Every release archive also carries a build provenance attestation, which shows that this repository's release workflow built it from the tagged commit. With the GitHub CLI (for Unix archives; Windows archives end in `.zip`):
 
 ```bash
-TAG=v<version>
+TAG="v<version>"   # replace <version> with the release you downloaded
 gh attestation verify "purview-${TAG}-<target>.tar.gz" --repo aberoham/ms-purview-cli \
   --signer-workflow aberoham/ms-purview-cli/.github/workflows/release.yml \
   --source-ref "refs/tags/$TAG"
@@ -146,7 +146,7 @@ On macOS, `cargo build` produces an ad-hoc-signed binary, whose identity changes
 
 `purview` has no app registration of its own. Create a single-tenant public-client registration in your Microsoft Entra ID tenant before signing in.
 
-1. **Create the app registration.** With the Azure CLI (signed in as a Cloud Application Administrator, Application Administrator or higher), run `contrib/create-purview-app.sh` from a checkout of `main`. It performs a dry run by default and changes nothing until you pass `--apply`. The script grants `eDiscovery.ReadWrite.All` by default, and `auth login --read-only` alone does not narrow the registration's grant. For a read-only setup, add `READ_ONLY=1` to both the dry run and the `--apply` run (for example `READ_ONLY=1 TENANT_ID=<tenant-id> ASSIGN_USERS="alex@contoso.example" ./contrib/create-purview-app.sh`) and then sign in with `purview auth login --read-only`.
+1. **Create the app registration.** With the Azure CLI (signed in as a Cloud Application Administrator, Application Administrator or higher), run `contrib/create-purview-app.sh` from a checkout of `main`. It performs a dry run by default and changes nothing until you pass `--apply`. The script grants `eDiscovery.ReadWrite.All` by default, and `auth login --read-only` alone does not narrow the registration's grant. For a read-only setup, add `READ_ONLY=1` to both the dry run and the `--apply` run (for example `READ_ONLY=1 TENANT_ID=<tenant-id> ASSIGN_USERS="alex@contoso.example" ./contrib/create-purview-app.sh`) and then sign in with the command the script prints at the end, which includes both identifiers and `--read-only`.
 
    ```bash
    az login --tenant <tenant-id>

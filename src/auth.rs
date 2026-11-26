@@ -664,7 +664,7 @@ async fn complete_login(
 /// `http://localhost/callback` (`docs/SPEC.md` section 5.2). The identity
 /// platform ignores the port of a loopback redirect when it compares it with
 /// the registration (Docs), so the listener's port is added at run time.
-/// That this registration accepts it is an Assumption checked live in PR 1.2.
+/// The observed registration accepted it (Observed, `docs/api-notes.md`).
 const REDIRECT_PATH: &str = "/callback";
 /// The most of one request to the loopback listener that is read.
 const MAX_CALLBACK_REQUEST: usize = 16 * 1024;

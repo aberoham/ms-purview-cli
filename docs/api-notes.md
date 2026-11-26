@@ -185,3 +185,27 @@ public-client registration whose only assignee was the signing-in account.
   0644, before the configuration was first saved; login then warned and narrowed the
   configuration directory to 0700. A later code change creates lock folders 0700 and
   lock files 0600, and refuses a linked lock folder.
+
+### PR 1.2: browser sign-in and the setup script's dry run
+
+Status: **run on 26 November 2026** from a local build of the PR 1.2 branch, signed with a
+local code-signing identity, against the same tenant and registration as the PR 1.1 check.
+
+- **Browser sign-in:** `auth login --browser --json` succeeded on the first attempt. The
+  registration lists the public-client redirect `http://localhost/callback` without a port;
+  the authorization request named `http://localhost:<port>/callback` with the port the
+  listener was given, and the identity platform redirected to it. (Observed) Login printed
+  `downloadReady: true`.
+- **Graph scope returned:** `openid profile email https://graph.microsoft.com/eDiscovery.ReadWrite.All`,
+  the same as after device-code sign-in. (Observed)
+- **Credential compatibility:** the `v0.1.0-rc.1` release build then ran `auth refresh`
+  on the credential the branch build had stored, and it succeeded without a keychain
+  prompt. (Observed)
+- **Not observed:** whether the browser reached the listener over IPv4 or IPv6.
+- **Setup script, dry run:** `contrib/create-purview-app.sh` without `--apply`, with
+  `CLIENT_ID` naming the existing registration and the signed-in account in
+  `ASSIGN_USERS`, exited 0 and found the existing owner, service principal, assignment,
+  redirect and both per-user grants. Its plan proposed one change: adding `offline_access`,
+  `openid` and `profile` to `requiredResourceAccess`, which held only the Graph eDiscovery
+  permission and the eDiscovery download scope. (Observed) Reading the registration back
+  afterwards showed it unchanged. (Observed)

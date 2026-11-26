@@ -1169,9 +1169,9 @@ OpenID Connect scopes as separate entries in `requiredResourceAccess`.
    name, which `purview` does not use (Observed).
 2. **Application.**
    - `signInAudience: AzureADMyOrg`, `isFallbackPublicClient: true` (Observed).
-   - Public-client redirect `http://localhost/callback` (Observed). That `--browser` works with
-     `http://localhost:<port>/callback` on this registration is an Assumption, based on
-     `entra`; PR 1.2 checks it.
+   - Public-client redirect `http://localhost/callback` (Observed). `--browser` works with
+     `http://localhost:<port>/callback` on this registration (Observed in the PR 1.2 live
+     check).
    - No credentials (Observed).
    - `requiredResourceAccess`:
      - Graph `eDiscovery.ReadWrite.All` (`acb8f680-0834-4146-b69e-4ab1b39745ad`) (Observed).

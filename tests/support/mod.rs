@@ -170,7 +170,11 @@ impl Harness {
         configure(&mut env);
         let mut argv = vec!["purview"];
         argv.extend_from_slice(args);
-        let outcome = execute_with(env, argv).await;
+        // A command that waits for something that never comes fails the
+        // test rather than hanging it.
+        let outcome = tokio::time::timeout(Duration::from_secs(60), execute_with(env, argv))
+            .await
+            .expect("the command finished within 60 seconds");
         Run { outcome, captured }
     }
 
@@ -230,6 +234,13 @@ impl Harness {
     /// Fails if any canary is in the output or in any file under the
     /// configuration directory.
     pub fn assert_no_canaries(&self, run: &Run) {
+        self.assert_absent(run, CANARIES);
+    }
+
+    /// Fails if any of `values` is in the output or in the name or contents
+    /// of any file under the harness's directory. The failure names the
+    /// value's position in `values`, never the value.
+    pub fn assert_absent(&self, run: &Run, values: &[&str]) {
         let mut sources = vec![
             ("stdout".to_owned(), run.captured.stdout.bytes()),
             ("stderr".to_owned(), run.captured.stderr.bytes()),
@@ -246,12 +257,12 @@ impl Harness {
             }
         }
         for (name, bytes) in sources {
-            for canary in CANARIES {
+            for (index, value) in values.iter().enumerate() {
                 assert!(
                     !bytes
-                        .windows(canary.len())
-                        .any(|window| window == canary.as_bytes()),
-                    "{canary} found in {name}"
+                        .windows(value.len())
+                        .any(|window| window == value.as_bytes()),
+                    "value {index} found in {name}"
                 );
             }
         }
@@ -314,7 +325,9 @@ fn paths_under(dir: &Path) -> Vec<PathBuf> {
 /// address, it sends each visit to the loopback listener that the
 /// address's `redirect_uri` names, over IPv4, as a browser following the
 /// identity platform's redirect would. `{state}` in a visit becomes the
-/// address's `state`. It records the address and the status line of each
+/// address's `state`. A visit of `<idle>` opens a connection that sends
+/// nothing and stays open until the visits end, as a browser's speculative
+/// connection does. It records the address and the status line of each
 /// answer.
 #[derive(Default)]
 pub struct ScriptedBrowser {
@@ -376,9 +389,20 @@ impl BrowserOpener for ScriptedBrowser {
         let visits = self.visits.clone();
         let answers = self.answers.clone();
         let play = move || {
+            let mut idle = Vec::new();
             for visit in visits {
+                if visit == "<idle>" {
+                    idle.push(std::net::TcpStream::connect(("127.0.0.1", port)).unwrap());
+                    continue;
+                }
                 let target = visit.replace("{state}", &state);
                 let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
                 write!(
                     stream,
                     "GET {target} HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n"
@@ -394,7 +418,7 @@ impl BrowserOpener for ScriptedBrowser {
         };
         if self.fail_open {
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(200));
                 play();
             });
             return Err(std::io::Error::other("no browser found"));

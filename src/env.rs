@@ -45,13 +45,59 @@ pub trait BrowserOpener: Send + Sync {
     fn open(&self, url: &Url) -> io::Result<()>;
 }
 
-/// The system's default browser, or the one `$BROWSER` names.
+/// The system's default browser, through the platform's own opener:
+/// `open` on macOS, the URL protocol handler on Windows, `xdg-open`
+/// elsewhere.
 #[derive(Debug, Default)]
 pub struct SystemBrowser;
 
 impl BrowserOpener for SystemBrowser {
+    /// Opens only an `https` address. The program is a fixed one and the
+    /// address goes to it as a single argument, never through a shell; the
+    /// scheme check keeps a handler that also opens files (Windows'
+    /// `FileProtocolHandler`) from being given a path.
     fn open(&self, url: &Url) -> io::Result<()> {
-        webbrowser::open(url.as_str())
+        if url.scheme() != "https" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "only an https address is opened in the browser",
+            ));
+        }
+        let (program, args) = browser_command(url.as_str());
+        launch(program, &args)
+    }
+}
+
+fn browser_command(url: &str) -> (&'static str, Vec<String>) {
+    if cfg!(target_os = "macos") {
+        ("/usr/bin/open", vec![url.to_owned()])
+    } else if cfg!(windows) {
+        // The address goes to the handler as one argument, with no shell to
+        // read the `&` in its query.
+        (
+            "rundll32.exe",
+            vec!["url.dll,FileProtocolHandler".to_owned(), url.to_owned()],
+        )
+    } else {
+        ("xdg-open", vec![url.to_owned()])
+    }
+}
+
+/// Runs an opener and waits for it to exit. The program is a literal from
+/// `browser_command` (or a test), never a value read at run time. It gets none of this process's
+/// standard streams, so nothing it or a browser it starts prints can reach
+/// the command's output: under `--json`, stdout must hold one document.
+fn launch(program: &'static str, args: &[String]) -> io::Result<()> {
+    let status = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("{program} exited with {status}")))
     }
 }
 
@@ -398,6 +444,45 @@ mod tests {
         clock.advance(Duration::from_secs(1));
         assert_eq!(clock.now(), test_epoch() + chrono::Duration::seconds(6));
         assert_eq!(clock.sleeps(), [Duration::from_secs(5)]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_opener_gets_none_of_the_commands_streams() {
+        // Each stream must be a character device that is not a terminal:
+        // /dev/null. An inherited stream is a terminal, or a pipe under CI.
+        let check = "for fd in 0 1 2; do if [ -t $fd ]; then exit 3; fi; done; \
+                     [ -c /dev/stdin ] && [ -c /dev/stdout ] && [ -c /dev/stderr ] || exit 4";
+        launch("/bin/sh", &["-c".to_owned(), check.to_owned()]).unwrap();
+        let failed = launch("/bin/sh", &["-c".to_owned(), "exit 7".to_owned()]).unwrap_err();
+        assert!(
+            failed.to_string().contains("/bin/sh exited with"),
+            "{failed}"
+        );
+    }
+
+    #[test]
+    fn the_system_browser_opens_only_https_addresses() {
+        for refused in [
+            "file:///etc/passwd",
+            "http://login.microsoftonline.com/x",
+            "javascript:alert(1)",
+        ] {
+            let error = SystemBrowser
+                .open(&Url::parse(refused).unwrap())
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{refused}");
+        }
+    }
+
+    #[test]
+    fn the_opener_passes_the_address_as_one_argument() {
+        let url = "https://login.microsoftonline.com/x/oauth2/v2.0/authorize?a=1&b=2";
+        let (program, args) = browser_command(url);
+        assert_eq!(args.last().map(String::as_str), Some(url));
+        if cfg!(target_os = "macos") {
+            assert_eq!(program, "/usr/bin/open");
+        }
     }
 
     #[test]

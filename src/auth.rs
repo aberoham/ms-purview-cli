@@ -673,6 +673,8 @@ const MAX_CALLBACK_REQUEST: usize = 16 * 1024;
 const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long `auth login --browser` waits for the browser to come back.
 pub const BROWSER_TIMEOUT: Duration = Duration::from_secs(900);
+/// How many connections to the listener are served at once.
+const MAX_CALLBACK_CONNECTIONS: usize = 16;
 /// How long a refusal's description from the browser may be when quoted.
 const MAX_CALLBACK_DESCRIPTION: usize = 1_000;
 
@@ -780,6 +782,9 @@ impl Loopback {
                  'purview auth login' without --browser to use a device code",
             )
         };
+        // Ports given up are held until binding ends, so that the system
+        // cannot hand the same one out again.
+        let mut given_up = Vec::new();
         for _ in 0..8 {
             let v4 = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
                 .await
@@ -793,7 +798,7 @@ impl Loopback {
                         port,
                     })
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+                Err(error) if ipv6_port_taken(error.kind()) => given_up.push(v4),
                 Err(_) => return Ok(Self { v4, v6: None, port }),
             }
         }
@@ -819,6 +824,17 @@ impl Loopback {
     }
 }
 
+/// Whether a failure to bind `::1` means another socket holds the port, so
+/// that another port must be tried. Windows reports an address held with
+/// `SO_EXCLUSIVEADDRUSE` as `WSAEACCES`, which is `PermissionDenied`. Any
+/// other failure is taken to mean IPv6 loopback is unavailable.
+fn ipv6_port_taken(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+    )
+}
+
 /// What one request to the loopback listener means for the sign-in.
 #[derive(Debug)]
 enum Callback {
@@ -834,22 +850,28 @@ enum Callback {
 }
 
 /// Reads one request head: the request line, as the identity platform
-/// puts the answer in the query string (`response_mode=query`).
+/// puts the answer in the query string (`response_mode=query`). Only a
+/// complete head whose request line is `GET /callback?… HTTP/1.x`, with the
+/// path exactly as written, can be the redirect.
 fn classify_callback(head: &str, expected_state: &str, redactor: &Redactor) -> Callback {
-    let mut words = head.lines().next().unwrap_or_default().split_whitespace();
-    let (Some(method), Some(target), Some(version)) = (words.next(), words.next(), words.next())
-    else {
-        return Callback::Unrelated;
-    };
-    if method != "GET" || !target.starts_with('/') || !version.starts_with("HTTP/") {
+    if !head.ends_with("\r\n\r\n") && !head.ends_with("\n\n") {
         return Callback::Unrelated;
     }
-    let Ok(url) = Url::parse(&format!("http://localhost{target}")) else {
+    let line = head.lines().next().unwrap_or_default();
+    let words: Vec<&str> = line.split(' ').collect();
+    let [method, target, version] = words.as_slice() else {
         return Callback::Unrelated;
     };
-    if url.path() != REDIRECT_PATH {
+    if *method != "GET" || !matches!(*version, "HTTP/1.1" | "HTTP/1.0") {
         return Callback::Unrelated;
     }
+    let (raw_path, query) = target.split_once('?').unwrap_or((target, ""));
+    if raw_path != REDIRECT_PATH {
+        return Callback::Unrelated;
+    }
+    let Ok(url) = Url::parse(&format!("http://localhost{REDIRECT_PATH}?{query}")) else {
+        return Callback::Unrelated;
+    };
     let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
     let values = |name: &str| -> Vec<&str> {
         pairs
@@ -858,17 +880,17 @@ fn classify_callback(head: &str, expected_state: &str, redactor: &Redactor) -> C
             .map(|(_, value)| value.as_str())
             .collect()
     };
-    // A code is a secret from the moment it arrives, whatever else the
-    // request holds.
-    for code in values("code") {
-        redactor.register(code);
-    }
     // The identity platform returns `state` with errors as well as codes, so
-    // it is checked first, and exactly one copy is accepted.
+    // it is checked first, and exactly one copy is accepted. A foreign
+    // request's values are dropped unread.
     if values("state") != [expected_state] {
         return Callback::Foreign;
     }
     let (codes, errors) = (values("code"), values("error"));
+    // A code is a secret from the moment it is accepted.
+    for code in &codes {
+        redactor.register(code);
+    }
     let answer = match (codes.as_slice(), errors.as_slice()) {
         ([], [error]) => {
             let clean = |text: &str| {
@@ -932,59 +954,97 @@ async fn respond(stream: &mut TcpStream, status: &str, body: &str) {
     let _ = stream.shutdown().await;
 }
 
-/// Answers requests to the listener until one carries this sign-in's
-/// `state`, and returns its authorization code or refusal.
+/// Reads and answers one connection to the listener. It gives the sign-in's
+/// answer if the request carried this sign-in's `state`, and nothing for
+/// any other request, or for a connection that sent no complete request
+/// within `CALLBACK_READ_TIMEOUT`.
+async fn answer_connection(
+    mut stream: TcpStream,
+    expected_state: &str,
+    redactor: &Redactor,
+) -> Option<Result<SecretString>> {
+    let head =
+        match tokio::time::timeout(CALLBACK_READ_TIMEOUT, read_request_head(&mut stream)).await {
+            Ok(Ok(head)) => head,
+            _ => return None,
+        };
+    match classify_callback(&head, expected_state, redactor) {
+        Callback::Unrelated => {
+            respond(&mut stream, "404 Not Found", "Not found.").await;
+            None
+        }
+        Callback::Foreign => {
+            respond(
+                &mut stream,
+                "400 Bad Request",
+                "This answer does not belong to the purview sign-in in progress.",
+            )
+            .await;
+            None
+        }
+        Callback::Answer(answer) => {
+            let (status, body) = match &answer {
+                Ok(_) => (
+                    "200 OK",
+                    "Answer received. Return to the terminal to see whether sign-in \
+                     finished, then close this window.",
+                ),
+                Err(_) => (
+                    "400 Bad Request",
+                    "The sign-in did not finish. Return to the terminal for the reason.",
+                ),
+            };
+            respond(&mut stream, status, body).await;
+            Some(answer)
+        }
+    }
+}
+
+/// Answers connections to the listener until one carries this sign-in's
+/// `state`, and returns its authorization code or refusal. Connections are
+/// served side by side, because a browser can open a connection it never
+/// uses, and that connection must not hold up the one that carries the
+/// answer. Past `MAX_CALLBACK_CONNECTIONS` at once, a new connection is
+/// closed unread.
 async fn receive_callback(
     loopback: &Loopback,
     expected_state: &str,
-    redactor: &Redactor,
+    redactor: &Arc<Redactor>,
 ) -> Result<SecretString> {
+    let expected_state: Arc<str> = Arc::from(expected_state);
+    let mut connections = tokio::task::JoinSet::new();
     loop {
-        let mut stream = match loopback.accept().await {
-            Ok(stream) => stream,
-            // A connection that went away before it was accepted.
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::ConnectionReset
-                ) =>
-            {
-                continue
+        tokio::select! {
+            Some(served) = connections.join_next() => {
+                if let Ok(Some(answer)) = served {
+                    return answer;
+                }
             }
-            Err(error) => {
-                return Err(PurviewError::Io(error)
-                    .context("the loopback listener for the browser sign-in failed"))
-            }
-        };
-        let head = match tokio::time::timeout(CALLBACK_READ_TIMEOUT, read_request_head(&mut stream))
-            .await
-        {
-            Ok(Ok(head)) => head,
-            _ => continue,
-        };
-        match classify_callback(&head, expected_state, redactor) {
-            Callback::Unrelated => respond(&mut stream, "404 Not Found", "Not found.").await,
-            Callback::Foreign => {
-                respond(
-                    &mut stream,
-                    "400 Bad Request",
-                    "This answer does not belong to the purview sign-in in progress.",
-                )
-                .await
-            }
-            Callback::Answer(answer) => {
-                let (status, body) = match &answer {
-                    Ok(_) => (
-                        "200 OK",
-                        "Signed in. You can close this window and return to the terminal.",
-                    ),
-                    Err(_) => (
-                        "400 Bad Request",
-                        "The sign-in did not finish. Return to the terminal for the reason.",
-                    ),
+            accepted = loopback.accept() => {
+                let stream = match accepted {
+                    Ok(stream) => stream,
+                    // A connection that went away before it was accepted.
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::ConnectionReset
+                        ) =>
+                    {
+                        continue
+                    }
+                    Err(error) => {
+                        return Err(PurviewError::Io(error)
+                            .context("the loopback listener for the browser sign-in failed"))
+                    }
                 };
-                respond(&mut stream, status, body).await;
-                return answer;
+                if connections.len() >= MAX_CALLBACK_CONNECTIONS {
+                    continue;
+                }
+                let (expected_state, redactor) = (expected_state.clone(), redactor.clone());
+                connections.spawn(async move {
+                    answer_connection(stream, &expected_state, &redactor).await
+                });
             }
         }
     }
@@ -1016,13 +1076,21 @@ pub async fn login_browser(
          on this computer:\n{authorize}\nWaiting for sign-in..."
     )?;
     prompt.flush()?;
-    // A browser named in $BROWSER can be a text browser that holds the
-    // call until it exits, so the opener runs on its own thread while the
-    // listener waits.
-    let mut opening = Some(tokio::task::spawn_blocking({
+    // An opener can wait for the browser it starts (`xdg-open` can), so it
+    // runs on a thread of its own while the listener waits. The thread is
+    // detached: nothing waits for it to end, the runtime included.
+    let (sender, mut opened) = tokio::sync::oneshot::channel();
+    let thread = std::thread::Builder::new().spawn({
         let authorize = authorize.clone();
-        move || opener.open(&authorize)
-    }));
+        move || {
+            let _ = sender.send(opener.open(&authorize));
+        }
+    });
+    let mut waiting_for_opener = true;
+    if let Err(error) = thread {
+        waiting_for_opener = false;
+        warn_if_not_opened(Ok(Err(error)), prompt)?;
+    }
     let received = {
         let receiving = tokio::time::timeout(
             timeout,
@@ -1030,27 +1098,23 @@ pub async fn login_browser(
         );
         tokio::pin!(receiving);
         loop {
+            // Biased, so that an opener failure known by the time the answer
+            // arrives is reported first.
             tokio::select! {
-                received = &mut receiving => break received,
-                opened = async { opening.as_mut().expect("guarded").await }, if opening.is_some() => {
-                    opening = None;
-                    let failure = match opened {
-                        Ok(Ok(())) => None,
-                        Ok(Err(error)) => Some(error.to_string()),
-                        Err(error) => Some(error.to_string()),
-                    };
-                    if let Some(failure) = failure {
-                        writeln!(
-                            prompt,
-                            "warning: could not open the browser ({}); open the address above",
-                            sanitize(&failure)
-                        )?;
-                        prompt.flush()?;
-                    }
+                biased;
+                result = &mut opened, if waiting_for_opener => {
+                    waiting_for_opener = false;
+                    warn_if_not_opened(result, prompt)?;
                 }
+                received = &mut receiving => break received,
             }
         }
     };
+    if waiting_for_opener {
+        if let Ok(result) = opened.try_recv() {
+            warn_if_not_opened(Ok(result), prompt)?;
+        }
+    }
     let code = received.map_err(|_| {
         PurviewError::message(format!(
             "the browser sign-in did not finish within {}; run 'purview auth login --browser' \
@@ -1064,6 +1128,26 @@ pub async fn login_browser(
         .exchange_code(&code, &redirect_uri, &pkce.verifier, &scope)
         .await?;
     complete_login(identity, clock, token, &scope).await
+}
+
+/// Warns that the browser did not open. A closed channel means the opener
+/// panicked.
+fn warn_if_not_opened(
+    opened: std::result::Result<std::io::Result<()>, tokio::sync::oneshot::error::RecvError>,
+    prompt: &mut dyn Write,
+) -> Result<()> {
+    let failure = match opened {
+        Ok(Ok(())) => return Ok(()),
+        Ok(Err(error)) => error.to_string(),
+        Err(_) => "the opener stopped without an answer".to_owned(),
+    };
+    writeln!(
+        prompt,
+        "warning: could not open the browser ({}); open the address above",
+        sanitize(&failure)
+    )?;
+    prompt.flush()?;
+    Ok(())
 }
 
 fn describe_duration(duration: Duration) -> String {
@@ -1276,6 +1360,10 @@ mod tests {
             "/callback/extra?code=abc&state=expected",
             "/",
             "http://localhost/callback?code=abc&state=expected",
+            "//callback?code=abc&state=expected",
+            "/./callback?code=abc&state=expected",
+            "/callback%3F?code=abc&state=expected",
+            "/CALLBACK?code=abc&state=expected",
         ] {
             assert!(
                 matches!(callback(target, &redactor), Callback::Unrelated),
@@ -1285,6 +1373,11 @@ mod tests {
         for head in [
             "POST /callback?code=abc&state=expected HTTP/1.1\r\n\r\n",
             "GET /callback?code=abc&state=expected\r\n\r\n",
+            // Incomplete: no blank line ends the head.
+            "GET /callback?code=abc&state=expected HTTP/1.1\r\nHost: localhost\r\n",
+            "GET /callback?code=abc&state=expected HTTP/2\r\n\r\n",
+            "GET /callback?code=abc&state=expected HTTP/1.1 extra\r\n\r\n",
+            "GET  /callback?code=abc&state=expected HTTP/1.1\r\n\r\n",
             "",
             "\u{16}\u{3}\u{1}",
         ] {
@@ -1314,8 +1407,9 @@ mod tests {
                 "{target}"
             );
         }
-        // Even a foreign code is kept out of output.
-        assert!(!redactor.redact("canary-code-0002").contains("canary"));
+        // A foreign request's values are not registered: nothing reads them,
+        // and a registered value would make later writes that hold it fail.
+        assert_eq!(redactor.redact("canary-code-0002"), "canary-code-0002");
     }
 
     #[test]
@@ -1367,9 +1461,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn an_ipv6_port_held_elsewhere_is_given_up_and_other_failures_fall_back() {
+        use std::io::ErrorKind;
+        assert!(ipv6_port_taken(ErrorKind::AddrInUse));
+        // Windows: an address held with SO_EXCLUSIVEADDRUSE (WSAEACCES).
+        assert!(ipv6_port_taken(ErrorKind::PermissionDenied));
+        for unavailable in [
+            ErrorKind::AddrNotAvailable,
+            ErrorKind::Unsupported,
+            ErrorKind::Other,
+        ] {
+            assert!(!ipv6_port_taken(unavailable), "{unavailable:?}");
+        }
+    }
+
     #[tokio::test]
     async fn the_loopback_listener_takes_one_port_on_both_loopback_addresses() {
         let loopback = Loopback::bind().await.unwrap();
+        // macOS always has IPv6 loopback, so there the second listener must
+        // exist; elsewhere it may not.
+        if cfg!(target_os = "macos") {
+            assert!(loopback.v6.is_some());
+        }
         assert_eq!(loopback.v4.local_addr().unwrap().port(), loopback.port);
         if let Some(v6) = &loopback.v6 {
             let address = v6.local_addr().unwrap();

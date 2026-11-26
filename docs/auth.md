@@ -130,10 +130,11 @@ These are the steps the script automates (`docs/SPEC.md` section 5.2):
      (`acb8f680-0834-4146-b69e-4ab1b39745ad`) or `eDiscovery.Read.All`
      (`99201db3-7652-4d5a-809a-bdb94f85fe3c`), with `offline_access`, `openid`
      and `profile`; and, under "APIs my organization uses",
-     `MicrosoftPurviewEDiscovery` `eDiscovery.Download.Read`. The Graph
-     permission and the eDiscovery scope are Observed; listing the OpenID
-     Connect scopes here is an Assumption, because the observed registration
-     had them only on its consent grant.
+     `MicrosoftPurviewEDiscovery` `eDiscovery.Download.Read`.
+     `eDiscovery.ReadWrite.All` and the eDiscovery scope are Observed. The id
+     of `eDiscovery.Read.All` is Observed, but its use here is an Assumption.
+     Listing the OpenID Connect scopes here is an Assumption too, because the
+     observed registration had them only on its consent grant.
    - Add yourself, or whoever maintains it, as an owner. Creating an
      application through Graph does not add the caller as owner (Observed).
 3. **The application's service principal** (its enterprise application), with
@@ -156,9 +157,9 @@ These are the steps the script automates (`docs/SPEC.md` section 5.2):
   (Docs; not observed). This is the choice for a group
   assignment.
 - **Every user (`ALLOW_ALL_TENANT_USERS=1` with `CONSENT=tenant`).** Assignment
-  is not required, so every user in the tenant can sign in through the app.
-  Purview roles still decide what each person can see, but use this only when
-  that is the intent.
+  is not required, so every user in the tenant can sign in through the app
+  (Docs). Purview roles still decide what each person can see (Docs), but use
+  this only when that is the intent.
 
 Without consent for the eDiscovery app, sign-in still succeeds with a warning,
 and download commands fail with `DownloadNotConsented` until consent is granted
@@ -171,8 +172,9 @@ purview auth login --client-id <application-client-id> --tenant-id <tenant-id>
 ```
 
 `PURVIEW_CLIENT_ID` and `PURVIEW_TENANT_ID` can stand in for the two flags.
-Both ids must be GUIDs; `common` and `organizations` cannot sign in to a
-single-tenant registration. The registration is saved with the account, so a
+Both ids must be GUIDs. `common` and `organizations` are refused, because a
+single-tenant registration accepts sign-in only through its own tenant
+(Docs). The registration is saved with the account, so a
 later sign-in needs neither.
 
 `--no-input` refuses `auth login` before any request, because sign-in needs a
@@ -192,13 +194,17 @@ Exchange (PKCE, RFC 7636) on a loopback redirect:
 1. It starts a listener on `127.0.0.1` on a port the system picks, and on `::1`
    on the same port when it can, because a browser may try `localhost` over
    IPv6 first. If another program holds that port on `::1`, it picks another
-   port. It opens the sign-in page in the system browser (or the one
-   `$BROWSER` names). It also prints the address on stderr, in case the browser
+   port. It opens the sign-in page in the default browser, through `open` on
+   macOS, the URL handler on Windows or `xdg-open` elsewhere, with none of the
+   command's output streams, so nothing the browser prints reaches the
+   command's output. It also prints the address on stderr, in case the browser
    does not open.
 2. After sign-in, the identity platform sends the browser to
    `http://localhost:<port>/callback` with an authorization code. The listener
-   accepts only an answer that carries the random `state` of this sign-in;
-   anything else gets an error page, and it keeps waiting.
+   accepts only an answer that carries the random `state` of this sign-in.
+   Any other request gets an error page, a connection that sends nothing is
+   closed after 10 seconds, and it keeps waiting. Connections are served side
+   by side, so one the browser opens and never uses holds nothing up.
 3. It redeems the code with the PKCE verifier, which never left the process,
    then redeems the refresh token for the download token, as the device-code
    flow does.
@@ -212,8 +218,9 @@ platform ignores the port when it compares a loopback redirect with the
 registration (Docs), so any port the listener gets is accepted. The redirect
 uses `localhost`, not the `127.0.0.1` that Microsoft recommends, because the
 observed registration lists `localhost`, and a `127.0.0.1` redirect would need
-its own entry, which the portal cannot add (Docs). An IPv6 literal (`[::1]`) cannot be registered (Docs). That this
-registration accepts the port is checked live (see `docs/api-notes.md`).
+its own entry, which the portal cannot add (Docs). An IPv6 literal (`[::1]`) cannot be registered (Docs). That the
+observed registration accepts a redirect with a port is an Assumption until
+the PR 1.2 live check is recorded in `docs/api-notes.md`.
 
 ### Choosing the account
 
@@ -256,13 +263,13 @@ part way, and `auth refresh` asks you to sign in again rather than guess.
 ## `AADSTS65001` and `AADSTS65002`
 
 - **`AADSTS65001`** (consent required) on the download redemption means the app
-  has no consent for `eDiscovery.Download.Read`. `auth login` warns and stores
+  has no consent for `eDiscovery.Download.Read` (Observed with another client). `auth login` warns and stores
   the Graph token; `auth refresh` fails with `DownloadNotConsented`. Grant the
   consent (run the script again, or grant admin consent in the Microsoft Entra
   admin center), then run `purview auth refresh`.
 - **`AADSTS65002`** means the client is a first-party Microsoft app that the
-  eDiscovery API has not pre-authorised. Consent cannot fix it. Use your own
-  registration.
+  eDiscovery API has not pre-authorised. Consent cannot fix it (Observed). Use
+  your own registration.
 
 ## Environment variables
 
@@ -273,7 +280,6 @@ part way, and `auth refresh` asks you to sign in again rather than guess.
 | `PURVIEW_ACCOUNT` | Default for `--account` |
 | `PURVIEW_NO_INPUT` | Default for `--no-input` |
 | `PURVIEW_CONFIG_DIR` | Configuration directory, instead of the platform default |
-| `BROWSER` | The browser `auth login --browser` opens, instead of the system default |
 
 An empty variable counts as unset.
 

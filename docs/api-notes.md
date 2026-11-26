@@ -139,8 +139,7 @@ From the queries sampled in one tenant (Observed):
 ## Not yet observed
 
 1. Whether a missing eDiscovery role gives 403 (not checked in PR 1.4; Assumption).
-2. What an `eDiscovery.Read.All` session can reach (PR 1.4 checks list and get).
-3. Non-empty custodian, non-custodial and additional source lists.
+2. Non-empty custodian, non-custodial and additional source lists.
 4. Redirects on download (PR 1.5).
 5. Reports and exports without Teams context (PR 2.5, PR 4.1).
 6. Case close on a case with holds, and hold reads on an empty case (PR 2.6).
@@ -278,5 +277,13 @@ repository.
 - **`$expand=search` on operations:** refused on both the list and a single `GET` with HTTP
   400 `BadRequest` ("Could not find a property named 'search'"). (Observed) The tool does
   not send it; an operation's search cannot be read from the operation.
+- **Read-only session:** `auth login --read-only` (device code) asked for
+  `eDiscovery.Read.All`, and the identity platform returned
+  `openid profile email https://graph.microsoft.com/eDiscovery.ReadWrite.All
+  https://graph.microsoft.com/eDiscovery.Read.All`: it grants every scope consented for the
+  app, so the token is not narrowed. (Observed) `auth status`, `case list`, `case get`,
+  `search list`, `search get`, `operation list` and `operation get` all succeeded in that
+  session. (Observed) `--read-only` therefore limits what the tool sends, not what the token
+  allows; a registration made with `READ_ONLY=1` is the way to narrow the token (Derived).
 - **Missing role:** not checked; whether an account without an eDiscovery role gets 403
   stays an Assumption.

@@ -345,7 +345,8 @@ struct CaseList {
 
 fn parse_date(text: &str) -> std::result::Result<chrono::NaiveDate, String> {
     chrono::NaiveDate::parse_from_str(text.trim(), "%Y-%m-%d")
-        .map_err(|_| format!("{text:?} is not a date in the form YYYY-MM-DD"))
+        // The value is not repeated, as in every argument error.
+        .map_err(|_| "expected a date in the form YYYY-MM-DD".to_owned())
 }
 
 #[derive(Debug, Clone, Args)]
@@ -846,9 +847,15 @@ impl Printer {
             let text = rendered.trim();
             text.strip_prefix("error: ").unwrap_or(text).to_owned()
         };
-        // Clap quotes the value it refused, which could be a signed URL
-        // pasted into the wrong place: URLs in its message are redacted as
-        // in any free text.
+        // Clap quotes the value it refused, which could be a secret pasted
+        // into the wrong place. That value is left out, and any other URL in
+        // the message is redacted as in free text.
+        let message = match error.get(clap::error::ContextKind::InvalidValue) {
+            Some(clap::error::ContextValue::String(value)) if !value.is_empty() => {
+                message.replace(&format!(" '{value}'"), "")
+            }
+            _ => message,
+        };
         let message = crate::redact::urls_in_text(&message, &env.redactor);
         let json_mode = json_requested(args, json_default);
         self.fail(env, json_mode, &PurviewError::message(message))

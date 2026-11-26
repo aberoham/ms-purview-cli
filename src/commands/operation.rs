@@ -147,6 +147,7 @@ pub async fn list(
     }
     entries.retain(|entry| filters.action.admits(&entry.record.action(entry.source)));
     warn_invalid_counts(
+        &session.env.redactor.clone(),
         &mut session.env.stderr,
         entries.iter().map(|entry| &entry.record),
     );
@@ -291,6 +292,7 @@ async fn resolve(session: &mut Session<'_>, case: CaseId, entries: &mut [Entry])
 }
 
 fn warn_invalid_counts<'a>(
+    redactor: &crate::redact::Redactor,
     log: &mut dyn Write,
     records: impl Iterator<Item = &'a OperationRecord>,
 ) {
@@ -300,7 +302,10 @@ fn warn_invalid_counts<'a>(
                 log,
                 "warning: operation {} has fields that are not counts ({}); they are shown as \
                  unknown",
-                sanitize(record.id.as_deref().unwrap_or("?")),
+                sanitize(&crate::redact::shown(
+                    record.id.as_deref().unwrap_or("?"),
+                    redactor
+                )),
                 record.invalid_counts.join(", ")
             );
         }
@@ -376,7 +381,11 @@ pub async fn get(
             }
         }
     };
-    warn_invalid_counts(&mut session.env.stderr, std::iter::once(&record));
+    warn_invalid_counts(
+        &session.env.redactor.clone(),
+        &mut session.env.stderr,
+        std::iter::once(&record),
+    );
     show(session, &record)
 }
 
@@ -606,11 +615,12 @@ fn stopped(
     }
     let _ = writeln!(
         session.env.stderr,
-        "{message}. Operation {operation} was {}. Resume with: {resume}",
+        "{message}. Operation {operation} was {}. Resume with: {}",
         status
             .as_deref()
             .map(sanitize)
-            .unwrap_or_else(|| "not read yet".to_owned())
+            .unwrap_or_else(|| "not read yet".to_owned()),
+        sanitize(&resume)
     );
     Ok(Produced {
         exit_code,

@@ -1376,6 +1376,24 @@ async fn a_signed_url_in_a_refused_argument_is_redacted() {
 }
 
 #[tokio::test]
+async fn a_rejected_date_is_not_repeated() {
+    let harness = Harness::new().await;
+    let run = harness
+        .run(&[
+            "--json",
+            "case",
+            "list",
+            "--created-before",
+            "canary-sig-0009",
+        ])
+        .await;
+    assert_eq!(run.outcome.exit_code, 1);
+    let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
+    assert!(message.contains("YYYY-MM-DD"), "{message}");
+    assert!(!message.contains("canary"), "{message}");
+}
+
+#[tokio::test]
 async fn a_rejected_operation_id_is_not_repeated() {
     let harness = Harness::new().await;
     let pasted = "https://graph.example/x?sig=canary-sig-0003";

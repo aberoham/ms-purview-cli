@@ -2436,7 +2436,9 @@ live check a feature depends on cannot be done, the feature is left out of that 
   - the three search source reads;
   - `$expand=search` on operations;
   - a missing role gives 403;
-  - a `--read-only` session can list and get. This says nothing about actions.
+  - a `--read-only` session can list and get. This says nothing about actions. (Observed:
+    it can, and its token still carried `eDiscovery.ReadWrite.All`, because the identity
+    platform grants every consented scope; see `docs/api-notes.md`.)
 
   The `Location` form is not checked here: an existing operation cannot reproduce the
   original 202 header. PR 2.3 checks it.

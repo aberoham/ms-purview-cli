@@ -1028,7 +1028,7 @@ dependencies = [
 
 [[package]]
 name = "ms-purview-cli"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "assert_cmd",
  "async-trait",

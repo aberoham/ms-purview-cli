@@ -2,8 +2,9 @@
 //! arguments, injected so that `cli::execute_with` can run a whole command
 //! in-process under test.
 //!
-//! It carries the identity-platform base URL, the credential store, the
-//! clock and the browser opener. Later releases add the Graph origin and the download host rule.
+//! It carries the identity-platform and Graph base URLs, the credential
+//! store, the clock and the browser opener. A later release adds the
+//! download host rule.
 //! The production `Env` reads no environment variable that could change an
 //! endpoint, so the release binary has no path that could send a token to
 //! another host.
@@ -242,6 +243,9 @@ pub struct Env {
     /// The identity platform: `IDENTITY_BASE` in production, a mock origin
     /// in tests.
     pub identity_base: Url,
+    /// The Graph base URL, whose origin is the only one Graph requests go
+    /// to: `origin::GRAPH_BASE` in production, a mock origin in tests.
+    pub graph_base: Url,
     /// Where tokens persist: the operating-system store in production, a
     /// `MemoryStore` in tests.
     pub credentials: Arc<dyn CredentialStore>,
@@ -283,6 +287,9 @@ pub const FLAG_VARIABLES: &[&str] = &[
     "PURVIEW_SELECT",
     "PURVIEW_ACCOUNT",
     "PURVIEW_NO_INPUT",
+    "PURVIEW_VERBOSE",
+    "PURVIEW_TIMEOUT",
+    "PURVIEW_TRACE_DIR",
     "PURVIEW_CLIENT_ID",
     "PURVIEW_TENANT_ID",
 ];
@@ -299,6 +306,7 @@ impl fmt::Debug for Env {
             // Names only: a value could be anything a user pasted.
             .field("vars", &self.vars.keys().collect::<Vec<_>>())
             .field("identity_base", &self.identity_base.as_str())
+            .field("graph_base", &self.graph_base.as_str())
             .finish_non_exhaustive()
     }
 }
@@ -322,6 +330,7 @@ impl Env {
                 .filter_map(|name| std::env::var_os(name).map(|value| ((*name).to_owned(), value)))
                 .collect(),
             identity_base: production_identity_base(),
+            graph_base: crate::origin::graph_base(),
             credentials: Arc::new(KeyringStore),
             clock: Arc::new(SystemClock::default()),
             identity_timeout: crate::auth::REQUEST_TIMEOUT,
@@ -347,8 +356,8 @@ impl Env {
 
     /// An `Env` over the given streams, with no terminal attached, no
     /// `PURVIEW_*` variables set, an empty in-memory credential store, a
-    /// manual clock at `test_epoch()`, and an identity platform that cannot
-    /// be reached until a test points it at a mock.
+    /// manual clock at `test_epoch()`, and an identity platform and Graph
+    /// that cannot be reached until a test points them at mocks.
     #[doc(hidden)]
     pub fn with_writers(stdout: Box<dyn Write + Send>, stderr: Box<dyn Write + Send>) -> Self {
         let redactor = Arc::new(Redactor::new());
@@ -362,6 +371,7 @@ impl Env {
             config_dir: None,
             vars: BTreeMap::new(),
             identity_base: unreachable_identity_base(),
+            graph_base: unreachable_graph_base(),
             credentials: Arc::new(MemoryStore::default()),
             clock: Arc::new(ManualClock::new(test_epoch())),
             identity_timeout: crate::auth::REQUEST_TIMEOUT,
@@ -382,6 +392,13 @@ fn production_identity_base() -> Url {
 /// must replace with a mock origin.
 fn unreachable_identity_base() -> Url {
     Url::parse("http://identity-unset.example")
+        .unwrap_or_else(|_| unreachable!("a valid URL literal"))
+}
+
+/// A Graph base under the reserved `.example` domain, which a test must
+/// replace with a mock origin.
+fn unreachable_graph_base() -> Url {
+    Url::parse("http://graph-unset.example/v1.0/")
         .unwrap_or_else(|_| unreachable!("a valid URL literal"))
 }
 
@@ -433,6 +450,10 @@ mod tests {
         assert_eq!(
             production_identity_base().as_str(),
             "https://login.microsoftonline.com/"
+        );
+        assert_eq!(
+            Env::production().graph_base.as_str(),
+            "https://graph.microsoft.com/v1.0/"
         );
     }
 

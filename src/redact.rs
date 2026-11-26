@@ -376,6 +376,69 @@ impl Drop for RedactingWriter {
     }
 }
 
+/// The query keys `url` keeps with their values (`docs/SPEC.md` section
+/// 4.9).
+pub const KEPT_QUERY_KEYS: &[&str] = &[
+    "$top",
+    "$select",
+    "$filter",
+    "$expand",
+    "$skiptoken",
+    "downloadType",
+];
+
+/// What `url` writes in place of a query value it does not keep, and of a
+/// query key that is not a plain name.
+pub const REDACTED_QUERY_VALUE: &str = "REDACTED";
+
+/// A URL as it may be shown or recorded: user information and fragment
+/// removed, and every query value whose key is not in `KEPT_QUERY_KEYS`
+/// replaced with `REDACTED`. That covers storage signatures (`sig`, `se`,
+/// `sp`, `sv`) and any `code` or `token`. A key that is not a short plain
+/// name is replaced as well, since a bare `?<value>` is all key. The result
+/// still goes through the Redactor at its sink.
+pub fn url(value: &::url::Url) -> String {
+    let mut clean = value.clone();
+    // Both fail only for URLs that cannot hold credentials, which then
+    // have none to remove.
+    let _ = clean.set_username("");
+    let _ = clean.set_password(None);
+    clean.set_fragment(None);
+    if value.query().is_some() {
+        let pairs: Vec<(String, String)> = value
+            .query_pairs()
+            .map(|(key, item)| {
+                if KEPT_QUERY_KEYS.contains(&key.as_ref()) {
+                    (key.into_owned(), item.into_owned())
+                } else if is_plain_key(&key) {
+                    (key.into_owned(), REDACTED_QUERY_VALUE.to_owned())
+                } else {
+                    (
+                        REDACTED_QUERY_VALUE.to_owned(),
+                        REDACTED_QUERY_VALUE.to_owned(),
+                    )
+                }
+            })
+            .collect();
+        clean.set_query(None);
+        if !pairs.is_empty() {
+            clean.query_pairs_mut().extend_pairs(pairs);
+        }
+    }
+    clean.to_string()
+}
+
+/// A query key that names a parameter rather than carrying data: at most
+/// 16 characters, made only of letters and `$_-`. Parameter names such as
+/// `sig`, `skoid` or `code` pass; a value used as a bare key almost always
+/// holds a digit or is longer.
+fn is_plain_key(key: &str) -> bool {
+    (1..=16).contains(&key.len())
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphabetic() || matches!(byte, b'$' | b'_' | b'-'))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -662,5 +725,52 @@ mod tests {
         redactor.register("canary-access-0002");
         writeln!(writer, "canary-access-0002").unwrap();
         assert_eq!(sink.text(), "[redacted]\n");
+    }
+
+    #[test]
+    fn url_keeps_only_the_allowed_query_keys() {
+        let parse = |text: &str| ::url::Url::parse(text).unwrap();
+        assert_eq!(
+            url(&parse(
+                "https://graph.microsoft.com/v1.0/security/cases/ediscoveryCases?$top=1&$select=id\
+                 &$filter=x&$expand=search&$skiptoken=next-0001&downloadType=Report"
+            )),
+            "https://graph.microsoft.com/v1.0/security/cases/ediscoveryCases?%24top=1&%24select=id\
+             &%24filter=x&%24expand=search&%24skiptoken=next-0001&downloadType=Report"
+        );
+        let redacted = url(&parse(
+            "https://alpha.proxyservice.ediscovery.svc.cloud.microsoft/ediscovery/api/proxy/x\
+             ?downloadType=Report&sig=canary-sig-0001&se=2026&sp=r&sv=1&code=canary-code-0001\
+             &token=canary-token-0001&Top=1",
+        ));
+        assert!(!redacted.contains("canary"), "{redacted}");
+        assert!(redacted.ends_with(
+            "?downloadType=Report&sig=REDACTED&se=REDACTED&sp=REDACTED&sv=REDACTED\
+             &code=REDACTED&token=REDACTED&Top=REDACTED"
+        ));
+    }
+
+    #[test]
+    fn url_drops_credentials_fragments_and_keys_that_carry_data() {
+        let parse = |text: &str| ::url::Url::parse(text).unwrap();
+        // Joined at run time so that the public-data lint does not read
+        // the user information as an address.
+        let redacted = url(&parse(&format!(
+            "{}{}{}{}",
+            "https:",
+            "//user:canary-pass-0001",
+            '@',
+            "graph.microsoft.com/v1.0/?canary-bare-key-0001&x%20y=1#canary-fragment-0001"
+        )));
+        assert!(!redacted.contains("canary"), "{redacted}");
+        assert!(!redacted.contains("user"), "{redacted}");
+        assert_eq!(
+            redacted,
+            "https://graph.microsoft.com/v1.0/?REDACTED=REDACTED&REDACTED=REDACTED"
+        );
+        assert_eq!(
+            url(&parse("https://graph.microsoft.com/v1.0/x")),
+            "https://graph.microsoft.com/v1.0/x"
+        );
     }
 }

@@ -98,6 +98,12 @@ pub struct GraphToken(SecretString);
 pub struct DownloadToken(SecretString);
 
 impl GraphToken {
+    /// For a `TokenProvider` other than `StoredTokenProvider`, such as a
+    /// test's.
+    pub fn new(token: SecretString) -> Self {
+        Self(token)
+    }
+
     pub fn expose(&self) -> &str {
         self.0.expose()
     }
@@ -134,6 +140,12 @@ pub trait TokenProvider: Send + Sync {
     /// Forgets the Graph token, so the next `graph` call refreshes. Used
     /// after a 401.
     async fn invalidate_graph(&self);
+    /// What the provider did since the last call, one line each, for
+    /// `--verbose`: each redemption, the scope it returned and whether the
+    /// refresh token rotated. Never a token.
+    fn take_notes(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// One access token as stored.
@@ -530,6 +542,7 @@ pub struct StoredTokenProvider {
     clock: Arc<dyn Clock>,
     account_locks: Option<AccountLocks>,
     state: tokio::sync::Mutex<State>,
+    notes: std::sync::Mutex<Vec<String>>,
 }
 
 impl fmt::Debug for StoredTokenProvider {
@@ -579,7 +592,31 @@ impl StoredTokenProvider {
                 uncertain: None,
                 invalidated_graph: None,
             }),
+            notes: std::sync::Mutex::default(),
         })
+    }
+
+    /// The credential in use now, after any refresh this provider made.
+    pub async fn credential(&self) -> Credential {
+        self.state.lock().await.credential.clone()
+    }
+
+    /// Records one redemption for `take_notes`. The scope is the
+    /// response's own, or "none" when it sent none; it is not a secret.
+    fn note(&self, operation: &str, response: &TokenResponse, previous: &SecretString) {
+        let rotated = response
+            .refresh_token
+            .as_ref()
+            .is_some_and(|token| !token.is_empty() && token != previous);
+        let scope = response.scope.trim();
+        self.notes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(format!(
+                "{operation}: returned scope {}; refresh token rotated: {}",
+                if scope.is_empty() { "none" } else { scope },
+                if rotated { "yes" } else { "no" }
+            ));
     }
 
     /// Takes the account lock around each store write.
@@ -630,6 +667,11 @@ impl StoredTokenProvider {
                 "refreshing the Graph token",
             )
             .await?;
+        self.note(
+            "refreshed the Graph token",
+            &response,
+            &credential.refresh_token,
+        );
         let mut refreshed = credential.clone();
         refreshed.graph =
             AccessToken::from_response(&response, self.clock.now(), &credential.graph.scope);
@@ -656,6 +698,11 @@ impl StoredTokenProvider {
                 "redeeming the refresh token for the download token",
             )
             .await?;
+        self.note(
+            "redeemed the download token",
+            &response,
+            &credential.refresh_token,
+        );
         let mut refreshed = credential.clone();
         refreshed.download = Some(AccessToken::from_response(
             &response,
@@ -844,6 +891,15 @@ impl TokenProvider for StoredTokenProvider {
         let mut state = self.state.lock().await;
         state.invalidated_graph = Some(state.credential.graph.token.clone());
         state.credential.graph.expires_at = DateTime::<Utc>::UNIX_EPOCH;
+    }
+
+    fn take_notes(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .notes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
     }
 }
 

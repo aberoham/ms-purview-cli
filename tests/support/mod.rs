@@ -1,6 +1,6 @@
 //! Shared harness for in-process flows: an injected `Env` with an
-//! in-memory credential store, a manual clock and a wiremock identity
-//! platform; fixture loading; and the canary scanner.
+//! in-memory credential store, a manual clock, and wiremock origins for the
+//! identity platform and Graph; fixture loading; and the canary scanner.
 
 #![allow(dead_code)]
 
@@ -43,6 +43,18 @@ pub fn fixture(name: &str) -> Value {
         .join(name);
     serde_json::from_slice(&std::fs::read(&path).unwrap())
         .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+}
+
+/// A Graph fixture with every `https://graph.microsoft.com/v1.0/` URL in
+/// it moved to the mock origin `uri`, so paging links lead to the mock.
+pub fn graph_fixture(name: &str, uri: &str) -> Value {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/graph")
+        .join(name);
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+    let text = text.replace("https://graph.microsoft.com/v1.0/", &format!("{uri}/v1.0/"));
+    serde_json::from_str(&text).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
 }
 
 /// An unsigned JSON Web Token carrying the claims in an id-claims fixture.
@@ -116,6 +128,7 @@ pub struct Harness {
     pub clock: Arc<ManualClock>,
     pub root: tempfile::TempDir,
     pub identity: MockServer,
+    pub graph: MockServer,
 }
 
 impl Harness {
@@ -130,6 +143,7 @@ impl Harness {
             clock: Arc::new(ManualClock::new(test_epoch())),
             root: tempfile::tempdir().unwrap(),
             identity: MockServer::start().await,
+            graph: MockServer::start().await,
         }
     }
 
@@ -156,6 +170,7 @@ impl Harness {
         env.clock = self.clock.clone();
         env.config_dir = Some(self.config_dir());
         env.identity_base = url::Url::parse(&self.identity.uri()).unwrap();
+        env.graph_base = url::Url::parse(&format!("{}/v1.0/", self.graph.uri())).unwrap();
         env.account_locks = Some(self.account_locks());
         (env, captured)
     }

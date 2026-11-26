@@ -274,7 +274,7 @@ fn auth_help_lists_exactly_the_shipped_auth_commands() {
         .collect();
     assert_eq!(
         commands,
-        ["login", "refresh", "list", "logout", "help"],
+        ["login", "refresh", "status", "list", "logout", "help"],
         "{text}"
     );
 }

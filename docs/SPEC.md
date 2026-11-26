@@ -642,7 +642,7 @@ Adding a write needs a reviewed design, a change to that test and an update to
 - **GET:** at most 3 attempts. Retries happen on connection errors, timeouts, a truncated
   body, 429, 500, 502, 503 and 504. `Retry-After` is honoured in seconds or HTTP-date form,
   up to 60 s; a longer one ends the GET with Graph's error rather than wait. Otherwise the wait is 250 ms × 2^(attempt−1), capped at 30 s. A 401 makes the token
-  provider refresh once, then the GET is retried once.
+  provider refresh once, then the GET is retried once, within the same three attempts.
 - **POST: never retried automatically**, whatever the status or error. A `Retry-After` header
   says when to try again; it does not prove the first request had no effect. If the outcome
   is unclear (timeout, reset, 5xx, 429), the command runs the reconciliation in section 6.7

@@ -1130,17 +1130,20 @@ whatever properties can be read, with `error: "unsupportedClass"` when they have
 **Stored credential.** One credential-store item per account, holding JSON:
 
 ```json
-{"version":1,"email":"alex@contoso.example",
+{"version":1,"email":"alex@contoso.example","tid":"<tenant-id>","oid":"<object-id>",
  "client_id":"<application-client-id>","tenant_id":"<tenant-id>","refresh_token":"…",
  "graph":{"access_token":"…","expires_at":"…","scope":"…"},
  "download":{"access_token":"…","expires_at":"…","scope":"…"}}
 ```
 
-`download` may be absent. `client_id` and `tenant_id` name the app registration and tenant
-that issued the tokens. Every refresh and redemption uses the registration recorded here,
+`download` may be absent. `tid` and `oid` are the id token's claims for the identity the
+tokens belong to: they bind the account key to one principal. `client_id` and `tenant_id`
+name the app registration and tenant that issued the tokens. Every refresh and redemption uses the registration recorded here,
 never one from `config.json` or the account file, so tokens and registration cannot come
-apart. A stored credential without them, or with values that are not GUIDs, is treated as
-needing sign-in (`auth login` again), not as matching. If the account file or `config.json`
+apart. A stored credential without any of these four, or with a registration that is not GUIDs,
+is treated as needing sign-in (`auth login` again), not as matching. A sign-in whose id
+token lacks `tid` or `oid` stores nothing. `auth refresh` also refuses, before any
+request, when the credential's `tid` and `oid` differ from the selected account file's. If the account file or `config.json`
 names a different registration, a sign-in stopped part way: `auth refresh` refuses with a
 "sign in again" error and sends nothing. The service name is `purview`, the key `purview:token:<email>`,
 the macOS label `purview — <email>`, and the description `Microsoft Purview eDiscovery
@@ -1247,13 +1250,27 @@ display and account selection (`tenant_id` is the id token's `tid`, and `oid` bi
 `--account` at sign-in); `config.json` `clients` only says which registration to offer at
 the next sign-in. Neither chooses the registration a refresh uses (section 5.1).
 
-`auth login` stores a sign-in in this order: the credential, replaced in place under its
+After the ownership check below, `auth login` stores a sign-in in this order: the
+credential, replaced in place under its
 key (the old item is not deleted first, so a macOS keychain item keeps its access list);
 then the account file; then `config.json`. A failure at the first write leaves the earlier
 sign-in as it was. A failure at the account file on a first sign-in removes the new
 credential again; on a later sign-in it leaves an account file that may name the old
 registration, which `auth refresh` detects. A failure at `config.json` leaves a working
 account whose stale registration, if it differs, `auth refresh` also detects.
+
+**An account key belongs to one principal.** Before any write, `auth login` refuses when
+the destination key already has an account file, or a credential, that records a different
+`tid` or `oid` from the sign-in's. This covers an address reassigned to another person and a
+rename onto a key another stored account holds; both accounts' files and credentials stay
+as they were. `auth logout --account <key>` frees the key, after which the new identity can
+sign in under it. A rename onto a free key is stored under the new key; the old key's
+entries stay until they are logged out.
+
+If the credential write reports a failure, the store may still have taken it (a macOS label
+failure, a Windows clean-up failure). On a first sign-in, `auth login` reads the key back and
+removes any credential it finds; if that removal fails, the error names `auth logout
+--account <key>`, which removes a credential that has no account file.
 
 When `--account` (or `PURVIEW_ACCOUNT`) names a stored account, the sign-in must return
 that account's recorded `tid` and `oid`; otherwise the returned account key or `upn` must

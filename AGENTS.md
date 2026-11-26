@@ -217,8 +217,9 @@ Preserve these so that users do not have to sign in again after an upgrade:
 
 - service name `purview`, key `purview:token:<email>`, macOS label
   `purview — <email>` and description `Microsoft Purview eDiscovery token`;
-- the stored JSON shape with `"version": 1`, including the issuing
-  `client_id` and `tenant_id` (`docs/SPEC.md` section 5.1);
+- the stored JSON shape with `"version": 1`, including the principal's
+  `tid` and `oid` and the issuing `client_id` and `tenant_id`
+  (`docs/SPEC.md` section 5.1);
 - the `config.json` and `accounts/<email>.json` shapes (section 5.3).
 
 Tests use an in-memory credential store and synthetic records. They never

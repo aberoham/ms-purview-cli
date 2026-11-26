@@ -284,6 +284,8 @@ repository.
   app, so the token is not narrowed. (Observed) `auth status`, `case list`, `case get`,
   `search list`, `search get`, `operation list` and `operation get` all succeeded in that
   session. (Observed) `--read-only` therefore limits what the tool sends, not what the token
-  allows; a registration made with `READ_ONLY=1` is the way to narrow the token (Derived).
+  allows; a registration made with `READ_ONLY=1` is the way to narrow the token (Derived). A later
+  sign-in without `--read-only` returned both Graph eDiscovery scopes, so the read-only
+  sign-in had added a consent for `eDiscovery.Read.All` that persists. (Observed)
 - **Missing role:** not checked; whether an account without an eDiscovery role gets 403
   stays an Assumption.

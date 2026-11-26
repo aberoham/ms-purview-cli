@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  # Pushes to main and pull requests run CI, so a pull request branch runs it
+  # once, not twice. Changes to Markdown and docs/ alone skip it: no job in
+  # this workflow reads them. The public-data workflow checks those changes.
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**"]
+  pull_request:
+    paths-ignore: ["**.md", "docs/**"]
+  workflow_call:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch or pull request supersedes a run in
+# progress. The prefix keeps this group apart from other workflows'. A run
+# on a tag, which only the release workflow starts, is never cancelled.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  ACTIONLINT_VERSION: "1.7.12"
+  ACTIONLINT_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+  ZIZMOR_VERSION: "1.32.0"
+
+jobs:
+  quality:
+    name: Format and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # rustup installs the release named in rust-toolchain.toml.
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install
+          rustc --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo fmt --all -- --check
+      - run: cargo check --all-targets --locked
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      # Workflow checks. actionlint is the release archive, checked against
+      # its pinned SHA-256; it runs the runner's shellcheck over every run:
+      # block. zizmor is pinned by version.
+      - name: actionlint
+        run: |
+          archive="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -sSfL -o "${RUNNER_TEMP}/${archive}" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${archive}"
+          echo "${ACTIONLINT_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum --check --strict
+          tar -xzf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}" actionlint
+          "${RUNNER_TEMP}/actionlint" -color
+      - name: zizmor
+        run: pipx run "zizmor==${ZIZMOR_VERSION}" --offline .github/workflows
+
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # rustup installs the release named in rust-toolchain.toml.
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install
+          rustc --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo test --all-targets --locked
+      - run: cargo build --release --locked

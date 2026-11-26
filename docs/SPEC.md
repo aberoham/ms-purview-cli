@@ -1215,6 +1215,14 @@ contract.
 `{email, upn, oid, display_name, tenant_id, client_id, login_time}`. Symlinks are refused, modes are 0600
 and 0700, and writes are atomic, as in `entra`.
 
+- On Windows there are no modes. The configuration lives under the user's profile and relies on
+  that directory's default access control list (ACL); the tool sets no ACL of its own. Any
+  reparse point (a symlink or a junction) is refused as the configuration directory, the
+  accounts directory or `config.json`.
+- Keys the running release does not read are kept when the file is saved.
+- `config.json` never holds a secret. Saving refuses any value the Redactor recognises
+  (section 6.8).
+
 ### 5.4 Data directory
 
 Downloads go to `dirs::data_local_dir()/purview/cases/<case-id>/<operation-id>/` (mode 0700),
@@ -1835,13 +1843,13 @@ pub fn parse_msg(bytes: &[u8]) -> Result<MsgItem, MsgError>; // pure, no I/O
 
     | Host | Allowed paths |
     |---|---|
-    | `graph.microsoft.com` | `/v1.0/…` |
+    | `graph.microsoft.com` | `/v1.0/…`; an empty path or `/`; permission-scope paths (`/<Name>.<Name>…`, `/.default`) |
     | `login.microsoftonline.com` | any |
     | `*.proxyservice.ediscovery.svc.cloud.microsoft` | `/ediscovery/api/proxy/…` |
     | `learn.microsoft.com` | any |
     | `aka.ms` | any |
     | `github.com` | `/aberoham/…` only |
-    | `img.shields.io` | `/github/…/aberoham/…` only |
+    | `img.shields.io` | `/github/…` only, with the exact owner/repository pair `aberoham/ms-purview-cli` or `aberoham/ms-entra-cli` as consecutive path segments |
     | `*.example`, `localhost`, `127.0.0.1` | any |
 
   - **the presence of `docs/reviews/`**, or of any file that names the maintainer's private
@@ -2225,8 +2233,9 @@ The `aberoham/homebrew-tap` formula `purview` reads releases, as it does for `en
 
 Dev-dependencies: `wiremock`, `assert_cmd`, `predicates`, `tempfile`.
 
-The release profile is `lto = true`, `codegen-units = 1`, `strip = true`. The minimum Rust
-version is current stable.
+The release profile is `lto = true`, `codegen-units = 1`, `strip = true`. `Cargo.toml` declares the
+minimum Rust version; local rustup builds and CI use the release pinned in
+`rust-toolchain.toml`, raised in its own pull request.
 
 ---
 

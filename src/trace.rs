@@ -540,6 +540,11 @@ mod tests {
         let dir = root.path().join("read-only");
         std::fs::create_dir(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // A privileged runner can write regardless of the mode; there is
+        // nothing to test then.
+        if std::fs::write(dir.join("probe"), b"").is_ok() {
+            return;
+        }
         let result = TraceSink::open(
             &dir,
             Arc::new(Redactor::new()),

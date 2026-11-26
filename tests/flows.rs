@@ -2857,6 +2857,11 @@ async fn a_trace_directory_that_cannot_be_written_stops_before_any_request() {
     let trace = harness.root.path().join("read-only");
     std::fs::create_dir(&trace).unwrap();
     std::fs::set_permissions(&trace, std::fs::Permissions::from_mode(0o500)).unwrap();
+    // A privileged runner can write regardless of the mode; there is
+    // nothing to test then.
+    if std::fs::write(trace.join("probe"), b"").is_ok() {
+        return;
+    }
     let trace_arg = trace.display().to_string();
     let run = harness
         .run(&["--json", "--trace", &trace_arg, "auth", "status"])
@@ -2867,6 +2872,56 @@ async fn a_trace_directory_that_cannot_be_written_stops_before_any_request() {
     assert!(message.contains("opening the trace directory"), "{message}");
     assert_eq!(graph_requests(&harness).await, 0);
     assert_eq!(identity_requests(&harness).await, 0);
+}
+
+#[tokio::test]
+async fn a_signed_url_in_a_graph_error_reaches_no_output_or_trace_with_its_signature() {
+    let harness = Harness::new().await;
+    sign_in_alex(&harness).await;
+    let signed = format!(
+        "{}/v1.0/files/O'Brien.pdf?sig=canary-sig-0007&se=2026",
+        harness.graph.uri()
+    );
+    mount_probe(
+        &harness,
+        "canary-graph-access-0001",
+        json_response(
+            403,
+            serde_json::json!({"error": {
+                "code": "Forbidden",
+                "message": format!("no role; see '{signed}'."),
+                "target": signed,
+            }}),
+        ),
+    )
+    .await;
+    let trace = harness.root.path().join("trace");
+    let trace_arg = trace.display().to_string();
+    for args in [
+        vec!["auth", "status"],
+        vec!["--json", "--trace", &trace_arg, "auth", "status"],
+    ] {
+        let run = harness.run(&args).await;
+        assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
+        if args[0] == "--json" {
+            let detail = run.json()["results"]["purviewRoleDetail"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(
+                detail.contains("O'Brien.pdf?sig=REDACTED&se=REDACTED'."),
+                "{detail}"
+            );
+        } else {
+            assert!(
+                run.stdout().contains("Purview role: denied"),
+                "{}",
+                run.stdout()
+            );
+        }
+        harness.assert_absent(&run, &["canary-sig-0007"]);
+    }
+    assert_eq!(std::fs::read_dir(&trace).unwrap().count(), 1);
 }
 
 #[tokio::test]

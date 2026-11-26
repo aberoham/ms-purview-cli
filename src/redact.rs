@@ -458,11 +458,14 @@ pub fn url(value: &::url::Url, redactor: &Redactor) -> String {
 }
 
 /// `text` with every `http://` or `https://` URL in it passed through
-/// `url`, for free text such as a Graph error message. A URL runs to the
-/// next space, quote, angle bracket or backslash, less any trailing
-/// punctuation. One that does not parse keeps nothing after its first `?`
-/// or `#`.
+/// `url`, for free text such as a Graph error message. A URL runs from its
+/// scheme to the next whitespace, so no query can be cut off from the URL
+/// it belongs to (a quote or bracket inside a URL is legal); only trailing
+/// punctuation and closing quotes are trimmed back off the end, and they
+/// hold no query. A URL that does not parse keeps nothing after its first
+/// `?` or `#`.
 pub fn urls_in_text(text: &str, redactor: &Redactor) -> String {
+    const TRAILING: &[char] = &['.', ',', ';', ':', '!', ')', ']', '}', '"', '\'', '`', '>'];
     let lower = text.to_ascii_lowercase();
     let mut output = String::with_capacity(text.len());
     let mut position = 0;
@@ -473,22 +476,18 @@ pub fn urls_in_text(text: &str, redactor: &Redactor) -> String {
     {
         let start = position + found;
         let rest = &text[start..];
-        let mut length = rest
-            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '\\' | '`'))
-            .unwrap_or(rest.len());
-        while length > 0 && rest[..length].ends_with(['.', ',', ';', ':', ')', ']', '}', '!']) {
-            length -= 1;
-        }
-        let candidate = &rest[..length];
+        let token = rest
+            .find(char::is_whitespace)
+            .map_or(rest, |end| &rest[..end]);
+        let candidate = token.trim_end_matches(TRAILING);
         output.push_str(&text[position..start]);
         match ::url::Url::parse(candidate) {
             Ok(parsed) => output.push_str(&url(&parsed, redactor)),
             Err(_) => output.push_str(candidate.split(['?', '#']).next().unwrap_or_default()),
         }
-        position = start + length.max(1);
-        if length == 0 {
-            output.push_str(&text[start..position]);
-        }
+        output.push_str(&token[candidate.len()..]);
+        // The scheme alone is at least seven bytes, so this always moves.
+        position = start + token.len().max(1);
     }
     output.push_str(&text[position..]);
     output
@@ -931,6 +930,23 @@ mod tests {
         assert_eq!(
             urls_in_text("no address here", &redactor),
             "no address here"
+        );
+        // Quotes and brackets inside a URL do not end it.
+        for text in [
+            "see https://graph.microsoft.com/v1.0/O'Brien.pdf?sig=canary-sig-0002 now",
+            "see 'https://graph.microsoft.com/v1.0/a\"b(c)?sig=canary-sig-0003'.",
+            "https://graph.microsoft.com/v1.0/x?a=1&sig=canary-sig-0004",
+        ] {
+            let shown = urls_in_text(text, &redactor);
+            assert!(!shown.contains("canary"), "{text}: {shown}");
+            assert!(shown.contains("sig=REDACTED"), "{text}: {shown}");
+        }
+        assert_eq!(
+            urls_in_text(
+                "('https://graph.microsoft.com/v1.0/x?sig=canary-sig-0005').",
+                &redactor
+            ),
+            "('https://graph.microsoft.com/v1.0/x?sig=REDACTED')."
         );
     }
 }

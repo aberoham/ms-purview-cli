@@ -112,7 +112,7 @@ The tool never places a hold.
 | `--yes` | `PURVIEW_YES` | Approve a write without the interactive prompt |
 | `--dry-run` | none | Run the read-only preflight, print the plan, send no write, exit 0. Wins over `--yes` |
 | `--trace DIR` | `PURVIEW_TRACE_DIR` | Record Graph and download exchanges as JSON (section 4.9) |
-| `--wrap-untrusted` | `PURVIEW_WRAP_UNTRUSTED` | In JSON, wrap free text that tenant users or outside senders control as `[UNTRUSTED:<id>]…` |
+| `--wrap-untrusted` | `PURVIEW_WRAP_UNTRUSTED` | In JSON, wrap free text that tenant users or outside senders control as `[UNTRUSTED:<id>]…[/UNTRUSTED:<id>]`, with one random id per document and an `untrustedNotice` in the envelope. From v0.1 it covers every string under `displayName`, `description`, `externalId`, `contentQuery` and `fileName`, at any depth (`output::UNTRUSTED_KEYS`) |
 
 `PURVIEW_CONFIG_DIR` is an environment variable only; there is no flag. `--color` is not
 offered: `entra` keeps it only for compatibility, and `purview` has none to keep.
@@ -144,7 +144,7 @@ nothing else on stdout, whatever the exit code; their summary and any reasons go
 | 0 | Success, including a write applied or a `--dry-run` | `{"results": …, "count": …}`. For a write, `results` is `{"applied": true|false, "plan": {…}, "result": {…}|null}` and `count` is 1. `--results-only` prints that inner object |
 | 1 | Failure, including argument errors, guard refusals and `WriteRefused` | `{"error": {"code", "status", "message"}}` |
 | 3 | Write not applied: no `--yes` in a non-interactive run, or the user declined | `{"plan": {…}, "applied": false, "error": {"code": "ConfirmationRequired" or "Declined", "status": 0, "message"}}` |
-| 4 | Finished but incomplete: operation `partiallySucceeded`, `failed` or `submissionFailed`, an unknown terminal status, `--strict` with failed locations or missing evidence, or items that failed to parse or join | The command's normal envelope, plus `"outcome": {"code": "Incomplete", "reasons": [ … ]}` |
+| 4 | Finished but incomplete: operation `partiallySucceeded`, `failed` or `submissionFailed`, an unknown terminal status, `--strict` with failed locations or missing evidence, or items that failed to parse or join | The command's normal envelope, plus `"outcome": {"code": "Incomplete", "reasons": [ … ]}`. Each reason is `{"code", "message"}`; an operation gives `OperationPartiallySucceeded`, `OperationFailed`, `OperationSubmissionFailed` or `UnknownStatus`, with `resultInfo` in the message. The envelope is printed whole even under `--results-only` |
 | 5 | Wait deadline reached | Operation waits: `{"caseId", "operationId", "status", "elapsedSeconds", "resume": [ … ], "error": {"code": "WaitTimeout", …}}`. Case-close waits: `{"caseId", "caseStatus", "elapsedSeconds", "resume": ["purview case get <case>"], "error": {"code": "WaitTimeout", …}}` |
 | 130 | Interrupted (Ctrl-C) while waiting | As exit 5, with code `Interrupted` |
 
@@ -157,11 +157,14 @@ Human output for 3, 4, 5 and 130 goes to stderr, apart from tables already writt
 ### 3.4 Keys
 
 - `<case>`: a case id (globally unique identifier, GUID) or an exact `displayName`. Names are
-  not unique (Observed). Name matching covers every status. Several matches fail with
-  `AmbiguousCase`, listing id, status and creation date. A name match prints `notice:` on
-  stderr.
+  not unique (Observed). Name matching covers every status, compares the whole name with
+  case, and needs the case list to reach its last page. Several matches fail with
+  `AmbiguousCase`, listing id, status and creation date but not the name; none fails with
+  `CaseNotFound`. A name match prints `notice:` on stderr with the id it matched. An id is
+  used as given, with no read of the case: a command that reads below the case gets Graph's
+  answer to that read.
 - `<search>`: a search id or an exact display name within the case, with the same ambiguity
-  rule (`AmbiguousSearch`).
+  rule (`AmbiguousSearch`, or `SearchNotFound`).
 - `<op>`: an operation id, 32 hexadecimal characters with no hyphens (Observed).
 
 ### 3.5 Commands
@@ -261,8 +264,16 @@ Flags: `--status active|closing|closed|all` (default `all`), `--name SUBSTR`,
   absent, whose `createdBy.user.userPrincipalName` equals the stored `upn`,
   case-insensitively.
 
+- A case without `createdDateTime` is left out when either date flag is given.
+- When the sign-in recorded no `upn` (the observed id token had none), `--mine` compares
+  `createdBy.user.userPrincipalName` with the account key.
+
 Columns: `ID`, `NAME`, `STATUS`, `CREATED`, `AGE (DAYS)`, `CREATED BY`. Rows with a missing
-id or name are shown with `?` and counted in a stderr warning; they are not dropped.
+id or name are shown with `?` and counted in a stderr warning; they are not dropped. `AGE
+(DAYS)` is whole days since `createdDateTime`; `CREATED BY` is the creator's user principal
+name, else their display name. JSON `results` is the list of Graph's records as they came.
+A list that stops before its last page (a repeated paging link, or 200 pages) is shown with
+a warning.
 
 #### `purview case get <case>` (read)
 
@@ -309,6 +320,12 @@ snapshot (Observed); whether they were stuck there is not known.
 
 Columns: `ID`, `NAME`, `SCOPE`, `CREATED`, `QUERY` (cut to 80 characters in the table; full
 in JSON).
+
+`search get` also reads the search's `custodianSources`, `noncustodialSources` and
+`additionalSources`, at once, because an action on the search would also collect from them
+(section 6.4). JSON adds each list to Graph's record under that name when the record lacks
+it. A source list that cannot be read is a warning, shown as `unknown`, and is left out of
+the JSON; a token that cannot be had fails the command.
 
 #### `purview search create <case> --name NAME [query flags]` (write: create)
 
@@ -428,7 +445,15 @@ The list response has base fields only, and it shows an `exportReport` operation
   list cannot tell them apart.
 
 `--resolve` fetches each operation individually, at most 4 at a time, and reports the true
-action, the counts and the files. JSON marks `actionSource: "list" | "get"`.
+action, the counts and the files. Only entries that could pass `--action` and `--status` on
+their list record are fetched, and both filters apply again to the fetched record. JSON
+marks `actionSource: "list" | "get"` on each record. Any failed fetch fails the command.
+
+`--status` takes `notStarted`, `running`, `succeeded`, `partiallySucceeded`, `failed` or
+`submissionFailed`, ignoring case. Columns: `ID`, `ACTION`, `STATUS`, `CREATED`, `COMPLETED`,
+`CREATED BY`, `ITEMS` (an estimate's `indexedItemCount`) and `FILES`; the last two are filled
+only for fetched records. The `exportResult?` footer goes to stderr, so `--plain` output
+stays rows only.
 
 #### `purview operation get <case> <op>` (read)
 
@@ -442,6 +467,11 @@ collection check for the operation's action, taken from the single GET: the esti
 report zip, the report zip, or the report part of an export. A later `download` reuses that
 verified file instead of fetching it again. The 30-second not-found grace in section 4.6 does
 not apply here: a wrong id fails at once.
+
+`collection` is added for an estimate, item report or export only. A finished operation whose
+status is not `succeeded` exits 4, with or without `--wait`. `--wait-timeout` takes whole
+seconds or a duration such as `90s`, `15m`, `2h` or `1h30m`, from 1 second to 24 hours;
+`--wait-timeout` and `--poll-interval` need `--wait`.
 
 #### `purview download <case> <op>` (read)
 
@@ -546,6 +576,8 @@ src/
   graph.rs       GraphClient: the only Graph transport; GET, paging, send_write(ApprovedWrite)
   routes.rs      ReadRoute and WriteRoute enums: every method and path the tool may use
   poll.rs        operation polling state machine with a deadline
+  commands/      bodies of the read commands (case.rs, search.rs, operation.rs) and key
+                 resolution (mod.rs); cli.rs checks arguments, signs in and dispatches
   download.rs    DownloadClient: origin binding, streaming, temporary files, publishing, manifest
   trace.rs       TraceSink: redacted JSON exchange recording
   redact.rs      Redactor applied to every output sink
@@ -738,9 +770,15 @@ States, from the Graph documentation for `caseOperationStatus`:
 | `partiallySucceeded`, `failed`, `submissionFailed` | stop, exit 4, show `resultInfo` | Docs |
 | `unknownFutureValue` or any other string | stop, exit 4, show the raw value | Docs or Assumption |
 
-- **Deadline.** `--wait-timeout` is a single deadline enforced with `tokio::time::timeout_at`.
-  It covers sleeps, `Retry-After` waits and requests in flight. When it passes, the command
-  exits 5.
+- **Deadline.** `--wait-timeout` is a single deadline. It covers sleeps, `Retry-After` waits
+  and requests in flight: each read runs under `tokio::time::timeout` for the time left, and
+  each sleep is cut to the time left. When it passes, the command exits 5 without a further
+  read.
+- **Failed reads.** A read that gets no response, or 429 or 5xx after `GraphClient`'s own
+  three attempts, does not end the wait; a warning goes to stderr. That includes a
+  `Retry-After` longer than the 60 seconds `GraphClient` waits for (section 4.3): the poll
+  waits the interval or the `Retry-After`, whichever is longer, cut to the deadline. Any
+  other failure, including a token that cannot be had, ends the command.
 - **Interval schedule:** 10 s for the first 2 minutes, then 30 s up to 10 minutes, then
   60 s. `--poll-interval` overrides it.
 - **Observed timings,** from the queries sampled in one tenant:
@@ -761,8 +799,9 @@ States, from the Graph documentation for `caseOperationStatus`:
   `operation get --wait` fails on a 404 at once.
 - **Progress** goes to stderr when stderr is a terminal and `--verbose` is off:
   `estimate 3f2a…: running · 4m10s`.
-- **Ctrl-C** (tokio `signal`) ends the wait, prints the resume commands available in the
-  running release (section 3.3) and exits 130. The service carries on running the
+- **Ctrl-C** (tokio `signal`, injected through `Env` as `Interrupt`) ends the wait, prints the
+  resume commands available in the running release (section 3.3) and exits 130. One listener
+  covers the whole wait, and a read in flight is abandoned. The service carries on running the
   operation. A case-close wait prints `purview case get <case>` instead.
 
 ### 4.7 Download (`download.rs`)
@@ -1648,9 +1687,12 @@ command again.
 Two layers, so a sparse or changed response does not break a whole list:
 
 - **Wire records** (`model/wire.rs`). Every field is optional or has a default; no field is
-  required to deserialise. Each record keeps the original JSON in `raw: serde_json::Value`
-  for full views and `--json`. Numbers arrive as `i64` or `f64`. Negative or fractional
-  values where a count is expected become `None`, with a warning.
+  required. Each record is read field by field from a `serde_json::Value` rather than
+  derived with serde, so a field of an unexpected type becomes `None` instead of failing the
+  record, and an element that is not an object is left out of a list with a warning. Each
+  record keeps the original JSON in `raw: serde_json::Value` for full views and `--json`.
+  Negative or fractional values where a count is expected become `None`, with a warning that
+  names the field.
 - **Validated inputs** (`model/valid.rs`). A command turns a wire record into what it needs,
   with a targeted error if something is missing:
   - `CaseRef` (id required);
@@ -1661,10 +1703,13 @@ Two layers, so a sparse or changed response does not break a whole list:
   A file with a missing `downloadUrl` still shows in `operation get`; `download` then fails
   for that file only, with `FileNotDownloadable`.
 
-Cargo features this needs: `serde` (`derive`), `chrono` (`serde`), `uuid` (`serde`), `url`
-(`serde`).
+Because records are read by hand, no Cargo feature is added for them.
 
 ### 7.2 Helpers
+
+The code reads each field from the JSON object with `graph_time` and `read_count` in
+`model/wire.rs`, which follow the rules below; the serde forms are kept as the statement of
+those rules.
 
 ```rust
 pub mod graph_time {
@@ -1992,7 +2037,7 @@ tests/fixtures/graph/
   search-create-201.json
   operations-list.json            base fields only; exportReport shown as "exportResult"; placeholder completedDateTime
   operation-estimate-running.json, -succeeded.json   (size 0, ?downloadType=Report)
-  operation-exportreport-running.json, -succeeded.json
+  operation-exportreport-succeeded.json, operation-exportresult-running.json
   operation-exportresult-succeeded.json              two files
   operation-partially-succeeded.json, -failed.json, -submission-failed.json   (shapes: Assumption, with numeric resultInfo code and subcode)
   operation-failed-resultinfo-strings.json   (resultInfo code as a string: the operation still parses, code becomes None, raw kept)
@@ -2377,7 +2422,8 @@ live check a feature depends on cannot be done, the feature is left out of that 
 
   The `Location` form is not checked here: an existing operation cannot reproduce the
   original 202 header. PR 2.3 checks it.
-- Tests: model, polling, `operation list` refusal.
+- Tests: model, polling, `operation list` refusal. The read flows live in `tests/reads.rs`,
+  and the `Poller` tests over a mock Graph in `tests/graph.rs`.
 - Acceptance: tables and JSON match the fixtures; the observations are recorded.
 
 **PR 1.5: Download.**

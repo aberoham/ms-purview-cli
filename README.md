@@ -1,12 +1,12 @@
 # purview
 
-**Drive Microsoft Purview eDiscovery (Premium) through Microsoft Graph v1.0 from a terminal. Today's binary signs in, stores credentials and checks the Purview role; case, search, download, export and parsing commands are planned.**
+**Drive Microsoft Purview eDiscovery (Premium) through Microsoft Graph v1.0 from a terminal. On `main` it signs in, stores credentials, checks the Purview role, and lists and shows cases, searches and operations; download, write, export and parsing commands are planned.**
 
 [![Latest release](https://img.shields.io/github/v/release/aberoham/ms-purview-cli?include_prereleases)](https://github.com/aberoham/ms-purview-cli/releases)
 [![CI](https://img.shields.io/github/actions/workflow/status/aberoham/ms-purview-cli/ci.yml?branch=main&label=CI)](https://github.com/aberoham/ms-purview-cli/actions/workflows/ci.yml)
 [![Licence](https://img.shields.io/github/license/aberoham/ms-purview-cli)](LICENSE)
 
-Status: release candidate (`v0.1.0-rc.1`, published 2026-11-26). Today the binary implements `purview version` and authentication (`purview auth login`, `auth refresh`, `auth list` and `auth logout`), with global options `--json`, `--results-only`, `--plain`, `--select`, `--account` and `--no-input`. Browser sign-in (`auth login --browser`), `auth status`, the Microsoft Graph transport, the global options `--verbose`, `--timeout` and `--trace`, the app registration script and authentication documentation are on `main` since the release candidate. All case, search, download, export and parsing commands are planned in [docs/SPEC.md](docs/SPEC.md).
+Status: release candidate (`v0.1.0-rc.1`, published 2026-11-26). Today the binary implements `purview version` and authentication (`purview auth login`, `auth refresh`, `auth list` and `auth logout`), with global options `--json`, `--results-only`, `--plain`, `--select`, `--account` and `--no-input`. Browser sign-in (`auth login --browser`), `auth status`, the read commands for cases, searches and operations (`case list`, `case get`, `search list`, `search get`, `operation list`, `operation get`), the Microsoft Graph transport, the global options `--verbose`, `--timeout`, `--trace` and `--wrap-untrusted`, the app registration script and authentication documentation are on `main` since the release candidate. Download, write, export and parsing commands are planned in [docs/SPEC.md](docs/SPEC.md).
 
 Sibling project of [ms-entra-cli](https://github.com/aberoham/ms-entra-cli), sharing output, configuration and credential-storage conventions.
 
@@ -23,7 +23,16 @@ Planned scope from [docs/SPEC.md](docs/SPEC.md):
 - join an item export to its report and stream message headers and body text from the zip archive;
 - list old cases with their hold policies and ages, read-only.
 
-None of the commands below exist in the current binary; each line is an independent example of the planned shape from [docs/SPEC.md](docs/SPEC.md), not a sequence:
+The read commands are on `main`:
+
+```bash
+purview case list --status active --mine
+purview search get "Records research - Orders review" <search>
+purview operation list <case> --resolve --action report
+purview operation get <case> <op> --wait --wait-timeout 30m
+```
+
+None of the commands below exist yet; each line is an independent example of the planned shape from [docs/SPEC.md](docs/SPEC.md), not a sequence:
 
 ```bash
 # Independent examples of the planned shape (not yet implemented)
@@ -63,10 +72,14 @@ Existing tools leave gaps across the eDiscovery workflow (recorded in [docs/SPEC
 - `purview auth status`: check the Graph token and the Purview role with one read (`purviewRole: ok`, `denied` or `unknown`), showing both token expiries without sending the download token.
 - The Microsoft Graph transport: requests only to `https://graph.microsoft.com/v1.0/`, redirects disabled, bounded retries for reads.
 - Global options `--verbose`, `--timeout SECS` and `--trace DIR` (trace files hold tenant data; keep them out of version control).
+- `purview case list` (filters `--status`, `--name`, `--created-before`, `--created-after`, `--mine`) and `purview case get`. A case is named by its id or its exact display name; names are not unique, and several matches fail with `AmbiguousCase`.
+- `purview search list` and `purview search get`, which also reads the search's custodian, non-custodial and additional sources.
+- `purview operation list` (filters `--action`, `--status`; `--resolve` reads each operation for its true action, because the list shows item reports and exports alike) and `purview operation get`, with `--wait`, `--wait-timeout` and `--poll-interval`. A finished operation that did not succeed exits 4, the wait deadline exits 5 and Ctrl-C exits 130, each with a resume command.
+- Global option `--wrap-untrusted`: in JSON, wrap names, descriptions, queries and file names that tenant users wrote in `[UNTRUSTED:<id>]` markers.
 
 **Planned roadmap (not yet built, no dates):**
 
-- **v0.1 (remaining items):** `case list`, `case get`, `search list`, `search get`, `operation list`, and `operation get` with `--wait`; `download`; the Keyword Query Language (KQL) guard and `purview kql`.
+- **v0.1 (remaining items):** `download`; the Keyword Query Language (KQL) guard and `purview kql`.
 - **v0.2:** write commands (`case create`, `search create`, `estimate`, `report`, and `case close` if its live checks complete) with preflight checks and explicit approval, plus estimate report parsing (`parse locations`, `parse failures`, `parse summary`).
 - **v0.3:** item report parsing (`parse items`, `parse profile`).
 - **v0.4:** `export create` and `export index`.

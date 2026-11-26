@@ -463,12 +463,17 @@ pub fn url(value: &::url::Url, redactor: &Redactor) -> String {
     clean.to_string()
 }
 
+/// What `urls_in_text` writes in place of a URL in free text that does not
+/// parse.
+pub const UNREADABLE_URL: &str = "[unreadable URL]";
+
 /// `text` as it may be shown or recorded. A string that is one URL and
 /// nothing else (a `downloadUrl` or `@odata.nextLink` field) goes through
 /// `url`, which keeps the OData query options. In any other text, such as
-/// a Graph error message, a URL keeps only its scheme, host and path:
-/// everything from its first `?` or `#` to the next whitespace becomes
-/// `?REDACTED`. Free text gives no reliable end to a URL (quotes, brackets
+/// a Graph error message, a URL keeps only its scheme, host and path, as
+/// `url` shows them: everything from its first `?` or `#` to the next
+/// whitespace becomes `?REDACTED`, and a URL that does not parse becomes
+/// `[unreadable URL]`. Free text gives no reliable end to a URL (quotes, brackets
 /// and a second URL can all run on from it), so no part of a query in it
 /// is kept.
 pub fn urls_in_text(text: &str, redactor: &Redactor) -> String {
@@ -489,13 +494,17 @@ pub fn urls_in_text(text: &str, redactor: &Redactor) -> String {
             .find(char::is_whitespace)
             .map_or(rest, |end| &rest[..end]);
         output.push_str(&text[position..start]);
-        match token.find(['?', '#']) {
-            Some(cut) => {
-                output.push_str(&token[..cut]);
-                output.push('?');
-                output.push_str(REDACTED_QUERY_VALUE);
-            }
-            None => output.push_str(token),
+        let cut = token.find(['?', '#']);
+        let prefix = cut.map_or(token, |cut| &token[..cut]);
+        // The part kept still goes through `url`, which removes user
+        // information and any path segment holding a secret, encoded or not.
+        match ::url::Url::parse(prefix) {
+            Ok(parsed) => output.push_str(&url(&parsed, redactor)),
+            Err(_) => output.push_str(UNREADABLE_URL),
+        }
+        if cut.is_some() {
+            output.push('?');
+            output.push_str(REDACTED_QUERY_VALUE);
         }
         // The scheme alone is at least seven bytes, so this always moves.
         position = start + token.len().max(1);
@@ -943,9 +952,8 @@ mod tests {
         assert_eq!(
             shown,
             format!(
-                "Download from {path_only}?REDACTED Or \"HTTP://graph.microsoft.com/v1.0/y?REDACTED \
-                 or {}?REDACTED now",
-                ["https://", "[bad"].concat()
+                "Download from {path_only}?REDACTED Or \"http://graph.microsoft.com/v1.0/y?REDACTED \
+                 or [unreadable URL]?REDACTED now"
             )
         );
         for text in [
@@ -962,6 +970,21 @@ mod tests {
         assert_eq!(
             urls_in_text("no address here", &redactor),
             "no address here"
+        );
+    }
+
+    #[test]
+    fn a_url_in_free_text_loses_user_information_and_secret_path_segments() {
+        let redactor = Redactor::new();
+        redactor.register("canary+slash/0001");
+        let text = format!(
+            "see https:{}{}{} and https://one.example/x/canary%2Bslash%2F0001?sig=value now",
+            "//user:canary-pass-0002", '@', "graph.microsoft.com/v1.0/y"
+        );
+        let shown = urls_in_text(&text, &redactor);
+        assert_eq!(
+            shown,
+            "see https://graph.microsoft.com/v1.0/y and https://one.example/x/REDACTED?REDACTED now"
         );
     }
 

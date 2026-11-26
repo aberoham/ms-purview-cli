@@ -9,7 +9,8 @@ downloads, and offline parsing of the resulting zips.
 
 `docs/SPEC.md` is the design and the phased plan. Each pull request
 implements one item of its section 11 and nothing from later items. Today
-the binary has one command, `purview version`. Do not add stubs for commands
+the binary has `purview version` and the device-code `purview auth login`,
+`auth refresh`, `auth list` and `auth logout`. Do not add stubs for commands
 that a later pull request owns.
 
 The tool never places, changes or releases a hold, never deletes or reopens a
@@ -64,11 +65,37 @@ that the test files pass their own scan.
   (`PURVIEW_CONFIG_DIR`) and the `PURVIEW_*` variables that give flags their
   defaults. `Env::production()` captures those variables once; Clap never
   reads the process environment, so an in-process test does not depend on
-  the shell that runs it. `Env::in_memory()` sets none. Later pull requests add the Graph origin, the token
-  endpoint, the download host rule, the credential store and the clock.
-  `Env::production()` reads no environment variable that could change an
-  endpoint, so the release binary has no test path that could send a token
-  to another host.
+  the shell that runs it. `Env::in_memory()` sets none. `Env` also carries
+  the identity-platform base URL, the credential store and the clock:
+  production uses `https://login.microsoftonline.com`, the operating-system
+  keyring and the system clock; `Env::in_memory()` uses an unreachable
+  `.example` host, an empty `MemoryStore` and a `ManualClock`, and tests
+  point the base URL at a wiremock origin. It also carries the
+  identity-platform request timeout and a test-only `login_write_fault`,
+  always `None` in production, that makes one of `auth login`'s writes
+  fail, and the per-account locks (`AccountLocks`) that serialise login,
+  logout and refresh commits across processes; `Env::in_memory()` has none
+  until a test sets them. Later pull requests add the Graph
+  origin and the download host rule. `Env::production()` reads no
+  environment variable that could change an endpoint, so the release binary
+  has no test path that could send a token to another host.
+- `src/auth.rs` holds the device-code flow, refresh-token redemption for
+  Graph and for the Purview eDiscovery app (the download token), and the
+  account claims from the id token. OAuth errors keep only the
+  allow-listed fields of `docs/SPEC.md` section 6.8, redacted.
+- `src/token.rs` defines `SecretString`, `GraphToken`, `DownloadToken`, the
+  stored `Credential` (stamped with the app registration that issued it,
+  which every refresh uses) and the `TokenProvider` trait. `StoredTokenProvider`
+  refreshes lazily, shares one refresh per process behind a
+  `tokio::sync::Mutex`, writes every refresh to the store before using it
+  (a refused write is the command's error, and the provider reads the
+  store again before its next redemption in case the write took effect),
+  refuses a refresh that changes
+  the Graph permission set, and registers every secret it sees with the
+  Redactor.
+- `src/secrets.rs` is the `CredentialStore` trait, `KeyringStore` (Windows
+  chunking and lock, macOS label, Linux keyutils) and the in-memory
+  `MemoryStore` tests use.
 - `src/error.rs` defines `PurviewError` and `metadata()`, which gives the
   JSON error code and HTTP status.
 - `src/output.rs` implements tables, `--plain` tab-separated values, the
@@ -78,11 +105,16 @@ that the test files pass their own scan.
   accounts directory and the file, keeps files at mode 0600 and directories
   at 0700 on Unix, keeps keys it does not read, and refuses to save a
   secret. On Windows it relies on the profile directory's default ACL. It
-  also resolves the data directory for downloads.
+  also reads, lists and removes the `accounts/<email>.json` files with the
+  same link and mode checks, and resolves the data directory for
+  downloads.
 - `src/redact.rs` defines the `Redactor` and `RedactingWriter`.
 - `build.rs` records the target triple for `purview version`. The release
   workflow sets `PURVIEW_BUILD_COMMIT`.
 - `tests/cli.rs` holds offline process contracts (`assert_cmd`);
+  `tests/flows.rs` runs whole commands in-process through `execute_with`
+  against wiremock, with the harness and canary scanner in
+  `tests/support/` and hand-written fixtures in `tests/fixtures/`;
   `tests/fixture_lint.rs` is the public-data lint.
 - `contrib/resign.sh` gives local macOS builds a stable signing identity.
   `contrib/install.sh` tests, builds, signs and installs the per-user
@@ -97,9 +129,10 @@ that the test files pass their own scan.
 `docs/SPEC.md` section 4.1 lists the modules later pull requests add. Put new
 code where that layout says.
 
-Code copied from `aberoham/ms-entra-cli` (today `output.rs`, the
-`config.rs` file handling, `release.yml`, the signing helper and its test,
-and the two `contrib/` scripts; later `secrets.rs` and parts of `auth.rs`) is
+Code copied from `aberoham/ms-entra-cli` (`output.rs`, the `config.rs` file
+handling, `secrets.rs`, the device-code and token-endpoint parts of
+`auth.rs`, `release.yml`, the signing helper and its test, and the two
+`contrib/` scripts) is
 maintained separately in each repository. When fixing a bug in copied code,
 check whether the other repository needs the same fix.
 
@@ -110,6 +143,14 @@ check whether the other repository needs the same fix.
 - A failure exits 1. Under `--json` it prints
   `{"error": {"code", "status", "message"}}` on stdout and nothing on
   stderr; otherwise `Error: …` goes to stderr and nothing to stdout.
+- One exception: `auth login` writes its interactive sign-in text (the app
+  registration line and the device-code prompt) to stderr in every mode,
+  `--json` included, because the person signing in must see the code. Under
+  `--json`, stdout still holds exactly one document, and a failure after
+  the prompt still puts its error document on stdout.
+- An explicit flag given a blank value (`--account ""`, `--client-id ""`,
+  `--tenant-id ""`) is an error, raised before any fallback, configuration
+  read or network call. An empty `PURVIEW_*` variable counts as unset.
 - Argument errors, including Clap's and an invalid `PURVIEW_*` value, follow
   the same rule. Their code is `CommandFailed`; the human form is `Error: `
   and the message, then Clap's usage. `--json` before a `--`, or
@@ -162,10 +203,11 @@ Do not weaken them.
 
 ## Write allow list
 
-The crate sends no request today. From the transport pull request (1.3)
-on, every Purview write is a `WriteRoute` variant, and `WriteRoute::ALL` is
-the six POSTs in `docs/SPEC.md` section 4.3: create case, close case,
-create search, estimate statistics, export report and export result. No
+The crate sends no Graph request today, only identity-platform requests.
+From the transport pull request (1.3) on, every Purview write is a
+`WriteRoute` variant, and `WriteRoute::ALL` is the six POSTs in
+`docs/SPEC.md` section 4.3: create case, close case, create search,
+estimate statistics, export report and export result. No
 `PATCH`, `PUT` or `DELETE` may exist in the crate, and from that pull
 request a test scans the source tree for them. Adding a write needs a
 reviewed design, a change to that test and an update to `docs/safety.md`.
@@ -177,7 +219,9 @@ Preserve these so that users do not have to sign in again after an upgrade:
 
 - service name `purview`, key `purview:token:<email>`, macOS label
   `purview — <email>` and description `Microsoft Purview eDiscovery token`;
-- the stored JSON shape with `"version": 1` (`docs/SPEC.md` section 5.1);
+- the stored JSON shape with `"version": 1`, including the principal's
+  `tid` and `oid` and the issuing `client_id` and `tenant_id`
+  (`docs/SPEC.md` section 5.1);
 - the `config.json` and `accounts/<email>.json` shapes (section 5.3).
 
 Tests use an in-memory credential store and synthetic records. They never

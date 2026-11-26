@@ -4,13 +4,20 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 
-use clap::{error::ErrorKind, CommandFactory, Parser, Subcommand};
+use clap::{error::ErrorKind, Args, CommandFactory, Parser, Subcommand};
 use serde_json::{json, Value};
 
-use crate::env::Env;
+use crate::auth::{self, IdentityClient};
+use crate::config::{self, AccountRecord, ClientConfig, Config};
+use crate::env::{Env, LoginWrite};
 use crate::error::{PurviewError, Result};
-use crate::output::{error_value, sanitize, sanitize_multiline, OutputFormat, OutputOptions};
+use crate::output::{
+    error_value, sanitize, sanitize_multiline, write_rows, OutputFormat, OutputOptions,
+};
+use crate::secrets::{delete_value, entry_exists, token_key, CredentialLock};
+use crate::token::{Credential, IdentityEndpoint, StoredPrincipal, StoredTokenProvider};
 
 /// The command line. Clap never reads the process environment here: flag
 /// defaults come from `Env::vars` (see `FlagDefaults`).
@@ -22,7 +29,8 @@ use crate::output::{error_value, sanitize, sanitize_multiline, OutputFormat, Out
     about = "Microsoft Purview eDiscovery (Premium) from the terminal, through Microsoft Graph",
     after_help = "\
 Examples:
-  purview version
+  purview auth login --client-id <application-client-id> --tenant-id <tenant-id>
+  purview auth list
   purview version --json",
     next_help_heading = "Global Options"
 )]
@@ -46,12 +54,47 @@ struct Cli {
         help = "Print lists as tab-separated values with no header row [env: PURVIEW_PLAIN=true]"
     )]
     plain: bool,
+    #[arg(
+        long,
+        global = true,
+        value_name = "COLS",
+        help = "Table or --plain columns to print, by header name, comma-separated \
+[env: PURVIEW_SELECT]"
+    )]
+    select: Option<String>,
+    #[arg(
+        long,
+        global = true,
+        value_name = "EMAIL",
+        help = "Stored account to use, by its address or the upn recorded at sign-in, ignoring \
+case (default: the default account) [env: PURVIEW_ACCOUNT]"
+    )]
+    account: Option<String>,
+    #[arg(
+        long,
+        global = true,
+        help = "Never prompt; a command that needs input fails instead [env: PURVIEW_NO_INPUT=true]"
+    )]
+    no_input: bool,
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Debug, Clone, Subcommand)]
 enum Command {
+    #[command(
+        about = "Sign in, refresh, list and sign out accounts",
+        long_about = "\
+Sign in, refresh, list and sign out accounts. Tokens are kept only in the \
+operating system's credential store.",
+        after_help = "\
+Examples:
+  purview auth login --client-id <application-client-id> --tenant-id <tenant-id>
+  purview auth refresh
+  purview auth list
+  purview auth logout --account alex@contoso.example"
+    )]
+    Auth(AuthArgs),
     #[command(
         about = "Show the version, commit and build target",
         after_help = "\
@@ -62,14 +105,101 @@ Examples:
     Version,
 }
 
-/// Defaults for the global flags, from `PURVIEW_JSON`,
-/// `PURVIEW_RESULTS_ONLY` and `PURVIEW_PLAIN`. Each accepts `true` or
-/// `false`; an empty or unset variable is `false`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Args)]
+struct AuthArgs {
+    #[command(subcommand)]
+    command: AuthCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum AuthCommand {
+    #[command(
+        about = "Sign in with a device code and store the Graph and download tokens",
+        long_about = "\
+Sign in with a device code. The sign-in asks for the Microsoft Graph eDiscovery \
+permission, then redeems the refresh token for the Purview eDiscovery download \
+token. Both tokens go to the operating system's credential store.
+
+purview has no app registration of its own. The first sign-in needs \
+--client-id and --tenant-id (or PURVIEW_CLIENT_ID and PURVIEW_TENANT_ID); \
+both are saved with the account, and a later sign-in reuses them.
+
+If the app has no consent for the download permission, sign-in still \
+succeeds with a warning, and downloads fail until 'purview auth refresh' \
+succeeds after consent is granted.",
+        after_help = "\
+Examples:
+  purview auth login --client-id <application-client-id> --tenant-id <tenant-id>
+  purview auth login --read-only
+  purview auth login --account alex@contoso.example"
+    )]
+    Login(AuthLogin),
+    #[command(
+        about = "Redeem the stored refresh token for both resources, with the scopes already held",
+        long_about = "\
+Redeem the stored refresh token for a new Graph token and a new download \
+token, with the scopes already held. It never adds or removes a scope; sign \
+in again with 'purview auth login' to change them. It succeeds only if the \
+refresh and the credential-store write both succeed.",
+        after_help = "\
+Examples:
+  purview auth refresh
+  purview auth refresh --account alex@contoso.example --json"
+    )]
+    Refresh,
+    #[command(
+        about = "List the signed-in accounts; * marks the default",
+        after_help = "\
+Examples:
+  purview auth list
+  purview auth list --json"
+    )]
+    List,
+    #[command(
+        about = "Remove an account's stored tokens and account file",
+        after_help = "\
+Examples:
+  purview auth logout
+  purview auth logout --account alex@contoso.example"
+    )]
+    Logout,
+}
+
+#[derive(Debug, Clone, Args)]
+struct AuthLogin {
+    #[arg(
+        long,
+        value_name = "GUID",
+        help = "Application (client) id of the app registration [env: PURVIEW_CLIENT_ID]"
+    )]
+    client_id: Option<String>,
+    #[arg(
+        long,
+        value_name = "GUID",
+        help = "Directory (tenant) id [env: PURVIEW_TENANT_ID]"
+    )]
+    tenant_id: Option<String>,
+    #[arg(
+        long,
+        help = "Ask for eDiscovery.Read.All instead of eDiscovery.ReadWrite.All; every write is \
+then refused"
+    )]
+    read_only: bool,
+}
+
+/// Defaults for flags, from the `PURVIEW_*` variables in `Env::vars`. The
+/// boolean ones accept `true` or `false`, and an empty or unset variable
+/// is `false`. The text ones are taken as given; an empty one is unset.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct FlagDefaults {
     json: bool,
     results_only: bool,
     plain: bool,
+    no_input: bool,
+    select: Option<String>,
+    account: Option<String>,
+    client_id: Option<String>,
+    tenant_id: Option<String>,
 }
 
 impl FlagDefaults {
@@ -80,12 +210,64 @@ impl FlagDefaults {
             Some(value) if value == "true" => Ok(true),
             Some(_) => Err(format!("{name} must be true or false")),
         };
+        let text = |name: &str| match vars.get(name) {
+            None => Ok(None),
+            Some(value) => match value.to_str() {
+                Some(text) if text.trim().is_empty() => Ok(None),
+                Some(text) => Ok(Some(text.trim().to_owned())),
+                None => Err(format!("{name} is not valid UTF-8")),
+            },
+        };
         Ok(Self {
             json: flag("PURVIEW_JSON")?,
             results_only: flag("PURVIEW_RESULTS_ONLY")?,
             plain: flag("PURVIEW_PLAIN")?,
+            no_input: flag("PURVIEW_NO_INPUT")?,
+            select: text("PURVIEW_SELECT")?,
+            account: text("PURVIEW_ACCOUNT")?,
+            client_id: text("PURVIEW_CLIENT_ID")?,
+            tenant_id: text("PURVIEW_TENANT_ID")?,
         })
     }
+}
+
+/// The global settings a command reads, after flags and their variables
+/// are combined.
+#[derive(Debug, Clone, Default)]
+struct Globals {
+    account: Option<String>,
+    no_input: bool,
+    client_id: Option<String>,
+    tenant_id: Option<String>,
+}
+
+impl Globals {
+    /// An explicit flag wins over its variable. An explicit flag that is
+    /// blank is an error, never a fall back to the variable or the
+    /// default: `--account "$unset"` must not act on the default account.
+    fn new(cli: &Cli, defaults: &FlagDefaults) -> Result<Self> {
+        Ok(Self {
+            account: match cli.account.as_deref() {
+                Some(value) => Some(explicit("--account", value)?),
+                None => defaults.account.clone(),
+            },
+            no_input: cli.no_input || defaults.no_input,
+            client_id: defaults.client_id.clone(),
+            tenant_id: defaults.tenant_id.clone(),
+        })
+    }
+}
+
+/// The trimmed value of a flag given on the command line, refused when
+/// blank.
+fn explicit(flag: &str, value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(PurviewError::message(format!(
+            "{flag} was given an empty value; pass a value or leave the flag out"
+        )));
+    }
+    Ok(value.to_owned())
 }
 
 /// What a command produced. Exit code 0 is success; a fatal error is an
@@ -143,9 +325,15 @@ where
     let mut printer = Printer::default();
     let mut outcome = match (Cli::try_parse_from(&args), defaults) {
         (Ok(cli), Ok(defaults)) => {
-            let options = output_options(&cli, defaults);
-            let json_mode = options.format == OutputFormat::Json;
-            match run(&mut env, &options, cli.command).await {
+            let json_mode = cli.json || defaults.json;
+            let result = match (
+                output_options(&cli, &defaults),
+                Globals::new(&cli, &defaults),
+            ) {
+                (Ok(options), Ok(globals)) => run(&mut env, &options, &globals, cli.command).await,
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            };
+            match result {
                 Ok(outcome) => printer.deliver(&mut env, outcome),
                 // A command that failed because stdout refused its output
                 // gets the output diagnostic, not a second error.
@@ -179,10 +367,14 @@ where
     outcome
 }
 
-fn output_options(cli: &Cli, defaults: FlagDefaults) -> OutputOptions {
+fn output_options(cli: &Cli, defaults: &FlagDefaults) -> Result<OutputOptions> {
     let json = cli.json || defaults.json;
     let plain = cli.plain || defaults.plain;
-    OutputOptions {
+    let select = match cli.select.as_deref() {
+        Some(value) => explicit("--select", value)?,
+        None => defaults.select.clone().unwrap_or_default(),
+    };
+    Ok(OutputOptions {
         format: if json {
             OutputFormat::Json
         } else if plain {
@@ -190,9 +382,9 @@ fn output_options(cli: &Cli, defaults: FlagDefaults) -> OutputOptions {
         } else {
             OutputFormat::Table
         },
-        select: String::new(),
+        select,
         results_only: cli.results_only || defaults.results_only,
-    }
+    })
 }
 
 /// Writes results and errors, and remembers whether stdout has already
@@ -314,10 +506,819 @@ fn json_requested(args: &[OsString], json_default: bool) -> bool {
             .any(|arg| arg == "--json")
 }
 
-async fn run(env: &mut Env, output: &OutputOptions, command: Command) -> Result<Outcome> {
+async fn run(
+    env: &mut Env,
+    output: &OutputOptions,
+    globals: &Globals,
+    command: Command,
+) -> Result<Outcome> {
     match command {
+        Command::Auth(auth) => match auth.command {
+            AuthCommand::Login(login) => auth_login(env, output, globals, login).await,
+            AuthCommand::Refresh => auth_refresh(env, output, globals).await,
+            AuthCommand::List => auth_list(env, output),
+            AuthCommand::Logout => auth_logout(env, output, globals).await,
+        },
         Command::Version => version(env, output),
     }
+}
+
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn configuration_dir(env: &Env) -> Result<PathBuf> {
+    config::config_dir(env.config_dir.as_deref())
+}
+
+fn load_config(env: &mut Env, dir: &Path) -> Result<Config> {
+    Config::load(dir, &mut env.stderr).map_err(|error| error.context("loading config.json"))
+}
+
+/// `auth login`: device-code sign-in, then both tokens stored. Arguments
+/// are checked, and `--no-input` refused, before any network call.
+async fn auth_login(
+    env: &mut Env,
+    output: &OutputOptions,
+    globals: &Globals,
+    login: AuthLogin,
+) -> Result<Outcome> {
+    // An explicit flag is checked first, blank included, and only an
+    // absent one falls back to its variable.
+    let client_flag = match login.client_id.as_deref() {
+        Some(value) => Some(auth::validate_client_id(&explicit("--client-id", value)?)?),
+        None => globals
+            .client_id
+            .as_deref()
+            .map(auth::validate_client_id)
+            .transpose()?,
+    };
+    let tenant_flag = match login.tenant_id.as_deref() {
+        Some(value) => Some(auth::validate_tenant_id(&explicit("--tenant-id", value)?)?),
+        None => globals
+            .tenant_id
+            .as_deref()
+            .map(auth::validate_tenant_id)
+            .transpose()?,
+    };
+    if globals.no_input {
+        return Err(PurviewError::message(
+            "auth login is interactive (it shows a code to enter in a browser) and --no-input \
+             was given",
+        ));
+    }
+    let dir = configuration_dir(env)?;
+    let stored = load_config(env, &dir)?;
+    let accounts = config::list_accounts(&dir, &mut env.stderr)?;
+    let wanted = globals
+        .account
+        .as_deref()
+        .map(|requested| wanted_account(&accounts, requested))
+        .transpose()?;
+    let registration = login_registration(
+        client_flag.as_deref(),
+        tenant_flag.as_deref(),
+        &stored,
+        wanted.as_ref().map(|wanted| wanted.key.as_str()),
+    )?;
+    let reused = registration
+        .saved_with
+        .as_deref()
+        .map(|email| format!(", as saved with {}", sanitize(email)))
+        .unwrap_or_default();
+    writeln!(
+        env.stderr,
+        "Signing in through app registration {} in tenant {}{reused}",
+        registration.client_id, registration.tenant_id
+    )?;
+    let identity = IdentityClient::new(
+        env.identity_base.clone(),
+        &registration.client_id,
+        &registration.tenant_id,
+        env.identity_timeout,
+        env.redactor.clone(),
+    )?;
+    let outcome = auth::login_device_code(
+        &identity,
+        env.clock.as_ref(),
+        login.read_only,
+        &mut env.stderr,
+    )
+    .await
+    .map_err(|error| error.context("sign-in failed"))?;
+    let record = outcome.record;
+    if let Some(wanted) = &wanted {
+        if !wanted.is(&record) {
+            return Err(PurviewError::message(format!(
+                "the browser signed in as {}, but --account asked for {}; nothing was stored. \
+                 Sign in as {} in the browser, or leave --account out",
+                sanitize(&record.email),
+                sanitize(&wanted.requested),
+                sanitize(&wanted.requested)
+            )));
+        }
+    }
+    store_login(env, &dir, &record, &outcome.credential, &registration).await?;
+    let download_ready = outcome.credential.download.is_some();
+    if let Some(refusal) = &outcome.download_refused {
+        writeln!(
+            env.stderr,
+            "warning: no download token: the app has no consent for the Purview eDiscovery \
+             permission eDiscovery.Download.Read ({}). Download commands will fail with \
+             DownloadNotConsented until an administrator grants it and 'purview auth refresh' \
+             succeeds",
+            sanitize(&refusal.to_string())
+        )?;
+    }
+    let graph_scope = outcome.credential.graph.scope.clone();
+    if output.format == OutputFormat::Json {
+        let result = json!({
+            "account": record.email,
+            "upn": record.upn,
+            "tenantId": record.tenant_id,
+            "clientId": record.client_id,
+            "graphScope": graph_scope,
+            "downloadReady": download_ready,
+        });
+        return Ok(Outcome::success(Some(output.json_value(&result, 1)?)));
+    }
+    let name = record
+        .display_name
+        .as_deref()
+        .map(|name| format!("{} ", sanitize(name)))
+        .unwrap_or_default();
+    writeln!(
+        env.stdout,
+        "Signed in as {name}({})\nTenant: {}\nGraph scope: {}\nDownload token: {}",
+        sanitize(&record.email),
+        sanitize(&record.tenant_id),
+        sanitize(&graph_scope),
+        if download_ready {
+            "stored"
+        } else {
+            "not issued"
+        }
+    )?;
+    Ok(Outcome::success(None))
+}
+
+/// The account `--account` names for a sign-in. A stored account matches
+/// by its key or recorded `upn`, as for every command; a name that matches
+/// none is taken as the key of a signed-out account, whose saved
+/// registration may still be reused.
+#[derive(Debug)]
+struct WantedAccount {
+    requested: String,
+    key: String,
+    /// The stored account the name resolved to, if any.
+    stored: Option<AccountRecord>,
+}
+
+impl WantedAccount {
+    /// Whether the signed-in identity is the one asked for. A stored
+    /// account is bound by its stable identifiers, the tenant and object
+    /// ids recorded at its sign-in, because a name can match more than one
+    /// identity (one account's `upn` can be another's address). A stored
+    /// account recorded without them, and a name that matched no stored
+    /// account, need the returned key or `upn` to be that name exactly.
+    fn is(&self, record: &AccountRecord) -> bool {
+        match &self.stored {
+            Some(stored) if !stored.oid.is_empty() && !stored.tenant_id.is_empty() => {
+                stored.oid.eq_ignore_ascii_case(&record.oid)
+                    && stored.tenant_id.eq_ignore_ascii_case(&record.tenant_id)
+            }
+            Some(stored) => record.email.eq_ignore_ascii_case(&stored.email),
+            None => record.matches(&self.requested),
+        }
+    }
+}
+
+fn wanted_account(accounts: &[AccountRecord], requested: &str) -> Result<WantedAccount> {
+    let stored = match matching_accounts(accounts, requested)?.as_slice() {
+        [only] => Some((*only).clone()),
+        _ => None,
+    };
+    Ok(WantedAccount {
+        requested: requested.to_owned(),
+        key: stored.as_ref().map_or_else(
+            || requested.to_ascii_lowercase(),
+            |account| account.email.clone(),
+        ),
+        stored,
+    })
+}
+
+/// The stored accounts `requested` names: the account whose key it is,
+/// else the accounts whose recorded `upn` it is. Several are refused.
+fn matching_accounts<'a>(
+    accounts: &'a [AccountRecord],
+    requested: &str,
+) -> Result<Vec<&'a AccountRecord>> {
+    let by_key: Vec<&AccountRecord> = accounts
+        .iter()
+        .filter(|account| account.email.eq_ignore_ascii_case(requested))
+        .collect();
+    let matches: Vec<&AccountRecord> = if by_key.is_empty() {
+        accounts
+            .iter()
+            .filter(|account| account.matches(requested))
+            .collect()
+    } else {
+        by_key
+    };
+    if matches.len() > 1 {
+        return Err(PurviewError::message(format!(
+            "{:?} matches several signed-in accounts ({}); pass the account's address",
+            sanitize(requested),
+            matches
+                .iter()
+                .map(|account| sanitize(&account.email))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    Ok(matches)
+}
+
+/// Stores a completed sign-in. The credential records the registration
+/// that issued it, and every refresh uses that registration, so no order of
+/// writes can pair tokens with the wrong app. The writes:
+///
+/// 1. The credential, replaced in place under its key. The old item is not
+///    deleted first: on macOS that would discard its access list, and the
+///    user would have to allow access again. If the store refuses the
+///    write, the previous sign-in is left as it was. A failure the store
+///    reports after the write took effect (a macOS label failure, a Windows
+///    clean-up failure) may leave the new credential in place; on a first
+///    sign-in everything under the key is then swept, and on a later one
+///    the account file still names the previous sign-in, which refresh
+///    checks against.
+/// 2. `accounts/<email>.json`. If this fails on a first sign-in, the new
+///    credential is removed again, so nothing is left that `auth list`
+///    cannot show. On a later sign-in the old account file stays; if it
+///    names another registration, `auth refresh` refuses and asks for a new
+///    sign-in.
+/// 3. `config.json`: the registration to offer at the next sign-in, and
+///    the account as default when the default names no stored account. If
+///    this fails, the account works, but a registration left in
+///    `config.json` that differs makes `auth refresh` ask for a new
+///    sign-in.
+async fn store_login(
+    env: &mut Env,
+    dir: &Path,
+    record: &AccountRecord,
+    credential: &Credential,
+    registration: &LoginRegistration,
+) -> Result<()> {
+    config::account_file_path(dir, &record.email)?;
+    // Held from the ownership check to the last write or rollback, so a
+    // concurrent sign-in under the same key cannot slip in between.
+    let _lock = account_lock(env, &record.email).await?;
+    let (first_sign_in, repair) = check_key_owner(env, dir, record)?;
+    // The injected fault fires after the store has taken the write, as a
+    // macOS label failure or a Windows clean-up failure does.
+    let saved = if repair {
+        credential.save_repairing(env.credentials.as_ref())
+    } else {
+        credential.save(env.credentials.as_ref())
+    };
+    if let Err(error) = saved.and_then(|()| fault(env, LoginWrite::Credential)) {
+        return Err(credential_write_failed(
+            env,
+            &record.email,
+            first_sign_in,
+            error,
+        ));
+    }
+    if let Err(error) = fault(env, LoginWrite::AccountFile)
+        .and_then(|()| config::save_account(dir, record, &env.redactor))
+    {
+        if first_sign_in {
+            return Err(remove_new_credential(
+                env,
+                &record.email,
+                error.context("saving the account file"),
+            ));
+        }
+        return Err(error.context(
+            "saving the account file; the new tokens were stored, but the account file still \
+             describes the previous sign-in. Run 'purview auth login' again",
+        ));
+    }
+    // Read again, with the account list: the sign-in may have taken
+    // minutes, and another command may have changed either.
+    let mut stored = load_config(env, dir)?;
+    let accounts = config::list_accounts(dir, &mut env.stderr)?;
+    stored.set_client(
+        &record.email,
+        &registration.client_id,
+        &registration.tenant_id,
+    );
+    let default_is_stored = accounts
+        .iter()
+        .any(|account| account.email.eq_ignore_ascii_case(&stored.default_account));
+    if !default_is_stored {
+        stored.default_account = record.email.clone();
+    }
+    fault(env, LoginWrite::Config)
+        .and_then(|()| stored.save(dir, &env.redactor))
+        .map_err(|error| {
+            error.context(
+                "saving config.json; the tokens and account file were stored, but config.json \
+                 still names the previous registration or default. Run 'purview auth login' \
+                 again",
+            )
+        })
+}
+
+/// Refuses to store a sign-in under a key that another identity owns, or
+/// whose owner cannot be told. An address can be reassigned, or a rename
+/// can land on a key another stored account holds; either way the key
+/// keeps its owner until `auth logout` frees it. Each recorded id is
+/// compared on its own:
+///
+/// - the account file at the exact key must be readable and record both
+///   ids, each equal to the sign-in's; an unreadable, damaged or partly
+///   recorded file counts as owned by someone else;
+/// - a credential under the key that records an id different from the
+///   sign-in's is someone else's;
+/// - an unreadable credential, or one that records an id only partly,
+///   counts as owned too, unless the account file matches this sign-in, in
+///   which case the sign-in replaces (repairs) it.
+///
+/// Returns whether nothing at all is stored under the key (a first
+/// sign-in), and whether the sign-in is authorised to repair a damaged
+/// credential. The caller holds the account lock.
+fn check_key_owner(env: &mut Env, dir: &Path, record: &AccountRecord) -> Result<(bool, bool)> {
+    let same = |recorded: &str, signed_in: &str| {
+        !recorded.trim().is_empty() && recorded.trim().eq_ignore_ascii_case(signed_in)
+    };
+    let file = config::read_account_file(dir, &record.email, &mut env.stderr);
+    let (file_absent, file_matches) = match &file {
+        Ok(None) => (true, false),
+        Ok(Some(owner)) => (
+            false,
+            same(&owner.oid, &record.oid) && same(&owner.tenant_id, &record.tenant_id),
+        ),
+        Err(_) => (false, false),
+    };
+    let stored =
+        Credential::stored_principal(env.credentials.as_ref(), &record.email, &env.redactor)?;
+    let credential_ok = match &stored {
+        StoredPrincipal::Absent => true,
+        StoredPrincipal::Recorded { tid, oid } => {
+            let differs = |recorded: &str, signed_in: &str| {
+                !recorded.is_empty() && !recorded.eq_ignore_ascii_case(signed_in)
+            };
+            if differs(tid, &record.tenant_id) || differs(oid, &record.oid) {
+                false
+            } else if tid.is_empty() || oid.is_empty() {
+                file_matches
+            } else {
+                true
+            }
+        }
+        StoredPrincipal::Unreadable => file_matches,
+    };
+    if !(file_absent || file_matches) || !credential_ok {
+        let key = sanitize(&record.email);
+        return Err(PurviewError::message(format!(
+            "the account key {key} belongs to another identity, or what is stored under it \
+             cannot show whom it belongs to, so nothing was stored. If that address now belongs \
+             to the identity that just signed in, run 'purview auth logout --account {key}' to \
+             free the key, then sign in again"
+        )));
+    }
+    let repair = file_matches && stored == StoredPrincipal::Unreadable;
+    Ok((file_absent && stored == StoredPrincipal::Absent, repair))
+}
+
+/// After a credential write that reported a failure. The store may have
+/// refused the write outright, or taken it and then failed (a macOS label
+/// failure, a Windows clean-up failure). On a first sign-in, everything
+/// under the key is swept, the primary entry and every chunk slot, whether
+/// or not it can be read back; a sweep that fails is reported with the
+/// logout command that finishes it.
+fn credential_write_failed(
+    env: &Env,
+    email: &str,
+    first_sign_in: bool,
+    error: PurviewError,
+) -> PurviewError {
+    let error = error.context("storing the tokens");
+    if !first_sign_in {
+        return error.context(
+            "the stored credential may or may not have been replaced; the account file still \
+             describes the previous sign-in. Run 'purview auth login' again",
+        );
+    }
+    remove_new_credential(env, email, error)
+}
+
+/// Sweeps what a failed first sign-in may have left under the key. If the
+/// sweep fails, the error says how to finish it: `auth logout --account
+/// <key>` removes whatever is under a key that has no account file.
+fn remove_new_credential(env: &Env, email: &str, error: PurviewError) -> PurviewError {
+    match delete_value(env.credentials.as_ref(), &token_key(email)) {
+        Ok(()) => {
+            error.context("nothing from this sign-in was kept; run 'purview auth login' again")
+        }
+        Err(removal) => {
+            let key = sanitize(email);
+            error.context(format!(
+                "the new tokens may still be in the credential store, and removing them failed \
+                 ({}); run 'purview auth logout --account {key}' to remove them",
+                sanitize(&removal.to_string())
+            ))
+        }
+    }
+}
+
+/// Takes the account lock for `email`, when `Env` has locks.
+async fn account_lock(env: &Env, email: &str) -> Result<Option<CredentialLock>> {
+    match &env.account_locks {
+        Some(locks) => locks.lock(email).await.map(Some),
+        None => Ok(None),
+    }
+}
+
+/// The failure a test asked `Env` to inject at this write, if any.
+fn fault(env: &Env, write: LoginWrite) -> Result<()> {
+    if env.login_write_fault == Some(write) {
+        return Err(PurviewError::message(format!(
+            "injected failure at the {write:?} write"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuses a credential whose recorded app registration differs from the
+/// one the account file or `config.json` names: a sign-in stopped part
+/// way, and the account needs a new one.
+fn check_registration(
+    credential: &Credential,
+    account: &AccountRecord,
+    saved: Option<&ClientConfig>,
+) -> Result<()> {
+    let differs = |client_id: &str, tenant_id: &str| {
+        (!client_id.trim().is_empty() && !client_id.eq_ignore_ascii_case(&credential.client_id))
+            || (!tenant_id.trim().is_empty()
+                && !tenant_id.eq_ignore_ascii_case(&credential.tenant_id))
+    };
+    let named_by = if differs(&account.client_id, &account.tenant_id) {
+        Some("its account file")
+    } else if saved.is_some_and(|client| differs(&client.client_id, &client.tenant_id)) {
+        Some("config.json")
+    } else {
+        None
+    };
+    match named_by {
+        Some(source) => Err(PurviewError::message(format!(
+            "the tokens stored for {} were issued through another app registration than \
+             {source} names, so an earlier sign-in did not finish; run 'purview auth login' \
+             again",
+            sanitize(&account.email)
+        ))),
+        None => Ok(()),
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct LoginRegistration {
+    client_id: String,
+    tenant_id: String,
+    /// The stored account whose registration is reused, if any.
+    saved_with: Option<String>,
+}
+
+/// The app registration to sign in through. `purview` ships with none, so
+/// it comes from `--client-id` (or `PURVIEW_CLIENT_ID`) when given, and
+/// otherwise from the registration saved at an earlier sign-in: the
+/// `--account` named, else the default account, else the one registration
+/// every saved account shares. The tenant follows the same order, with an
+/// explicit tenant always winning. There is no `common` fallback: the app
+/// is single-tenant.
+fn login_registration(
+    client_flag: Option<&str>,
+    tenant_flag: Option<&str>,
+    stored: &Config,
+    account: Option<&str>,
+) -> Result<LoginRegistration> {
+    let missing_tenant = || {
+        PurviewError::message(
+            "no tenant id given and none is saved for this app registration; pass --tenant-id \
+             <tenant-id> or set PURVIEW_TENANT_ID",
+        )
+    };
+    if let Some(client_id) = client_flag {
+        let tenant = match tenant_flag {
+            Some(tenant) => tenant.to_owned(),
+            None => auth::validate_tenant_id(
+                &saved_tenant_for(stored, client_id, account)?.ok_or_else(missing_tenant)?,
+            )
+            .map_err(|error| error.context("the tenant saved for this app registration"))?,
+        };
+        return Ok(LoginRegistration {
+            client_id: client_id.to_owned(),
+            tenant_id: tenant,
+            saved_with: None,
+        });
+    }
+    let (email, client) = saved_registration(stored, account)?;
+    let tenant = match tenant_flag {
+        Some(tenant) => tenant.to_owned(),
+        None => auth::validate_tenant_id(&client.tenant_id).map_err(|_| missing_tenant())?,
+    };
+    Ok(LoginRegistration {
+        client_id: auth::validate_client_id(&client.client_id)
+            .map_err(|error| error.context(format!("the registration saved with {email}")))?,
+        tenant_id: tenant,
+        saved_with: Some(email.to_owned()),
+    })
+}
+
+/// The saved tenant for an explicitly given client id: the chosen or
+/// default account's, when it used that app, else the one tenant every
+/// account using that app shares. Several tenants are refused rather than
+/// guessed.
+fn saved_tenant_for(
+    stored: &Config,
+    client_id: &str,
+    account: Option<&str>,
+) -> Result<Option<String>> {
+    let tenant_of = |client: &ClientConfig| {
+        (client.client_id.eq_ignore_ascii_case(client_id))
+            .then(|| non_empty(Some(&client.tenant_id)).map(str::to_owned))
+            .flatten()
+    };
+    let preferred = non_empty(account).or(non_empty(Some(&stored.default_account)));
+    if let Some(tenant) = preferred.and_then(|wanted| {
+        stored
+            .clients
+            .iter()
+            .find(|(email, _)| email.eq_ignore_ascii_case(wanted))
+            .and_then(|(_, client)| tenant_of(client))
+    }) {
+        return Ok(Some(tenant));
+    }
+    let mut tenants: Vec<String> = stored.clients.values().filter_map(tenant_of).collect();
+    tenants.sort_by_key(|tenant| tenant.to_ascii_lowercase());
+    tenants.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    match tenants.as_slice() {
+        [] => Ok(None),
+        [only] => Ok(Some(only.clone())),
+        _ => Err(PurviewError::message(format!(
+            "app registration {client_id} is saved against several tenants ({}); pass \
+             --tenant-id or --account",
+            tenants
+                .iter()
+                .map(|tenant| sanitize(tenant))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
+fn saved_registration<'a>(
+    stored: &'a Config,
+    account: Option<&str>,
+) -> Result<(&'a str, &'a ClientConfig)> {
+    let usable = |(email, client): (&'a String, &'a ClientConfig)| {
+        (!client.client_id.trim().is_empty()).then_some((email.as_str(), client))
+    };
+    let lookup = |wanted: &str| {
+        stored
+            .clients
+            .iter()
+            .find(|(email, _)| email.eq_ignore_ascii_case(wanted))
+            .and_then(usable)
+    };
+    if let Some(account) = non_empty(account) {
+        return lookup(account).ok_or_else(|| {
+            PurviewError::message(format!(
+                "no app registration is saved for {:?}; pass --client-id <application-client-id> \
+                 and --tenant-id <tenant-id>",
+                sanitize(account)
+            ))
+        });
+    }
+    if let Some(found) = non_empty(Some(&stored.default_account)).and_then(lookup) {
+        return Ok(found);
+    }
+    let saved: Vec<_> = stored.clients.iter().filter_map(usable).collect();
+    let first = saved.first().copied();
+    let shared = first.filter(|(_, first)| {
+        saved.iter().all(|(_, client)| {
+            client.client_id.eq_ignore_ascii_case(&first.client_id)
+                && client.tenant_id.eq_ignore_ascii_case(&first.tenant_id)
+        })
+    });
+    shared.ok_or_else(|| {
+        let reason = if saved.is_empty() {
+            "no app registration given and none is saved from an earlier sign-in"
+        } else {
+            "no app registration given, and the saved accounts use different ones; choose with \
+             --account"
+        };
+        PurviewError::message(format!(
+            "{reason}; pass --client-id <application-client-id> and --tenant-id <tenant-id>, or \
+             set PURVIEW_CLIENT_ID and PURVIEW_TENANT_ID"
+        ))
+    })
+}
+
+/// The one account a command acts as: `--account` (its key or recorded
+/// `upn`, ignoring case), else the default account. There is no fallback
+/// to another account (`docs/SPEC.md` section 4.2).
+fn select_account(
+    stored: &Config,
+    accounts: &[AccountRecord],
+    requested: Option<&str>,
+) -> Result<AccountRecord> {
+    if accounts.is_empty() {
+        return Err(PurviewError::message(
+            "no account is signed in; run 'purview auth login' first",
+        ));
+    }
+    if let Some(requested) = non_empty(requested) {
+        return match matching_accounts(accounts, requested)?.as_slice() {
+            [only] => Ok((*only).clone()),
+            _ => Err(PurviewError::message(format!(
+                "no signed-in account matches {:?}; 'purview auth list' shows the accounts",
+                sanitize(requested)
+            ))),
+        };
+    }
+    accounts
+        .iter()
+        .find(|account| account.email.eq_ignore_ascii_case(&stored.default_account))
+        .cloned()
+        .ok_or_else(|| {
+            PurviewError::message(format!(
+                "no default account is set; pass --account with one of: {}",
+                accounts
+                    .iter()
+                    .map(|account| sanitize(&account.email))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })
+}
+
+/// `auth refresh`: both resources, with the scopes already stored.
+async fn auth_refresh(env: &mut Env, output: &OutputOptions, globals: &Globals) -> Result<Outcome> {
+    let dir = configuration_dir(env)?;
+    let stored = load_config(env, &dir)?;
+    let accounts = config::list_accounts(&dir, &mut env.stderr)?;
+    let account = select_account(&stored, &accounts, globals.account.as_deref())?;
+    let credential = Credential::load(env.credentials.as_ref(), &account.email, &env.redactor)?
+        .ok_or_else(|| {
+            PurviewError::message(format!(
+                "no stored credential for {}; run 'purview auth login' again",
+                sanitize(&account.email)
+            ))
+        })?;
+    check_registration(&credential, &account, stored.client(&account.email))?;
+    if !credential.belongs_to(&account.tenant_id, &account.oid) {
+        let key = sanitize(&account.email);
+        return Err(PurviewError::message(format!(
+            "the tokens stored for {key} belong to another identity than its account file \
+             records, so nothing was sent. Run 'purview auth logout --account {key}' to free the \
+             key, then sign in again"
+        )));
+    }
+    let provider = StoredTokenProvider::new(
+        &IdentityEndpoint {
+            base: env.identity_base.clone(),
+            request_timeout: env.identity_timeout,
+        },
+        env.credentials.clone(),
+        env.redactor.clone(),
+        env.clock.clone(),
+        credential,
+    )?
+    .with_account_locks(env.account_locks.clone());
+    let credential = provider
+        .refresh_all()
+        .await
+        .map_err(|error| error.context(format!("refreshing {}", sanitize(&account.email))))?;
+    let download_expires = credential
+        .download
+        .as_ref()
+        .map(|token| token.expires_at_text());
+    if output.format == OutputFormat::Json {
+        let result = json!({
+            "account": account.email,
+            "graphExpiresAt": credential.graph.expires_at_text(),
+            "downloadExpiresAt": download_expires,
+            "graphScope": credential.graph.scope,
+        });
+        return Ok(Outcome::success(Some(output.json_value(&result, 1)?)));
+    }
+    writeln!(
+        env.stdout,
+        "Refreshed {}\nGraph token expires: {}\nDownload token expires: {}\nGraph scope: {}",
+        sanitize(&account.email),
+        credential.graph.expires_at_text(),
+        download_expires.as_deref().unwrap_or("not issued"),
+        sanitize(&credential.graph.scope)
+    )?;
+    Ok(Outcome::success(None))
+}
+
+const ACCOUNT_COLUMNS: &[&str] = &["EMAIL", "NAME", "DEFAULT"];
+
+/// `auth list`: the account files, with the default marked.
+fn auth_list(env: &mut Env, output: &OutputOptions) -> Result<Outcome> {
+    let dir = configuration_dir(env)?;
+    let stored = load_config(env, &dir)?;
+    let accounts = config::list_accounts(&dir, &mut env.stderr)?;
+    if output.format == OutputFormat::Json {
+        return Ok(Outcome::success(Some(
+            output.json_value(&accounts, accounts.len())?,
+        )));
+    }
+    let rows: Vec<Vec<String>> = accounts
+        .iter()
+        .map(|account| {
+            vec![
+                account.email.clone(),
+                account.display_name.clone().unwrap_or_default(),
+                if account.email.eq_ignore_ascii_case(&stored.default_account) {
+                    "*".to_owned()
+                } else {
+                    String::new()
+                },
+            ]
+        })
+        .collect();
+    write_rows(&mut env.stdout, output, ACCOUNT_COLUMNS, &rows)?;
+    Ok(Outcome::success(None))
+}
+
+/// `auth logout`: removes the selected account's credential and account
+/// file. The saved app registration stays, so signing in again needs no
+/// flags. A signed-out default is replaced by the first remaining account.
+async fn auth_logout(env: &mut Env, output: &OutputOptions, globals: &Globals) -> Result<Outcome> {
+    let dir = configuration_dir(env)?;
+    let stored = load_config(env, &dir)?;
+    let accounts = config::list_accounts(&dir, &mut env.stderr)?;
+    // An explicitly named key that exists as a file or a store entry is
+    // that key, before any `upn` matching: the printed remedy for an
+    // orphan names its exact key, which may be another account's `upn`.
+    let exact = match globals.account.as_deref() {
+        Some(requested) => {
+            let key = requested.to_ascii_lowercase();
+            let path = config::account_file_path(&dir, &key)?;
+            // Inspected without following links: a link is refused here,
+            // before anything is deleted.
+            let file_exists = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(PurviewError::message(format!(
+                        "the account file for {} is a link; refusing to sign it out",
+                        sanitize(&key)
+                    )));
+                }
+                Ok(_) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error.into()),
+            };
+            let exists = file_exists || entry_exists(env.credentials.as_ref(), &token_key(&key))?;
+            exists.then_some(key)
+        }
+        None => None,
+    };
+    let email = match exact {
+        Some(key) => key,
+        None => select_account(&stored, &accounts, globals.account.as_deref())?.email,
+    };
+    // Checked before the lock is taken and before anything is removed.
+    config::account_file_path(&dir, &email)?;
+    let _lock = account_lock(env, &email).await?;
+    // Read again under the lock: another command may have changed either.
+    let stored = load_config(env, &dir)?;
+    let accounts = config::list_accounts(&dir, &mut env.stderr)?;
+    delete_value(env.credentials.as_ref(), &token_key(&email)).map_err(|error| {
+        error.context(format!("deleting the credential for {}", sanitize(&email)))
+    })?;
+    config::remove_account(&dir, &email)?;
+    if stored.default_account.eq_ignore_ascii_case(&email) {
+        let mut stored = stored;
+        stored.default_account = accounts
+            .iter()
+            .map(|account| account.email.clone())
+            .find(|other| !other.eq_ignore_ascii_case(&email))
+            .unwrap_or_default();
+        stored
+            .save(&dir, &env.redactor)
+            .map_err(|error| error.context("saving config.json"))?;
+    }
+    if output.format == OutputFormat::Json {
+        let result = json!({"account": email, "signedOut": true});
+        return Ok(Outcome::success(Some(output.json_value(&result, 1)?)));
+    }
+    writeln!(env.stdout, "Signed out {}", sanitize(&email))?;
+    Ok(Outcome::success(None))
 }
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");

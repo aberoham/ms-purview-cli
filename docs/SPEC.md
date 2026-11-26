@@ -191,8 +191,14 @@ JSON: `{"account", "upn", "tenantId", "clientId", "graphScope", "downloadReady"}
 
 Redeems the stored refresh token for both resources, with the scopes already stored. It
 never narrows or widens scopes; sign in again with `auth login` (with or without
-`--read-only`) to change them, as `entra` requires for narrowing. It succeeds only if the
-network refresh and the credential-store write both succeed.
+`--read-only`) to change them, as `entra` requires for narrowing. A Graph response whose
+permissions differ from the stored set is refused and nothing is stored (section 4.5); the
+error names neither set. It
+succeeds only if both redemptions and every credential-store write succeed. Each result is
+stored before the next step: if the download redemption fails with `AADSTS65001`, the Graph
+rotation stays stored, the refused download entry is removed from the store, and the
+command exits 1 with `DownloadNotConsented`. Only `auth login` treats that refusal as a
+warning.
 
 JSON: `{"account", "graphExpiresAt", "downloadExpiresAt", "graphScope"}`.
 
@@ -686,12 +692,29 @@ pub trait TokenProvider: Send + Sync {
 - `GraphClient` and `DownloadClient` hold an `Arc<dyn TokenProvider>`, never a token string.
 - Before each request, `graph` refreshes when fewer than 60 s remain; before a POST, when
   fewer than 5 minutes remain. Refresh rotates the refresh token and stores the newest one.
+  A refresh is written to the credential store before its tokens are used. If the store
+  refuses the write, the refresh is that command's error, and the rotated refresh token is
+  never used; the provider keeps the credential the store still holds.
+- The Graph refresh request is built from the stored scope list: short Graph permission
+  names get the `https://graph.microsoft.com/` prefix, repeats are dropped and
+  `offline_access` is added when missing. A response whose Graph permission set (ignoring
+  case, the resource prefix and the OpenID Connect entries) differs from the stored one is
+  refused, and nothing is stored: the stored scope must describe the token in use, and a
+  refresh must neither widen nor narrow a session. A response without a `scope` keeps the
+  stored list.
 - `download` runs only when a download starts, after polling ends, never at command start.
   It refreshes when fewer than 5 minutes remain, before each file. The server is assumed to
   check the token when a request starts, not during the transfer (Assumption; PR 4.1 checks
   this with a download that outlasts the token).
 - A missing `download` entry in the stored credential triggers one silent refresh attempt.
-  If that fails, the error is `DownloadNotConsented` with its remedy.
+  If the identity platform refuses it for want of consent (error code `65001`, matched as a
+  complete code), the error is `DownloadNotConsented` with its remedy. Any other failure,
+  such as a network error or an expired session, keeps its own error and remedy, and a
+  later call may try again.
+- A consent refusal, whether for a missing entry or while renewing an expired one, stops
+  further download attempts in the process: the entry is cleared and the credential stored
+  without it, so a later call finds no expired entry to renew and fails at once with
+  `DownloadNotConsented`.
 - Concurrent refreshes in one process share one refresh request, guarded by a
   `tokio::sync::Mutex` (tokio feature `sync`). Writes from several processes to the store
   follow `entra`'s locking.
@@ -1107,12 +1130,22 @@ whatever properties can be read, with `error: "unsupportedClass"` when they have
 **Stored credential.** One credential-store item per account, holding JSON:
 
 ```json
-{"version":1,"email":"alex@contoso.example","refresh_token":"…",
+{"version":1,"email":"alex@contoso.example","tid":"<tenant-id>","oid":"<object-id>",
+ "client_id":"<application-client-id>","tenant_id":"<tenant-id>","refresh_token":"…",
  "graph":{"access_token":"…","expires_at":"…","scope":"…"},
  "download":{"access_token":"…","expires_at":"…","scope":"…"}}
 ```
 
-`download` may be absent. The service name is `purview`, the key `purview:token:<email>`,
+`download` may be absent. `tid` and `oid` are the id token's claims for the identity the
+tokens belong to: they bind the account key to one principal. `client_id` and `tenant_id`
+name the app registration and tenant that issued the tokens. Every refresh and redemption uses the registration recorded here,
+never one from `config.json` or the account file, so tokens and registration cannot come
+apart. A stored credential without any of these four, or with a registration that is not GUIDs,
+is treated as needing sign-in (`auth login` again), not as matching. A sign-in whose id
+token lacks `tid` or `oid` stores nothing. `auth refresh` also refuses, before any
+request, when the credential's `tid` and `oid` differ from the selected account file's. If the account file or `config.json`
+names a different registration, a sign-in stopped part way: `auth refresh` refuses with a
+"sign in again" error and sends nothing. The service name is `purview`, the key `purview:token:<email>`,
 the macOS label `purview — <email>`, and the description `Microsoft Purview eDiscovery
 token`. Windows chunking and Linux keyutils behave as in `entra`. The credential store is the
 only place a token is ever persisted.
@@ -1212,7 +1245,54 @@ contract.
 
 `config.json` lives under `dirs::config_dir()/purview/`, overridable with
 `PURVIEW_CONFIG_DIR`. Account files are `accounts/<email>.json`, holding
-`{email, upn, oid, display_name, tenant_id, client_id, login_time}`. Symlinks are refused, modes are 0600
+`{email, upn, oid, display_name, tenant_id, client_id, login_time}`. The account file is for
+display and account selection (`tenant_id` is the id token's `tid`, and `oid` binds
+`--account` at sign-in); `config.json` `clients` only says which registration to offer at
+the next sign-in. Neither chooses the registration a refresh uses (section 5.1).
+
+After the ownership check below, `auth login` stores a sign-in in this order: the
+credential, replaced in place under its
+key (the old item is not deleted first, so a macOS keychain item keeps its access list);
+then the account file; then `config.json`. If the store refuses the first write
+outright, the earlier sign-in is left as it was. A failure the store reports after the write
+took effect (a macOS label failure, a Windows clean-up failure) can leave the new credential
+in place: on a first sign-in it is swept (below); on a later sign-in the account file still
+names the earlier sign-in, and `auth refresh` refuses the mismatch. A failure at the account file on a first sign-in removes the new
+credential again; on a later sign-in it leaves an account file that may name the old
+registration, which `auth refresh` detects. A failure at `config.json` leaves a working
+account whose stale registration, if it differs, `auth refresh` also detects.
+
+**An account key belongs to one principal.** Before any write, `auth login` refuses when
+the destination key already has an account file, or a credential, that records a different
+`tid` or `oid` from the sign-in's. This covers an address reassigned to another person and a
+rename onto a key another stored account holds; both accounts' files and credentials stay
+as they were. `auth logout --account <key>` frees the key, after which the new identity can
+sign in under it. A rename onto a free key is stored under the new key; the old key's
+entries stay until they are logged out.
+
+If a first sign-in fails at the credential or the account file, `auth login` sweeps the key:
+the primary entry and, in the Windows chunked layout, every chunk in both slots, whether or not
+a header was written. If that sweep fails, the error names `auth logout --account <key>`.
+`auth logout --account <key>` acts on that exact key when an account file or any store entry
+exists under it, before any `upn` matching, and removes the entry without parsing it, so a
+damaged credential or headerless chunks can always be removed.
+
+An unreadable, damaged or partly recorded destination counts as owned: an account file that
+cannot be read or lacks `tid` or `oid`, or a credential that cannot be read or records only one
+of them. `auth login` then refuses and names `auth logout --account <key>`. The exception is a
+damaged or partly recorded credential under a key whose account file is readable and records
+the sign-in's own `tid` and `oid`: the sign-in replaces (repairs) it. Each id is compared on
+its own.
+
+`auth login` (from the ownership check to its last write or rollback), `auth logout` and each
+refresh commit hold a per-account lock file under the local data directory, taken with the
+same file lock the credential store uses on Windows, so two processes cannot interleave on one
+key. Before committing a rotation, a refresh checks under that lock that the key still holds a
+credential of the same principal and registration.
+
+When `--account` (or `PURVIEW_ACCOUNT`) names a stored account, the sign-in must return
+that account's recorded `tid` and `oid`; otherwise the returned account key or `upn` must
+equal the name given, ignoring case. On a mismatch nothing is written. Symlinks are refused, modes are 0600
 and 0700, and writes are atomic, as in `entra`.
 
 - On Windows there are no modes. The configuration lives under the user's profile and relies on
@@ -2217,10 +2297,12 @@ The `aberoham/homebrew-tap` formula `purview` reads releases, as it does for `en
 | `dirs` | | 0.1 |
 | `keyring` | `apple-native`, `linux-native`, `windows-native` | 1.1 |
 | `security-framework` (macOS) | | 1.1 |
-| `reqwest` | `json`, `rustls-tls`, `gzip`, `stream`; no default features | 1.1 |
-| `url`, `uuid`, `chrono` | `serde` each | 1.1 |
-| `base64`, `sha2`, `getrandom` | | 1.1 |
+| `reqwest` | `json`, `rustls-tls`, `gzip`; no default features. `stream` is added in 1.5 with the download client | 1.1 |
+| `url`, `uuid`, `chrono` | (default features); add `serde` only where a later PR serialises one of these types | 1.1 |
+| `base64` | | 1.1 |
 | `async-trait` | | 1.1 |
+| `sha2` | | 1.1 (account lock file names) |
+| `getrandom` | | 1.2 (PKCE) |
 | `webbrowser` | | 1.2 |
 | `futures-util` | | 1.5 |
 | `zip` | `deflate` (plus `deflate64` only if PR 4.1 finds it) | 1.5 |

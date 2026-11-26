@@ -1,0 +1,9 @@
+{
+  "token_type": "Bearer",
+  "scope": "https://graph.microsoft.com/eDiscovery.ReadWrite.All openid profile",
+  "expires_in": 4271,
+  "ext_expires_in": 4271,
+  "access_token": "canary-graph-access-0001",
+  "refresh_token": "canary-refresh-0001",
+  "id_token": "built at run time from an id-claims fixture"
+}

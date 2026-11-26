@@ -9,8 +9,8 @@ downloads, and offline parsing of the resulting zips.
 
 `docs/SPEC.md` is the design and the phased plan. Each pull request
 implements one item of its section 11 and nothing from later items. Today
-the binary has `purview version` and the device-code `purview auth login`,
-`auth refresh`, `auth list` and `auth logout`. Do not add stubs for commands
+the binary has `purview version`, `purview auth login` (device code, or
+`--browser`), `auth refresh`, `auth list` and `auth logout`. Do not add stubs for commands
 that a later pull request owns.
 
 The tool never places, changes or releases a hold, never deletes or reopens a
@@ -75,11 +75,18 @@ that the test files pass their own scan.
   always `None` in production, that makes one of `auth login`'s writes
   fail, and the per-account locks (`AccountLocks`) that serialise login,
   logout and refresh commits across processes; `Env::in_memory()` has none
-  until a test sets them. Later pull requests add the Graph
+  until a test sets them. It carries the `BrowserOpener` that
+`auth login --browser` uses (the system browser in production, `NoBrowser`
+in `Env::in_memory()`, and the harness's `ScriptedBrowser`, which plays the
+redirect against the loopback listener, in flows) and that sign-in's
+timeout. Later pull requests add the Graph
   origin and the download host rule. `Env::production()` reads no
   environment variable that could change an endpoint, so the release binary
   has no test path that could send a token to another host.
-- `src/auth.rs` holds the device-code flow, refresh-token redemption for
+- `src/auth.rs` holds the device-code flow, the browser flow (authorization
+  code with PKCE on a `http://localhost:<port>/callback` listener bound on
+  `127.0.0.1` and, when possible, `::1`; only an answer carrying the sign-in's
+  `state` ends the wait), refresh-token redemption for
   Graph and for the Purview eDiscovery app (the download token), and the
   account claims from the id token. OAuth errors keep only the
   allow-listed fields of `docs/SPEC.md` section 6.8, redacted.
@@ -119,6 +126,21 @@ that the test files pass their own scan.
 - `contrib/resign.sh` gives local macOS builds a stable signing identity.
   `contrib/install.sh` tests, builds, signs and installs the per-user
   `~/.local/bin/purview`.
+- `contrib/create-purview-app.sh` creates or updates the app registration,
+  its service principals, assignments and consent grants under the
+  contract in `docs/SPEC.md` section 5.2: a dry run by default, `--apply`
+  to change anything, each change sent once and read back when its
+  outcome is unclear. It must run under macOS's `/bin/bash` 3.2 and needs
+  only `az`. Long `az` output goes to `awk`, `sed` and `grep` through
+  here-strings, never a pipe into a reader that can stop early: under
+  `pipefail` the writer's SIGPIPE would end the script without a message.
+  `tests/scripts/create-purview-app-test.sh` runs it against the fake
+  `az` in `tests/scripts/fake-bin/` (Python 3). The fake answers only the
+  command words, options, queries and body fields the script sends, from
+  a JSON state file. It refuses duplicates as Graph does and logs each
+  call as one JSON array; any other call exits 99. `tests/scripts/azlog.py`
+  reads that log for the harness. A change to a query or a body in the
+  script needs the same change in the fake.
 - `.github/workflows/release.yml` builds, signs, notarises, attests and
   publishes the release archives when a `v*` tag is pushed; the tag must
   equal `v` plus the `Cargo.toml` version. `.github/scripts/macos-signing.py`
@@ -267,7 +289,13 @@ cargo build --release
 
 The public-data lint alone is `cargo test --test fixture_lint`. For workflow
 changes, also run `actionlint` and `zizmor --offline .github/workflows`. For
-shell changes, run `bash -n` and ShellCheck. For changes to the signing
+shell changes, run `bash -n` and ShellCheck. For changes to
+`contrib/create-purview-app.sh` or its fake, run
+`tests/scripts/create-purview-app-test.sh`, and on macOS also
+`TEST_BASH=/bin/bash tests/scripts/create-purview-app-test.sh`; name test
+cases as arguments to run only those. `TEST_SCRIPT=<path>` runs the cases
+against a copy of the script, which is how to check that a test fails when
+the behaviour it covers is removed without editing the tracked file. For changes to the signing
 helper, run `python3 .github/scripts/test_macos_signing.py`.
 
 A passing suite does not show that the tenant behaves this way. Report live

@@ -1169,9 +1169,9 @@ OpenID Connect scopes as separate entries in `requiredResourceAccess`.
    name, which `purview` does not use (Observed).
 2. **Application.**
    - `signInAudience: AzureADMyOrg`, `isFallbackPublicClient: true` (Observed).
-   - Public-client redirect `http://localhost/callback` (Observed). That `--browser` works with
-     `http://localhost:<port>/callback` on this registration is an Assumption, based on
-     `entra`; PR 1.2 checks it.
+   - Public-client redirect `http://localhost/callback` (Observed). `--browser` works with
+     `http://localhost:<port>/callback` on this registration (Observed in the PR 1.2 live
+     check).
    - No credentials (Observed).
    - `requiredResourceAccess`:
      - Graph `eDiscovery.ReadWrite.All` (`acb8f680-0834-4146-b69e-4ab1b39745ad`) (Observed).
@@ -2303,7 +2303,7 @@ The `aberoham/homebrew-tap` formula `purview` reads releases, as it does for `en
 | `async-trait` | | 1.1 |
 | `sha2` | | 1.1 (account lock file names) |
 | `getrandom` | | 1.2 (PKCE) |
-| `webbrowser` | | 1.2 |
+| (no browser crate) | `auth login --browser` runs the platform's opener (`open`, `rundll32 url.dll,FileProtocolHandler`, `xdg-open`) with null standard streams, so a browser cannot write into the command's output | 1.2 |
 | `futures-util` | | 1.5 |
 | `zip` | `deflate` (plus `deflate64` only if PR 4.1 finds it) | 1.5 |
 | `regex` | | 1.6 |

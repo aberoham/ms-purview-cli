@@ -60,8 +60,10 @@ jobs:
       - name: zizmor
         run: pipx run "zizmor==${ZIZMOR_VERSION}" --offline .github/workflows
       # The release depends on these scripts, but nothing else runs them.
-      - run: shellcheck contrib/*.sh
+      - run: shellcheck contrib/*.sh tests/scripts/*.sh tests/scripts/fake-bin/sleep
       - run: python3 .github/scripts/test_macos_signing.py
+      # The app registration script, run against a fake az.
+      - run: tests/scripts/create-purview-app-test.sh
 
   test:
     name: Test (${{ matrix.os }})

@@ -114,11 +114,17 @@ struct AuthArgs {
 #[derive(Debug, Clone, Subcommand)]
 enum AuthCommand {
     #[command(
-        about = "Sign in with a device code and store the Graph and download tokens",
+        about = "Sign in and store the Graph and download tokens",
         long_about = "\
-Sign in with a device code. The sign-in asks for the Microsoft Graph eDiscovery \
-permission, then redeems the refresh token for the Purview eDiscovery download \
-token. Both tokens go to the operating system's credential store.
+Sign in with a device code, or with --browser in the system browser. The \
+sign-in asks for the Microsoft Graph eDiscovery permission, then redeems the \
+refresh token for the Purview eDiscovery download token. Both tokens go to \
+the operating system's credential store.
+
+--browser opens the identity platform's sign-in page and receives the answer \
+on a loopback address (http://localhost:<port>/callback), so the browser must \
+run on this computer. The app registration needs the public-client redirect \
+http://localhost/callback; contrib/create-purview-app.sh adds it.
 
 purview has no app registration of its own. The first sign-in needs \
 --client-id and --tenant-id (or PURVIEW_CLIENT_ID and PURVIEW_TENANT_ID); \
@@ -130,6 +136,7 @@ succeeds after consent is granted.",
         after_help = "\
 Examples:
   purview auth login --client-id <application-client-id> --tenant-id <tenant-id>
+  purview auth login --browser
   purview auth login --read-only
   purview auth login --account alex@contoso.example"
     )]
@@ -185,6 +192,11 @@ struct AuthLogin {
 then refused"
     )]
     read_only: bool,
+    #[arg(
+        long,
+        help = "Sign in in the system browser on this computer instead of with a device code"
+    )]
+    browser: bool,
 }
 
 /// Defaults for flags, from the `PURVIEW_*` variables in `Env::vars`. The
@@ -535,7 +547,7 @@ fn load_config(env: &mut Env, dir: &Path) -> Result<Config> {
     Config::load(dir, &mut env.stderr).map_err(|error| error.context("loading config.json"))
 }
 
-/// `auth login`: device-code sign-in, then both tokens stored. Arguments
+/// `auth login`: device-code or browser sign-in, then both tokens stored. Arguments
 /// are checked, and `--no-input` refused, before any network call.
 async fn auth_login(
     env: &mut Env,
@@ -563,8 +575,8 @@ async fn auth_login(
     };
     if globals.no_input {
         return Err(PurviewError::message(
-            "auth login is interactive (it shows a code to enter in a browser) and --no-input \
-             was given",
+            "auth login is interactive (a person signs in in a browser) and --no-input was \
+             given",
         ));
     }
     let dir = configuration_dir(env)?;
@@ -598,13 +610,25 @@ async fn auth_login(
         env.identity_timeout,
         env.redactor.clone(),
     )?;
-    let outcome = auth::login_device_code(
-        &identity,
-        env.clock.as_ref(),
-        login.read_only,
-        &mut env.stderr,
-    )
-    .await
+    let outcome = if login.browser {
+        auth::login_browser(
+            &identity,
+            env.clock.as_ref(),
+            login.read_only,
+            env.browser.clone(),
+            env.browser_timeout,
+            &mut env.stderr,
+        )
+        .await
+    } else {
+        auth::login_device_code(
+            &identity,
+            env.clock.as_ref(),
+            login.read_only,
+            &mut env.stderr,
+        )
+        .await
+    }
     .map_err(|error| error.context("sign-in failed"))?;
     let record = outcome.record;
     if let Some(wanted) = &wanted {

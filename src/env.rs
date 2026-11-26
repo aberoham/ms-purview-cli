@@ -2,8 +2,8 @@
 //! arguments, injected so that `cli::execute_with` can run a whole command
 //! in-process under test.
 //!
-//! It carries the identity-platform base URL, the credential store and the
-//! clock. Later releases add the Graph origin and the download host rule.
+//! It carries the identity-platform base URL, the credential store, the
+//! clock and the browser opener. Later releases add the Graph origin and the download host rule.
 //! The production `Env` reads no environment variable that could change an
 //! endpoint, so the release binary has no path that could send a token to
 //! another host.
@@ -38,6 +38,82 @@ pub trait Clock: Send + Sync {
     /// to the wall clock must not move.
     fn elapsed(&self) -> Duration;
     async fn sleep(&self, duration: Duration);
+}
+
+/// Opens an address in a web browser, for `auth login --browser`.
+pub trait BrowserOpener: Send + Sync {
+    fn open(&self, url: &Url) -> io::Result<()>;
+}
+
+/// The system's default browser, through the platform's own opener:
+/// `open` on macOS, the URL protocol handler on Windows, `xdg-open`
+/// elsewhere.
+#[derive(Debug, Default)]
+pub struct SystemBrowser;
+
+impl BrowserOpener for SystemBrowser {
+    /// Opens only an `https` address. The program is a fixed one and the
+    /// address goes to it as a single argument, never through a shell; the
+    /// scheme check keeps a handler that also opens files (Windows'
+    /// `FileProtocolHandler`) from being given a path.
+    fn open(&self, url: &Url) -> io::Result<()> {
+        if url.scheme() != "https" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "only an https address is opened in the browser",
+            ));
+        }
+        let (program, args) = browser_command(url.as_str());
+        launch(program, &args)
+    }
+}
+
+fn browser_command(url: &str) -> (&'static str, Vec<String>) {
+    if cfg!(target_os = "macos") {
+        ("/usr/bin/open", vec![url.to_owned()])
+    } else if cfg!(windows) {
+        // The address goes to the handler as one argument, with no shell to
+        // read the `&` in its query.
+        (
+            "rundll32.exe",
+            vec!["url.dll,FileProtocolHandler".to_owned(), url.to_owned()],
+        )
+    } else {
+        ("xdg-open", vec![url.to_owned()])
+    }
+}
+
+/// Runs an opener and waits for it to exit. The program is a literal from
+/// `browser_command` (or a test), never a value read at run time. It gets none of this process's
+/// standard streams, so nothing it or a browser it starts prints can reach
+/// the command's output: under `--json`, stdout must hold one document.
+fn launch(program: &'static str, args: &[String]) -> io::Result<()> {
+    let status = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("{program} exited with {status}")))
+    }
+}
+
+/// The opener of an in-memory `Env`: it opens nothing and fails, until a
+/// test replaces it with one that plays the browser's part.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct NoBrowser;
+
+impl BrowserOpener for NoBrowser {
+    fn open(&self, _url: &Url) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no browser in this environment",
+        ))
+    }
 }
 
 /// The system clock and tokio's timer.
@@ -173,6 +249,13 @@ pub struct Env {
     /// The timeout for each identity-platform request: `auth::REQUEST_TIMEOUT`
     /// in production; tests shorten it to exercise a stalled request.
     pub identity_timeout: Duration,
+    /// Opens the sign-in address for `auth login --browser`: the system
+    /// browser in production, `NoBrowser` in `in_memory()` until a test
+    /// sets one that answers the loopback redirect.
+    pub browser: Arc<dyn BrowserOpener>,
+    /// How long `auth login --browser` waits for the browser:
+    /// `auth::BROWSER_TIMEOUT` in production; tests shorten it.
+    pub browser_timeout: Duration,
     /// Makes one of `auth login`'s writes fail before it is made, for tests
     /// of a sign-in that stops part way. Always `None` in production.
     #[doc(hidden)]
@@ -242,6 +325,8 @@ impl Env {
             credentials: Arc::new(KeyringStore),
             clock: Arc::new(SystemClock::default()),
             identity_timeout: crate::auth::REQUEST_TIMEOUT,
+            browser: Arc::new(SystemBrowser),
+            browser_timeout: crate::auth::BROWSER_TIMEOUT,
             login_write_fault: None,
             account_locks: crate::secrets::AccountLocks::production(),
         }
@@ -280,6 +365,8 @@ impl Env {
             credentials: Arc::new(MemoryStore::default()),
             clock: Arc::new(ManualClock::new(test_epoch())),
             identity_timeout: crate::auth::REQUEST_TIMEOUT,
+            browser: Arc::new(NoBrowser),
+            browser_timeout: crate::auth::BROWSER_TIMEOUT,
             login_write_fault: None,
             account_locks: None,
         }
@@ -357,6 +444,45 @@ mod tests {
         clock.advance(Duration::from_secs(1));
         assert_eq!(clock.now(), test_epoch() + chrono::Duration::seconds(6));
         assert_eq!(clock.sleeps(), [Duration::from_secs(5)]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_opener_gets_none_of_the_commands_streams() {
+        // Each stream must be a character device that is not a terminal:
+        // /dev/null. An inherited stream is a terminal, or a pipe under CI.
+        let check = "for fd in 0 1 2; do if [ -t $fd ]; then exit 3; fi; done; \
+                     [ -c /dev/stdin ] && [ -c /dev/stdout ] && [ -c /dev/stderr ] || exit 4";
+        launch("/bin/sh", &["-c".to_owned(), check.to_owned()]).unwrap();
+        let failed = launch("/bin/sh", &["-c".to_owned(), "exit 7".to_owned()]).unwrap_err();
+        assert!(
+            failed.to_string().contains("/bin/sh exited with"),
+            "{failed}"
+        );
+    }
+
+    #[test]
+    fn the_system_browser_opens_only_https_addresses() {
+        for refused in [
+            "file:///etc/passwd",
+            "http://login.microsoftonline.com/x",
+            "javascript:alert(1)",
+        ] {
+            let error = SystemBrowser
+                .open(&Url::parse(refused).unwrap())
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{refused}");
+        }
+    }
+
+    #[test]
+    fn the_opener_passes_the_address_as_one_argument() {
+        let url = "https://login.microsoftonline.com/x/oauth2/v2.0/authorize?a=1&b=2";
+        let (program, args) = browser_command(url);
+        assert_eq!(args.last().map(String::as_str), Some(url));
+        if cfg!(target_os = "macos") {
+            assert_eq!(program, "/usr/bin/open");
+        }
     }
 
     #[test]

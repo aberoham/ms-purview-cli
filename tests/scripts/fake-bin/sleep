@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Polling in contrib/create-purview-app.sh must not wait in tests. Each call
+# is logged, in the fake az's JSON form, so that a test can count the polls.
+printf '["sleep", "%s"]\n' "${1:-}" >>"${FAKE_AZ_LOG:?}"

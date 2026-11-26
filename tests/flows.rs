@@ -2361,3 +2361,337 @@ async fn repair_an_undecodable_primary(store: MemoryStore) {
         "canary-refresh-0002"
     );
 }
+
+// Browser sign-in (`auth login --browser`).
+
+const AUTH_CODE: &str = "canary-auth-code-0001";
+
+/// Mounts the code exchange, answered with `exchange`, and the download
+/// redemption.
+async fn mount_browser_login(harness: &Harness, exchange: impl wiremock::Respond + 'static) {
+    Mock::given(method("POST"))
+        .and(path(token_path("token")))
+        .and(Form::new(&[
+            ("grant_type", "authorization_code"),
+            ("code", AUTH_CODE),
+            ("client_id", CLIENT_ID),
+        ]))
+        .respond_with(exchange)
+        .expect(1)
+        .mount(&harness.identity)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(token_path("token")))
+        .and(Form::new(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", "canary-refresh-0001"),
+        ]))
+        .respond_with(json_response(200, fixture("token-download.json")))
+        .mount(&harness.identity)
+        .await;
+}
+
+fn browser_login_args(extra: &[&'static str]) -> Vec<&'static str> {
+    let mut args = vec![
+        "auth",
+        "login",
+        "--browser",
+        "--client-id",
+        CLIENT_ID,
+        "--tenant-id",
+        TENANT_ID,
+    ];
+    args.extend_from_slice(extra);
+    args
+}
+
+/// Sets the browser, and a sign-in timeout short enough for a test.
+fn with_browser(browser: &std::sync::Arc<ScriptedBrowser>) -> impl FnOnce(&mut Env, &Captured) {
+    let browser = browser.clone();
+    move |env: &mut Env, captured: &Captured| {
+        *browser.stderr.lock().unwrap() = Some(captured.stderr.clone());
+        env.browser = browser;
+        env.browser_timeout = Duration::from_secs(20);
+    }
+}
+
+/// The value of a form field, or a failure that names only the field.
+fn form_field(form: &[(String, String)], name: &str) -> String {
+    form.iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.clone())
+        .unwrap_or_else(|| panic!("no {name} field in the request"))
+}
+
+/// A token endpoint that refuses the code exchange and quotes the code and
+/// the verifier it was sent in its description, as a careless service
+/// might.
+struct RefusalQuotingTheExchange;
+
+impl wiremock::Respond for RefusalQuotingTheExchange {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let form = form_of(request);
+        json_response(
+            400,
+            serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": format!(
+                    "AADSTS70008: The provided authorization code has expired. code {} verifier {}",
+                    form_field(&form, "code"),
+                    form_field(&form, "code_verifier")
+                ),
+                "error_codes": [70008],
+                "trace_id": "00000000-0000-4000-8000-000000000031",
+            }),
+        )
+    }
+}
+
+#[tokio::test]
+async fn browser_login_uses_pkce_on_the_loopback_redirect_and_stores_both_tokens() {
+    let harness = Harness::new().await;
+    mount_browser_login(
+        &harness,
+        json_response(200, graph_token("id-claims-preferred.json")),
+    )
+    .await;
+    // A favicon request and an answer for another sign-in come first; the
+    // listener answers both and keeps waiting.
+    let browser = ScriptedBrowser::new(&[
+        "/favicon.ico",
+        "/callback?code=canary-auth-code-0001&state=another-sign-in",
+        "/callback?code=canary-auth-code-0001&state={state}&session_state=x",
+    ]);
+    let mut args = vec!["--json"];
+    args.extend(browser_login_args(&[]));
+    let run = harness.run_with(&args, with_browser(&browser)).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
+    assert_eq!(
+        browser.answers(3),
+        [
+            "HTTP/1.1 404 Not Found",
+            "HTTP/1.1 400 Bad Request",
+            "HTTP/1.1 200 OK"
+        ]
+    );
+    assert_eq!(run.json()["results"]["account"], ALEX);
+    assert_eq!(run.json()["results"]["downloadReady"], true);
+
+    // The authorization request.
+    let opened = browser.opened();
+    assert_eq!(
+        opened.path(),
+        format!("/{TENANT_ID}/oauth2/v2.0/authorize").as_str()
+    );
+    let redirect_uri = query_value(&opened, "redirect_uri");
+    let redirect = url::Url::parse(&redirect_uri).unwrap();
+    assert_eq!(
+        (redirect.scheme(), redirect.host_str(), redirect.path()),
+        ("http", Some("localhost"), "/callback")
+    );
+    assert!(redirect.port().is_some_and(|port| port > 0));
+    for (name, value) in [
+        ("client_id", CLIENT_ID),
+        ("response_type", "code"),
+        ("response_mode", "query"),
+        ("code_challenge_method", "S256"),
+        ("prompt", "select_account"),
+        (
+            "scope",
+            "https://graph.microsoft.com/eDiscovery.ReadWrite.All offline_access openid profile",
+        ),
+    ] {
+        assert_eq!(query_value(&opened, name), value, "{name}");
+    }
+    assert!(query_value(&opened, "state").len() >= 32);
+    // The address is printed too, for a browser that did not open.
+    assert!(run.stderr().contains(opened.as_str()), "{}", run.stderr());
+
+    // The exchange sends the verifier whose S256 hash is the challenge,
+    // with the same redirect and scope; no device code was requested.
+    let requests = harness.identity.received_requests().await.unwrap();
+    assert!(requests
+        .iter()
+        .all(|request| !request.url.path().ends_with("/devicecode")));
+    let exchange = form_of(&requests[0]);
+    let field = |name: &str| form_field(&exchange, name);
+    use base64::Engine;
+    use sha2::Digest;
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(sha2::Sha256::digest(field("code_verifier").as_bytes()));
+    assert!(
+        challenge == query_value(&opened, "code_challenge"),
+        "the verifier does not match the challenge"
+    );
+    assert_eq!(field("redirect_uri"), redirect_uri);
+    assert_eq!(field("scope"), query_value(&opened, "scope"));
+
+    let stored = harness.stored(ALEX).expect("a stored credential");
+    assert_eq!(stored["refresh_token"], "canary-refresh-0002");
+    assert_eq!(
+        stored["download"]["access_token"],
+        "canary-download-access-0001"
+    );
+    harness.assert_no_canaries(&run);
+}
+
+#[tokio::test]
+async fn an_idle_connection_does_not_hold_up_the_answer() {
+    let harness = Harness::new().await;
+    mount_browser_login(
+        &harness,
+        json_response(200, graph_token("id-claims-preferred.json")),
+    )
+    .await;
+    let browser = ScriptedBrowser::new(&[
+        "<idle>",
+        "<idle>",
+        "/callback?code=canary-auth-code-0001&state={state}",
+    ]);
+    let run = harness
+        .run_with(&browser_login_args(&[]), with_browser(&browser))
+        .await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
+    // Served one at a time, each idle connection would hold the answer
+    // back for the 10-second read timeout: 20 seconds for the two, which
+    // the 20-second sign-in timeout would cut off first. Only the answer
+    // is timed, not the token exchange after it.
+    let answers = browser.timed_answers(1);
+    assert_eq!(answers.len(), 1, "{answers:?}");
+    let (status, answered) = &answers[0];
+    assert_eq!(status, "HTTP/1.1 200 OK");
+    assert!(*answered < Duration::from_secs(9), "{answered:?}");
+}
+
+#[tokio::test]
+async fn a_browser_that_does_not_open_leaves_the_printed_address_working() {
+    let harness = Harness::new().await;
+    mount_browser_login(
+        &harness,
+        json_response(200, graph_token("id-claims-preferred.json")),
+    )
+    .await;
+    let browser = std::sync::Arc::new(ScriptedBrowser {
+        visits: vec!["/callback?code=canary-auth-code-0001&state={state}".into()],
+        fail_open: true,
+        ..ScriptedBrowser::default()
+    });
+    let run = harness
+        .run_with(
+            &browser_login_args(&["--read-only"]),
+            with_browser(&browser),
+        )
+        .await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
+    let stderr = run.stderr();
+    assert!(
+        stderr.contains("warning: could not open the browser (no browser found)"),
+        "{stderr}"
+    );
+    assert!(
+        query_value(&browser.opened(), "scope").contains("/eDiscovery.Read.All "),
+        "{}",
+        browser.opened()
+    );
+    assert_eq!(browser.answers(1), ["HTTP/1.1 200 OK"]);
+    assert!(harness.stored(ALEX).is_some());
+    harness.assert_no_canaries(&run);
+}
+
+#[tokio::test]
+async fn a_refusal_in_the_browser_stores_nothing_and_redeems_nothing() {
+    let harness = Harness::new().await;
+    let browser = ScriptedBrowser::new(&[
+        "/callback?state={state}&error=access_denied&error_description=AADSTS65004%3A+User+declined",
+    ]);
+    let run = harness
+        .run_with(&browser_login_args(&[]), with_browser(&browser))
+        .await;
+    assert_eq!(run.outcome.exit_code, 1);
+    let stderr = run.stderr();
+    assert!(
+        stderr.contains("sign-in failed: the browser sign-in was refused: access_denied: AADSTS65004: User declined"),
+        "{stderr}"
+    );
+    assert_eq!(browser.answers(1), ["HTTP/1.1 400 Bad Request"]);
+    assert!(harness
+        .identity
+        .received_requests()
+        .await
+        .unwrap()
+        .is_empty());
+    harness.assert_store_empty();
+    assert!(!harness.account_file(ALEX).exists());
+}
+
+#[tokio::test]
+async fn a_refused_code_exchange_keeps_the_code_and_verifier_out_of_output() {
+    let harness = Harness::new().await;
+    mount_browser_login(&harness, RefusalQuotingTheExchange).await;
+    let browser = ScriptedBrowser::new(&["/callback?code=canary-auth-code-0001&state={state}"]);
+    let mut args = vec!["--json"];
+    args.extend(browser_login_args(&[]));
+    let run = harness.run_with(&args, with_browser(&browser)).await;
+    assert_eq!(run.outcome.exit_code, 1);
+    // The scan comes first, so that no failure message below can show a
+    // value the command failed to redact.
+    let requests = harness.identity.received_requests().await.unwrap();
+    let verifier = form_field(&form_of(&requests[0]), "code_verifier");
+    harness.assert_absent(&run, &[AUTH_CODE, verifier.as_str()]);
+    let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
+    assert!(
+        message.contains(
+            "redeeming the browser sign-in's authorization code failed with HTTP 400: \
+             invalid_grant: AADSTS70008"
+        ),
+        "{message}"
+    );
+    harness.assert_store_empty();
+    harness.assert_no_canaries(&run);
+}
+
+#[tokio::test]
+async fn a_browser_that_never_comes_back_times_out_and_stores_nothing() {
+    let harness = Harness::new().await;
+    // A browser that opens but never follows the redirect.
+    let browser = ScriptedBrowser::new(&[]);
+    let configure = with_browser(&browser);
+    let run = harness
+        .run_with(&browser_login_args(&[]), |env, captured| {
+            configure(env, captured);
+            env.browser_timeout = Duration::from_millis(300);
+        })
+        .await;
+    assert_eq!(run.outcome.exit_code, 1);
+    let stderr = run.stderr();
+    assert!(
+        stderr.contains("the browser sign-in did not finish within 0 seconds"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("leave out --browser"), "{stderr}");
+    assert!(harness
+        .identity
+        .received_requests()
+        .await
+        .unwrap()
+        .is_empty());
+    harness.assert_store_empty();
+}
+
+#[tokio::test]
+async fn browser_login_under_no_input_is_refused_before_the_browser_opens() {
+    let harness = Harness::new().await;
+    let browser = ScriptedBrowser::new(&[]);
+    let mut args = vec!["--no-input"];
+    args.extend(browser_login_args(&[]));
+    let run = harness.run_with(&args, with_browser(&browser)).await;
+    assert_eq!(run.outcome.exit_code, 1);
+    assert!(run.stderr().contains("--no-input"), "{}", run.stderr());
+    assert!(browser.opened.lock().unwrap().is_empty());
+    assert!(harness
+        .identity
+        .received_requests()
+        .await
+        .unwrap()
+        .is_empty());
+}

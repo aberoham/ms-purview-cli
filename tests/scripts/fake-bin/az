@@ -1,0 +1,583 @@
+#!/usr/bin/env python3
+"""A fake `az` for tests/scripts/create-purview-app-test.sh.
+
+It answers exactly the commands, options and JMESPath queries that
+contrib/create-purview-app.sh sends, from a JSON state file, and writes every
+change back so that a later read sees it. Any other command word, option,
+query or body field exits 99, so a change to the script that the fake does
+not know about fails the tests loudly. Writes are checked as Graph checks
+them: each endpoint takes only its own body fields, and a duplicate owner,
+assignment or grant is refused.
+
+Environment:
+  FAKE_AZ_STATE  path of the state file (read and rewritten on every call)
+  FAKE_AZ_LOG    path of the call log; each call appends its arguments as
+                 one JSON array, so argument boundaries are kept
+
+State keys: tenant, signed_in, users, groups, sps, apps, assignments,
+grants, next_id, page_size, next_link_base, new_sp_hidden_polls, faults,
+edits.
+  A fault {"match": <regex>, "nth": <1-based>, "kind": "timeout" |
+  "throttle" | "server" | "definite", "applied": <bool>} fires on the nth
+  call whose arguments, joined by spaces, match. With "applied" the change
+  takes effect before the failure.
+  An edit {"match", "nth", "target": "app" | "grant", "key": <appId or grant
+  id>, "set": {...}} changes that object just before the nth matching call,
+  as another administrator would.
+  A service principal with "hidden_polls": N is invisible to the next N
+  `ad sp show` calls.
+"""
+
+import json
+import os
+import re
+import sys
+import urllib.parse
+
+EDISCOVERY_APP_ID = "b26e684c-5068-4120-a679-64a5d2c909d9"
+EDISCOVERY_SCOPES = [["eDiscovery.Download.Read", "c78f9c7e-bb5c-4125-b69a-5594d2f4ffc2"]]
+DEFAULT_ROLE = "00000000-0000-0000-0000-000000000000"
+GRAPH = "https://graph.microsoft.com/v1.0"
+RRA_QUERY = (
+    "requiredResourceAccess[].[resourceAppId, join(',', resourceAccess[].join(':', [id, type]))]"
+)
+PAGED_QUERY = re.compile(
+    r"\[\[\['next', \"@odata\.nextLink\"\]\], value\[\]\.\['row', ([A-Za-z, ]+)\]\]\[\]"
+)
+
+FAULT_MESSAGES = {
+    "timeout": "ERROR: HTTPSConnectionPool(host='graph.microsoft.com', port=443): "
+    "Read timed out. (read timeout=60)",
+    "throttle": 'ERROR: Too Many Requests({"error":{"code":"TooManyRequests",'
+    '"message":"Too many requests."}})',
+    "server": 'ERROR: Service Unavailable({"error":{"code":"serviceNotAvailable",'
+    '"message":"Service unavailable."}})',
+    "definite": 'ERROR: Forbidden({"error":{"code":"Authorization_RequestDenied",'
+    '"message":"Insufficient privileges to complete the operation."}})',
+    # A server error over several lines, with a carriage return and a bell
+    # character to strip, and no final newline.
+    "multiline": 'ERROR: Bad Gateway({"error":{"code":"badGateway"}})\r\n'
+    "Second line of the error\a\nThird line of the error",
+}
+# Fault kinds whose message az writes without a final newline.
+NO_FINAL_NEWLINE = {"multiline"}
+
+# Command words, then (allowed options, required options).
+COMMANDS = {
+    ("account", "show"): ({"--query", "-o"}, set()),
+    ("ad", "signed-in-user", "show"): ({"--query", "-o"}, set()),
+    ("ad", "user", "show"): ({"--id", "--query", "-o"}, {"--id"}),
+    ("ad", "sp", "show"): ({"--id", "--query", "-o"}, {"--id"}),
+    ("ad", "sp", "list"): ({"--filter", "--query", "-o"}, {"--filter"}),
+    ("ad", "app", "show"): ({"--id", "--query", "-o"}, {"--id"}),
+    ("ad", "app", "list"): ({"--filter", "--query", "-o"}, {"--filter"}),
+    ("rest",): ({"--method", "--url", "--body", "--query", "-o"}, {"--method", "--url"}),
+}
+
+
+class AzError(Exception):
+    def __init__(self, message, code=1):
+        super().__init__(message)
+        self.message = message
+        self.code = code
+
+
+def graph_error(reason, code, message, exit_code=1):
+    body = json.dumps({"error": {"code": code, "message": message}})
+    return AzError(f"ERROR: {reason}({body})", exit_code)
+
+
+def not_found(what):
+    return graph_error("Not Found", "Request_ResourceNotFound", f"{what} does not exist.", 3)
+
+
+def unsupported(detail):
+    return AzError(f"fake az: unsupported {detail}", 99)
+
+
+def parse(argv):
+    words, options, i = [], {}, 0
+    while i < len(argv) and not argv[i].startswith("-"):
+        words.append(argv[i])
+        i += 1
+    command = COMMANDS.get(tuple(words))
+    if command is None:
+        raise unsupported(f"command words: {words}")
+    allowed, required = command
+    while i < len(argv):
+        option = argv[i]
+        if option not in allowed:
+            raise unsupported(f"option {option} for {' '.join(words)}")
+        if option in options:
+            raise unsupported(f"repeated option {option}")
+        if i + 1 >= len(argv):
+            raise unsupported(f"option without a value: {option}")
+        options[option] = argv[i + 1]
+        i += 2
+    missing = required - options.keys()
+    if missing:
+        raise unsupported(f"missing options {sorted(missing)}")
+    if options.get("-o", "json") not in ("tsv", "none"):
+        raise unsupported(f"output format: {options.get('-o')}")
+    return words, options
+
+
+def cell(value):
+    if isinstance(value, list):
+        return str(len(value))
+    if isinstance(value, dict):
+        return ""
+    return value if isinstance(value, str) else str(value)
+
+
+def tsv(result):
+    """Formats a result as knack's TSV output does."""
+    rows = result if isinstance(result, list) else [result]
+    lines = []
+    for row in rows:
+        if isinstance(row, list):
+            lines.append("\t".join(cell(value) for value in row))
+        elif isinstance(row, bool):
+            lines.append(str(row).lower())
+        else:
+            lines.append(cell(row))
+    return "".join(line + "\n" for line in lines)
+
+
+def rra_rows(app):
+    return [
+        [
+            entry["resourceAppId"],
+            ",".join(f"{access['id']}:{access['type']}" for access in entry["resourceAccess"]),
+        ]
+        for entry in app.get("requiredResourceAccess", [])
+    ]
+
+
+QUERIES = {
+    "id": lambda o: o["id"],
+    "tenantId": lambda o: o["tenantId"],
+    "[].id": lambda o: [x["id"] for x in o],
+    "[].appId": lambda o: [x["appId"] for x in o],
+    "[].[id, appRoleAssignmentRequired]": lambda o: [
+        [x["id"], x.get("appRoleAssignmentRequired", False)] for x in o
+    ],
+    "oauth2PermissionScopes[].[value, id]": lambda o: [list(s) for s in o.get("scopes", [])],
+    "[].[id, signInAudience, isFallbackPublicClient, displayName]": lambda o: [
+        [x["id"], x["signInAudience"], x.get("isFallbackPublicClient"), x["displayName"]] for x in o
+    ],
+    "publicClient.redirectUris": lambda o: o.get("publicClient", {}).get("redirectUris", []),
+    "appRoles[].id": lambda o: [role["id"] for role in o.get("appRoles", [])],
+    RRA_QUERY: rra_rows,
+    "[id, userPrincipalName]": lambda o: [o["id"], o["userPrincipalName"]],
+    "[id, displayName]": lambda o: [o["id"], o["displayName"]],
+    "[id, appId]": lambda o: [o["id"], o["appId"]],
+}
+
+
+def apply_query(query, result):
+    if query in QUERIES:
+        return QUERIES[query](result)
+    paged = PAGED_QUERY.fullmatch(query)
+    if paged and isinstance(result, dict) and "value" in result:
+        fields = paged.group(1).split(", ")
+        rows = [["next", result.get("@odata.nextLink")]]
+        rows += [["row"] + [item.get(field) for field in fields] for item in result["value"]]
+        return rows
+    raise unsupported(f"query: {query}")
+
+
+def emit(result, options):
+    if "--query" in options:
+        result = apply_query(options["--query"], result)
+    if options.get("-o") == "none":
+        return
+    sys.stdout.write(tsv(result))
+
+
+def new_id(state):
+    state["next_id"] = state.get("next_id", 0x60) + 1
+    return f"00000000-0000-4000-8000-{state['next_id']:012x}"
+
+
+def filter_value(options, key):
+    match = re.fullmatch(key + r" eq '([^']*)'", options["--filter"])
+    if not match:
+        raise unsupported(f"filter: {options['--filter']}")
+    return match.group(1)
+
+
+def sp_by_app_id(state, app_id):
+    for sp in state["sps"]:
+        if sp["appId"].lower() == app_id.lower():
+            return sp
+    return None
+
+
+def sp_by_object_id(state, object_id):
+    for sp in state["sps"]:
+        if sp["id"].lower() == object_id.lower():
+            return sp
+    return None
+
+
+def command_ad(state, words, options):
+    noun = words[1]
+    verb = words[2]
+    if noun == "signed-in-user":
+        return user_by(state, state["signed_in"])
+    if noun == "user":
+        return user_by(state, options["--id"])
+    if noun == "sp" and verb == "show":
+        sp = sp_by_app_id(state, options["--id"]) or sp_by_object_id(state, options["--id"])
+        if sp is None or sp.get("hidden_polls", 0) > 0:
+            if sp is not None:
+                sp["hidden_polls"] -= 1
+            raise AzError(f"ERROR: Service principal '{options['--id']}' doesn't exist", 3)
+        return sp
+    if noun == "sp":
+        app_id = filter_value(options, "appId").lower()
+        return [sp for sp in state["sps"] if sp["appId"].lower() == app_id]
+    if verb == "show":
+        app_id = options["--id"].lower()
+        for app in state["apps"]:
+            if app["appId"].lower() == app_id:
+                return app
+        raise AzError(f"ERROR: Resource '{options['--id']}' does not exist.", 3)
+    if options["--filter"].startswith("appId"):
+        app_id = filter_value(options, "appId").lower()
+        return [app for app in state["apps"] if app["appId"].lower() == app_id]
+    name = filter_value(options, "displayName")
+    return [app for app in state["apps"] if app["displayName"] == name]
+
+
+def user_by(state, key):
+    for user in state["users"]:
+        if key.lower() in (user["id"].lower(), user["userPrincipalName"].lower()):
+            return user
+    raise AzError(
+        f"ERROR: Resource '{key}' does not exist or one of its queried "
+        "reference-property objects are not present.",
+        3,
+    )
+
+
+def page(state, items, path, query):
+    """Returns one page of a collection, with a continuation link if more."""
+    size = state.get("page_size", 100)
+    start = int(query.pop("$skiptoken", ["0"])[0])
+    result = {"value": items[start : start + size]}
+    if start + size < len(items):
+        params = {key: values[0] for key, values in query.items()}
+        params["$skiptoken"] = str(start + size)
+        base = state.get("next_link_base", GRAPH)
+        encoded = urllib.parse.urlencode(params, quote_via=urllib.parse.quote, safe="$'")
+        result["@odata.nextLink"] = f"{base}{path}?{encoded}"
+    return result
+
+
+def rest_get(state, path, query):
+    if m := re.fullmatch(r"/applications/([^/]+)/owners", path):
+        if query.get("$select") != ["id"]:
+            raise unsupported(f"owners query: {query}")
+        owners = [{"id": owner} for owner in app_by_object(state, m.group(1)).get("owners", [])]
+        return page(state, owners, path, query)
+    if m := re.fullmatch(r"/servicePrincipals/([^/]+)/appRoleAssignedTo", path):
+        sp_id = m.group(1).lower()
+        items = [a for a in state["assignments"] if a["resourceId"].lower() == sp_id]
+        return page(state, items, path, query)
+    if path == "/oauth2PermissionGrants":
+        m = re.fullmatch(r"clientId eq '([^']*)'", query.get("$filter", [""])[0])
+        if not m:
+            raise unsupported(f"grant filter: {query}")
+        client = m.group(1).lower()
+        items = [g for g in state["grants"] if g["clientId"].lower() == client]
+        return page(state, items, path, query)
+    if m := re.fullmatch(r"/groups/([^/]+)", path):
+        for group in state.get("groups", []):
+            if group["id"].lower() == m.group(1).lower():
+                return group
+        raise not_found("Group")
+    raise unsupported(f"GET {path}")
+
+
+def app_by_object(state, object_id):
+    for app in state["apps"]:
+        if app["id"].lower() == object_id.lower():
+            return app
+    raise not_found("Application")
+
+
+def check_fields(body, required, allowed):
+    keys = set(body)
+    if not required <= keys or not keys <= allowed:
+        raise unsupported(f"body fields {sorted(keys)}")
+
+
+def principal_exists(state, principal_id):
+    ids = [u["id"] for u in state["users"]] + [g["id"] for g in state.get("groups", [])]
+    return principal_id.lower() in (i.lower() for i in ids)
+
+
+def post_service_principal(state, body):
+    check_fields(body, {"appId"}, {"appId", "appRoleAssignmentRequired"})
+    if sp_by_app_id(state, body["appId"]) is not None:
+        raise graph_error("Conflict", "Request_MultipleObjectsWithSameKeyValue", "already exists")
+    sp = {
+        "id": new_id(state),
+        "appId": body["appId"],
+        "appRoleAssignmentRequired": body.get("appRoleAssignmentRequired", False),
+        "scopes": EDISCOVERY_SCOPES if body["appId"] == EDISCOVERY_APP_ID else [],
+        "hidden_polls": state.get("new_sp_hidden_polls", 0),
+    }
+    state["sps"].append(sp)
+    return sp
+
+
+def post_application(state, body):
+    fields = {
+        "displayName",
+        "signInAudience",
+        "isFallbackPublicClient",
+        "publicClient",
+        "requiredResourceAccess",
+    }
+    check_fields(body, fields, fields)
+    check_fields(body["publicClient"], {"redirectUris"}, {"redirectUris"})
+    app = dict(body)
+    app.update({"id": new_id(state), "appId": new_id(state), "owners": [], "appRoles": []})
+    state["apps"].append(app)
+    return app
+
+
+def patch_application(state, object_id, body):
+    if not body:
+        raise unsupported("empty application update")
+    check_fields(body, set(), {"requiredResourceAccess", "isFallbackPublicClient", "publicClient"})
+    if "publicClient" in body:
+        check_fields(body["publicClient"], {"redirectUris"}, {"redirectUris"})
+    app_by_object(state, object_id).update(body)
+    return {}
+
+
+def post_owner(state, object_id, body):
+    check_fields(body, {"@odata.id"}, {"@odata.id"})
+    prefix = f"{GRAPH}/directoryObjects/"
+    if not body["@odata.id"].startswith(prefix):
+        raise unsupported(f"owner reference {body['@odata.id']}")
+    owner = body["@odata.id"][len(prefix) :]
+    app = app_by_object(state, object_id)
+    if owner.lower() in (o.lower() for o in app["owners"]):
+        raise graph_error(
+            "Bad Request",
+            "Request_BadRequest",
+            "One or more added object references already exist for the following "
+            "modified properties: 'owners'.",
+        )
+    app["owners"].append(owner)
+    return {}
+
+
+def patch_service_principal(state, object_id, body):
+    check_fields(body, {"appRoleAssignmentRequired"}, {"appRoleAssignmentRequired"})
+    sp = sp_by_object_id(state, object_id)
+    if sp is None:
+        raise not_found("Service principal")
+    sp.update(body)
+    return {}
+
+
+def post_assignment(state, object_id, body):
+    fields = {"principalId", "resourceId", "appRoleId"}
+    check_fields(body, fields, fields)
+    sp = sp_by_object_id(state, object_id)
+    if sp is None or body["resourceId"].lower() != object_id.lower():
+        raise not_found("Service principal")
+    if not principal_exists(state, body["principalId"]):
+        raise not_found("Principal")
+    app = next((a for a in state["apps"] if a["appId"] == sp["appId"]), {})
+    if body["appRoleId"] != DEFAULT_ROLE or app.get("appRoles"):
+        raise graph_error(
+            "Bad Request",
+            "Request_BadRequest",
+            "Permission being assigned was not found on application",
+        )
+    for existing in state["assignments"]:
+        if (
+            existing["resourceId"].lower() == object_id.lower()
+            and existing["principalId"].lower() == body["principalId"].lower()
+            and existing["appRoleId"] == body["appRoleId"]
+        ):
+            raise graph_error(
+                "Bad Request",
+                "Request_BadRequest",
+                "Permission being assigned already exists on the object",
+            )
+    assignment = dict(body)
+    assignment["id"] = new_id(state)
+    state["assignments"].append(assignment)
+    return assignment
+
+
+def check_scope(scope):
+    if len(scope) > 3850 or not re.fullmatch(r"[A-Za-z0-9._-]+( [A-Za-z0-9._-]+)*", scope):
+        raise graph_error("Bad Request", "Request_BadRequest", "Invalid value for scope")
+
+
+def post_grant(state, body):
+    base = {"clientId", "consentType", "resourceId", "scope"}
+    if body.get("consentType") == "Principal":
+        check_fields(body, base | {"principalId"}, base | {"principalId"})
+        if not principal_exists(state, body["principalId"]):
+            raise not_found("Principal")
+    elif body.get("consentType") == "AllPrincipals":
+        check_fields(body, base, base)
+    else:
+        raise unsupported(f"consentType {body.get('consentType')}")
+    if sp_by_object_id(state, body["clientId"]) is None:
+        raise not_found("Client service principal")
+    if sp_by_object_id(state, body["resourceId"]) is None:
+        raise not_found("Resource service principal")
+    check_scope(body["scope"])
+    for existing in state["grants"]:
+        same = all(
+            str(existing.get(key) or "").lower() == str(body.get(key) or "").lower()
+            for key in ("clientId", "resourceId", "consentType", "principalId")
+        )
+        if same:
+            raise graph_error("Conflict", "Request_Conflict", "Permission entry already exists.")
+    grant = {"principalId": None}
+    grant.update(body)
+    grant["id"] = f"grant{new_id(state)[-4:]}"
+    state["grants"].append(grant)
+    return grant
+
+
+def patch_grant(state, grant_id, body):
+    check_fields(body, {"scope"}, {"scope"})
+    check_scope(body["scope"])
+    for grant in state["grants"]:
+        if grant["id"] == grant_id:
+            grant.update(body)
+            return {}
+    raise not_found("Grant")
+
+
+def rest_write(state, method, path, body):
+    routes = [
+        ("POST", r"/servicePrincipals", lambda m: post_service_principal(state, body)),
+        ("POST", r"/applications", lambda m: post_application(state, body)),
+        ("PATCH", r"/applications/([^/]+)", lambda m: patch_application(state, m[1], body)),
+        ("POST", r"/applications/([^/]+)/owners/\$ref", lambda m: post_owner(state, m[1], body)),
+        (
+            "PATCH",
+            r"/servicePrincipals/([^/]+)",
+            lambda m: patch_service_principal(state, m[1], body),
+        ),
+        (
+            "POST",
+            r"/servicePrincipals/([^/]+)/appRoleAssignedTo",
+            lambda m: post_assignment(state, m[1], body),
+        ),
+        ("POST", r"/oauth2PermissionGrants", lambda m: post_grant(state, body)),
+        ("PATCH", r"/oauth2PermissionGrants/([^/]+)", lambda m: patch_grant(state, m[1], body)),
+    ]
+    for route_method, pattern, handler in routes:
+        match = re.fullmatch(pattern, path)
+        if route_method == method and match:
+            return handler(match)
+    raise unsupported(f"{method} {path}")
+
+
+def command_rest(state, options):
+    method = options["--method"]
+    url = urllib.parse.urlsplit(options["--url"])
+    if f"{url.scheme}://{url.netloc}/v1.0" != GRAPH or not url.path.startswith("/v1.0/"):
+        raise unsupported(f"URL: {options['--url']}")
+    path = urllib.parse.unquote(url.path[len("/v1.0") :])
+    query = urllib.parse.parse_qs(url.query)
+    if method == "GET":
+        if "--body" in options:
+            raise unsupported("GET with a body")
+        return rest_get(state, path, query)
+    if method not in ("POST", "PATCH") or "--body" not in options:
+        raise unsupported(f"{method} without a body")
+    body = json.loads(options["--body"])
+    if not isinstance(body, dict):
+        raise unsupported("body that is not an object")
+    return rest_write(state, method, path, body)
+
+
+def run(state, words, options):
+    if words[0] == "account":
+        if not state.get("tenant"):
+            raise AzError("ERROR: Please run 'az login' to setup account.")
+        return {"tenantId": state["tenant"]}
+    if words[0] == "ad":
+        return command_ad(state, words, options)
+    return command_rest(state, options)
+
+
+def nth_match(state, kind, index, rule, line):
+    if not re.search(rule["match"], line):
+        return False
+    counts = state.setdefault("counts", {})
+    key = f"{kind}{index}"
+    counts[key] = counts.get(key, 0) + 1
+    return counts[key] == rule.get("nth", 1)
+
+
+def apply_edits(state, line):
+    for index, edit in enumerate(state.get("edits", [])):
+        if not nth_match(state, "edit", index, edit, line):
+            continue
+        if edit["target"] == "app":
+            items = [a for a in state["apps"] if a["appId"] == edit["key"]]
+        else:
+            items = [g for g in state["grants"] if g["id"] == edit["key"]]
+        for item in items:
+            item.update(edit["set"])
+
+
+def fault_for(state, line):
+    for index, fault in enumerate(state.get("faults", [])):
+        if nth_match(state, "fault", index, fault, line):
+            return fault
+    return None
+
+
+def main():
+    argv = sys.argv[1:]
+    with open(os.environ["FAKE_AZ_LOG"], "a", encoding="utf-8") as log:
+        log.write(json.dumps(argv) + "\n")
+    line = " ".join(argv)
+    state_path = os.environ["FAKE_AZ_STATE"]
+    with open(state_path, encoding="utf-8") as handle:
+        state = json.load(handle)
+    status = 0
+    ending = "\n"
+    try:
+        words, options = parse(argv)
+        apply_edits(state, line)
+        fault = fault_for(state, line)
+        if fault is not None and fault["kind"] in NO_FINAL_NEWLINE:
+            ending = ""
+        if fault is not None and not fault.get("applied", False):
+            raise AzError(FAULT_MESSAGES[fault["kind"]])
+        result = run(state, words, options)
+        if fault is not None:
+            raise AzError(FAULT_MESSAGES[fault["kind"]])
+        emit(result, options)
+    except AzError as error:
+        sys.stderr.write(error.message + ending)
+        status = error.code
+    except (KeyError, IndexError, ValueError, TypeError, AttributeError) as error:
+        sys.stderr.write(f"fake az: malformed call: {error!r}\n")
+        status = 99
+    with open(state_path, "w", encoding="utf-8") as handle:
+        json.dump(state, handle, indent=1)
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main())

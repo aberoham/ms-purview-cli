@@ -766,21 +766,28 @@ fn store_login(
     registration: &LoginRegistration,
 ) -> Result<()> {
     config::account_file_path(dir, &record.email)?;
-    let first_sign_in = Credential::load(env.credentials.as_ref(), &record.email, &env.redactor)
-        .map(|existing| existing.is_none())
-        .unwrap_or(false);
-    fault(env, LoginWrite::Credential)
-        .and_then(|()| credential.save(env.credentials.as_ref()))
-        .map_err(|error| error.context("nothing from this sign-in was stored"))?;
+    let first_sign_in = check_key_owner(env, dir, record)?;
+    // The injected fault fires after the store has taken the write, as a
+    // macOS label failure or a Windows clean-up failure does.
+    if let Err(error) = credential
+        .save(env.credentials.as_ref())
+        .and_then(|()| fault(env, LoginWrite::Credential))
+    {
+        return Err(credential_write_failed(
+            env,
+            &record.email,
+            first_sign_in,
+            error,
+        ));
+    }
     if let Err(error) = fault(env, LoginWrite::AccountFile)
         .and_then(|()| config::save_account(dir, record, &env.redactor))
     {
         if first_sign_in {
-            // Best effort; the error reported is the account file's.
-            let _ = delete_value(env.credentials.as_ref(), &token_key(&record.email));
-            return Err(error.context(
-                "saving the account file; nothing from this sign-in was kept. Run 'purview \
-                 auth login' again",
+            return Err(remove_new_credential(
+                env,
+                &record.email,
+                error.context("saving the account file"),
             ));
         }
         return Err(error.context(
@@ -812,6 +819,85 @@ fn store_login(
                  again",
             )
         })
+}
+
+/// Refuses to store a sign-in under a key that another identity owns: an
+/// account file or a credential under the key that records a different
+/// `tid` or `oid`. An address can be reassigned, or a rename can land on a
+/// key another stored account holds; either way the key keeps its owner
+/// until `auth logout` frees it. Returns whether nothing at all is stored
+/// under the key (a first sign-in).
+fn check_key_owner(env: &mut Env, dir: &Path, record: &AccountRecord) -> Result<bool> {
+    let accounts = config::list_accounts(dir, &mut env.stderr)?;
+    let file_owner = accounts
+        .iter()
+        .find(|account| account.email.eq_ignore_ascii_case(&record.email));
+    let file_differs = file_owner.is_some_and(|owner| {
+        !owner.oid.eq_ignore_ascii_case(&record.oid)
+            || !owner.tenant_id.eq_ignore_ascii_case(&record.tenant_id)
+    });
+    let stored =
+        Credential::stored_principal(env.credentials.as_ref(), &record.email, &env.redactor)?;
+    // A credential that records no principal predates the stamp; its owner
+    // is whatever the account file says.
+    let credential_differs = stored.as_ref().is_some_and(|(tid, oid)| {
+        !tid.is_empty()
+            && !oid.is_empty()
+            && (!tid.eq_ignore_ascii_case(&record.tenant_id)
+                || !oid.eq_ignore_ascii_case(&record.oid))
+    });
+    if file_differs || credential_differs {
+        let key = sanitize(&record.email);
+        return Err(PurviewError::message(format!(
+            "the account key {key} belongs to another identity: a different tenant or object id \
+             is stored under it, so nothing was stored. If that address now belongs to the \
+             identity that just signed in, run 'purview auth logout --account {key}' to free the \
+             key, then sign in again"
+        )));
+    }
+    Ok(file_owner.is_none() && stored.is_none())
+}
+
+/// After a credential write that reported a failure: the write may still
+/// have taken effect, so what is under the key is read back. On a first
+/// sign-in a credential found there is removed again; one that cannot be
+/// removed is reported with the logout command that removes it.
+fn credential_write_failed(
+    env: &Env,
+    email: &str,
+    first_sign_in: bool,
+    error: PurviewError,
+) -> PurviewError {
+    let error = error.context("storing the tokens");
+    if !first_sign_in {
+        return error.context(
+            "the stored credential may or may not have been replaced; the account file still \
+             describes the previous sign-in. Run 'purview auth login' again",
+        );
+    }
+    match crate::secrets::find_value(env.credentials.as_ref(), &token_key(email)) {
+        Ok(None) => error.context("nothing from this sign-in was stored"),
+        Ok(Some(_)) | Err(_) => remove_new_credential(env, email, error),
+    }
+}
+
+/// Removes the credential a first sign-in wrote before it failed. If the
+/// removal fails too, the error says how to remove it: `auth logout
+/// --account <key>` removes a credential that has no account file.
+fn remove_new_credential(env: &Env, email: &str, error: PurviewError) -> PurviewError {
+    match delete_value(env.credentials.as_ref(), &token_key(email)) {
+        Ok(()) => {
+            error.context("nothing from this sign-in was kept; run 'purview auth login' again")
+        }
+        Err(removal) => {
+            let key = sanitize(email);
+            error.context(format!(
+                "the new tokens may still be in the credential store, and removing them failed \
+                 ({}); run 'purview auth logout --account {key}' to remove them",
+                sanitize(&removal.to_string())
+            ))
+        }
+    }
 }
 
 /// The failure a test asked `Env` to inject at this write, if any.
@@ -1051,6 +1137,14 @@ async fn auth_refresh(env: &mut Env, output: &OutputOptions, globals: &Globals) 
             ))
         })?;
     check_registration(&credential, &account, stored.client(&account.email))?;
+    if !credential.belongs_to(&account.tenant_id, &account.oid) {
+        let key = sanitize(&account.email);
+        return Err(PurviewError::message(format!(
+            "the tokens stored for {key} belong to another identity than its account file \
+             records, so nothing was sent; run 'purview auth login --account {key}' again, or \
+             'purview auth logout --account {key}' to free the key"
+        )));
+    }
     let provider = StoredTokenProvider::new(
         &IdentityEndpoint {
             base: env.identity_base.clone(),
@@ -1126,8 +1220,24 @@ fn auth_logout(env: &mut Env, output: &OutputOptions, globals: &Globals) -> Resu
     let dir = configuration_dir(env)?;
     let stored = load_config(env, &dir)?;
     let accounts = config::list_accounts(&dir, &mut env.stderr)?;
-    let account = select_account(&stored, &accounts, globals.account.as_deref())?;
-    let email = account.email;
+    let email = match select_account(&stored, &accounts, globals.account.as_deref()) {
+        Ok(account) => account.email,
+        // A credential with no account file (left by a sign-in that failed
+        // part way) can still be removed by naming its key.
+        Err(error) => match globals.account.as_deref() {
+            Some(requested)
+                if matching_accounts(&accounts, requested)?.is_empty()
+                    && crate::secrets::find_value(
+                        env.credentials.as_ref(),
+                        &token_key(requested),
+                    )?
+                    .is_some() =>
+            {
+                requested.to_ascii_lowercase()
+            }
+            _ => return Err(error),
+        },
+    };
     // Checked before anything is removed.
     config::account_file_path(&dir, &email)?;
     delete_value(env.credentials.as_ref(), &token_key(&email)).map_err(|error| {

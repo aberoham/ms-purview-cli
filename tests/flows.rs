@@ -1116,16 +1116,58 @@ async fn refresh_clients(harness: &Harness) -> Vec<String> {
 
 #[tokio::test]
 async fn a_re_sign_in_through_a_new_registration_that_fails_at_the_credential_keeps_the_old() {
+    // The store refuses the write outright: the first sign-in is intact,
+    // and refresh uses its registration.
     let harness = Harness::new().await;
     sign_in_alex(&harness).await;
-    let run = login_with_fault(&harness, LoginWrite::Credential, OTHER_CLIENT).await;
+    mount_login(
+        &harness,
+        "id-claims-preferred.json",
+        json_response(200, fixture("token-download.json")),
+    )
+    .await;
+    harness.store.fail_writes(true);
+    let run = harness
+        .run(&[
+            "auth",
+            "login",
+            "--client-id",
+            OTHER_CLIENT,
+            "--tenant-id",
+            TENANT_ID,
+        ])
+        .await;
+    harness.store.fail_writes(false);
+    harness.identity.reset().await;
     assert_eq!(run.outcome.exit_code, 1);
     assert_eq!(harness.stored(ALEX).unwrap()["client_id"], CLIENT_ID);
-    // Everything still names the first registration, and refresh uses it.
     mount_any_refresh(&harness).await;
     let refresh = harness.run(&["auth", "refresh"]).await;
     assert_eq!(refresh.outcome.exit_code, 0, "{}", refresh.stderr());
     assert_eq!(refresh_clients(&harness).await, [CLIENT_ID, CLIENT_ID]);
+
+    // The write takes effect and then reports a failure: the new tokens
+    // are in place, the account file still names the old registration, and
+    // refresh refuses rather than mixing them.
+    let harness = Harness::new().await;
+    sign_in_alex(&harness).await;
+    let run = login_with_fault(&harness, LoginWrite::Credential, OTHER_CLIENT).await;
+    assert_eq!(run.outcome.exit_code, 1);
+    assert!(
+        run.stderr().contains("may or may not have been replaced"),
+        "{}",
+        run.stderr()
+    );
+    assert_eq!(harness.stored(ALEX).unwrap()["client_id"], OTHER_CLIENT);
+    mount_any_refresh(&harness).await;
+    let refresh = harness.run(&["auth", "refresh"]).await;
+    assert_eq!(refresh.outcome.exit_code, 1);
+    assert!(
+        refresh.stderr().contains("its account file"),
+        "{}",
+        refresh.stderr()
+    );
+    assert!(refresh_clients(&harness).await.is_empty());
 }
 
 #[tokio::test]
@@ -1468,46 +1510,6 @@ async fn a_name_that_matches_no_stored_account_needs_the_same_key_or_upn() {
 }
 
 #[tokio::test]
-async fn a_stalled_poll_with_time_left_is_a_transport_failure() {
-    let harness = Harness::new().await;
-    Mock::given(method("POST"))
-        .and(path(token_path("devicecode")))
-        .respond_with(json_response(200, fixture("device-code.json")))
-        .mount(&harness.identity)
-        .await;
-    Mock::given(method("POST"))
-        .and(path(token_path("token")))
-        .respond_with(
-            json_response(400, fixture("authorization-pending.json"))
-                .set_delay(Duration::from_secs(5)),
-        )
-        .mount(&harness.identity)
-        .await;
-    let (mut env, captured) = harness.env();
-    env.identity_timeout = Duration::from_millis(200);
-    let outcome = ms_purview_cli::cli::execute_with(
-        env,
-        [
-            "purview",
-            "auth",
-            "login",
-            "--client-id",
-            CLIENT_ID,
-            "--tenant-id",
-            TENANT_ID,
-        ],
-    )
-    .await;
-    assert_eq!(outcome.exit_code, 1);
-    let stderr = captured.stderr.text();
-    assert!(
-        stderr.contains("could not reach the identity platform: the request timed out"),
-        "{stderr}"
-    );
-    assert!(!stderr.contains("expired"), "{stderr}");
-}
-
-#[tokio::test]
 async fn a_permission_change_error_names_no_scope_even_with_an_escaped_canary() {
     // A rotated refresh token with a backslash, which JSON escapes, also
     // reflected in the scope the response claims.
@@ -1566,4 +1568,365 @@ async fn an_explicit_blank_select_is_an_error_and_an_empty_variable_is_unset() {
     let outcome = ms_purview_cli::cli::execute_with(env, ["purview", "auth", "list"]).await;
     assert_eq!(outcome.exit_code, 0);
     assert_eq!(captured.stdout.text(), format!("{ALEX}\tAlex Wilber\t*\n"));
+}
+
+/// Signs in with the given claims, replacing `tid` and `oid` as asked.
+async fn mount_login_as(harness: &Harness, claims_fixture: &str, edit: impl Fn(&mut Value)) {
+    let mut claims = fixture(claims_fixture);
+    edit(&mut claims);
+    let encode = |value: &Value| {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.to_string())
+    };
+    let mut body = fixture("token-graph.json");
+    body["id_token"] = Value::from(format!(
+        "{}.{}.",
+        encode(&serde_json::json!({"alg": "none"})),
+        encode(&claims)
+    ));
+    Mock::given(method("POST"))
+        .and(path(token_path("devicecode")))
+        .respond_with(json_response(200, fixture("device-code.json")))
+        .mount(&harness.identity)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(token_path("token")))
+        .and(Form::new(&[(
+            "grant_type",
+            "urn:ietf:params:oauth:grant-type:device_code",
+        )]))
+        .respond_with(json_response(200, body))
+        .mount(&harness.identity)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(token_path("token")))
+        .and(Form::new(&[("grant_type", "refresh_token")]))
+        .respond_with(json_response(200, fixture("token-download.json")))
+        .mount(&harness.identity)
+        .await;
+}
+
+/// What a refused sign-in must leave: every account's file and credential
+/// exactly as before.
+struct Snapshot(Vec<(String, Vec<u8>, Value)>);
+
+impl Snapshot {
+    fn take(harness: &Harness, emails: &[&str]) -> Self {
+        Self(
+            emails
+                .iter()
+                .map(|email| {
+                    (
+                        (*email).to_owned(),
+                        std::fs::read(harness.account_file(email)).unwrap(),
+                        harness.stored(email).unwrap(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn assert_unchanged(&self, harness: &Harness) {
+        for (email, file, credential) in &self.0 {
+            assert_eq!(
+                &std::fs::read(harness.account_file(email)).unwrap(),
+                file,
+                "{email}"
+            );
+            assert_eq!(&harness.stored(email).unwrap(), credential, "{email}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_key_owned_by_another_object_id_is_refused_before_any_write() {
+    let harness = Harness::new().await;
+    sign_in_alex(&harness).await;
+    let before = Snapshot::take(&harness, &[ALEX]);
+    // The address was reassigned: same key, same registration, another oid.
+    mount_login_as(&harness, "id-claims-preferred.json", |claims| {
+        claims["oid"] = "00000000-0000-4000-8000-000000000099".into();
+    })
+    .await;
+    let run = harness.run(&["--json", "auth", "login"]).await;
+    assert_eq!(run.outcome.exit_code, 1);
+    let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
+    assert!(message.contains("belongs to another identity"), "{message}");
+    assert!(
+        message.contains(&format!("purview auth logout --account {ALEX}")),
+        "{message}"
+    );
+    before.assert_unchanged(&harness);
+    // Even with the account-file write set to fail, as in the sequence that
+    // once left the other identity's tokens under this key, nothing changes.
+    let run = login_with_fault_as(&harness, LoginWrite::AccountFile, |claims| {
+        claims["oid"] = "00000000-0000-4000-8000-000000000099".into();
+    })
+    .await;
+    assert_eq!(run.outcome.exit_code, 1);
+    before.assert_unchanged(&harness);
+    // The first identity's tokens still refresh, through its own token.
+    harness.identity.reset().await;
+    mount_refresh(
+        &harness,
+        "canary-refresh-0002",
+        json_response(
+            200,
+            token(
+                "canary-graph-access-0002",
+                "canary-refresh-0003",
+                "https://graph.microsoft.com/eDiscovery.ReadWrite.All openid profile",
+            ),
+        ),
+        "canary-refresh-0003",
+        json_response(200, fixture("token-download.json")),
+    )
+    .await;
+    let refresh = harness.run(&["auth", "refresh"]).await;
+    assert_eq!(refresh.outcome.exit_code, 0, "{}", refresh.stderr());
+    harness.identity.reset().await;
+    mount_login_as(&harness, "id-claims-preferred.json", |claims| {
+        claims["oid"] = "00000000-0000-4000-8000-000000000099".into();
+    })
+    .await;
+    // Logging out frees the key, and the new identity can then sign in.
+    harness.run(&["auth", "logout", "--account", ALEX]).await;
+    let run = harness.run(&["auth", "login"]).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
+    assert_eq!(
+        harness.stored(ALEX).unwrap()["oid"],
+        "00000000-0000-4000-8000-000000000099"
+    );
+}
+
+#[tokio::test]
+async fn a_key_owned_by_the_same_object_id_in_another_tenant_is_refused() {
+    let harness = Harness::new().await;
+    sign_in_alex(&harness).await;
+    let before = Snapshot::take(&harness, &[ALEX]);
+    mount_login_as(&harness, "id-claims-preferred.json", |claims| {
+        claims["tid"] = "00000000-0000-4000-8000-000000000098".into();
+    })
+    .await;
+    // The id token names another tenant; the sign-in endpoint is the same.
+    let run = harness.run(&["auth", "login"]).await;
+    assert_eq!(run.outcome.exit_code, 1);
+    assert!(
+        run.stderr().contains("belongs to another identity"),
+        "{}",
+        run.stderr()
+    );
+    before.assert_unchanged(&harness);
+}
+
+#[tokio::test]
+async fn a_rename_onto_a_key_another_account_holds_is_refused_and_keeps_both() {
+    let harness = Harness::new().await;
+    sign_in_alex(&harness).await;
+    sign_in_sam_too(&harness).await;
+    let before = Snapshot::take(&harness, &[ALEX, "sam.taylor@contoso.example"]);
+    // Alex, asked for by key and recognised by tid and oid, now has Sam's
+    // address as preferred_username.
+    mount_login_as(&harness, "id-claims-preferred.json", |claims| {
+        claims["preferred_username"] = "sam.taylor@contoso.example".into();
+        claims["upn"] = "sam.taylor@contoso.example".into();
+    })
+    .await;
+    let run = harness.run(&["auth", "login", "--account", ALEX]).await;
+    assert_eq!(run.outcome.exit_code, 1);
+    assert!(
+        run.stderr()
+            .contains("the account key sam.taylor@contoso.example belongs to another identity"),
+        "{}",
+        run.stderr()
+    );
+    before.assert_unchanged(&harness);
+}
+
+#[tokio::test]
+async fn a_rename_onto_a_free_key_signs_in_under_the_new_key() {
+    let harness = Harness::new().await;
+    sign_in_alex(&harness).await;
+    mount_login_as(&harness, "id-claims-preferred.json", |claims| {
+        claims["preferred_username"] = "alex.renamed@contoso.example".into();
+    })
+    .await;
+    let run = harness
+        .run(&["--json", "auth", "login", "--account", ALEX])
+        .await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
+    assert_eq!(
+        run.json()["results"]["account"],
+        "alex.renamed@contoso.example"
+    );
+    let renamed = harness.stored("alex.renamed@contoso.example").unwrap();
+    assert_eq!(renamed["oid"], "00000000-0000-4000-8000-000000000011");
+    assert!(harness
+        .account_file("alex.renamed@contoso.example")
+        .exists());
+}
+
+#[tokio::test]
+async fn refresh_refuses_tokens_of_another_object_id_than_the_account_file() {
+    let harness = Harness::new().await;
+    sign_in_alex(&harness).await;
+    // A re-login under the same key and registration by another identity,
+    // as an older release could have stored it: the credential's principal
+    // differs from the account file's.
+    let key = format!("purview:token:{ALEX}");
+    let mut credential = harness.stored(ALEX).unwrap();
+    credential["oid"] = "00000000-0000-4000-8000-000000000099".into();
+    ms_purview_cli::secrets::store_value(harness.store.as_ref(), &key, &credential.to_string())
+        .unwrap();
+    mount_any_refresh(&harness).await;
+    let run = harness
+        .run(&["--json", "auth", "refresh", "--account", ALEX])
+        .await;
+    assert_eq!(run.outcome.exit_code, 1);
+    let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
+    assert!(message.contains("belong to another identity"), "{message}");
+    assert!(refresh_clients(&harness).await.is_empty());
+    harness.assert_no_canaries(&run);
+}
+
+#[tokio::test]
+async fn a_first_sign_in_whose_credential_write_commits_then_fails_keeps_nothing() {
+    let harness = Harness::new().await;
+    let run = login_with_fault(&harness, LoginWrite::Credential, CLIENT_ID).await;
+    assert_eq!(run.outcome.exit_code, 1);
+    assert!(
+        run.stderr().contains("nothing from this sign-in was kept"),
+        "{}",
+        run.stderr()
+    );
+    harness.assert_store_empty();
+}
+
+#[tokio::test]
+async fn a_credential_that_cannot_be_removed_after_a_failed_sign_in_is_named_for_logout() {
+    for write in [LoginWrite::Credential, LoginWrite::AccountFile] {
+        let harness = Harness::new().await;
+        harness.store.fail_deletes(true);
+        let run = login_with_fault(&harness, write, CLIENT_ID).await;
+        harness.store.fail_deletes(false);
+        assert_eq!(run.outcome.exit_code, 1, "{write:?}");
+        let stderr = run.stderr();
+        assert!(
+            stderr.contains("removing them failed"),
+            "{write:?}: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("purview auth logout --account {ALEX}")),
+            "{stderr}"
+        );
+        assert_eq!(harness.credentials(), [ALEX], "{write:?}");
+        assert!(!harness.account_file(ALEX).exists());
+        // Logout removes a credential that has no account file.
+        let logout = harness.run(&["auth", "logout", "--account", ALEX]).await;
+        assert_eq!(logout.outcome.exit_code, 0, "{}", logout.stderr());
+        harness.assert_store_empty();
+    }
+}
+
+#[tokio::test]
+async fn the_device_code_and_client_timers_are_told_apart() {
+    // The client's own timeout is shorter than the time the code has left:
+    // the poll endpoint is reached and the failure is a transport one.
+    let harness = Harness::new().await;
+    Mock::given(method("POST"))
+        .and(path(token_path("devicecode")))
+        .respond_with(json_response(200, fixture("device-code.json")))
+        .mount(&harness.identity)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(token_path("token")))
+        .respond_with(
+            json_response(400, fixture("authorization-pending.json"))
+                .set_delay(Duration::from_secs(3)),
+        )
+        .expect(1)
+        .mount(&harness.identity)
+        .await;
+    let (mut env, captured) = harness.env();
+    env.identity_timeout = Duration::from_millis(300);
+    let outcome = ms_purview_cli::cli::execute_with(
+        env,
+        [
+            "purview",
+            "auth",
+            "login",
+            "--client-id",
+            CLIENT_ID,
+            "--tenant-id",
+            TENANT_ID,
+        ],
+    )
+    .await;
+    assert_eq!(outcome.exit_code, 1);
+    let stderr = captured.stderr.text();
+    assert!(stderr.contains("enter the code CNTSO0001"), "{stderr}");
+    assert!(
+        stderr.contains("could not reach the identity platform: the request timed out"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("expired"), "{stderr}");
+    drop(harness);
+
+    // The code has one second left and the client would wait ten: only the
+    // device-code deadline can end the stalled poll.
+    let harness = Harness::new().await;
+    let mut code = fixture("device-code.json");
+    code["expires_in"] = 6.into();
+    Mock::given(method("POST"))
+        .and(path(token_path("devicecode")))
+        .respond_with(json_response(200, code))
+        .mount(&harness.identity)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(token_path("token")))
+        .respond_with(
+            json_response(400, fixture("authorization-pending.json"))
+                .set_delay(Duration::from_secs(3)),
+        )
+        .expect(1)
+        .mount(&harness.identity)
+        .await;
+    let (mut env, captured) = harness.env();
+    env.identity_timeout = Duration::from_secs(10);
+    let started = std::time::Instant::now();
+    let outcome = ms_purview_cli::cli::execute_with(
+        env,
+        [
+            "purview",
+            "auth",
+            "login",
+            "--client-id",
+            CLIENT_ID,
+            "--tenant-id",
+            TENANT_ID,
+        ],
+    )
+    .await;
+    assert_eq!(outcome.exit_code, 1);
+    let stderr = captured.stderr.text();
+    assert!(stderr.contains("the device code expired"), "{stderr}");
+    assert!(!stderr.contains("could not reach"), "{stderr}");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+/// `auth login` with the given claim edits and one write made to fail.
+async fn login_with_fault_as(
+    harness: &Harness,
+    write: LoginWrite,
+    edit: impl Fn(&mut Value),
+) -> Run {
+    mount_login_as(harness, "id-claims-preferred.json", edit).await;
+    let (mut env, captured) = harness.env();
+    env.login_write_fault = Some(write);
+    let outcome = ms_purview_cli::cli::execute_with(env, ["purview", "auth", "login"]).await;
+    Run { outcome, captured }
 }

@@ -2548,19 +2548,17 @@ async fn an_idle_connection_does_not_hold_up_the_answer() {
         "<idle>",
         "/callback?code=canary-auth-code-0001&state={state}",
     ]);
-    let started = std::time::Instant::now();
     let run = harness
         .run_with(&browser_login_args(&[]), with_browser(&browser))
         .await;
     assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
-    // Served one at a time, each idle connection would hold the answer
-    // back for the 10-second read timeout: 20 seconds for the two.
-    assert!(
-        started.elapsed() < Duration::from_secs(15),
-        "{:?}",
-        started.elapsed()
-    );
     assert_eq!(browser.answers(1), ["HTTP/1.1 200 OK"]);
+    // Served one at a time, each idle connection would hold the answer
+    // back for the 10-second read timeout: 20 seconds for the two, which
+    // the 20-second sign-in timeout would cut off first. Only the answer
+    // is timed, not the token exchange after it.
+    let answered = browser.answer_times.lock().unwrap()[0];
+    assert!(answered < Duration::from_secs(9), "{answered:?}");
 }
 
 #[tokio::test]

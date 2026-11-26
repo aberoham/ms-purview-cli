@@ -345,6 +345,8 @@ pub struct ScriptedBrowser {
     pub stderr: Mutex<Option<ms_purview_cli::env::SharedBuffer>>,
     pub opened: Mutex<Vec<url::Url>>,
     pub answers: Arc<Mutex<Vec<String>>>,
+    /// How long after the browser opened each answer arrived.
+    pub answer_times: Arc<Mutex<Vec<Duration>>>,
 }
 
 impl ScriptedBrowser {
@@ -396,6 +398,8 @@ impl BrowserOpener for ScriptedBrowser {
         let state = query_value(url, "state");
         let visits = self.visits.clone();
         let answers = self.answers.clone();
+        let answer_times = self.answer_times.clone();
+        let opened_at = std::time::Instant::now();
         let play = move || {
             let mut idle = Vec::new();
             for visit in visits {
@@ -422,6 +426,7 @@ impl BrowserOpener for ScriptedBrowser {
                     .lock()
                     .unwrap()
                     .push(answer.lines().next().unwrap_or_default().to_owned());
+                answer_times.lock().unwrap().push(opened_at.elapsed());
             }
         };
         if self.fail_open {
@@ -433,9 +438,12 @@ impl BrowserOpener for ScriptedBrowser {
                 .expect("a fail_open browser watches the command's stderr");
             std::thread::spawn(move || {
                 let deadline = std::time::Instant::now() + Duration::from_secs(10);
-                while !stderr.text().contains("could not open the browser")
-                    && std::time::Instant::now() < deadline
-                {
+                // Without the warning there is no visit, and the command's
+                // own timeout fails the test.
+                while !stderr.text().contains("could not open the browser") {
+                    if std::time::Instant::now() > deadline {
+                        return;
+                    }
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 play();

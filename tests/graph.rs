@@ -1225,6 +1225,34 @@ mod polling {
     }
 
     #[tokio::test]
+    async fn ctrl_c_between_a_read_and_the_sleep_ends_the_wait_before_sleeping() {
+        let server = MockServer::start().await;
+        answer(&server, 1, None, status("running")).await;
+        let setup = setup(&server);
+        let interrupt = ManualInterrupt::default();
+        let poller = Poller {
+            graph: &setup.client,
+            clock: setup.clock.as_ref(),
+            interrupt: &interrupt,
+            timing: Timing {
+                timeout: Duration::from_secs(3600),
+                interval: None,
+            },
+            not_found_grace: None,
+        };
+        let end = poller
+            .wait(&route(), &mut Vec::new(), &mut |_, _, _| interrupt.fire())
+            .await
+            .unwrap();
+        let PollEnd::Interrupted { last: Some(last) } = end else {
+            panic!("{end:?}");
+        };
+        assert_eq!(last.status.as_str(), "running");
+        assert!(setup.clock.sleeps().is_empty());
+        assert_eq!(requests(&server).await, 1);
+    }
+
+    #[tokio::test]
     async fn the_interval_steps_up_after_two_minutes() {
         let server = MockServer::start().await;
         answer(&server, 1, Some(14), status("running")).await;

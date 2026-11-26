@@ -1082,12 +1082,13 @@ struct InterruptingAnswer {
     body: Value,
     interrupt: Arc<ManualInterrupt>,
     reads: std::sync::atomic::AtomicUsize,
+    /// The read, counted from 0, that fires Ctrl-C while it is in flight.
+    fire_on: usize,
 }
 
 impl Respond for InterruptingAnswer {
-    /// The second read fires Ctrl-C while it is in flight.
     fn respond(&self, _request: &Request) -> ResponseTemplate {
-        if self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+        if self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == self.fire_on {
             self.interrupt.fire();
         }
         json_response(200, self.body.clone())
@@ -1105,6 +1106,7 @@ async fn ctrl_c_ends_the_wait_with_exit_130_and_the_resume_command() {
             body: fixture_value(&harness, "operation-estimate-running.json"),
             interrupt: interrupt.clone(),
             reads: Default::default(),
+            fire_on: 1,
         })
         .mount(&harness.graph)
         .await;
@@ -1124,6 +1126,39 @@ async fn ctrl_c_ends_the_wait_with_exit_130_and_the_resume_command() {
     );
     assert_eq!(requests(&harness).await.len(), 2);
     assert_eq!(sleeps_since(&harness, before), [Duration::from_secs(10)]);
+}
+
+#[tokio::test]
+async fn ctrl_c_during_the_first_read_abandons_it() {
+    let harness = signed_in().await;
+    let before = harness.clock.sleeps().len();
+    let interrupt = Arc::new(ManualInterrupt::default());
+    Mock::given(method("GET"))
+        .and(path(operation_path(ESTIMATE)))
+        .respond_with(InterruptingAnswer {
+            body: fixture_value(&harness, "operation-estimate-running.json"),
+            interrupt: interrupt.clone(),
+            reads: Default::default(),
+            fire_on: 0,
+        })
+        .mount(&harness.graph)
+        .await;
+    let run = harness
+        .run_with(&["operation", "get", CASE, ESTIMATE, "--wait"], |env, _| {
+            env.interrupt = interrupt.clone()
+        })
+        .await;
+    assert_eq!(run.outcome.exit_code, 130, "{}", run.stderr());
+    assert!(run.stdout().is_empty());
+    assert_eq!(
+        run.stderr(),
+        format!(
+            "interrupted after 0s; the service carries on running the operation. Operation \
+             {ESTIMATE} was not read yet. Resume with: purview operation get {CASE} {ESTIMATE} \
+             --wait\n"
+        )
+    );
+    assert!(sleeps_since(&harness, before).is_empty());
 }
 
 #[tokio::test]

@@ -87,18 +87,15 @@ impl CredentialLock {
             source,
         };
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| failed("create the folder for", error))?;
+            create_private_dir(parent).map_err(|error| failed("create the folder for", error))?;
         }
         let deadline = Instant::now() + wait;
         let file = loop {
-            match OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(path)
-            {
+            let mut options = OpenOptions::new();
+            options.create(true).truncate(false).read(true).write(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+            match options.open(path) {
                 Ok(file) => break file,
                 Err(error) if is_transient_open_error(&error) && Instant::now() < deadline => {
                     std::thread::sleep(LOCK_POLL);
@@ -121,6 +118,31 @@ impl CredentialLock {
                 Err(TryLockError::Error(error)) => return Err(failed("lock", error)),
             }
         }
+    }
+}
+
+/// Creates a lock folder and any missing parents with mode 0700, and narrows
+/// the folder itself to 0700 if it already exists more open. On macOS the
+/// local data directory is also the configuration directory, so a lock taken
+/// first would otherwise create `purview/` with the default mode. Windows has
+/// no modes and relies on the profile's access control list.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        let metadata = std::fs::metadata(dir)?;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
     }
 }
 
@@ -919,6 +941,29 @@ mod tests {
         assert_eq!(error.metadata(), ("CredentialLockBusy", 0));
         drop(holder);
         CredentialLock::acquire(&path, Duration::ZERO).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_folders_and_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let directory = tempfile::tempdir().unwrap();
+        // A first run: neither the app folder nor the lock folder exists.
+        let app = directory.path().join("purview");
+        let path = app.join("account-locks").join("key.lock");
+        drop(CredentialLock::acquire(&path, Duration::ZERO).unwrap());
+        assert_eq!(mode(&app), 0o700);
+        assert_eq!(mode(&app.join("account-locks")), 0o700);
+        assert_eq!(mode(&path), 0o600);
+        // A lock folder an earlier release left open is narrowed.
+        std::fs::set_permissions(
+            app.join("account-locks"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        drop(CredentialLock::acquire(&path, Duration::ZERO).unwrap());
+        assert_eq!(mode(&app.join("account-locks")), 0o700);
     }
 
     #[test]

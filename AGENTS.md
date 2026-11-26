@@ -37,8 +37,9 @@ search data, in code, fixtures, docs, commit messages or issues.
   published tree. `docs/reviews/` must not exist in the working tree.
 
 The public-data lint, `tests/fixture_lint.rs`, enforces these rules on
-`tests/`, `docs/`, `contrib/`, `src/`, `README.md`, `SKILL.md`, `AGENTS.md`
-and `CHANGELOG.md`. It refuses GUIDs that are neither synthetic nor allowed
+`tests/`, `docs/`, `contrib/`, `src/`, `.github/ISSUE_TEMPLATE/`,
+`README.md`, `SKILL.md`, `AGENTS.md`, `CHANGELOG.md`, `CONTRIBUTING.md` and
+`SECURITY.md`. It refuses GUIDs that are neither synthetic nor allowed
 Microsoft constants, email addresses outside `*.example`, URLs whose
 normalised host and path are not an allowed pair, absolute paths into a
 home directory, files it cannot read as UTF-8 text, and `docs/reviews/`.

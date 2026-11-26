@@ -1,7 +1,8 @@
 //! The public-data lint. This is a public repository, so tracked text may
 //! hold only synthetic data and well-known Microsoft constants. The lint
-//! scans `tests/`, `docs/`, `contrib/`, `src/`, `README.md`, `SKILL.md`,
-//! `AGENTS.md` and `CHANGELOG.md`, and fails on:
+//! scans `tests/`, `docs/`, `contrib/`, `src/`, `.github/ISSUE_TEMPLATE/`,
+//! `README.md`, `SKILL.md`, `AGENTS.md`, `CHANGELOG.md`, `CONTRIBUTING.md`
+//! and `SECURITY.md`, and fails on:
 //!
 //! - a globally unique identifier (GUID) that is neither synthetic
 //!   (`00000000-0000-4000-8000-0000000000NN`) nor an allowed Microsoft
@@ -29,8 +30,21 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const SCANNED_DIRECTORIES: &[&str] = &["tests/", "docs/", "contrib/", "src/"];
-const SCANNED_FILES: &[&str] = &["README.md", "SKILL.md", "AGENTS.md", "CHANGELOG.md"];
+const SCANNED_DIRECTORIES: &[&str] = &[
+    "tests/",
+    "docs/",
+    "contrib/",
+    "src/",
+    ".github/ISSUE_TEMPLATE/",
+];
+const SCANNED_FILES: &[&str] = &[
+    "README.md",
+    "SKILL.md",
+    "AGENTS.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+];
 
 /// Microsoft constants that may appear: the zero role id, the Microsoft
 /// Graph and Purview eDiscovery application ids, and published delegated

@@ -1,0 +1,32 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#security/cases/ediscoveryCases('00000000-0000-4000-8000-000000000031')/operations/$entity",
+  "@odata.type": "#microsoft.graph.security.ediscoverySearchExportOperation",
+  "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaa0002",
+  "action": "exportReport",
+  "status": "succeeded",
+  "percentProgress": 100,
+  "createdDateTime": "2026-01-02T10:30:00Z",
+  "completedDateTime": "2026-01-02T10:33:00Z",
+  "createdBy": {
+    "application": null,
+    "user": {
+      "displayName": "Alex Wilber",
+      "userPrincipalName": "alex.w@contoso.example",
+      "id": "00000000-0000-4000-8000-000000000011"
+    }
+  },
+  "resultInfo": null,
+  "displayName": "report 2026-01-02 1030Z",
+  "description": "",
+  "exportCriteria": "searchHits",
+  "exportLocation": "responsiveLocations",
+  "additionalOptions": "none",
+  "exportFormat": "pst",
+  "exportFileMetadata": [
+    {
+      "fileName": "Reports-report 2026-01-02 1030Z.zip",
+      "size": 482113,
+      "downloadUrl": "https://eur.proxyservice.ediscovery.svc.cloud.microsoft/ediscovery/api/proxy/exportaedblobFileResult?downloadType=Report"
+    }
+  ]
+}

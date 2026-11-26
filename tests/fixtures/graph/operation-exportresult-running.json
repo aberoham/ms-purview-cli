@@ -1,0 +1,26 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#security/cases/ediscoveryCases('00000000-0000-4000-8000-000000000031')/operations/$entity",
+  "@odata.type": "#microsoft.graph.security.ediscoverySearchExportOperation",
+  "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaa0003",
+  "action": "exportResult",
+  "status": "running",
+  "percentProgress": 0,
+  "createdDateTime": "2026-01-02T11:00:00Z",
+  "completedDateTime": "0001-01-01T00:00:00Z",
+  "createdBy": {
+    "application": null,
+    "user": {
+      "displayName": "Alex Wilber",
+      "userPrincipalName": "alex.w@contoso.example",
+      "id": "00000000-0000-4000-8000-000000000011"
+    }
+  },
+  "resultInfo": null,
+  "displayName": "export 2026-01-02 1100Z",
+  "description": "",
+  "exportCriteria": "searchHits",
+  "exportLocation": "responsiveLocations",
+  "additionalOptions": "teamsAndYammerConversations",
+  "exportFormat": "pst",
+  "exportFileMetadata": []
+}

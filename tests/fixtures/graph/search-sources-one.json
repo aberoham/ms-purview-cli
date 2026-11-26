@@ -1,0 +1,12 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#security/cases/ediscoveryCases('00000000-0000-4000-8000-000000000031')/searches('00000000-0000-4000-8000-000000000051')/additionalSources",
+  "value": [
+    {
+      "@odata.type": "#microsoft.graph.security.userSource",
+      "id": "00000000-0000-4000-8000-000000000061",
+      "displayName": "Sam Taylor",
+      "email": "sam.taylor@contoso.example",
+      "includedSources": "mailbox"
+    }
+  ]
+}

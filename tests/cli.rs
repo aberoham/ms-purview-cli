@@ -252,7 +252,33 @@ fn help_is_success_and_lists_exactly_the_shipped_commands() {
         .take_while(|line| !line.trim().is_empty())
         .filter_map(|line| line.split_whitespace().next())
         .collect();
-    assert_eq!(commands, ["auth", "version", "help"], "{text}");
+    assert_eq!(
+        commands,
+        ["auth", "case", "search", "operation", "version", "help"],
+        "{text}"
+    );
+}
+
+#[test]
+fn read_command_groups_list_exactly_their_shipped_commands() {
+    for group in ["case", "search", "operation"] {
+        let output = purview()
+            .args([group, "--help"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let text = String::from_utf8(output).unwrap();
+        let commands: Vec<&str> = text
+            .lines()
+            .skip_while(|line| *line != "Commands:")
+            .skip(1)
+            .take_while(|line| !line.trim().is_empty())
+            .filter_map(|line| line.split_whitespace().next())
+            .collect();
+        assert_eq!(commands, ["list", "get", "help"], "{group}: {text}");
+    }
 }
 
 #[test]

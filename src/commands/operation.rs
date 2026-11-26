@@ -1,0 +1,575 @@
+//! `operation list` and `operation get` (`docs/SPEC.md` section 3.5).
+
+use std::io::Write;
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde_json::{json, Value};
+
+use super::{case_id, date_text, time_text, warn_incomplete, warn_unreadable, Produced, Session};
+use crate::error::{PurviewError, Result};
+use crate::graph::GraphClient;
+use crate::model::valid::{CaseKey, PollTarget};
+use crate::model::wire::{
+    identity, Action, OperationDetail, OperationRecord, OperationStatus, Source,
+};
+use crate::output::{sanitize, write_fields, write_rows, OutputFormat};
+use crate::poll::{elapsed_text, PollEnd, Poller, Timing};
+use crate::routes::{CaseId, OperationId, Query, ReadRoute};
+
+/// Operations read at once by `operation list --resolve`.
+pub const RESOLVE_CONCURRENCY: usize = 4;
+
+pub const LIST_COLUMNS: &[&str] = &[
+    "ID",
+    "ACTION",
+    "STATUS",
+    "CREATED",
+    "COMPLETED",
+    "CREATED BY",
+    "ITEMS",
+    "FILES",
+];
+
+/// `--action` of `operation list`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ActionFilter {
+    #[default]
+    Any,
+    Estimate,
+    Report,
+    Export,
+}
+
+impl ActionFilter {
+    /// Whether the filter needs each operation read on its own: the list
+    /// shows a report and an export alike (Observed).
+    pub fn needs_resolve(self) -> bool {
+        matches!(self, Self::Report | Self::Export)
+    }
+
+    /// Whether an entry of the list could pass, before it is resolved.
+    fn may_admit(self, action: &Action) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Estimate => *action == Action::Estimate,
+            Self::Report | Self::Export => matches!(
+                action,
+                Action::ExportReport | Action::ExportResult | Action::ExportReportOrResult
+            ),
+        }
+    }
+
+    fn admits(self, action: &Action) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Estimate => *action == Action::Estimate,
+            Self::Report => *action == Action::ExportReport,
+            Self::Export => *action == Action::ExportResult,
+        }
+    }
+}
+
+/// The filters of `operation list`, already checked.
+#[derive(Debug, Clone, Default)]
+pub struct ListFilters {
+    pub action: ActionFilter,
+    /// A status as Graph spells it.
+    pub status: Option<String>,
+    pub resolve: bool,
+}
+
+/// A `--status` value: one of the documented statuses, ignoring case,
+/// returned as Graph spells it.
+pub fn status_filter(text: &str) -> Result<String> {
+    OperationStatus::KNOWN
+        .iter()
+        .find(|known| known.eq_ignore_ascii_case(text.trim()))
+        .map(|known| (*known).to_owned())
+        .ok_or_else(|| {
+            PurviewError::message(format!(
+                "--status must be one of {}",
+                OperationStatus::KNOWN.join(", ")
+            ))
+        })
+}
+
+/// One entry of the list, and where its record came from.
+struct Entry {
+    record: OperationRecord,
+    source: Source,
+}
+
+/// `operation list <case>`.
+pub async fn list(
+    session: &mut Session<'_>,
+    case: &CaseKey,
+    filters: &ListFilters,
+) -> Result<Produced> {
+    let case = case_id(&session.graph, case, &mut session.env.stderr).await?;
+    let listing = session
+        .graph
+        .list(
+            &ReadRoute::Operations(case),
+            &Query::new(),
+            &mut session.env.stderr,
+        )
+        .await?;
+    warn_incomplete(&mut session.env.stderr, "operation", &listing);
+    let total = listing.items.len();
+    let records: Vec<OperationRecord> = listing
+        .items
+        .into_iter()
+        .filter_map(OperationRecord::from_value)
+        .collect();
+    warn_unreadable(&mut session.env.stderr, "operation", total - records.len());
+    let status_admits = |record: &OperationRecord| {
+        filters
+            .status
+            .as_deref()
+            .is_none_or(|wanted| record.status.as_str() == wanted)
+    };
+    let mut entries: Vec<Entry> = records
+        .into_iter()
+        .filter(|record| status_admits(record))
+        .filter(|record| filters.action.may_admit(&record.action(Source::List)))
+        .map(|record| Entry {
+            record,
+            source: Source::List,
+        })
+        .collect();
+    if filters.resolve {
+        resolve(session, case, &mut entries).await?;
+        entries.retain(|entry| status_admits(&entry.record));
+    }
+    entries.retain(|entry| filters.action.admits(&entry.record.action(entry.source)));
+    warn_invalid_counts(
+        &mut session.env.stderr,
+        entries.iter().map(|entry| &entry.record),
+    );
+    if session.output.format == OutputFormat::Json {
+        let count = entries.len();
+        let raw: Vec<Value> = entries
+            .into_iter()
+            .map(|entry| {
+                let mut raw = entry.record.raw;
+                if let Value::Object(object) = &mut raw {
+                    object.insert("actionSource".into(), json!(entry.source.as_str()));
+                }
+                raw
+            })
+            .collect();
+        return Ok(Produced::success(Some(
+            session
+                .output
+                .untrusted_json_value(Value::Array(raw), count)?,
+        )));
+    }
+    let rows: Vec<Vec<String>> = entries
+        .iter()
+        .map(|entry| {
+            let record = &entry.record;
+            let detail = (entry.source == Source::Single)
+                .then(|| record.detail())
+                .flatten();
+            vec![
+                record.id.clone().unwrap_or_else(|| "?".to_owned()),
+                record.action(entry.source).label().to_owned(),
+                record.status.as_str().to_owned(),
+                date_text(record.created_date_time),
+                date_text(record.completed_date_time),
+                identity::shown(record.created_by.as_ref()),
+                match &detail {
+                    Some(OperationDetail::Estimate(estimate)) => estimate
+                        .indexed_item_count
+                        .map(|count| count.to_string())
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                },
+                detail
+                    .as_ref()
+                    .map(|detail| detail.files().len().to_string())
+                    .unwrap_or_default(),
+            ]
+        })
+        .collect();
+    write_rows(&mut session.env.stdout, session.output, LIST_COLUMNS, &rows)?;
+    if entries
+        .iter()
+        .any(|entry| entry.record.action(entry.source) == Action::ExportReportOrResult)
+    {
+        let _ = writeln!(
+            session.env.stderr,
+            "note: the operation list shows both item reports and exports as exportResult, so \
+             their ACTION reads exportResult?; --resolve reads each operation to tell them apart"
+        );
+    }
+    Ok(Produced::success(None))
+}
+
+/// Replaces each list entry with a single GET of the operation, at most
+/// `RESOLVE_CONCURRENCY` at a time. An entry without a valid id keeps its
+/// list record, with a warning. Any failed read fails the command.
+async fn resolve(session: &mut Session<'_>, case: CaseId, entries: &mut [Entry]) -> Result<()> {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(RESOLVE_CONCURRENCY));
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut unresolvable = 0;
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(id) = entry.record.id.as_deref().and_then(OperationId::parse) else {
+            unresolvable += 1;
+            continue;
+        };
+        let graph: Arc<GraphClient> = session.graph.clone();
+        let semaphore = semaphore.clone();
+        tasks.spawn(async move {
+            let _permit = semaphore.acquire_owned().await;
+            let mut log = Vec::new();
+            let read = graph
+                .get(&ReadRoute::Operation(case, id), &Query::new(), &mut log)
+                .await;
+            (index, read, log)
+        });
+    }
+    let mut results = Vec::new();
+    while let Some(joined) = tasks.join_next().await {
+        results.push(
+            joined.map_err(|error| PurviewError::message(format!("a read stopped: {error}")))?,
+        );
+    }
+    results.sort_by_key(|(index, _, _)| *index);
+    let mut failure = None;
+    for (index, read, log) in results {
+        session.env.stderr.write_all(&log)?;
+        match read.and_then(|body| {
+            OperationRecord::from_value(body).ok_or_else(|| {
+                PurviewError::message("Graph returned an operation that is not an object")
+            })
+        }) {
+            Ok(record) => {
+                entries[index] = Entry {
+                    record,
+                    source: Source::Single,
+                };
+            }
+            Err(error) => {
+                failure.get_or_insert(error);
+            }
+        }
+    }
+    if let Some(error) = failure {
+        return Err(error.context("resolving the operations"));
+    }
+    if unresolvable > 0 {
+        let _ = writeln!(
+            session.env.stderr,
+            "warning: {unresolvable} operations have no valid id and were not resolved"
+        );
+    }
+    Ok(())
+}
+
+fn warn_invalid_counts<'a>(
+    log: &mut dyn Write,
+    records: impl Iterator<Item = &'a OperationRecord>,
+) {
+    for record in records {
+        if !record.invalid_counts.is_empty() {
+            let _ = writeln!(
+                log,
+                "warning: operation {} has fields that are not counts ({}); they are shown as \
+                 unknown",
+                sanitize(record.id.as_deref().unwrap_or("?")),
+                record.invalid_counts.join(", ")
+            );
+        }
+    }
+}
+
+/// How `operation get` waits, if it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Wait {
+    pub timing: Timing,
+}
+
+/// `operation get <case> <op>`, and with `--wait`, until it finishes. A
+/// finished operation whose status is not `succeeded` exits 4; the
+/// deadline exits 5, and Ctrl-C 130 (`docs/SPEC.md` section 3.3).
+pub async fn get(
+    session: &mut Session<'_>,
+    case: &CaseKey,
+    operation: &OperationId,
+    wait: Option<Wait>,
+) -> Result<Produced> {
+    let case = case_id(&session.graph, case, &mut session.env.stderr).await?;
+    let route = ReadRoute::Operation(case, operation.clone());
+    let record = match wait {
+        None => {
+            let body = session
+                .graph
+                .get(&route, &Query::new(), &mut session.env.stderr)
+                .await?;
+            OperationRecord::from_value(body).ok_or_else(|| {
+                PurviewError::message("Graph returned an operation that is not an object")
+            })?
+        }
+        Some(wait) => {
+            let started = session.env.clock.elapsed();
+            let show_progress = session.env.stderr_is_terminal && !session.verbose;
+            let interrupt = session.env.interrupt.clone();
+            let clock = session.env.clock.clone();
+            let poller = Poller {
+                graph: &session.graph,
+                clock: clock.as_ref(),
+                interrupt: interrupt.as_ref(),
+                timing: wait.timing,
+                not_found_grace: None,
+            };
+            let shown_id = short_id(operation);
+            let mut progress =
+                |record: &OperationRecord, waited: Duration, log: &mut (dyn Write + Send)| {
+                    if show_progress {
+                        let _ = writeln!(
+                            log,
+                            "{} {shown_id}: {} · {}",
+                            sanitize(record.action(Source::Single).label()),
+                            sanitize(record.status.as_str()),
+                            elapsed_text(waited)
+                        );
+                    }
+                };
+            let end = poller
+                .wait(&route, &mut session.env.stderr, &mut progress)
+                .await?;
+            let waited = clock.elapsed().saturating_sub(started);
+            match end {
+                PollEnd::Finished(record) => record,
+                PollEnd::TimedOut { last } => {
+                    return stopped(session, case, operation, last, waited, false);
+                }
+                PollEnd::Interrupted { last } => {
+                    return stopped(session, case, operation, last, waited, true);
+                }
+            }
+        }
+    };
+    PollTarget::new(&record)?;
+    warn_invalid_counts(&mut session.env.stderr, std::iter::once(&record));
+    show(session, &record)
+}
+
+/// `3f2a…` for progress lines.
+fn short_id(operation: &OperationId) -> String {
+    let text = operation.to_string();
+    format!("{}…", &text[..8.min(text.len())])
+}
+
+/// The exit-4 reason for a finished operation that did not succeed, or
+/// `None` when it succeeded.
+fn incomplete_reason(record: &OperationRecord) -> Option<Value> {
+    let code = match &record.status {
+        OperationStatus::Succeeded => return None,
+        OperationStatus::PartiallySucceeded => "OperationPartiallySucceeded",
+        OperationStatus::Failed => "OperationFailed",
+        OperationStatus::SubmissionFailed => "OperationSubmissionFailed",
+        OperationStatus::NotStarted | OperationStatus::Running => return None,
+        OperationStatus::Missing | OperationStatus::Other(_) => "UnknownStatus",
+    };
+    let mut message = format!(
+        "the operation finished with status {}",
+        record.status.as_str()
+    );
+    if let Some(info) = &record.result_info {
+        let summary = info.summary();
+        if !summary.is_empty() {
+            message.push_str(": ");
+            message.push_str(&summary);
+        }
+    }
+    Some(json!({"code": code, "message": message}))
+}
+
+/// Prints the operation. JSON keeps Graph's record, `downloadUrl`
+/// included, and adds `collection: unchecked` for an estimate, report or
+/// export, whose collection check arrives with `--check`.
+fn show(session: &mut Session<'_>, record: &OperationRecord) -> Result<Produced> {
+    let action = record.action(Source::Single);
+    let collects = matches!(
+        action,
+        Action::Estimate | Action::ExportReport | Action::ExportResult
+    );
+    let reason = incomplete_reason(record);
+    let exit_code = if reason.is_some() { 4 } else { 0 };
+    if session.output.format == OutputFormat::Json {
+        let mut raw = record.raw.clone();
+        if let (true, Value::Object(object)) = (collects, &mut raw) {
+            object.insert("collection".into(), json!("unchecked"));
+        }
+        let document = match &reason {
+            None => session.output.untrusted_json_value(raw, 1)?,
+            // Exit 4 prints the whole envelope, whatever --results-only
+            // says, so that the outcome has somewhere to go.
+            Some(reason) => {
+                let mut output = session.output.clone();
+                output.results_only = false;
+                let mut document = output.untrusted_json_value(raw, 1)?;
+                if let Value::Object(object) = &mut document {
+                    object.insert(
+                        "outcome".into(),
+                        json!({"code": "Incomplete", "reasons": [reason]}),
+                    );
+                }
+                document
+            }
+        };
+        return Ok(Produced {
+            exit_code,
+            document: Some(document),
+        });
+    }
+    let mut fields = vec![
+        ("ID", record.id.clone().unwrap_or_default()),
+        ("Action", action.label().to_owned()),
+        ("Status", record.status.as_str().to_owned()),
+        (
+            "Progress",
+            record
+                .percent_progress
+                .map(|percent| format!("{percent}%"))
+                .unwrap_or_default(),
+        ),
+        ("Created", time_text(record.created_date_time)),
+        ("Created by", identity::shown(record.created_by.as_ref())),
+        ("Completed", time_text(record.completed_date_time)),
+        (
+            "Result",
+            record
+                .result_info
+                .as_ref()
+                .map(|info| info.summary())
+                .unwrap_or_default(),
+        ),
+    ];
+    let count = |value: Option<u64>| value.map(|value| value.to_string()).unwrap_or_default();
+    let detail = record.detail();
+    match &detail {
+        Some(OperationDetail::Estimate(estimate)) => fields.extend([
+            ("Indexed items", count(estimate.indexed_item_count)),
+            ("Indexed size", count(estimate.indexed_items_size)),
+            ("Unindexed items", count(estimate.unindexed_item_count)),
+            ("Unindexed size", count(estimate.unindexed_items_size)),
+            ("Locations with hits", count(estimate.mailbox_count)),
+            ("Sites with hits", count(estimate.site_count)),
+        ]),
+        Some(OperationDetail::SearchExport(export)) => fields.extend([
+            ("Name", export.display_name.clone().unwrap_or_default()),
+            (
+                "Description",
+                export.description.clone().unwrap_or_default(),
+            ),
+            ("Format", export.export_format.clone().unwrap_or_default()),
+            (
+                "Criteria",
+                export.export_criteria.clone().unwrap_or_default(),
+            ),
+            (
+                "Location",
+                export.export_location.clone().unwrap_or_default(),
+            ),
+            (
+                "Options",
+                export.additional_options.clone().unwrap_or_default(),
+            ),
+        ]),
+        None => {}
+    }
+    if let Some(detail) = &detail {
+        for file in detail.files() {
+            fields.push((
+                "File",
+                format!(
+                    "{} ({})",
+                    file.file_name.as_deref().unwrap_or("?"),
+                    file.size
+                        .map(|size| format!("{size} bytes"))
+                        .unwrap_or_else(|| "size unknown".to_owned())
+                ),
+            ));
+        }
+    }
+    if collects {
+        fields.push(("Collection", "unchecked".to_owned()));
+    }
+    write_fields(&mut session.env.stdout, &fields)?;
+    if let Some(reason) = reason {
+        let _ = writeln!(
+            session.env.stderr,
+            "warning: operation {}: {}",
+            sanitize(record.id.as_deref().unwrap_or("?")),
+            sanitize(reason["message"].as_str().unwrap_or_default())
+        );
+    }
+    Ok(Produced {
+        exit_code,
+        document: None,
+    })
+}
+
+/// Exit 5 at the deadline, 130 on Ctrl-C: the last status read and the
+/// command that resumes the wait (`docs/SPEC.md` section 3.3).
+fn stopped(
+    session: &mut Session<'_>,
+    case: CaseId,
+    operation: &OperationId,
+    last: Option<OperationRecord>,
+    waited: Duration,
+    interrupted: bool,
+) -> Result<Produced> {
+    let status = last
+        .as_ref()
+        .map(|record| record.status.as_str().to_owned());
+    let resume = format!("purview operation get {case} {operation} --wait");
+    let (exit_code, code, message) = if interrupted {
+        (
+            130,
+            "Interrupted",
+            format!(
+                "interrupted after {}; the service carries on running the operation",
+                elapsed_text(waited)
+            ),
+        )
+    } else {
+        (
+            5,
+            "WaitTimeout",
+            format!(
+                "stopped waiting after {}; the service carries on running the operation",
+                elapsed_text(waited)
+            ),
+        )
+    };
+    if session.output.format == OutputFormat::Json {
+        return Ok(Produced {
+            exit_code,
+            document: Some(json!({
+                "caseId": case.to_string(),
+                "operationId": operation.to_string(),
+                "status": status,
+                "elapsedSeconds": waited.as_secs(),
+                "resume": [resume],
+                "error": {"code": code, "status": 0, "message": message},
+            })),
+        });
+    }
+    let _ = writeln!(
+        session.env.stderr,
+        "{message}. Operation {operation} was {}. Resume with: {resume}",
+        status
+            .as_deref()
+            .map(sanitize)
+            .unwrap_or_else(|| "not read yet".to_owned())
+    );
+    Ok(Produced {
+        exit_code,
+        document: None,
+    })
+}

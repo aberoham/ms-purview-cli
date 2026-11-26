@@ -3,7 +3,7 @@
 //! in-process under test.
 //!
 //! It carries the identity-platform and Graph base URLs, the credential
-//! store, the clock and the browser opener. A later release adds the
+//! store, the clock, the browser opener and Ctrl-C. A later release adds the
 //! download host rule.
 //! The production `Env` reads no environment variable that could change an
 //! endpoint, so the release binary has no path that could send a token to
@@ -39,6 +39,58 @@ pub trait Clock: Send + Sync {
     /// to the wall clock must not move.
     fn elapsed(&self) -> Duration;
     async fn sleep(&self, duration: Duration);
+}
+
+/// Ctrl-C, injected so that tests can interrupt a wait.
+#[async_trait]
+pub trait Interrupt: Send + Sync {
+    /// Returns when the person interrupts the command.
+    async fn wait(&self);
+}
+
+/// The process's Ctrl-C, through tokio's signal handler. The handler is
+/// installed on the first wait, so Ctrl-C ends the process as usual until
+/// a command starts waiting for an operation.
+#[derive(Debug, Default)]
+pub struct CtrlC;
+
+#[async_trait]
+impl Interrupt for CtrlC {
+    async fn wait(&self) {
+        if tokio::signal::ctrl_c().await.is_err() {
+            // No handler could be installed: nothing will interrupt.
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// An interrupt for tests: it fires when `fire` is called, and stays fired.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct ManualInterrupt {
+    fired: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+#[doc(hidden)]
+impl ManualInterrupt {
+    pub fn fire(&self) {
+        self.fired.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+}
+
+#[async_trait]
+impl Interrupt for ManualInterrupt {
+    async fn wait(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.fired.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 /// Opens an address in a web browser, for `auth login --browser`.
@@ -268,6 +320,9 @@ pub struct Env {
     /// commits across processes. `None` in `in_memory()` until a test sets
     /// them.
     pub account_locks: Option<crate::secrets::AccountLocks>,
+    /// Ctrl-C while a command waits for an operation: the process's own in
+    /// production, a `ManualInterrupt` that never fires in `in_memory()`.
+    pub interrupt: Arc<dyn Interrupt>,
 }
 
 /// One of the writes that store a sign-in, in the order they are made.
@@ -290,6 +345,7 @@ pub const FLAG_VARIABLES: &[&str] = &[
     "PURVIEW_VERBOSE",
     "PURVIEW_TIMEOUT",
     "PURVIEW_TRACE_DIR",
+    "PURVIEW_WRAP_UNTRUSTED",
     "PURVIEW_CLIENT_ID",
     "PURVIEW_TENANT_ID",
 ];
@@ -338,6 +394,7 @@ impl Env {
             browser_timeout: crate::auth::BROWSER_TIMEOUT,
             login_write_fault: None,
             account_locks: crate::secrets::AccountLocks::production(),
+            interrupt: Arc::new(CtrlC),
         }
     }
 
@@ -379,6 +436,7 @@ impl Env {
             browser_timeout: crate::auth::BROWSER_TIMEOUT,
             login_write_fault: None,
             account_locks: None,
+            interrupt: Arc::new(ManualInterrupt::default()),
         }
     }
 }

@@ -1,0 +1,16 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#security/cases/ediscoveryCases('00000000-0000-4000-8000-000000000031')/searches/$entity",
+  "id": "00000000-0000-4000-8000-000000000053",
+  "displayName": "Orders API mentions",
+  "contentQuery": "\"orders-api\"",
+  "dataSourceScopes": "allTenantMailboxes,allTenantSites",
+  "createdDateTime": "2026-01-04T12:00:00Z",
+  "createdBy": {
+    "application": null,
+    "user": {
+      "displayName": "Sam Taylor",
+      "userPrincipalName": "sam.taylor@contoso.example",
+      "id": "00000000-0000-4000-8000-000000000012"
+    }
+  }
+}

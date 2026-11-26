@@ -1131,3 +1131,134 @@ async fn a_fractional_wait_over_the_limit_is_reported_rounded_up() {
     );
     assert_eq!(requests(&server).await, 1);
 }
+
+mod polling {
+    use super::*;
+    use ms_purview_cli::env::ManualInterrupt;
+    use ms_purview_cli::poll::{PollEnd, Poller, Timing};
+    use ms_purview_cli::routes::OperationId;
+
+    const OPERATION: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaa0001";
+
+    fn route() -> ReadRoute {
+        ReadRoute::Operation(
+            CaseId::parse("00000000-0000-4000-8000-000000000031").unwrap(),
+            OperationId::parse(OPERATION).unwrap(),
+        )
+    }
+
+    fn operation_path() -> String {
+        format!("{CASES}/00000000-0000-4000-8000-000000000031/operations/{OPERATION}")
+    }
+
+    fn status(status: &str) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({"id": OPERATION, "status": status}))
+    }
+
+    async fn answer(server: &MockServer, priority: u8, times: Option<u64>, with: ResponseTemplate) {
+        let mock = Mock::given(method("GET"))
+            .and(path(operation_path()))
+            .respond_with(with)
+            .with_priority(priority);
+        match times {
+            Some(times) => mock.up_to_n_times(times),
+            None => mock,
+        }
+        .mount(server)
+        .await;
+    }
+
+    async fn wait(setup: &Setup, grace: Option<Duration>) -> Result<PollEnd> {
+        let interrupt = ManualInterrupt::default();
+        let poller = Poller {
+            graph: &setup.client,
+            clock: setup.clock.as_ref(),
+            interrupt: &interrupt,
+            timing: Timing {
+                timeout: Duration::from_secs(3600),
+                interval: None,
+            },
+            not_found_grace: grace,
+        };
+        poller
+            .wait(&route(), &mut Vec::new(), &mut |_, _, _| {})
+            .await
+    }
+
+    #[tokio::test]
+    async fn a_404_is_retried_only_within_the_grace_for_a_fresh_submission() {
+        let server = MockServer::start().await;
+        answer(&server, 1, Some(1), ResponseTemplate::new(404)).await;
+        answer(&server, 2, None, status("succeeded")).await;
+        let setup = setup(&server);
+        let end = wait(&setup, Some(Duration::from_secs(30))).await.unwrap();
+        assert!(matches!(end, PollEnd::Finished(_)), "{end:?}");
+        assert_eq!(setup.clock.sleeps(), [Duration::from_secs(10)]);
+
+        let server = MockServer::start().await;
+        answer(&server, 1, None, ResponseTemplate::new(404)).await;
+        let setup = setup_with(
+            base_of(&server.uri()),
+            FakeTokens::default(),
+            Duration::from_secs(10),
+            false,
+            None,
+        );
+        let error = wait(&setup, None).await.unwrap_err();
+        assert_eq!(error.graph_status(), Some(404));
+        assert_eq!(requests(&server).await, 1);
+
+        // Past the grace, the 404 stands: reads at 0, 10 and 20 s are
+        // retried, the one at 30 s is not.
+        let setup = setup_with(
+            base_of(&server.uri()),
+            FakeTokens::default(),
+            Duration::from_secs(10),
+            false,
+            None,
+        );
+        let error = wait(&setup, Some(Duration::from_secs(30)))
+            .await
+            .unwrap_err();
+        assert_eq!(error.graph_status(), Some(404));
+        assert_eq!(setup.clock.sleeps(), [Duration::from_secs(10); 3]);
+    }
+
+    #[tokio::test]
+    async fn the_interval_steps_up_after_two_minutes() {
+        let server = MockServer::start().await;
+        answer(&server, 1, Some(14), status("running")).await;
+        answer(&server, 2, None, status("failed")).await;
+        let setup = setup(&server);
+        let end = wait(&setup, None).await.unwrap();
+        let PollEnd::Finished(record) = end else {
+            panic!("{end:?}");
+        };
+        assert_eq!(record.status.as_str(), "failed");
+        let mut expected = vec![Duration::from_secs(10); 12];
+        expected.extend([Duration::from_secs(30); 2]);
+        assert_eq!(setup.clock.sleeps(), expected);
+    }
+
+    #[tokio::test]
+    async fn a_transport_failure_keeps_waiting_and_a_refusal_ends_it() {
+        let server = MockServer::start().await;
+        answer(&server, 1, Some(3), ResponseTemplate::new(502)).await;
+        answer(&server, 2, Some(1), status("running")).await;
+        answer(&server, 3, None, ResponseTemplate::new(403)).await;
+        let setup = setup(&server);
+        let error = wait(&setup, None).await.unwrap_err();
+        assert_eq!(error.graph_status(), Some(403));
+        // Three 502s use the client's three attempts (0.25 s and 0.5 s
+        // apart), then the poll waits its interval twice.
+        assert_eq!(
+            setup.clock.sleeps(),
+            [
+                Duration::from_millis(250),
+                Duration::from_millis(500),
+                Duration::from_secs(10),
+                Duration::from_secs(10)
+            ]
+        );
+    }
+}

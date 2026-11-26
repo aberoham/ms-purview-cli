@@ -534,7 +534,7 @@ fn parent_dir(path: &Path) -> PathBuf {
 
 /// Removes trailing separators and `.` components, so that checking
 /// `dir/` without following links checks `dir` itself and not its target.
-fn normalise(path: &Path) -> PathBuf {
+pub(crate) fn normalise(path: &Path) -> PathBuf {
     let normalised: PathBuf = path.components().collect();
     if normalised.as_os_str().is_empty() {
         PathBuf::from(".")
@@ -562,7 +562,7 @@ fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
 }
 
 /// Refuses a link or a non-directory at `path`; a missing path passes.
-fn check_dir_kind(path: &Path) -> Result<Option<fs::Metadata>> {
+pub(crate) fn check_dir_kind(path: &Path) -> Result<Option<fs::Metadata>> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if is_link_like(&metadata) => {
             Err(refusal(path, "is a link, refusing to use it"))

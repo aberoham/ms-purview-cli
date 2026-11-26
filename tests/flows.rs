@@ -2870,6 +2870,8 @@ async fn a_trace_directory_that_cannot_be_written_stops_before_any_request() {
     assert_eq!(run.outcome.exit_code, 1);
     let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
     assert!(message.contains("opening the trace directory"), "{message}");
+    // Under --json a failure leaves stderr empty, warnings included.
+    assert!(run.stderr().is_empty(), "{}", run.stderr());
     assert_eq!(graph_requests(&harness).await, 0);
     assert_eq!(identity_requests(&harness).await, 0);
 }

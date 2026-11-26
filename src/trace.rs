@@ -96,19 +96,19 @@ impl TraceSink {
                 sanitize(&dir.display().to_string())
             ))
         };
-        match std::fs::symlink_metadata(dir) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(context(PurviewError::message("it is a link")));
-            }
-            Ok(metadata) if !metadata.is_dir() => {
-                return Err(context(PurviewError::message("it is not a directory")));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                crate::config::ensure_private_dir(dir).map_err(context)?;
-            }
-            Err(error) => return Err(context(error.into())),
+        // Normalised first, so a trailing separator cannot make the check
+        // follow a link; the check refuses a symlink and, on Windows, any
+        // reparse point, as the configuration directory's does.
+        let dir = &crate::config::normalise(dir);
+        if crate::config::check_dir_kind(dir)
+            .map_err(context)?
+            .is_none()
+        {
+            crate::config::ensure_private_dir(dir).map_err(context)?;
         }
+        // Before any warning: under --json a failure must leave stderr
+        // empty.
+        probe_write(dir).map_err(|error| context(error.into()))?;
         let shown = sanitize(&dir.display().to_string());
         writeln!(
             warnings,
@@ -122,7 +122,6 @@ impl TraceSink {
                  .gitignore or choose a directory outside the repository"
             )?;
         }
-        probe_write(dir).map_err(|error| context(error.into()))?;
         Ok(Self {
             dir: dir.to_path_buf(),
             redactor,
@@ -301,17 +300,34 @@ fn location_text(request: &Url, value: &str, redactor: &Redactor) -> String {
 
 /// Creates and removes a file in `dir`, so a directory the tool cannot
 /// write to is refused before any request is sent.
+/// The name is unique to the process and the call, and a name already
+/// taken (a stale probe, another open) moves on to the next.
 fn probe_write(dir: &Path) -> std::io::Result<()> {
-    let probe = dir.join(format!(".purview-trace-probe-{}", std::process::id()));
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+    static PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut last = None;
+    for _ in 0..8 {
+        let count = PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let probe = dir.join(format!(
+            ".purview-trace-probe-{}-{count}",
+            std::process::id()
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&probe) {
+            Ok(file) => {
+                drop(file);
+                return std::fs::remove_file(&probe);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => last = Some(error),
+            Err(error) => return Err(error),
+        }
     }
-    drop(options.open(&probe)?);
-    std::fs::remove_file(&probe)
+    Err(last.unwrap_or_else(|| std::io::Error::other("no free probe name")))
 }
 
 /// Whether `dir`, or any directory above it, holds a `.git` entry.
@@ -505,7 +521,30 @@ mod tests {
             &mut Vec::new(),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("it is a link"), "{error}");
+        assert!(error.to_string().contains("is a link"), "{error}");
+        // A trailing separator does not make the check follow the link.
+        let slashed = PathBuf::from(format!("{}/", link.display()));
+        let error = TraceSink::open(
+            &slashed,
+            Arc::new(Redactor::new()),
+            Arc::new(ManualClock::new(test_epoch())),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("is a link"), "{error}");
+        // A stale probe of this process does not block the next open.
+        std::fs::write(
+            dir.join(format!(".purview-trace-probe-{}-0", std::process::id())),
+            b"",
+        )
+        .unwrap();
+        TraceSink::open(
+            &dir,
+            Arc::new(Redactor::new()),
+            Arc::new(ManualClock::new(test_epoch())),
+            &mut Vec::new(),
+        )
+        .unwrap();
     }
 
     #[test]

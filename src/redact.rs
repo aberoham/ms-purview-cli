@@ -434,19 +434,35 @@ pub fn url(value: &::url::Url, redactor: &Redactor) -> String {
             path.clear().extend(&segments);
         }
     }
-    if value.query().is_some() {
-        let pairs: Vec<(String, String)> = value
-            .query_pairs()
-            .map(|(key, item)| {
+    if let Some(query) = value.query() {
+        // Each pair is read raw as well as decoded: form decoding turns `+`
+        // into a space, so a secret holding `+` would pass a check of the
+        // decoded value alone.
+        let holds_secret = |raw: &str, decoded: &str| {
+            redactor.recognises(raw)
+                || redactor.recognises(&percent_decode(raw))
+                || redactor.recognises(decoded)
+        };
+        let pairs: Vec<(String, String)> = query
+            .split('&')
+            .filter(|pair| !pair.is_empty())
+            .map(|pair| {
+                let (raw_key, raw_item) = pair.split_once('=').unwrap_or((pair, ""));
+                let (key, item) = ::url::form_urlencoded::parse(pair.as_bytes())
+                    .next()
+                    .map(|(key, item)| (key.into_owned(), item.into_owned()))
+                    .unwrap_or_default();
+                let secret_key = holds_secret(raw_key, &key);
                 // A kept value that holds another URL is not an OData
                 // option but text run together with one.
-                if KEPT_QUERY_KEYS.contains(&key.as_ref())
-                    && !redactor.recognises(&item)
+                if KEPT_QUERY_KEYS.contains(&key.as_str())
+                    && !secret_key
+                    && !holds_secret(raw_item, &item)
                     && !item.contains("://")
                 {
-                    (key.into_owned(), item.into_owned())
-                } else if is_plain_key(&key) {
-                    (key.into_owned(), REDACTED_QUERY_VALUE.to_owned())
+                    (key, item)
+                } else if is_plain_key(&key) && !secret_key {
+                    (key, REDACTED_QUERY_VALUE.to_owned())
                 } else {
                     (
                         REDACTED_QUERY_VALUE.to_owned(),
@@ -1009,6 +1025,28 @@ mod tests {
             ),
             "https://graph.microsoft.com/v1.0/$metadata"
         );
+        // A registered secret holding `+`, raw or encoded, in a kept value
+        // or as a key.
+        redactor.register("canary+slash/0010");
+        for text in [
+            "https://graph.microsoft.com/v1.0/x?$skiptoken=canary+slash/0010",
+            "https://graph.microsoft.com/v1.0/x?$skiptoken=canary+slash%2F0010",
+            "https://graph.microsoft.com/v1.0/x?$skiptoken=canary%2Bslash%2F0010",
+            "https://graph.microsoft.com/v1.0/x?canary+slash/0010=1",
+        ] {
+            let shown = urls_in_text(text, &redactor);
+            assert!(!shown.contains("canary"), "{text}: {shown}");
+            assert!(!shown.contains("slash"), "{text}: {shown}");
+        }
+        // A URL run into a kept value, after a comma or in compact JSON.
+        for text in [
+            "https://one.example/x?$top=1,https://two.example/y?sig=canary-sig-0011",
+            "https://one.example/x?$filter=a%20eq%20%27https://two.example/y?sig=canary-sig-0012%27",
+            "{\"a\":\"https://one.example/x?$top=1\",\"b\":\"https://two.example/y?sig=canary-sig-0013\"}",
+        ] {
+            let shown = urls_in_text(text, &redactor);
+            assert!(!shown.contains("canary"), "{text}: {shown}");
+        }
         // A kept value that holds another URL is not kept.
         let joined = urls_in_text(
             "https://one.example/x?$top=1%22,%22https%3A//two.example/y?sig=canary-sig-0008",

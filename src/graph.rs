@@ -299,7 +299,12 @@ impl GraphClient {
                 .tokens
                 .graph(GET_TOKEN_VALIDITY)
                 .await
-                .map_err(|error| PurviewError::TokenUnavailable(Box::new(error)))?;
+                .map_err(|error| {
+                    // What the provider tried before it failed is still
+                    // worth showing.
+                    self.log_notes(log);
+                    PurviewError::TokenUnavailable(Box::new(error))
+                })?;
             self.log_notes(log);
             self.log(log, &format!("GET {shown}"));
             let started = self.clock.elapsed();
@@ -335,7 +340,7 @@ impl GraphClient {
                     status.as_u16(),
                     took.as_millis(),
                     header_text(&headers, "request-id")
-                        .map(|id| format!(", request-id {}", sanitize(&id)))
+                        .map(|id| format!(", request-id {}", sanitize(&self.redactor.redact(&id))))
                         .unwrap_or_default()
                 ),
             );
@@ -369,7 +374,7 @@ impl GraphClient {
                         return Err(self.graph_error(status, &headers, &body).context(format!(
                             "Graph asked to retry after {} seconds, longer than the {}-second \
                              limit",
-                            asked.as_secs(),
+                            asked.as_secs() + u64::from(asked.subsec_nanos() > 0),
                             MAX_RETRY_AFTER.as_secs()
                         )));
                     }

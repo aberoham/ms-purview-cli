@@ -86,19 +86,21 @@ impl CredentialLock {
             path: path.display().to_string(),
             source,
         };
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| failed("create the folder for", error))?;
+        // A bare file name has an empty parent: there is no folder to create,
+        // and the working directory is not the tool's to narrow.
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            create_private_dir(parent).map_err(|error| failed("create the folder for", error))?;
         }
         let deadline = Instant::now() + wait;
         let file = loop {
-            match OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(path)
-            {
+            let mut options = OpenOptions::new();
+            options.create(true).truncate(false).read(true).write(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+            match options.open(path) {
                 Ok(file) => break file,
                 Err(error) if is_transient_open_error(&error) && Instant::now() < deadline => {
                     std::thread::sleep(LOCK_POLL);
@@ -121,6 +123,34 @@ impl CredentialLock {
                 Err(TryLockError::Error(error)) => return Err(failed("lock", error)),
             }
         }
+    }
+}
+
+/// Creates a lock folder and any missing parents with mode 0700. On macOS the
+/// local data directory is also the configuration directory, so a lock taken
+/// first would otherwise create `purview/` with the default mode. A folder
+/// that already exists keeps its mode: changing the mode of an existing path
+/// would need a no-follow open that standard Rust does not offer. A lock
+/// folder that is a link, or not a folder, is refused. Windows has no modes
+/// and relies on the profile's access control list.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        if !std::fs::symlink_metadata(dir)?.file_type().is_dir() {
+            return Err(std::io::Error::other(
+                "the lock folder is a link or not a folder; refusing to use it",
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
     }
 }
 
@@ -919,6 +949,48 @@ mod tests {
         assert_eq!(error.metadata(), ("CredentialLockBusy", 0));
         drop(holder);
         CredentialLock::acquire(&path, Duration::ZERO).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_folders_and_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let directory = tempfile::tempdir().unwrap();
+        // A first run: neither the app folder nor the lock folder exists.
+        let app = directory.path().join("purview");
+        let path = app.join("account-locks").join("key.lock");
+        drop(CredentialLock::acquire(&path, Duration::ZERO).unwrap());
+        assert_eq!(mode(&app), 0o700);
+        assert_eq!(mode(&app.join("account-locks")), 0o700);
+        assert_eq!(mode(&path), 0o600);
+        // An existing folder keeps its mode; only new paths are created private.
+        std::fs::set_permissions(
+            app.join("account-locks"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        drop(CredentialLock::acquire(&path, Duration::ZERO).unwrap());
+        assert_eq!(mode(&app.join("account-locks")), 0o755);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_lock_folder_is_refused_and_its_target_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let shared = directory.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let app = directory.path().join("purview");
+        std::fs::create_dir(&app).unwrap();
+        std::os::unix::fs::symlink(&shared, app.join("account-locks")).unwrap();
+        let path = app.join("account-locks").join("key.lock");
+        let error = CredentialLock::acquire(&path, Duration::ZERO).unwrap_err();
+        assert_eq!(error.metadata().0, "CredentialLockFailed");
+        let target = std::fs::metadata(&shared).unwrap().permissions().mode() & 0o777;
+        assert_eq!(target, 0o755);
+        assert!(!shared.join("key.lock").exists());
     }
 
     #[test]

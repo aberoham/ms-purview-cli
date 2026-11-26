@@ -1253,8 +1253,11 @@ the next sign-in. Neither chooses the registration a refresh uses (section 5.1).
 After the ownership check below, `auth login` stores a sign-in in this order: the
 credential, replaced in place under its
 key (the old item is not deleted first, so a macOS keychain item keeps its access list);
-then the account file; then `config.json`. A failure at the first write leaves the earlier
-sign-in as it was. A failure at the account file on a first sign-in removes the new
+then the account file; then `config.json`. If the store refuses the first write
+outright, the earlier sign-in is left as it was. A failure the store reports after the write
+took effect (a macOS label failure, a Windows clean-up failure) can leave the new credential
+in place: on a first sign-in it is swept (below); on a later sign-in the account file still
+names the earlier sign-in, and `auth refresh` refuses the mismatch. A failure at the account file on a first sign-in removes the new
 credential again; on a later sign-in it leaves an account file that may name the old
 registration, which `auth refresh` detects. A failure at `config.json` leaves a working
 account whose stale registration, if it differs, `auth refresh` also detects.
@@ -1267,10 +1270,25 @@ as they were. `auth logout --account <key>` frees the key, after which the new i
 sign in under it. A rename onto a free key is stored under the new key; the old key's
 entries stay until they are logged out.
 
-If the credential write reports a failure, the store may still have taken it (a macOS label
-failure, a Windows clean-up failure). On a first sign-in, `auth login` reads the key back and
-removes any credential it finds; if that removal fails, the error names `auth logout
---account <key>`, which removes a credential that has no account file.
+If a first sign-in fails at the credential or the account file, `auth login` sweeps the key:
+the primary entry and, in the Windows chunked layout, every chunk in both slots, whether or not
+a header was written. If that sweep fails, the error names `auth logout --account <key>`.
+`auth logout --account <key>` acts on that exact key when an account file or any store entry
+exists under it, before any `upn` matching, and removes the entry without parsing it, so a
+damaged credential or headerless chunks can always be removed.
+
+An unreadable, damaged or partly recorded destination counts as owned: an account file that
+cannot be read or lacks `tid` or `oid`, or a credential that cannot be read or records only one
+of them. `auth login` then refuses and names `auth logout --account <key>`. The exception is a
+damaged or partly recorded credential under a key whose account file is readable and records
+the sign-in's own `tid` and `oid`: the sign-in replaces (repairs) it. Each id is compared on
+its own.
+
+`auth login` (from the ownership check to its last write or rollback), `auth logout` and each
+refresh commit hold a per-account lock file under the local data directory, taken with the
+same file lock the credential store uses on Windows, so two processes cannot interleave on one
+key. Before committing a rotation, a refresh checks under that lock that the key still holds a
+credential of the same principal and registration.
 
 When `--account` (or `PURVIEW_ACCOUNT`) names a stored account, the sign-in must return
 that account's recorded `tid` and `oid`; otherwise the returned account key or `upn` must

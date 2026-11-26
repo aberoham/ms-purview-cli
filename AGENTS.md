@@ -73,7 +73,9 @@ that the test files pass their own scan.
   point the base URL at a wiremock origin. It also carries the
   identity-platform request timeout and a test-only `login_write_fault`,
   always `None` in production, that makes one of `auth login`'s writes
-  fail. Later pull requests add the Graph
+  fail, and the per-account locks (`AccountLocks`) that serialise login,
+  logout and refresh commits across processes; `Env::in_memory()` has none
+  until a test sets them. Later pull requests add the Graph
   origin and the download host rule. `Env::production()` reads no
   environment variable that could change an endpoint, so the release binary
   has no test path that could send a token to another host.

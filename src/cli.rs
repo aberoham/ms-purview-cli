@@ -225,6 +225,30 @@ Examples:
     )]
     Download(DownloadArgs),
     #[command(
+        about = "Run a search's estimate: hit counts per location, without collecting items",
+        long_about = "\
+Run an estimate of a search over every tenant mailbox: the counts of items \
+and locations with hits, without collecting any item. Before anything is \
+sent, the search must cover all tenant mailboxes and nothing else, with no \
+custodian, non-custodial or additional sources, and its query must pass the \
+guard against generic tenant-wide searches (--allow-generic with --reason \
+overrides a query that is not narrowed). An estimate of the case not yet \
+finished may be a duplicate, and needs --allow-concurrent.
+
+After approval, the estimate is polled to its end, then its report zip is \
+downloaded and read: collection is complete when every location was \
+searched, incomplete when one failed, and unchecked when the zip was not \
+read. An estimate can succeed while locations failed; --strict makes that \
+exit 4. This command changes Purview: it shows a plan and sends it only \
+when approved, by --yes or by answering y at a terminal.",
+        after_help = "\
+Examples:
+  purview estimate <case> <search> --dry-run
+  purview estimate <case> <search> --yes --strict
+  purview estimate <case> <search> --yes --no-wait --json"
+    )]
+    Estimate(EstimateArgs),
+    #[command(
         about = "Check a query against the guard against generic tenant-wide searches",
         long_about = "\
 Build a Keyword Query Language (KQL) query from the query flags, or take one \
@@ -858,6 +882,70 @@ minutes, then 60s after 10)"
 }
 
 #[derive(Debug, Clone, Args)]
+struct EstimateArgs {
+    #[arg(value_name = "CASE", help = CASE_HELP)]
+    case: String,
+    #[arg(value_name = "SEARCH", help = SEARCH_HELP)]
+    search: String,
+    #[arg(
+        long,
+        requires = "reason",
+        help = "Run even though the guard finds the search's query not narrowed; needs --reason"
+    )]
+    allow_generic: bool,
+    #[arg(
+        long,
+        value_name = "TEXT",
+        requires = "allow_generic",
+        help = "Why a query that is not narrowed is needed; shown in the plan"
+    )]
+    reason: Option<String>,
+    #[arg(
+        long,
+        help = "Run even though an estimate of the case is not yet finished and may be a duplicate"
+    )]
+    allow_concurrent: bool,
+    #[arg(
+        long,
+        help = "Submit the estimate and stop, printing the commands that carry on"
+    )]
+    no_wait: bool,
+    #[arg(
+        long,
+        help = "Wait for the estimate, but do not download or read its report zip"
+    )]
+    no_download: bool,
+    #[arg(
+        long,
+        conflicts_with_all = ["no_download", "no_wait"],
+        help = "Exit 4 when a location failed or the report zip could not be checked"
+    )]
+    strict: bool,
+    #[arg(
+        long,
+        value_name = "DUR",
+        conflicts_with = "no_wait",
+        help = "How long to wait for the estimate, such as 30m or 2h (default 2h, at most 24h)"
+    )]
+    wait_timeout: Option<String>,
+    #[arg(
+        long,
+        value_name = "DUR",
+        conflicts_with = "no_wait",
+        help = "A fixed interval between reads, at least 5s (default: 10s, then 30s after 2 \
+minutes, then 60s after 10)"
+    )]
+    poll_interval: Option<String>,
+    #[arg(
+        long,
+        value_name = "DIR",
+        conflicts_with_all = ["no_download", "no_wait"],
+        help = "Write the report zip here instead of the data directory"
+    )]
+    out: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
 struct AuthLogin {
     #[arg(
         long,
@@ -1408,6 +1496,32 @@ async fn run(
         Command::Download(download) => {
             read_command(env, output, globals, ReadCommand::download(download)?).await
         }
+        Command::Estimate(args) => {
+            let override_reason = match (args.allow_generic, args.reason) {
+                (true, Some(reason)) => Some(commands::sent_text("--reason", &reason)?),
+                _ => None,
+            };
+            let mut command =
+                commands::estimate::Estimate::new(commands::estimate::EstimateFlags {
+                    case: CaseKey::parse(&args.case)?,
+                    search: SearchKey::parse(&args.search)?,
+                    override_reason,
+                    allow_concurrent: args.allow_concurrent,
+                    no_wait: args.no_wait,
+                    no_download: args.no_download,
+                    strict: args.strict,
+                    timing: poll::timing(
+                        args.wait_timeout.as_deref(),
+                        args.poll_interval.as_deref(),
+                        poll::DEFAULT_WAIT_TIMEOUT,
+                    )?,
+                    out: args
+                        .out
+                        .map(|out| not_blank("--out", out).map(PathBuf::from))
+                        .transpose()?,
+                });
+            write_command(env, output, globals, &mut command).await
+        }
         Command::Kql(query) => kql(env, output, query),
         Command::Parse(parse) => parse_zip(env, output, parse.command),
         Command::Version => version(env, output),
@@ -1722,6 +1836,7 @@ async fn write_command(
     let settings = safety::WriteSettings {
         naming: crate::naming::Naming::from_config(&stored.extra)?,
         guard: crate::kql::GuardConfig::from_config(&stored.extra)?,
+        report: crate::report::ReportLimits::from_config(&stored.extra)?,
     };
     command.check(&settings)?;
     // The download settings are checked before sign-in, as for download.

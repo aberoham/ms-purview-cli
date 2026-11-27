@@ -33,6 +33,24 @@ pub struct CreateSearch<'a> {
     pub data_source_scopes: AllTenantMailboxes,
 }
 
+/// `POST …/searches/{search}/estimateStatistics`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EstimateRequest {
+    /// Always `includeQueryStats`.
+    pub statistics_options: IncludeQueryStats,
+}
+
+/// Serialises only as `"includeQueryStats"`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IncludeQueryStats;
+
+impl Serialize for IncludeQueryStats {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str("includeQueryStats")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -56,6 +74,15 @@ mod tests {
                 "dataSourceScopes": "allTenantMailboxes",
             })
         );
+    }
+
+    #[test]
+    fn an_estimate_body_asks_for_query_statistics() {
+        let body = serde_json::to_value(EstimateRequest {
+            statistics_options: IncludeQueryStats,
+        })
+        .unwrap();
+        assert_eq!(body, json!({"statisticsOptions": "includeQueryStats"}));
     }
 
     #[test]

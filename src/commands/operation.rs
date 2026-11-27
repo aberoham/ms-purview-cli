@@ -559,7 +559,7 @@ fn show(session: &mut Session<'_>, record: &OperationRecord) -> Result<Produced>
 
 /// Exit 5 at the deadline, 130 on Ctrl-C: the last status read and the
 /// command that resumes the wait (`docs/SPEC.md` section 3.3).
-fn stopped(
+pub(crate) fn stopped(
     session: &mut Session<'_>,
     case: CaseId,
     operation: &OperationId,
@@ -635,7 +635,7 @@ fn stopped(
 
 /// `text` as one shell word: as it is when it holds only characters no
 /// shell treats specially, else in single quotes.
-fn shell_word(text: &str) -> String {
+pub(crate) fn shell_word(text: &str) -> String {
     if !text.is_empty()
         && text
             .chars()

@@ -359,6 +359,8 @@ pub(crate) async fn decide(
 pub struct WriteSettings {
     pub naming: Naming,
     pub guard: GuardConfig,
+    /// The limits for reading report zips (`limits` in `config.json`).
+    pub report: crate::report::ReportLimits,
 }
 
 /// What preflight decided.

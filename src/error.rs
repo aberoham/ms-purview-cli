@@ -225,6 +225,27 @@ pub enum PurviewError {
     #[error("{0}")]
     CaseNotActive(String),
 
+    /// An action's search whose scope could not be shown to be every
+    /// tenant mailbox and nothing else: `dataSourceScopes` absent, or a
+    /// source list that could not be read to its end.
+    #[error("{0}")]
+    ScopeUnverified(String),
+
+    /// An action's search with a `dataSourceScopes` other than
+    /// `allTenantMailboxes`.
+    #[error("{0}")]
+    ScopeNotAllowed(String),
+
+    /// An action's search with custodian, non-custodial or additional
+    /// sources.
+    #[error("{0}")]
+    SearchHasSources(String),
+
+    /// A 202 whose `Location` header does not name an operation of the
+    /// case in a known form. The operation may still be running.
+    #[error("{0}")]
+    UnexpectedLocation(String),
+
     /// An action whose plan names an operation that may be a duplicate,
     /// without `--allow-concurrent` (`docs/SPEC.md` section 6.7).
     #[error("{0}")]
@@ -387,6 +408,10 @@ impl PurviewError {
             Self::SearchNameInUse(_) => ("SearchNameInUse", 0),
             Self::CaseNotActive(_) => ("CaseNotActive", 0),
             Self::ConcurrentOperation(_) => ("ConcurrentOperation", 0),
+            Self::ScopeUnverified(_) => ("ScopeUnverified", 0),
+            Self::ScopeNotAllowed(_) => ("ScopeNotAllowed", 0),
+            Self::SearchHasSources(_) => ("SearchHasSources", 0),
+            Self::UnexpectedLocation(_) => ("UnexpectedLocation", 0),
             Self::HostileZip(_) => ("HostileZip", 0),
             Self::RecordTooLarge { .. } => ("RecordTooLarge", 0),
             Self::NotAReportZip(_) => ("NotAReportZip", 0),

@@ -34,7 +34,7 @@ use crate::error::{GraphErrorDetails, PurviewError, Result};
 use crate::origin::Origin;
 use crate::output::sanitize;
 use crate::redact::{self, Redactor};
-use crate::routes::{build_url, Query, ReadRoute};
+use crate::routes::{build_url, CaseId, OperationId, Query, ReadRoute};
 use crate::safety::{ApprovedWrite, WritePlan};
 use crate::token::TokenProvider;
 use crate::trace::{Exchange, TraceSink, TracedBody, TracedResponse};
@@ -345,6 +345,18 @@ impl GraphClient {
             });
         }
         Ok(url)
+    }
+
+    /// The operation a 202's `Location` header names, for a POST to
+    /// `case` (`docs/SPEC.md` section 4.4): on the Graph origin, below the
+    /// Graph base, in the key form or the path form, for that case.
+    pub fn operation_in_location(&self, location: &str, case: CaseId) -> Option<OperationId> {
+        let url = Url::parse(location.trim()).ok()?;
+        if !self.admits(&url) || url.query().is_some() || url.fragment().is_some() {
+            return None;
+        }
+        let rest = url.path().get(self.base.path().len()..)?;
+        crate::routes::operation_in_path(rest, case)
     }
 
     fn admits(&self, url: &Url) -> bool {

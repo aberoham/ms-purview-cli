@@ -2,8 +2,10 @@
 //! parses and checks the arguments, signs in, and hands each command a
 //! `Session`; nothing here reads the process environment.
 
+pub mod action;
 pub mod case;
 pub mod download;
+pub mod estimate;
 pub mod kql;
 pub mod operation;
 pub mod parse;

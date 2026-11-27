@@ -318,6 +318,44 @@ impl Query {
     }
 }
 
+/// The operation in the path of an action's `Location` header, below the
+/// Graph base: `security/cases/ediscoverycases('<case>')/operations('<op>')`
+/// (Observed (trace)) or `security/cases/ediscoveryCases/<case>/operations/<op>`,
+/// with any case of letters. The case must be `case`.
+pub fn operation_in_path(path: &str, case: CaseId) -> Option<OperationId> {
+    let decoded = percent_decode(path)?;
+    let pattern = regex::Regex::new(
+        r"(?i)^security/cases/ediscoverycases(?:\('([^'/]+)'\)|/([^/()']+))/operations(?:\('([^'/]+)'\)|/([^/()']+))/?$",
+    )
+    .ok()?;
+    let found = pattern.captures(&decoded)?;
+    let named = |a: usize, b: usize| found.get(a).or_else(|| found.get(b)).map(|m| m.as_str());
+    let posted = CaseId::parse(named(1, 2)?)?;
+    if posted != case {
+        return None;
+    }
+    OperationId::parse(named(3, 4)?)
+}
+
+/// `%XX` escapes decoded; `None` for a malformed escape or text that is
+/// not UTF-8.
+fn percent_decode(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'%' {
+            let hex = text.get(at + 1..at + 3)?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            at += 3;
+        } else {
+            out.push(bytes[at]);
+            at += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 /// The URL of `segments` below `base`, each segment percent-encoded on its
 /// own, with `query` appended. A segment that would navigate (`.` or `..`)
 /// or is empty is refused, so no id can address another path.
@@ -502,5 +540,36 @@ mod tests {
         assert!(OperationId::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaa00011").is_none());
         assert!(HoldId::parse("..").is_none());
         assert!(HoldId::parse(" ").is_none());
+    }
+
+    #[test]
+    fn location_paths_in_both_forms_name_the_operation() {
+        let case = CaseId::parse("00000000-0000-4000-8000-000000000031").unwrap();
+        let op = "aaaaaaaaaaaaaaaaaaaaaaaaaaaa0001";
+        for path in [
+            format!("security/cases/ediscoverycases('{case}')/operations('{op}')"),
+            format!("security/cases/ediscoveryCases/{case}/operations/{op}"),
+            format!("SECURITY/Cases/EDISCOVERYCASES/{case}/Operations/{op}"),
+            format!("security/cases/ediscoverycases(%27{case}%27)/operations(%27{op}%27)"),
+        ] {
+            assert_eq!(
+                operation_in_path(&path, case)
+                    .map(|id| id.to_string())
+                    .as_deref(),
+                Some(op),
+                "{path}"
+            );
+        }
+        let other = CaseId::parse("00000000-0000-4000-8000-000000000032").unwrap();
+        for path in [
+            format!("security/cases/ediscoverycases('{other}')/operations('{op}')"),
+            format!("security/cases/ediscoverycases('{case}')/operations('not-an-id')"),
+            format!("security/cases/ediscoverycases('{case}')/searches('{op}')"),
+            format!("security/cases/ediscoverycases('{case}')/operations('{op}')/x"),
+            format!("security/cases/ediscoverycases/{case}/operations('{op}'"),
+            "%zz".to_owned(),
+        ] {
+            assert_eq!(operation_in_path(&path, case), None, "{path}");
+        }
     }
 }

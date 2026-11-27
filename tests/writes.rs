@@ -33,8 +33,10 @@ const SEARCHES: &str =
 /// A write that exists only here.
 struct StubWrite {
     refuse_check: bool,
-    /// An account for the plan other than the signed-in one.
+    /// An account or tenant for the plan other than the signed-in one, set
+    /// on the session too, as a command that changed it would.
     plan_account: Option<&'static str>,
+    plan_tenant: Option<&'static str>,
 }
 
 #[async_trait]
@@ -48,9 +50,10 @@ impl WriteCommand for StubWrite {
 
     async fn plan(&mut self, session: &mut Session<'_>) -> Result<WritePlan> {
         if let Some(account) = self.plan_account {
-            // As a command that changed the session would.
             session.account.email = account.to_owned();
-            session.account.tenant_id = "00000000-0000-4000-8000-000000000099".into();
+        }
+        if let Some(tenant) = self.plan_tenant {
+            session.account.tenant_id = tenant.to_owned();
         }
         let case = CaseId::parse(CASE).unwrap();
         let record = session
@@ -99,6 +102,7 @@ fn stub() -> Box<dyn WriteCommand> {
     Box::new(StubWrite {
         refuse_check: false,
         plan_account: None,
+        plan_tenant: None,
     })
 }
 
@@ -355,6 +359,7 @@ async fn the_commands_own_check_runs_before_sign_in() {
         Box::new(StubWrite {
             refuse_check: true,
             plan_account: None,
+            plan_tenant: None,
         }),
         |_| {},
     )
@@ -400,7 +405,13 @@ fn change_credential(harness: &Harness, change: impl FnOnce(&mut Value)) {
 async fn a_sign_in_records_whether_it_may_write() {
     let harness = Harness::new().await;
     sign_in_alex(&harness).await;
-    assert_eq!(harness.stored(ALEX).unwrap()["access"], "read-write");
+    let first = harness.stored(ALEX).unwrap();
+    assert_eq!(first["access"], "read-write");
+    let id = first["sign_in"].as_str().unwrap().to_owned();
+    assert!(id.len() >= 16, "{id}");
+    // Each sign-in gets its own id.
+    sign_in_alex(&harness).await;
+    assert_ne!(harness.stored(ALEX).unwrap()["sign_in"], id.as_str());
 }
 
 #[tokio::test]
@@ -705,23 +716,29 @@ async fn select_is_refused_for_a_write_before_sign_in() {
 
 #[tokio::test]
 async fn a_plan_for_another_account_is_refused_before_approval() {
-    let harness = ready(created()).await;
-    let run = run_with(
-        &harness,
-        &["--json", "--yes"],
-        Box::new(StubWrite {
-            refuse_check: false,
-            plan_account: Some("sam.taylor@contoso.example"),
-        }),
-        |_| {},
-    )
-    .await;
-    assert_eq!(run.outcome.exit_code, 1);
-    assert!(run.json()["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("another account or tenant"));
-    assert!(writes(&harness).await.is_empty());
+    for (account, tenant) in [
+        (Some("sam.taylor@contoso.example"), None),
+        (None, Some("00000000-0000-4000-8000-000000000099")),
+    ] {
+        let harness = ready(created()).await;
+        let run = run_with(
+            &harness,
+            &["--json", "--yes"],
+            Box::new(StubWrite {
+                refuse_check: false,
+                plan_account: account,
+                plan_tenant: tenant,
+            }),
+            |_| {},
+        )
+        .await;
+        assert_eq!(run.outcome.exit_code, 1, "{account:?} {tenant:?}");
+        assert!(run.json()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("another account or tenant"));
+        assert!(writes(&harness).await.is_empty());
+    }
 }
 
 #[tokio::test]

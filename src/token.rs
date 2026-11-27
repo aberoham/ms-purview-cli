@@ -1892,6 +1892,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reload_refuses_a_credential_from_a_newer_sign_in() {
+        let memory = Arc::new(MemoryStore::default());
+        let store = Arc::new(CommitsThenFails::new(memory.clone()));
+        let setup = setup_with(credential(0, None), store.clone(), memory).await;
+        Mock::given(method("POST"))
+            .respond_with(response("canary-graph-0002", "canary-refresh-0002"))
+            .expect(1)
+            .mount(&setup.server)
+            .await;
+        // The refresh is stored, and the store then reports a failure.
+        store.fail_write(1);
+        assert!(setup.provider.graph(Duration::from_secs(60)).await.is_err());
+        // Before the next call reloads, the person signs in again.
+        let mut newer = credential(3600, None);
+        newer.sign_in = Some("sign-in-0004".into());
+        newer.refresh_token = SecretString::new("canary-refresh-0095");
+        newer.save(setup.memory.as_ref()).unwrap();
+        let error = setup
+            .provider
+            .graph(Duration::from_secs(60))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("signed in again"), "{error}");
+        assert_eq!(stored(&setup)["sign_in"], "sign-in-0004");
+    }
+
+    #[tokio::test]
     async fn a_reload_leaves_a_graph_token_stored_after_the_invalidation_alone() {
         let memory = Arc::new(MemoryStore::default());
         let store = Arc::new(CommitsThenFails::new(memory.clone()));

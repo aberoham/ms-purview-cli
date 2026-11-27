@@ -879,6 +879,12 @@ struct OperationGet {
 minutes, then 60s after 10)"
     )]
     poll_interval: Option<String>,
+    #[arg(
+        long,
+        help = "Download the evidence file of an estimate, item report or export and check \
+whether every location was searched"
+    )]
+    check: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1590,7 +1596,12 @@ enum ReadCommand {
     SearchList(CaseKey),
     SearchGet(CaseKey, SearchKey),
     OperationList(CaseKey, commands::operation::ListFilters),
-    OperationGet(CaseKey, OperationId, Option<commands::operation::Wait>),
+    OperationGet(
+        CaseKey,
+        OperationId,
+        Option<commands::operation::Wait>,
+        bool,
+    ),
     Download(commands::download::Request),
 }
 
@@ -1705,7 +1716,7 @@ impl ReadCommand {
                 } else {
                     None
                 };
-                Self::OperationGet(case, operation, wait)
+                Self::OperationGet(case, operation, wait, get.check)
             }
         })
     }
@@ -1726,7 +1737,17 @@ async fn read_command(
     }
     // The download settings in config.json are checked before sign-in.
     let download_setup = match &command {
-        ReadCommand::Download(_) => Some(download_setup(env)?),
+        ReadCommand::Download(_) | ReadCommand::OperationGet(.., true) => {
+            Some(download_setup(env)?)
+        }
+        _ => None,
+    };
+    let report_limits = match &command {
+        ReadCommand::OperationGet(.., true) => {
+            let dir = configuration_dir(env)?;
+            let stored = load_config(env, &dir)?;
+            Some(crate::report::ReportLimits::from_config(&stored.extra)?)
+        }
         _ => None,
     };
     let (account, credential) = signed_in(env, globals)?;
@@ -1754,8 +1775,14 @@ async fn read_command(
         ReadCommand::OperationList(case, filters) => {
             commands::operation::list(&mut session, case, filters).await
         }
-        ReadCommand::OperationGet(case, operation, wait) => {
-            commands::operation::get(&mut session, case, operation, *wait).await
+        ReadCommand::OperationGet(case, operation, wait, _) => {
+            let check = match (&download_context, report_limits) {
+                (Some(download), Some(limits)) => {
+                    Some(commands::operation::Check { download, limits })
+                }
+                _ => None,
+            };
+            commands::operation::get(&mut session, case, operation, *wait, check).await
         }
         ReadCommand::Download(request) => match &download_context {
             Some(context) => commands::download::run(&mut session, request, context).await,

@@ -628,3 +628,104 @@ fn search_create_runs_the_guard_before_sign_in() {
         assert_eq!(refused_before_sign_in(&args), code, "{extra:?}");
     }
 }
+
+/// A small estimate zip on disk, built from CSV text.
+fn estimate_zip_file(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::io::Write;
+    let path = dir.join("estimate.zip");
+    let mut writer = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+    let options = zip::write::SimpleFileOptions::default();
+    for (name, body) in [
+        (
+            "Locations-2026-01-05_09-00-00.csv",
+            "\u{feff}DataSourceName,DataSourceType,Location,LocationId,LocationType,LocationSubType,Count,Size,Status,ErrorWarning,Query\r\nExchange,Mailbox,alex@contoso.example,1,Mailbox,PrimaryMailBox,12,2048,Succeeded,,q\r\nExchange,Mailbox,sam@contoso.example,2,Mailbox,ArchiveMailBox,0,0,Failed,Timed out,q\r\n",
+        ),
+        (
+            "Statistics-2026-01-05_09-00-00.csv",
+            "\u{feff}DataSourceName,DataSourceType,Location,LocationType,LocationSubType,StatType,StatName,OriginalStatName,Value\r\n",
+        ),
+        ("Summary-2026-01-05_09-00-00.csv", "\u{feff}LocationCount,2,x\r\n"),
+    ] {
+        writer.start_file(name, options).unwrap();
+        writer.write_all(body.as_bytes()).unwrap();
+    }
+    writer.finish().unwrap();
+    path
+}
+
+/// `parse` runs with an empty configuration directory, signs nothing in,
+/// and creates no configuration.
+#[test]
+fn parse_reads_a_generated_zip_with_no_configuration() {
+    let dir = tempfile::tempdir().unwrap();
+    let zip = estimate_zip_file(dir.path());
+    let missing = dir.path().join("missing");
+    for (subcommand, check) in [
+        ("locations", "alex@contoso.example"),
+        ("failures", "sam@contoso.example"),
+        ("summary", "LocationCount"),
+    ] {
+        let output = purview()
+            .env("PURVIEW_CONFIG_DIR", &missing)
+            .args(["--json", "parse", subcommand])
+            .arg(&zip)
+            .assert()
+            .success()
+            .stderr(predicate::str::is_empty())
+            .get_output()
+            .stdout
+            .clone();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains(check), "{subcommand}: {text}");
+        serde_json::from_str::<Value>(&text).unwrap();
+    }
+    purview()
+        .env("PURVIEW_CONFIG_DIR", &missing)
+        .args(["parse", "locations", "--with-hits", "--top", "1", "--plain"])
+        .arg(&zip)
+        .assert()
+        .success()
+        .stdout("alex@contoso.example\tPrimaryMailBox\t12\t2048\tSucceeded\n");
+    assert!(!missing.exists());
+    // A file that is not a zip is refused without naming its path.
+    let not_zip = dir.path().join("plain.zip");
+    std::fs::write(&not_zip, b"not a zip").unwrap();
+    let output = purview()
+        .env("PURVIEW_CONFIG_DIR", &missing)
+        .args(["--json", "parse", "locations"])
+        .arg(&not_zip)
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(value["error"]["code"], "HostileZip");
+    assert!(!value["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("plain.zip"));
+}
+
+#[test]
+fn estimate_argument_errors_and_no_write_need_no_network() {
+    let case = "00000000-0000-4000-8000-000000000031";
+    let search = "00000000-0000-4000-8000-000000000051";
+    for extra in [
+        &["--strict", "--no-download"][..],
+        &["--strict", "--no-wait"],
+        &["--reason", "x"],
+        &["--allow-generic"],
+        &["--no-wait", "--wait-timeout", "1m"],
+        &["--wait-timeout", "nonsense"],
+        &["--poll-interval", "1s"],
+    ] {
+        let mut args = vec!["estimate", case, search];
+        args.extend_from_slice(extra);
+        assert_eq!(refused_before_sign_in(&args), "CommandFailed", "{extra:?}");
+    }
+    assert_eq!(
+        refused_before_sign_in(&["--no-write", "estimate", case, search]),
+        "WriteRefused"
+    );
+}

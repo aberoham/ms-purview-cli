@@ -18,6 +18,8 @@ use crate::model::wire::{
 };
 use crate::output::{sanitize, write_fields, write_rows, OutputFormat};
 use crate::poll::{elapsed_text, PollEnd, Poller, Timing};
+use crate::report::estimate::Collection;
+use crate::report::EvidenceOf;
 use crate::routes::{CaseId, OperationId, Query, ReadRoute};
 
 /// Operations read at once by `operation list --resolve`.
@@ -312,6 +314,12 @@ pub(crate) fn warn_invalid_counts<'a>(
     }
 }
 
+/// What `operation get --check` downloads and reads with.
+pub struct Check<'a> {
+    pub download: &'a super::download::Context,
+    pub limits: crate::report::ReportLimits,
+}
+
 /// How `operation get` waits, if it does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Wait {
@@ -326,6 +334,7 @@ pub async fn get(
     case: &CaseKey,
     operation: &OperationId,
     wait: Option<Wait>,
+    check: Option<Check<'_>>,
 ) -> Result<Produced> {
     let case = case_id(&session.graph, case, &mut session.env.stderr).await?;
     let route = ReadRoute::Operation(case, operation.clone());
@@ -386,7 +395,104 @@ pub async fn get(
         &mut session.env.stderr,
         std::iter::once(&record),
     );
-    show(session, &record)
+    let collection = match check {
+        Some(check) => Some(check_collection(session, case, operation, &record, check).await?),
+        None => None,
+    };
+    show(session, &record, collection)
+}
+
+/// `--check`: the evidence file of a finished estimate, item report or
+/// export downloaded into the data directory (a verified copy there is
+/// reused), and the collection check for its action. An operation that is
+/// not finished, or of another action, stays unchecked.
+async fn check_collection(
+    session: &mut Session<'_>,
+    case: CaseId,
+    operation: &OperationId,
+    record: &OperationRecord,
+    check: Check<'_>,
+) -> Result<Collection> {
+    let action = record.action(Source::Single);
+    let evidence_of = match action {
+        Action::Estimate => EvidenceOf::Estimate,
+        Action::ExportReport | Action::ExportResult => EvidenceOf::Report,
+        _ => return Ok(Collection::Unchecked),
+    };
+    if !record.status.is_terminal() {
+        let _ = writeln!(
+            session.env.stderr,
+            "notice: the operation is not finished, so --check has nothing to read yet"
+        );
+        return Ok(Collection::Unchecked);
+    }
+    // An export's evidence is its report part (Assumption: named
+    // Reports-…); the other actions have only the report.
+    let file = match action {
+        Action::ExportResult => record.detail().and_then(|detail| {
+            detail
+                .files()
+                .iter()
+                .filter_map(|file| file.file_name.clone())
+                .find(|name| name.starts_with("Reports-"))
+        }),
+        _ => None,
+    };
+    if action == Action::ExportResult && file.is_none() {
+        let _ = writeln!(
+            session.env.stderr,
+            "warning: collection unchecked: the export lists no Reports- file"
+        );
+        return Ok(Collection::Unchecked);
+    }
+    let request = super::download::Request {
+        case: CaseKey::Id(case),
+        operation: operation.clone(),
+        out: None,
+        file,
+        overwrite: false,
+    };
+    let fetched = super::download::fetch(session, case, record, &request, check.download).await?;
+    for reason in &fetched.reasons {
+        if reason["code"] == "FileNotDownloadable" {
+            let _ = writeln!(
+                session.env.stderr,
+                "warning: {}",
+                sanitize(reason["message"].as_str().unwrap_or_default())
+            );
+        }
+    }
+    if fetched.interrupted {
+        return Err(PurviewError::message(
+            "interrupted while downloading the evidence file; the collection was not checked",
+        ));
+    }
+    for done in &fetched.done {
+        match crate::report::ReportFiles::read(&done.path, check.limits) {
+            Ok(files) if files.locations.is_some() || files.statistics_errors.is_some() => {
+                super::parse::warn_missing_columns(&mut session.env.stderr, &files);
+                let _ = writeln!(
+                    session.env.stderr,
+                    "notice: checked {}",
+                    sanitize(&done.path.display().to_string())
+                );
+                return Ok(files.collection(evidence_of));
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let _ = writeln!(
+                    session.env.stderr,
+                    "warning: a downloaded file could not be read as a report zip ({})",
+                    error.metadata().0
+                );
+            }
+        }
+    }
+    let _ = writeln!(
+        session.env.stderr,
+        "warning: collection unchecked: no downloaded file is a report zip"
+    );
+    Ok(Collection::Unchecked)
 }
 
 /// `3f2a…` for progress lines.
@@ -423,7 +529,12 @@ pub(crate) fn incomplete_reason(record: &OperationRecord) -> Option<Value> {
 /// Prints the operation. JSON keeps Graph's record, `downloadUrl`
 /// included, and adds `collection: unchecked` for an estimate, report or
 /// export, whose collection check arrives with `--check`.
-fn show(session: &mut Session<'_>, record: &OperationRecord) -> Result<Produced> {
+fn show(
+    session: &mut Session<'_>,
+    record: &OperationRecord,
+    collection: Option<Collection>,
+) -> Result<Produced> {
+    let collection_text = collection.unwrap_or(Collection::Unchecked).as_str();
     let action = record.action(Source::Single);
     let collects = matches!(
         action,
@@ -439,7 +550,7 @@ fn show(session: &mut Session<'_>, record: &OperationRecord) -> Result<Produced>
     if session.output.format == OutputFormat::Json {
         let mut raw = record.raw.clone();
         if let (true, Value::Object(object)) = (collects, &mut raw) {
-            object.insert("collection".into(), json!("unchecked"));
+            object.insert("collection".into(), json!(collection_text));
         }
         let document = match &reason {
             None => session
@@ -536,7 +647,7 @@ fn show(session: &mut Session<'_>, record: &OperationRecord) -> Result<Produced>
         }
     }
     if collects {
-        fields.push(("Collection", "unchecked".to_owned()));
+        fields.push(("Collection", collection_text.to_owned()));
     }
     let fields = shown_fields(session, fields);
     write_fields(&mut session.env.stdout, &fields)?;

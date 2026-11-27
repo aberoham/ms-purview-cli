@@ -976,6 +976,64 @@ async fn a_count_graph_gives_as_another_type_is_unchecked_and_named() {
     );
 }
 
+/// The estimate zip with the file whose name starts with `prefix`
+/// replaced by `body`.
+fn estimate_zip_replacing(prefix: &str, body: &str) -> Vec<u8> {
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(estimate_zip(false))).unwrap();
+    let mut buffer = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = zip::ZipWriter::new(&mut buffer);
+        for index in 0..zip.len() {
+            let entry = zip.by_index(index).unwrap();
+            if entry.name().unwrap().starts_with(prefix) {
+                let name = entry.name().unwrap().into_owned();
+                drop(entry);
+                writer
+                    .start_file(name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(body.as_bytes()).unwrap();
+            } else {
+                writer.raw_copy_file(entry).unwrap();
+            }
+        }
+        writer.finish().unwrap();
+    }
+    buffer.into_inner()
+}
+
+#[tokio::test]
+async fn a_failed_location_with_a_count_leaves_hits_per_location_unchecked() {
+    let failed_row = format!(
+        "{LOCATIONS_HEADER}Exchange,Mailbox,alex@contoso.example,id-1,Mailbox,PrimaryMailBox,0,0,Failed,Timed out,q\r\n"
+    );
+    let statistics_error = format!(
+        "{STATISTICS_HEADER}Exchange,Mailbox,pat@fabrikam.example,Mailbox,SystemMailbox,Error,OperationCanceledException,x,0\r\n"
+    );
+    for zip in [
+        estimate_zip_replacing("Locations-", &failed_row),
+        estimate_zip_replacing("Statistics-", &statistics_error),
+    ] {
+        let setup = Setup::new().await;
+        setup
+            .preflight(
+                fixture_value(&setup.harness, "search-get-mailboxes.json"),
+                json!({"value": []}),
+            )
+            .await;
+        setup.accept(&setup.key_form_location()).await;
+        setup.operation(0, setup.succeeded()).await;
+        setup.serve(zip).await;
+        let run = setup.run(&["--json", "--yes"]).await;
+        assert_eq!(run.outcome.exit_code, 0, "{}", run.stdout());
+        let result = &run.json()["results"]["result"];
+        assert_eq!(result["collection"], "incomplete");
+        assert_eq!(
+            result["volume"]["unchecked"],
+            json!(["volume.warn_hits_per_location"])
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_second_locations_file_leaves_hits_per_location_unchecked() {
     let setup = Setup::new().await;

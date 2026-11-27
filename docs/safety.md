@@ -153,10 +153,11 @@ downloads its report zip and reads it:
   location with more than `warn_hits_per_location` hits (default 1,000),
   or an `indexedItemsSize` above `max_export_size` (default 10 GiB). Each
   limit passed is a `warning: VOLUME:` line on stderr and an entry in
-  `volume.over`. A count that is missing or unreadable, a location whose
-  hits are not known (a failed one, say) or a second Locations file
-  leaves its limit in `volume.unchecked`, and an estimate that did not
-  succeed has every limit there, with no warning. The warning does not change the exit code: it is
+  `volume.over`. A count that is missing or unreadable leaves its limit
+  in `volume.unchecked`. Hits per location are checked only when
+  `collection` is `complete` and every location has a count. An estimate
+  whose status is neither `succeeded` nor `partiallySucceeded` has every
+  limit there, with no warning. The warning does not change the exit code: it is
   there so that a person narrows the query or confirms the scope before a
   report or export. With Teams context on, an export held about four
   times the estimated count (Observed, one run), so it can be several

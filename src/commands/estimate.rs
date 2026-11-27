@@ -455,7 +455,12 @@ impl WriteCommand for Estimate {
                 );
             }
         }
-        let volume = volume_of(self.volume.unwrap_or_default(), &record, evidence.as_ref());
+        let volume = volume_of(
+            self.volume.unwrap_or_default(),
+            &record,
+            evidence.as_ref(),
+            collection,
+        );
         for line in volume.warnings() {
             let _ = writeln!(log, "{line}");
         }
@@ -559,6 +564,7 @@ fn volume_of(
     limits: VolumeLimits,
     record: &OperationRecord,
     evidence: Option<&ReportFiles>,
+    collection: Collection,
 ) -> Volume {
     if !matches!(
         record.status,
@@ -577,7 +583,7 @@ fn volume_of(
         items,
         size,
         evidence.and_then(|files| files.locations.as_ref()),
-        evidence.is_some_and(|files| files.duplicates.contains(&"Locations")),
+        collection == Collection::Complete,
     )
 }
 

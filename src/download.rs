@@ -517,8 +517,11 @@ pub type PathHook = Arc<dyn Fn(&Path) + Send + Sync>;
 pub struct DownloadFaults {
     /// Called with the final path just before a file is published.
     pub before_publish: Option<PathHook>,
-    /// Makes every manifest write fail.
+    /// Makes every manifest write after a publication fail.
     pub manifest_write: bool,
+    /// Makes publishing by hard link fail as on a file system without
+    /// hard links.
+    pub no_hard_links: bool,
 }
 
 impl std::fmt::Debug for DownloadFaults {
@@ -527,6 +530,7 @@ impl std::fmt::Debug for DownloadFaults {
             .debug_struct("DownloadFaults")
             .field("before_publish", &self.before_publish.is_some())
             .field("manifest_write", &self.manifest_write)
+            .field("no_hard_links", &self.no_hard_links)
             .finish()
     }
 }
@@ -568,18 +572,25 @@ pub async fn download_into(
     // rename a file that is open.
     let part = sink.into_std().await;
     let fetched = fetched?;
-    let part = tokio::task::spawn_blocking(move || part.sync_all())
-        .await
-        .map_err(|_| PurviewError::message("the file sync stopped unexpectedly"))?;
-    part?;
-    let checked = guard.path().to_path_buf();
-    tokio::task::spawn_blocking(move || check_zip(&checked))
-        .await
-        .map_err(|_| PurviewError::message("the zip check stopped unexpectedly"))??;
+    // The zip check reads the file just written, through the handle that
+    // wrote it, not a fresh open of its name.
+    let checked = tokio::task::spawn_blocking(move || -> Result<()> {
+        part.sync_all()?;
+        check_zip_file(&part)
+    })
+    .await
+    .map_err(|_| PurviewError::message("the zip check stopped unexpectedly"))?;
+    checked?;
     if let Some(hook) = &faults.before_publish {
         hook(&target);
     }
-    publish(guard, &target, placement.overwrite)?;
+    if let Some(left) = publish(guard, &target, placement.overwrite, faults.no_hard_links)? {
+        let _ = writeln!(
+            log,
+            "warning: the temporary file {} could not be removed",
+            sanitize(&left.display().to_string())
+        );
+    }
     Ok(Published {
         path: target,
         bytes: fetched.bytes,
@@ -617,7 +628,8 @@ fn create_part(dir: &Path, name: &str) -> Result<(fs::File, PartFile)> {
             .map_err(|_| PurviewError::message("could not draw a random temporary file name"))?;
         let path = dir.join(format!(".{name}.{}.part", hex(&random)));
         let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
+        // Read too: the zip check reads the file through this handle.
+        options.read(true).write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -636,7 +648,14 @@ fn create_part(dir: &Path, name: &str) -> Result<(fs::File, PartFile)> {
 
 /// Opens the zip's central directory.
 pub fn check_zip(path: &Path) -> Result<()> {
-    let file = fs::File::open(path)?;
+    check_zip_file(&fs::File::open(path)?)
+}
+
+/// Opens the central directory of an open zip, from its start.
+fn check_zip_file(file: &fs::File) -> Result<()> {
+    use std::io::Seek;
+    let mut file = file;
+    file.rewind()?;
     zip::ZipArchive::new(file).map(|_| ()).map_err(|_| {
         PurviewError::message(
             "the downloaded file is not a zip whose central directory can be read",
@@ -646,8 +665,14 @@ pub fn check_zip(path: &Path) -> Result<()> {
 
 /// Publishes the temporary file under `target`. Without `overwrite`, a
 /// hard link, which fails if the name exists; with it, a rename that
-/// replaces it, refused when `target` is a link.
-fn publish(mut part: PartFile, target: &Path, overwrite: bool) -> Result<()> {
+/// replaces it, refused when `target` is a link. Returns the temporary
+/// name when it could not be removed after a link.
+fn publish(
+    mut part: PartFile,
+    target: &Path,
+    overwrite: bool,
+    no_hard_links: bool,
+) -> Result<Option<PathBuf>> {
     let shown = || sanitize(&target.display().to_string());
     if overwrite {
         if let Ok(metadata) = fs::symlink_metadata(target) {
@@ -660,11 +685,19 @@ fn publish(mut part: PartFile, target: &Path, overwrite: bool) -> Result<()> {
         }
         fs::rename(part.path(), target)?;
         part.keep();
-        return Ok(());
+        return Ok(None);
     }
-    match fs::hard_link(part.path(), target) {
-        // The guard removes the temporary name.
-        Ok(()) => Ok(()),
+    let linked = if no_hard_links {
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    } else {
+        fs::hard_link(part.path(), target)
+    };
+    match linked {
+        Ok(()) => {
+            let left = part.path().to_path_buf();
+            part.keep();
+            Ok(fs::remove_file(&left).err().map(|_| left))
+        }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             Err(PurviewError::TargetAppeared { path: shown() })
         }
@@ -691,6 +724,62 @@ fn links_unsupported(error: &std::io::Error) -> bool {
         matches!(code, Some(1 | 50))
     } else {
         false
+    }
+}
+
+/// The lock file of a download directory. Its name starts with a dot, so
+/// no local file name can equal it.
+pub const LOCK_FILE: &str = ".purview-download.lock";
+
+/// How long a command waits for another `download` into the same
+/// directory to finish.
+pub const LOCK_WAIT: Duration = Duration::from_secs(30);
+
+/// An exclusive lock on a download directory, held from reading the
+/// manifest to the last write of it, so that two commands writing into one
+/// directory cannot lose each other's entries. Released when dropped.
+#[derive(Debug)]
+pub struct DirLock {
+    _file: fs::File,
+}
+
+impl DirLock {
+    pub async fn acquire(dir: &Path, clock: &dyn Clock) -> Result<Self> {
+        let path = dir.join(LOCK_FILE);
+        if let Ok(metadata) = fs::symlink_metadata(&path) {
+            if !metadata.is_file() || crate::config::is_link_like(&metadata) {
+                return Err(PurviewError::message(format!(
+                    "{} is a link or not a regular file; refusing to use it as the lock",
+                    sanitize(&path.display().to_string())
+                )));
+            }
+        }
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&path)?;
+        let started = clock.elapsed();
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(fs::TryLockError::WouldBlock) => {
+                    if clock.elapsed().saturating_sub(started) >= LOCK_WAIT {
+                        return Err(PurviewError::message(format!(
+                            "another purview download kept {} busy for over {} seconds; try \
+                             again when it finishes",
+                            sanitize(&dir.display().to_string()),
+                            LOCK_WAIT.as_secs()
+                        )));
+                    }
+                    clock.sleep(Duration::from_millis(200)).await;
+                }
+                Err(fs::TryLockError::Error(error)) => return Err(error.into()),
+            }
+        }
     }
 }
 
@@ -810,7 +899,7 @@ mod tests {
         drop(file);
         fs::write(&target, b"other writer").unwrap();
         let part_path = part.path().to_path_buf();
-        let error = publish(part, &target, false).unwrap_err();
+        let error = publish(part, &target, false, false).unwrap_err();
         assert_eq!(error.metadata().0, "TargetAppeared");
         assert_eq!(fs::read(&target).unwrap(), b"other writer");
         assert!(!part_path.exists());
@@ -829,13 +918,13 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .starts_with(".a.zip."));
-        publish(part, &target, false).unwrap();
+        publish(part, &target, false, false).unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"new");
         assert!(!part_path.exists());
         let (mut file, part) = create_part(dir.path(), "a.zip").unwrap();
         file.write_all(b"newer").unwrap();
         drop(file);
-        publish(part, &target, true).unwrap();
+        publish(part, &target, true, false).unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"newer");
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
@@ -849,7 +938,7 @@ mod tests {
         let target = dir.path().join("a.zip");
         std::os::unix::fs::symlink(&elsewhere, &target).unwrap();
         let (_file, part) = create_part(dir.path(), "a.zip").unwrap();
-        assert!(publish(part, &target, true).is_err());
+        assert!(publish(part, &target, true, false).is_err());
         assert_eq!(fs::read(&elsewhere).unwrap(), b"keep");
     }
 

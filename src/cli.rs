@@ -1026,15 +1026,15 @@ impl ReadCommand {
         Ok(Self::Download(commands::download::Request {
             case: CaseKey::parse(&args.case)?,
             operation: valid::operation_id(&args.operation)?,
+            // Checked for blankness, then kept as given: a leading or
+            // trailing space can be part of a file or directory name.
             out: args
                 .out
-                .as_deref()
-                .map(|out| explicit("--out", out).map(PathBuf::from))
+                .map(|out| not_blank("--out", out).map(PathBuf::from))
                 .transpose()?,
             file: args
                 .file
-                .as_deref()
-                .map(|file| explicit("--file", file))
+                .map(|file| not_blank("--file", file))
                 .transpose()?,
             overwrite: args.overwrite,
         }))
@@ -1173,6 +1173,12 @@ async fn read_command(
         exit_code: produced.exit_code,
         stdout_value: produced.document,
     })
+}
+
+/// `value` unchanged, or the blank-value error `explicit` gives.
+fn not_blank(flag: &str, value: String) -> Result<String> {
+    explicit(flag, &value)?;
+    Ok(value)
 }
 
 fn non_empty(value: Option<&str>) -> Option<&str> {

@@ -35,9 +35,16 @@ const RESERVED: &[&str] = &[
     "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 
+/// Names the tool keeps for itself in a download directory, compared
+/// without regard to case. Local names never start with a dot, so the
+/// lock and temporary files cannot collide with one.
+pub const RESERVED_NAMES: &[&str] = &["manifest.json"];
+
 /// The local names for one operation's server names, in the same order.
-/// `None` for a name that cannot be made into a local one: two files with
-/// the very same server name, which no suffix can tell apart.
+/// A name that would equal another file's (without regard to case) or a
+/// reserved name gets the hash suffix. `None` for a name that cannot be
+/// made unique: two files with the very same server name, or a suffixed
+/// name that still equals another.
 pub fn local_names(originals: &[&str]) -> Vec<Option<String>> {
     let plain: Vec<String> = originals
         .iter()
@@ -51,18 +58,33 @@ pub fn local_names(originals: &[&str]) -> Vec<Option<String>> {
     for original in originals {
         *exact.entry(original).or_default() += 1;
     }
-    originals
+    let reserved = |name: &str| {
+        RESERVED_NAMES
+            .iter()
+            .any(|kept| name.eq_ignore_ascii_case(kept))
+    };
+    let chosen: Vec<Option<String>> = originals
         .iter()
         .zip(plain)
         .map(|(original, name)| {
             if exact.get(original).copied().unwrap_or(0) > 1 {
                 None
-            } else if seen.get(&name.to_lowercase()).copied().unwrap_or(0) > 1 {
+            } else if seen.get(&name.to_lowercase()).copied().unwrap_or(0) > 1 || reserved(&name) {
                 Some(local_name(original, true))
             } else {
                 Some(name)
             }
         })
+        .collect();
+    // The whole allocation must be unique: a suffixed name could equal
+    // another file's plain one.
+    let mut finals: HashMap<String, usize> = HashMap::new();
+    for name in chosen.iter().flatten() {
+        *finals.entry(name.to_lowercase()).or_default() += 1;
+    }
+    chosen
+        .into_iter()
+        .map(|name| name.filter(|name| finals.get(&name.to_lowercase()) == Some(&1)))
         .collect()
 }
 
@@ -241,6 +263,27 @@ mod tests {
         assert_eq!(names[3].as_deref(), Some("c.zip"));
         let same = local_names(&["x.zip", "x.zip", "y.zip"]);
         assert_eq!(same, vec![None, None, Some("y.zip".to_owned())]);
+    }
+
+    #[test]
+    fn the_manifest_name_is_never_a_local_name() {
+        for alone in ["manifest.json", "Manifest.JSON"] {
+            let names = local_names(&[alone, "report.zip"]);
+            assert!(
+                names[0].as_deref().is_some_and(|name| name.contains('~')),
+                "{names:?}"
+            );
+            assert_eq!(names[1].as_deref(), Some("report.zip"));
+        }
+    }
+
+    #[test]
+    fn a_suffixed_name_that_equals_another_file_is_refused() {
+        let suffixed = local_name("a:b.zip", true);
+        let names = local_names(&["a:b.zip", "a?b.zip", &suffixed]);
+        assert_eq!(names[0], None);
+        assert_eq!(names[2], None);
+        assert!(names[1].is_some());
     }
 
     #[test]

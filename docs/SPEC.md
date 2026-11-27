@@ -504,20 +504,34 @@ again, unless `--overwrite` is given. A URL cannot be passed on the command line
   `cases/<case-id>/<operation-id>/` below the data root (section 5.4). `--file NAME` keeps
   the one file whose server `fileName` is exactly `NAME`; no match is an error that does not
   repeat the name.
-- Every file is planned before any download request: its local name (section 4.7.1), and
-  whether its target is absent, a verified download (skipped), a file with no manifest
-  entry that verifies (recorded as `recovered`), or anything else (`TargetExists` without
-  `--overwrite`). A link at a target is refused even with `--overwrite`. Any refusal ends
-  the command before a download request or a download-token refresh.
-- A file with no `fileName`, no `downloadUrl`, one that does not parse, one the host rule
-  refuses, or a `fileName` another file of the operation shares exactly, is left out with
+- Every file is planned before any download request: its local name (section 4.7.1, made
+  across all the operation's files, so `--file` gives the same name a full download does),
+  and whether its target is absent, a verified download (skipped), a file that no manifest
+  entry reaches and that verifies (recorded as `recovered`), or anything else
+  (`TargetExists` without `--overwrite`). An entry reaches a file under its own name or
+  under another name for the same file (`Report.zip` and `report.zip` on a case-insensitive
+  file system), so another operation's file is never recovered as this one's. A link at a
+  target, and a link at any directory of the managed path below the data root, is refused
+  even with `--overwrite`. A known size over `download.max_size` is refused too. Any refusal
+  ends the command before a download request or a download-token refresh.
+- A command holds an exclusive lock on the directory (`.purview-download.lock`) from
+  reading the manifest to its last write, so two commands writing into one directory never
+  lose each other's entries. A command waits up to 30 seconds for the lock, then fails.
+- A file with no `fileName`, a `fileName` that holds a web address or a secret the
+  Redactor knows, no `downloadUrl`, one that does not parse, one the host rule refuses, or a
+  `fileName` whose local name cannot be made unique, is left out with
   a `FileNotDownloadable` reason, and the other files are still downloaded. Such a reason,
   or an operation that finished without succeeding (its exit-4 reason as in `operation
   get`), makes the command exit 4 after the other files are written; the envelope is
   printed whole even under `--results-only`.
 - Files are fetched one at a time. A failure while fetching ends the command with exit 1;
   files already published stay recorded, and the next run skips them. A download is not
-  retried automatically.
+  retried automatically. Under `--overwrite`, a file's old manifest entry is removed before
+  its replacement is fetched, so a manifest write that fails after the replacement leaves
+  a file the next run recovers.
+- Ctrl-C ends the run with exit 130: the file in flight is abandoned and its temporary
+  file removed, and the files already published are printed, with `"error": {"code":
+  "Interrupted", …}` beside `results` under `--json`.
 - JSON `results` has one object per file: `fileName` (the server name), `path`, `size`,
   `sha256` and `status` (`downloaded`, `alreadyDownloaded` or `recovered`). The table has
   `STATUS`, `SIZE` and `PATH`.
@@ -937,7 +951,11 @@ and contain any character. The tool:
 - cuts the stem, on a character boundary, so the whole name fits 200 bytes, and adds `~` plus
   8 hexadecimal characters of the SHA-256 of the original name when it cuts;
 - checks that the result is a single normal path component;
-- when two files of one operation map to the same name, adds the hash suffix to both.
+- when two files of one operation map to the same name, without regard to case, adds the
+  hash suffix to both, and does the same for `manifest.json`; a name that is still not
+  unique leaves that file out (`FileNotDownloadable`). Names that differ only in Unicode
+  normalisation are not detected; on a file system that treats them as one, the second
+  publication fails with `TargetAppeared` and nothing is replaced.
 
 The manifest keeps the original server name, because `export index` matches item zips by
 that name.

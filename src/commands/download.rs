@@ -23,7 +23,8 @@ use url::Url;
 use super::{case_id, shown, Produced, Session};
 use crate::download::manifest::{Entry, Manifest};
 use crate::download::{
-    self, check_zip, digest_file, names, DownloadClient, DownloadFaults, DownloadableFile, Limits,
+    self, check_zip, digest_file, names, DirLock, DownloadClient, DownloadFaults, DownloadableFile,
+    Limits,
 };
 use crate::error::{PurviewError, Result};
 use crate::model::valid::CaseKey;
@@ -112,44 +113,39 @@ pub async fn run(
             request.operation
         )));
     }
+    super::operation::warn_invalid_counts(
+        &session.env.redactor.clone(),
+        &mut session.env.stderr,
+        std::iter::once(&record),
+    );
     let files: Vec<FileRecord> = record
         .detail()
         .map(|detail| detail.files().to_vec())
         .unwrap_or_default();
-    let files = match &request.file {
-        None => files,
-        Some(wanted) => {
-            let kept: Vec<FileRecord> = files
-                .into_iter()
-                .filter(|file| file.file_name.as_deref() == Some(wanted.as_str()))
-                .collect();
-            if kept.is_empty() {
-                // The name is not repeated: it is tenant text.
-                return Err(PurviewError::message(
-                    "the operation has no file with the name given to --file; 'purview \
-                     operation get' lists its files",
-                ));
-            }
-            kept
+    if let Some(wanted) = &request.file {
+        if !files
+            .iter()
+            .any(|file| file.file_name.as_deref() == Some(wanted.as_str()))
+        {
+            // The name is not repeated: it is tenant text.
+            return Err(PurviewError::message(
+                "the operation has no file with the name given to --file; 'purview operation \
+                 get' lists its files",
+            ));
         }
-    };
+    }
     let mut reasons: Vec<Value> = Vec::new();
     if let Some(reason) = super::operation::incomplete_reason(&record) {
         let message = shown(session, reason["message"].as_str().unwrap_or_default());
         reasons.push(json!({"code": reason["code"], "message": message}));
     }
-    let candidates = downloadable(context.client.rule(), &files, &mut reasons);
-    let dir = match &request.out {
-        Some(out) => crate::config::normalise(out),
-        None => context
-            .data_root
-            .join("cases")
-            .join(case.to_string())
-            .join(request.operation.to_string()),
-    };
-    // Every path the command prints is a full one (`docs/SPEC.md` section
-    // 5.4), whatever --out or defaults.data_dir gave.
-    let dir = std::path::absolute(&dir)?;
+    let candidates = downloadable(
+        context.client.rule(),
+        &session.env.redactor,
+        &files,
+        request.file.as_deref(),
+        &mut reasons,
+    );
     if candidates.is_empty() {
         if files.is_empty() {
             let _ = writeln!(
@@ -158,9 +154,44 @@ pub async fn run(
                 request.operation
             );
         }
-        return finish(session, Vec::new(), reasons);
+        return finish(session, Vec::new(), reasons, false);
     }
-    prepare_dir(&dir)?;
+    // A known size over the limit is refused before anything is written.
+    for (index, (file, _)) in candidates.iter().enumerate() {
+        if let Some(size) = file.size.filter(|size| *size > context.limits.max_size) {
+            return Err(PurviewError::message(format!(
+                "a file of the operation is {size} bytes, over the {}-byte limit \
+                 (config.json download.max_size); nothing was downloaded (file {} of those \
+                 to download)",
+                context.limits.max_size,
+                index + 1
+            )));
+        }
+    }
+    // Every path the command prints is a full one (`docs/SPEC.md` section
+    // 5.4), whatever --out or defaults.data_dir gave.
+    let dir = match &request.out {
+        Some(out) => {
+            let dir = std::path::absolute(crate::config::normalise(out))?;
+            prepare_dir(&dir)?;
+            dir
+        }
+        None => {
+            let root = std::path::absolute(&context.data_root)?;
+            prepare_dir(&root)?;
+            let mut dir = root;
+            for part in [
+                "cases".to_owned(),
+                case.to_string(),
+                request.operation.to_string(),
+            ] {
+                dir.push(part);
+                prepare_dir(&dir)?;
+            }
+            dir
+        }
+    };
+    let _lock = DirLock::acquire(&dir, session.env.clock.as_ref()).await?;
     let mut manifest = Manifest::load(&dir)?;
     let action = record.action(Source::Single).label().to_owned();
     let ids = Ids {
@@ -184,48 +215,66 @@ pub async fn run(
     if recovered {
         save_manifest(&manifest, &dir, session, context, None)?;
     }
+    // One listener for the whole run; Ctrl-C abandons the file in flight,
+    // whose temporary file is removed, and keeps the files already
+    // published.
+    let interrupt = session.env.interrupt.clone();
+    let interrupted = interrupt.wait();
+    tokio::pin!(interrupted);
     let mut done = Vec::new();
     for plan in plans {
-        match plan {
-            Plan::Done(finished) => done.push(finished),
+        let (file, name, replace) = match plan {
+            Plan::Done(finished) => {
+                done.push(finished);
+                continue;
+            }
             Plan::Fetch {
                 file,
                 name,
                 replace,
-            } => {
-                let published = download::download_into(
-                    &context.client,
-                    &file,
-                    &download::Placement {
-                        dir: &dir,
-                        name: &name,
-                        overwrite: replace,
-                    },
-                    context.limits,
-                    &context.faults,
-                    &mut session.env.stderr,
-                )
-                .await
-                .map_err(|error| {
-                    error.context(format!(
-                        "downloading {}",
-                        sanitize(&shown(session, &file.server_name))
-                    ))
-                })?;
-                let finished = Done {
-                    server_name: file.server_name,
-                    path: published.path,
-                    bytes: published.bytes,
-                    sha256: published.sha256,
-                    status: Status::Downloaded,
-                };
-                manifest.record(entry(&ids, &finished, &session.env.clock.now(), false));
-                save_manifest(&manifest, &dir, session, context, Some(&finished.path))?;
-                done.push(finished);
-            }
+            } => (file, name, replace),
+        };
+        if replace && manifest.entry(&name).is_some() {
+            // The old entry goes first, so that if the manifest cannot be
+            // written after the replacement, the next run finds a file with
+            // no entry and recovers it.
+            manifest.files.retain(|entry| entry.file_name != name);
+            save_manifest(&manifest, &dir, session, context, None)?;
         }
+        let placement = download::Placement {
+            dir: &dir,
+            name: &name,
+            overwrite: replace,
+        };
+        let fetched = tokio::select! {
+            fetched = download::download_into(
+                &context.client,
+                &file,
+                &placement,
+                context.limits,
+                &context.faults,
+                &mut session.env.stderr,
+            ) => fetched,
+            () = &mut interrupted => return finish(session, done, reasons, true),
+        };
+        let published = fetched.map_err(|error| {
+            error.context(format!(
+                "downloading {}",
+                sanitize(&shown(session, &file.server_name))
+            ))
+        })?;
+        let finished = Done {
+            server_name: file.server_name,
+            path: published.path,
+            bytes: published.bytes,
+            sha256: published.sha256,
+            status: Status::Downloaded,
+        };
+        manifest.record(entry(&ids, &finished, &session.env.clock.now(), false));
+        save_manifest(&manifest, &dir, session, context, Some(&finished.path))?;
+        done.push(finished);
     }
-    finish(session, done, reasons)
+    finish(session, done, reasons, false)
 }
 
 struct Ids {
@@ -235,10 +284,13 @@ struct Ids {
 }
 
 /// The files that can be downloaded, with their local names; a reason for
-/// each that cannot.
+/// each that cannot. Names are made across every file of the operation,
+/// so `--file` gives a file the same local name a full download does.
 fn downloadable(
     rule: &download::DownloadRule,
+    redactor: &crate::redact::Redactor,
     files: &[FileRecord],
+    wanted: Option<&str>,
     reasons: &mut Vec<Value>,
 ) -> Vec<(DownloadableFile, String)> {
     let named: Vec<&str> = files
@@ -250,6 +302,11 @@ fn downloadable(
     let mut local = named.iter().zip(local);
     let mut kept = Vec::new();
     for (index, file) in files.iter().enumerate() {
+        let server_name = file.file_name.as_deref().filter(|name| !name.is_empty());
+        let name = server_name.and_then(|_| local.next().and_then(|(_, name)| name));
+        if wanted.is_some() && server_name != wanted {
+            continue;
+        }
         let refuse = |reasons: &mut Vec<Value>, why: &str| {
             reasons.push(json!({
                 "code": "FileNotDownloadable",
@@ -259,13 +316,23 @@ fn downloadable(
                 ),
             }));
         };
-        let Some(server_name) = file.file_name.as_deref().filter(|name| !name.is_empty()) else {
+        let Some(server_name) = server_name else {
             refuse(reasons, "it has no fileName");
             continue;
         };
-        let name = local.next().and_then(|(_, name)| name);
+        // A name that holds a web address or a secret would carry it into
+        // the local path and the manifest.
+        if crate::redact::urls_in_text(server_name, redactor) != server_name
+            || redactor.redact(server_name) != server_name
+        {
+            refuse(reasons, "its fileName holds a web address or a secret");
+            continue;
+        }
         let Some(name) = name else {
-            refuse(reasons, "it has the same fileName as another file");
+            refuse(
+                reasons,
+                "its fileName gives the same local name as another file's",
+            );
             continue;
         };
         let Some(text) = file.download_url.as_deref() else {
@@ -302,6 +369,38 @@ fn prepare_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The manifest entry for the file at `dir/name`: one recorded under that
+/// name, or under another name that reaches the same file, as `Report.zip`
+/// and `report.zip` do on a case-insensitive file system.
+fn entry_for<'m>(
+    dir: &Path,
+    manifest: &'m Manifest,
+    name: &str,
+    metadata: &fs::Metadata,
+) -> Option<&'m Entry> {
+    manifest.entry(name).or_else(|| {
+        manifest.files.iter().find(|entry| {
+            fs::symlink_metadata(dir.join(&entry.file_name))
+                .is_ok_and(|other| same_file(metadata, &other))
+        })
+    })
+}
+
+/// Whether two metadata describe one file: the same device and inode on
+/// Unix; elsewhere, where the standard library gives no file identity, the
+/// same length and modification time.
+fn same_file(first: &fs::Metadata, second: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        first.dev() == second.dev() && first.ino() == second.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        first.len() == second.len() && first.modified().ok() == second.modified().ok()
+    }
+}
+
 /// The plan for one file whose target is `dir/name`.
 fn plan(
     dir: &Path,
@@ -319,7 +418,7 @@ fn plan(
             return Ok(Plan::Fetch {
                 file,
                 name,
-                replace: false,
+                replace: overwrite,
             })
         }
         Err(error) => return Err(error.into()),
@@ -343,9 +442,10 @@ fn plan(
             replace: true,
         });
     }
-    let entry = manifest.entry(&name);
+    let entry = entry_for(dir, manifest, &name, &metadata);
     let ours = entry.is_some_and(|entry| {
-        entry.case_id == ids.case.to_string()
+        entry.file_name == name
+            && entry.case_id == ids.case.to_string()
             && entry.operation_id == ids.operation.to_string()
             && entry.server_file_name == file.server_name
     });
@@ -363,7 +463,7 @@ fn plan(
             }
         }
         (None, _) => {
-            // A file with no entry: verified and recorded, as after a
+            // A file no entry reaches: verified and recorded, as after a
             // manifest write that failed.
             let size_ok = file.size.is_none_or(|size| size == metadata.len());
             if size_ok && check_zip(&path).is_ok() {
@@ -412,7 +512,7 @@ fn save_manifest(
     context: &Context,
     published: Option<&Path>,
 ) -> Result<()> {
-    let saved = if context.faults.manifest_write {
+    let saved = if context.faults.manifest_write && published.is_some() {
         Err(PurviewError::message("the manifest write was made to fail"))
     } else {
         manifest.save(dir, &session.env.redactor)
@@ -427,9 +527,26 @@ fn save_manifest(
     }
 }
 
-/// Prints what was done: every path, and the reasons for exit 4.
-fn finish(session: &mut Session<'_>, done: Vec<Done>, reasons: Vec<Value>) -> Result<Produced> {
-    let exit_code = if reasons.is_empty() { 0 } else { 4 };
+/// What an interrupted run says. The temporary file of the file in flight
+/// is removed; the files already published stay recorded.
+const INTERRUPTED: &str = "interrupted; the files listed were written and recorded, and running \
+                           the same command again downloads the rest";
+
+/// Prints what was done: every path, and the reasons for exit 4, or exit
+/// 130 when Ctrl-C ended the run.
+fn finish(
+    session: &mut Session<'_>,
+    done: Vec<Done>,
+    reasons: Vec<Value>,
+    interrupted: bool,
+) -> Result<Produced> {
+    let exit_code = if interrupted {
+        130
+    } else if reasons.is_empty() {
+        0
+    } else {
+        4
+    };
     if session.output.format == OutputFormat::Json {
         let count = done.len();
         let results: Vec<Value> = done
@@ -452,11 +569,17 @@ fn finish(session: &mut Session<'_>, done: Vec<Done>, reasons: Vec<Value>) -> Re
         }
         let mut document =
             output.untrusted_json_value(Value::Array(results), count, &session.env.redactor)?;
-        if exit_code != 0 {
-            if let Value::Object(object) = &mut document {
+        if let Value::Object(object) = &mut document {
+            if !reasons.is_empty() {
                 object.insert(
                     "outcome".into(),
                     json!({"code": "Incomplete", "reasons": reasons}),
+                );
+            }
+            if interrupted {
+                object.insert(
+                    "error".into(),
+                    json!({"code": "Interrupted", "status": 0, "message": INTERRUPTED}),
                 );
             }
         }
@@ -482,6 +605,9 @@ fn finish(session: &mut Session<'_>, done: Vec<Done>, reasons: Vec<Value>) -> Re
             "incomplete: {}",
             sanitize(reason["message"].as_str().unwrap_or_default())
         );
+    }
+    if interrupted {
+        let _ = writeln!(session.env.stderr, "{INTERRUPTED}");
     }
     Ok(Produced {
         exit_code,

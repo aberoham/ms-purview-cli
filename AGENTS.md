@@ -177,9 +177,11 @@ timeout. It carries the Graph base URL (`origin::GRAPH_BASE` in production,
   under `--overwrite`). Never turn a `reqwest::Error` into an error with
   `?`: its message names the URL. `src/download/names.rs` makes local file
   names (section 4.7.1); `src/download/manifest.rs` is `manifest.json`.
-  `src/commands/download.rs` plans every file before any download
-  request, recovers verified files that have no manifest entry, and exits
-  4 when a file cannot be downloaded or the operation did not succeed.
+  `src/commands/download.rs` holds the directory lock (`DirLock`) from
+  reading the manifest to its last write, plans every file before any
+  download request, recovers verified files that no manifest entry
+  reaches, exits 4 when a file cannot be downloaded or the operation did
+  not succeed, and 130 on Ctrl-C.
 - `src/trace.rs` is `TraceSink` (`docs/SPEC.md` section 4.9). Only
   `GraphClient` and `DownloadClient` record, and a download's body never;
   token-endpoint exchanges are never traced.

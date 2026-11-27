@@ -100,11 +100,29 @@ impl Setup {
     /// Mounts the operation with these files and this status.
     async fn operation(&self, status: &str, files: Value) {
         self.harness.graph.reset().await;
+        self.add_operation(OP, status, files).await;
+    }
+
+    /// Mounts another operation beside those mounted already.
+    async fn add_operation(&self, op: &str, status: &str, files: Value) {
+        let mut record = estimate(status, files);
+        record["id"] = json!(op);
         Mock::given(method("GET"))
-            .and(path(format!("{CASES}/{CASE}/operations/{OP}")))
-            .respond_with(json_response(200, estimate(status, files)))
+            .and(path(format!("{CASES}/{CASE}/operations/{op}")))
+            .respond_with(json_response(200, record))
             .mount(&self.harness.graph)
             .await;
+    }
+
+    /// Sets `config.json`'s `download` object.
+    fn configure_download(&self, download: Value) {
+        let mut config = self.harness.config();
+        config["download"] = download;
+        std::fs::write(
+            self.harness.config_dir().join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
     }
 
     /// Mounts the default file at alpha.
@@ -158,11 +176,13 @@ fn sha256(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// Every name in `dir`, sorted.
+/// Every name in `dir` but the lock file, which stays once made, sorted.
+/// Temporary `.part` files are listed, so a test sees one left behind.
 fn entries(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .map(|read| {
             read.map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name != ms_purview_cli::download::LOCK_FILE)
                 .collect()
         })
         .unwrap_or_default();
@@ -191,7 +211,7 @@ async fn an_estimate_report_is_downloaded_with_the_download_token_and_recorded()
         .await;
     setup.serve(body.clone()).await;
     let run = setup.run(&["--json", "download", CASE, OP]).await;
-    assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
+    assert_eq!(run.outcome.exit_code, 0, "{}{}", run.stderr(), run.stdout());
     let target = setup.target_dir().join(NAME);
     assert_eq!(std::fs::read(&target).unwrap(), body);
     assert_eq!(
@@ -838,4 +858,263 @@ async fn names_that_collide_on_a_case_insensitive_file_system_both_get_a_suffix(
         .map(|entry| entry["serverFileName"].as_str().unwrap())
         .collect();
     assert_eq!(servers, ["Report:1.zip", "report?1.zip"]);
+}
+
+#[tokio::test]
+async fn a_directory_another_download_holds_is_refused_after_the_wait() {
+    let setup = Setup::new().await;
+    setup.serve(zip_bytes("x\n")).await;
+    setup
+        .operation("succeeded", json!([file(NAME, 0, &setup.file_url())]))
+        .await;
+    std::fs::create_dir_all(setup.target_dir()).unwrap();
+    let clock = setup.harness.clock.clone();
+    let held = ms_purview_cli::download::DirLock::acquire(&setup.target_dir(), clock.as_ref())
+        .await
+        .unwrap();
+    let run = setup.run(&["download", CASE, OP]).await;
+    assert_eq!(run.outcome.exit_code, 1);
+    assert!(run.stderr().contains("busy"), "{}", run.stderr());
+    assert!(Setup::requests(&setup.alpha).await.is_empty());
+    drop(held);
+    assert_eq!(
+        setup.run(&["download", CASE, OP]).await.outcome.exit_code,
+        0
+    );
+}
+
+#[tokio::test]
+async fn another_operation_s_file_under_an_equivalent_name_is_never_recovered() {
+    const OTHER: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaa0002";
+    let setup = Setup::new().await;
+    setup.serve(zip_bytes("first\n")).await;
+    let out = setup.harness.root.path().join("shared");
+    let out_text = out.to_str().unwrap().to_owned();
+    setup
+        .operation(
+            "succeeded",
+            json!([file("Report.zip", 0, &setup.file_url())]),
+        )
+        .await;
+    setup
+        .add_operation(
+            OTHER,
+            "succeeded",
+            json!([file("report.zip", 0, &setup.file_url())]),
+        )
+        .await;
+    let first = setup.run(&["download", CASE, OP, "--out", &out_text]).await;
+    assert_eq!(first.outcome.exit_code, 0, "{}", first.stderr());
+    let insensitive = out.join("REPORT.ZIP").exists();
+    let second = setup
+        .run(&["--json", "download", CASE, OTHER, "--out", &out_text])
+        .await;
+    if insensitive {
+        assert_eq!(second.outcome.exit_code, 1);
+        assert_eq!(second.json()["error"]["code"], "TargetExists");
+    } else {
+        assert_eq!(second.outcome.exit_code, 0);
+        assert_eq!(second.json()["results"][0]["status"], "downloaded");
+    }
+}
+
+#[tokio::test]
+async fn ctrl_c_keeps_the_files_published_and_leaves_no_temporary_file() {
+    let setup = Setup::new().await;
+    setup.serve(zip_bytes("first\n")).await;
+    Mock::given(method("GET"))
+        .and(path("/second"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes("second\n")))
+        .mount(&setup.alpha)
+        .await;
+    setup
+        .operation(
+            "succeeded",
+            json!([
+                file(NAME, 0, &setup.file_url()),
+                file("Second.zip", 0, &setup.url(&setup.alpha, ALPHA, "/second")),
+            ]),
+        )
+        .await;
+    let interrupt = Arc::new(ms_purview_cli::env::ManualInterrupt::default());
+    let fired = interrupt.clone();
+    let run = setup
+        .run_with(&["--json", "download", CASE, OP], |env| {
+            env.interrupt = interrupt.clone();
+            // Ctrl-C arrives while the first file is being published.
+            env.download_faults.before_publish = Some(Arc::new(move |_: &Path| fired.fire()));
+        })
+        .await;
+    assert_eq!(run.outcome.exit_code, 130, "{}", run.stdout());
+    let document = run.json();
+    assert_eq!(document["error"]["code"], "Interrupted");
+    assert_eq!(document["count"], 1);
+    assert_eq!(document["results"][0]["fileName"], NAME);
+    assert_eq!(entries(&setup.target_dir()), [NAME, "manifest.json"]);
+    assert!(Setup::requests(&setup.alpha)
+        .await
+        .iter()
+        .all(|request| request.url.path() != "/second"));
+}
+
+#[tokio::test]
+async fn a_known_size_over_the_limit_is_refused_before_any_request() {
+    let setup = Setup::new().await;
+    setup.serve(zip_bytes("x\n")).await;
+    setup.configure_download(json!({"max_size": "100B"}));
+    setup
+        .operation("succeeded", json!([file(NAME, 5000, &setup.file_url())]))
+        .await;
+    let run = setup.run(&["download", CASE, OP]).await;
+    assert_eq!(run.outcome.exit_code, 1);
+    assert!(run.stderr().contains("100-byte limit"), "{}", run.stderr());
+    assert!(Setup::requests(&setup.alpha).await.is_empty());
+    assert!(setup
+        .harness
+        .identity
+        .received_requests()
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn file_gives_a_colliding_file_the_name_a_full_download_does_and_is_not_trimmed() {
+    let setup = Setup::new().await;
+    setup.serve(zip_bytes("a\n")).await;
+    setup
+        .operation(
+            "succeeded",
+            json!([
+                file("Report:1.zip", 0, &setup.file_url()),
+                file(
+                    "report?1.zip",
+                    0,
+                    &setup.url(&setup.alpha, ALPHA, "/second")
+                ),
+                file("lead.zip", 0, &setup.url(&setup.alpha, ALPHA, "/third")),
+            ]),
+        )
+        .await;
+    let run = setup
+        .run(&["--json", "download", CASE, OP, "--file", "Report:1.zip"])
+        .await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stdout());
+    assert!(run.json()["results"][0]["path"]
+        .as_str()
+        .unwrap()
+        .contains('~'));
+    let spaced = setup
+        .run(&["download", CASE, OP, "--file", " lead.zip"])
+        .await;
+    assert_eq!(spaced.outcome.exit_code, 1);
+    assert!(
+        spaced.stderr().contains("no file with the name"),
+        "{}",
+        spaced.stderr()
+    );
+}
+
+#[tokio::test]
+async fn an_overwrite_whose_manifest_write_fails_is_recovered_by_the_next_run() {
+    let setup = Setup::new().await;
+    setup.serve(zip_bytes("v1\n")).await;
+    setup
+        .operation("succeeded", json!([file(NAME, 0, &setup.file_url())]))
+        .await;
+    assert_eq!(
+        setup.run(&["download", CASE, OP]).await.outcome.exit_code,
+        0
+    );
+    setup.alpha.reset().await;
+    let body = zip_bytes("v2, a different body\n");
+    setup.serve(body.clone()).await;
+    let failed = setup
+        .run_with(&["--json", "download", CASE, OP, "--overwrite"], |env| {
+            env.download_faults.manifest_write = true;
+        })
+        .await;
+    assert_eq!(failed.outcome.exit_code, 1);
+    let again = setup.run(&["--json", "download", CASE, OP]).await;
+    assert_eq!(again.outcome.exit_code, 0, "{}", again.stdout());
+    assert_eq!(again.json()["results"][0]["status"], "recovered");
+    assert_eq!(again.json()["results"][0]["sha256"], sha256(&body));
+}
+
+#[tokio::test]
+async fn an_invalid_size_is_warned_about_and_read_as_unknown() {
+    let setup = Setup::new().await;
+    setup.serve(zip_bytes("x\n")).await;
+    setup
+        .operation(
+            "succeeded",
+            json!([{"fileName": NAME, "size": -5, "downloadUrl": setup.file_url()}]),
+        )
+        .await;
+    let run = setup.run(&["download", CASE, OP]).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
+    assert!(run.stderr().contains("not counts"), "{}", run.stderr());
+}
+
+#[tokio::test]
+async fn without_hard_links_overwrite_publishes_by_renaming() {
+    let setup = Setup::new().await;
+    setup.serve(zip_bytes("x\n")).await;
+    setup
+        .operation("succeeded", json!([file(NAME, 0, &setup.file_url())]))
+        .await;
+    let no_links = |env: &mut Env| env.download_faults.no_hard_links = true;
+    let refused = setup
+        .run_with(&["--json", "download", CASE, OP], no_links)
+        .await;
+    assert_eq!(refused.outcome.exit_code, 1);
+    assert_eq!(refused.json()["error"]["code"], "PublishUnsupported");
+    assert_eq!(entries(&setup.target_dir()), Vec::<String>::new());
+    let renamed = setup
+        .run_with(&["download", CASE, OP, "--overwrite"], no_links)
+        .await;
+    assert_eq!(renamed.outcome.exit_code, 0, "{}", renamed.stderr());
+    assert_eq!(entries(&setup.target_dir()), [NAME, "manifest.json"]);
+}
+
+#[tokio::test]
+async fn a_file_name_that_holds_a_web_address_is_left_out() {
+    let setup = Setup::new().await;
+    setup.serve(zip_bytes("x\n")).await;
+    let named = [
+        "report ",
+        "https",
+        "://h.example/f?sig=canary-sig-0002",
+        ".zip",
+    ]
+    .concat();
+    setup
+        .operation("succeeded", json!([file(&named, 0, &setup.file_url())]))
+        .await;
+    let run = setup.run(&["--json", "download", CASE, OP]).await;
+    assert_eq!(run.outcome.exit_code, 4);
+    assert_eq!(
+        run.json()["outcome"]["reasons"][0]["code"],
+        "FileNotDownloadable"
+    );
+    setup.harness.assert_absent(&run, &["canary-sig-0002"]);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_link_inside_the_managed_data_path_is_refused() {
+    let setup = Setup::new().await;
+    setup.serve(zip_bytes("x\n")).await;
+    setup
+        .operation("succeeded", json!([file(NAME, 0, &setup.file_url())]))
+        .await;
+    let elsewhere = setup.harness.root.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::create_dir_all(setup.data_root()).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, setup.data_root().join("cases")).unwrap();
+    let run = setup.run(&["download", CASE, OP]).await;
+    assert_eq!(run.outcome.exit_code, 1);
+    assert!(run.stderr().contains("is a link"), "{}", run.stderr());
+    assert!(entries(&elsewhere).is_empty());
+    assert!(Setup::requests(&setup.alpha).await.is_empty());
 }

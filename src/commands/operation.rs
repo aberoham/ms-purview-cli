@@ -291,7 +291,7 @@ async fn resolve(session: &mut Session<'_>, case: CaseId, entries: &mut [Entry])
     Ok(())
 }
 
-fn warn_invalid_counts<'a>(
+pub(crate) fn warn_invalid_counts<'a>(
     redactor: &crate::redact::Redactor,
     log: &mut dyn Write,
     records: impl Iterator<Item = &'a OperationRecord>,

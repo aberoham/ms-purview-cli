@@ -925,8 +925,10 @@ the bytes the service sent.
      the other process's file. A filesystem without hard links gives `PublishUnsupported`,
      naming `--overwrite` as the alternative.
    - **With `--overwrite`:** `std::fs::rename`, which replaces the old file on every
-     platform.
-9. Update `manifest.json` atomically (temporary file and rename). Each entry records:
+     platform. The manifest is written first (step 9 before step 8): its entry names the
+     replacement, and every entry that reaches the target is dropped (section 3.5).
+9. Update `manifest.json` atomically (temporary file and rename): after publication by
+   default, before it with `--overwrite`. Each entry records:
    - case id, operation id and action;
    - server file name and local file name;
    - size and SHA-256;
@@ -935,8 +937,11 @@ the bytes the service sent.
 
 **Failures.**
 - Before publication, the temporary file is removed and the final name is left untouched.
-- If publication succeeded but the manifest update failed, the verified file stays. The
-  command exits 1 with `ManifestWriteFailed`, naming the file.
+- By default, if publication succeeded but the manifest update failed, the verified file
+  stays. The command exits 1 with `ManifestWriteFailed`, naming the file.
+- With `--overwrite`, a manifest update that fails replaces nothing. A rename that fails
+  after it leaves the old file under an entry whose SHA-256 does not match it, so the next
+  run refuses it with `TargetExists` rather than recording it.
 - **Recovery:** the next `download` or `--check` in that directory finds, under the local
   names of the operation's files, files that have no manifest entry. It verifies each one (size when known, central directory, SHA-256) and adds
   an entry marked `recovered: true`. A file that fails verification is left in place and

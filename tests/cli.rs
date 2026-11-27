@@ -151,7 +151,7 @@ fn argument_errors_without_json_go_to_stderr_only() {
         .code(1)
         .stdout(predicate::str::is_empty())
         .stderr(predicate::str::starts_with(
-            "Error: unexpected argument '--bogus' found\n",
+            "Error: an argument that this command does not take (not repeated here); quote a value that holds spaces\n",
         ))
         .stderr(predicate::str::contains("Usage: purview version"));
     purview()
@@ -271,6 +271,7 @@ fn help_is_success_and_lists_exactly_the_shipped_commands() {
             "search",
             "operation",
             "download",
+            "kql",
             "version",
             "help"
         ],
@@ -387,4 +388,48 @@ fn logout_with_no_accounts_fails_without_touching_the_store() {
         .stderr(predicate::str::starts_with(
             "Error: no account is signed in; run 'purview auth login' first",
         ));
+}
+
+/// The release smoke test: `purview kql` runs with no sign-in, no
+/// configuration and no network.
+#[test]
+fn the_kql_smoke_test_is_narrowed_with_no_configuration() {
+    let config = tempfile::tempdir().unwrap();
+    purview()
+        .env("PURVIEW_CONFIG_DIR", config.path().join("missing"))
+        .args([
+            "kql",
+            "--term",
+            "orders-api",
+            "--participant",
+            "alex@contoso.example",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty())
+        .stdout(predicate::str::ends_with("verdict: narrowed\n"));
+    assert!(!config.path().join("missing").exists());
+}
+
+/// A query that is not narrowed, and one outside the grammar, exit 1 from
+/// the process, with the JSON error code.
+#[test]
+fn kql_refusals_exit_1_with_their_codes() {
+    let config = tempfile::tempdir().unwrap();
+    for (query, code) in [
+        ("retention", "GenericQuery"),
+        ("retention policy", "KqlNotUnderstood"),
+    ] {
+        let output = purview()
+            .env("PURVIEW_CONFIG_DIR", config.path().join("missing"))
+            .args(["--json", "kql", "--kql", query])
+            .assert()
+            .code(1)
+            .stderr(predicate::str::is_empty())
+            .get_output()
+            .stdout
+            .clone();
+        let value: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(value["error"]["code"], code, "{query}");
+    }
 }

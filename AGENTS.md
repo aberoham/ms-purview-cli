@@ -12,7 +12,7 @@ implements one item of its section 11 and nothing from later items. Today
 the binary has `purview version`, `purview auth login` (device code, or
 `--browser`), `auth refresh`, `auth status`, `auth list` and `auth logout`,
 `case list`, `case get`, `search list`, `search get`, `operation list` and
-`operation get` (with `--wait`), `download`, and the global options `--verbose`,
+`operation get` (with `--wait`), `download`, `kql`, and the global options `--verbose`,
 `--timeout`, `--trace` and `--wrap-untrusted`. Do not add stubs for commands
 that a later pull request owns.
 
@@ -71,7 +71,24 @@ that the test files pass their own scan.
   `<case>` or `<search>` that is an id is used as given, with no read; a
   name is matched exactly against the whole list, which must reach its
   last page. A command returns `Produced { exit_code, document }`, and
-  `cli` prints the document.
+  `cli` prints the document. `commands/kql.rs` is `purview kql`, which is
+  local: `cli` builds the query and reads `guard` from `config.json`, with
+  no sign-in.
+- `src/kql/` is the guard of `docs/SPEC.md` section 6.3. `lexer.rs` lexes
+  each restriction (`participants:…`, `subject:…`, `kind:…`, `sent>=…`)
+  as one token with its value checked; `parser.rs` is the
+  recursive-descent parser, with nesting bounded at 64; `classify.rs` holds
+  the eight classification rules, the address pattern and
+  `BUILT_IN_GENERIC`, which `docs/safety.md` and `docs/SPEC.md` reproduce
+  between `built-in-generic-list` markers (a test compares the three);
+  `guard.rs` holds `GuardConfig`, the verdict (`analyse`) and `enforce`,
+  the entry point for write commands, whose `--allow-generic` needs a
+  non-blank reason and never covers a parse error; `build.rs` turns the
+  query flags into KQL that goes through the same parser. A refusal names
+  a column and the construct, and quotes only ASCII punctuation, never a
+  word or value from the query. A web address (`http://` or `https://`,
+  as `redact::urls_in_text` detects one) is refused anywhere in a query,
+  so `kql` never prints a URL and prints its JSON `kql` as given.
 - `src/model/wire.rs` holds the wire records (`CaseRecord`,
   `SearchRecord`, `OperationRecord` and its typed details), each read field
   by field from the JSON so that no field is required and a field of the
@@ -195,6 +212,7 @@ timeout. It carries the Graph base URL (`origin::GRAPH_BASE` in production,
   sign-in helpers it shares with `tests/flows.rs` in `tests/support/`;
   `tests/downloads.rs` runs `download` against mock download origins whose
   host names match the production pattern;
+  `tests/kql.rs` runs `purview kql` in-process with no reachable host;
   `tests/graph.rs` drives `GraphClient`, and `Poller` over it, against
   wiremock with a fake token provider; `tests/write_allow_list.rs` scans `src/` and `build.rs` for
   HTTP write methods; `tests/fixture_lint.rs` is the public-data lint.
@@ -245,6 +263,13 @@ check whether the other repository needs the same fix.
   `--json` included, because the person signing in must see the code. Under
   `--json`, stdout still holds exactly one document, and a failure after
   the prompt still puts its error document on stdout.
+- A second exception: `kql` with a query that is not narrowed (exit 1,
+  `GenericQuery`) prints its report first, because the report is what the
+  command is for. In a table the report goes to stdout and `Error: …` to
+  stderr; under `--json` the one document is `{"analysis": …, "error": …}`,
+  whatever `--results-only` says, so `error` is where every failure puts
+  it. `KqlNotUnderstood` and every other failure follow the general rule.
+  The write commands' guard refusals are plain errors.
 - An explicit flag given a blank value (`--account ""`, `--client-id ""`,
   `--tenant-id ""`) is an error, raised before any fallback, configuration
   read or network call. An empty `PURVIEW_*` variable counts as unset.

@@ -43,6 +43,7 @@ Examples:
   purview case list --status active
   purview search list <case>
   purview operation get <case> <op> --wait
+  purview kql --term orders-api --participant alex@contoso.example
   purview version --json",
     next_help_heading = "Global Options"
 )]
@@ -189,6 +190,24 @@ Examples:
     )]
     Download(DownloadArgs),
     #[command(
+        about = "Check a query against the guard against generic tenant-wide searches",
+        long_about = "\
+Build a Keyword Query Language (KQL) query from the query flags, or take one \
+with --kql, and check it as the guard of the search commands does. Every \
+branch of the query that can match a message must be narrowed, by a \
+specific term or by participants: on a full address. Prints the query, each \
+term and restriction with its class and the rule that decided it, and the \
+verdict. Exits 0 if the query is narrowed and 1 otherwise. Runs locally, \
+with no sign-in; guard.specific_terms and guard.generic_terms in \
+config.json change how terms are classified. docs/safety.md has the rules.",
+        after_help = "\
+Examples:
+  purview kql --term orders-api --participant alex@contoso.example
+  purview kql --term retention --participant alex@contoso.example --since 2025-01-01
+  purview kql --kql '\"orders-api\" AND NOT from:noreply@notify.example' --json"
+    )]
+    Kql(QueryArgs),
+    #[command(
         about = "Show the version, commit and build target",
         after_help = "\
 Examples:
@@ -196,6 +215,83 @@ Examples:
   purview version --json"
     )]
     Version,
+}
+
+/// The query flags, shared with `search create` (`docs/SPEC.md` section
+/// 3.5). The groups are ANDed in this order.
+#[derive(Debug, Clone, Args)]
+struct QueryArgs {
+    #[arg(
+        long = "term",
+        value_name = "TEXT",
+        help = "A word or phrase to search for, quoted in the query; repeat for more, all ORed"
+    )]
+    terms: Vec<String>,
+    #[arg(
+        long = "participant",
+        value_name = "ADDR",
+        help = "A full address that sent or received the item; repeat for more, all ORed"
+    )]
+    participants: Vec<String>,
+    #[arg(
+        long,
+        value_name = "YYYY-MM-DD",
+        value_parser = query_date,
+        help = "Items sent on or after this date"
+    )]
+    since: Option<chrono::NaiveDate>,
+    #[arg(
+        long,
+        value_name = "YYYY-MM-DD",
+        value_parser = query_date,
+        help = "Items sent on or before this date"
+    )]
+    until: Option<chrono::NaiveDate>,
+    #[arg(long, value_enum, help = "Only email, or only Teams messages")]
+    kind: Option<KindArg>,
+    #[arg(
+        long = "exclude-from",
+        value_name = "ADDR",
+        help = "Leave out items from this full address; repeat for more"
+    )]
+    exclude_from: Vec<String>,
+    #[arg(
+        long,
+        value_name = "KQL",
+        conflicts_with_all = ["terms", "participants", "since", "until", "kind", "exclude_from"],
+        help = "A raw query in the guard's subset of KQL, instead of the flags above"
+    )]
+    kql: Option<String>,
+}
+
+/// A `--since` or `--until` date, in exactly the form the query takes, so
+/// that the flags and `--kql` accept the same dates.
+fn query_date(text: &str) -> std::result::Result<chrono::NaiveDate, String> {
+    crate::kql::lexer::parse_date(text)
+        .ok_or_else(|| "expected a date in the form YYYY-MM-DD".to_owned())
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum KindArg {
+    Email,
+    Teams,
+}
+
+impl QueryArgs {
+    fn flags(self) -> crate::kql::build::QueryFlags {
+        crate::kql::build::QueryFlags {
+            terms: self.terms,
+            participants: self.participants,
+            since: self.since,
+            until: self.until,
+            kind: self.kind.map(|kind| match kind {
+                KindArg::Email => crate::kql::build::Kind::Email,
+                KindArg::Teams => crate::kql::build::Kind::Teams,
+            }),
+            exclude_from: self.exclude_from,
+            kql: self.kql,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -889,6 +985,24 @@ impl Printer {
         }
         let message = if error.kind() == ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand {
             format!("a command is required\n\n{}", rendered.trim_end())
+        } else if matches!(
+            error.kind(),
+            ErrorKind::UnknownArgument | ErrorKind::InvalidSubcommand
+        ) {
+            // Clap names the word it did not expect, and repeats it in its
+            // tip; the word could be part of a pasted value, such as the
+            // second word of an unquoted query. Only Clap's usage context
+            // is kept, which is built from the command, never the input.
+            let usage = match error.get(clap::error::ContextKind::Usage) {
+                Some(clap::error::ContextValue::StyledStr(usage)) => {
+                    format!("\n\n{}", usage.to_string().trim_end())
+                }
+                _ => String::new(),
+            };
+            format!(
+                "an argument that this command does not take (not repeated here); quote a \
+                 value that holds spaces{usage}\n\nFor more information, try '--help'."
+            )
         } else {
             let text = rendered.trim();
             text.strip_prefix("error: ").unwrap_or(text).to_owned()
@@ -963,8 +1077,24 @@ async fn run(
         Command::Download(download) => {
             read_command(env, output, globals, ReadCommand::download(download)?).await
         }
+        Command::Kql(query) => kql(env, output, query),
         Command::Version => version(env, output),
     }
+}
+
+/// `purview kql`: local. The query is built, and so checked as arguments,
+/// before config.json is read.
+fn kql(env: &mut Env, output: &OutputOptions, query: QueryArgs) -> Result<Outcome> {
+    let kql = crate::kql::build::build(&query.flags())?;
+    crate::output::selected_indices(&output.select, commands::kql::COLUMNS)?;
+    let dir = configuration_dir(env)?;
+    let stored = load_config(env, &dir)?;
+    let guard = crate::kql::GuardConfig::from_config(&stored.extra)?;
+    let produced = commands::kql::run(env, output, &kql, &guard)?;
+    Ok(Outcome {
+        exit_code: produced.exit_code,
+        stdout_value: produced.document,
+    })
 }
 
 /// A read command with its arguments checked, before any sign-in or
@@ -2319,7 +2449,7 @@ mod tests {
         assert_eq!(printed["error"]["status"], 0);
         let message = printed["error"]["message"].as_str().unwrap();
         assert!(
-            message.starts_with("unexpected argument '--bogus'"),
+            message.starts_with("an argument that this command does not take"),
             "{message}"
         );
         assert!(captured.stderr.text().is_empty());
@@ -2333,7 +2463,7 @@ mod tests {
         let text = captured.stderr.text();
         assert_eq!(
             text.lines().next(),
-            Some("Error: unexpected argument '--bogus' found"),
+            Some("Error: an argument that this command does not take (not repeated here); quote a value that holds spaces"),
             "{text}"
         );
         assert!(text.contains("Usage: purview version"), "{text}");
@@ -2372,6 +2502,35 @@ mod tests {
             }
             let outcome = execute_with(env, args).await;
             assert_eq!(outcome.exit_code, 1);
+            let stdout = captured.stdout.text();
+            let stderr = captured.stderr.text();
+            assert!(!stdout.contains("canary") && !stderr.contains("canary"));
+            if json {
+                let printed: Value = serde_json::from_str(&stdout).unwrap();
+                assert_eq!(Some(&printed), outcome.stdout_value.as_ref());
+                let message = printed["error"]["message"].as_str().unwrap();
+                // Clap's unexpected word is not repeated at all.
+                assert!(message.contains("does not take"), "{message}");
+            } else {
+                assert!(stderr.contains("does not take"), "{stderr}");
+            }
+        }
+    }
+
+    /// The error printer redacts a secret that JSON escaping would hide
+    /// from byte matching, in both forms. No argument error repeats a value
+    /// any more, so the printer is driven directly.
+    #[test]
+    fn the_error_printer_redacts_escaped_secrets_in_both_forms() {
+        let secret = "canary\"refresh\\0001";
+        for json in [true, false] {
+            let (mut env, captured) = Env::in_memory();
+            env.redactor.register(secret);
+            let error = PurviewError::message(format!("failed near {secret} here"));
+            let outcome = Printer::default().fail(&mut env, json, &error);
+            assert_eq!(outcome.exit_code, 1);
+            env.stdout.finish().unwrap();
+            env.stderr.finish().unwrap();
             let stdout = captured.stdout.text();
             let stderr = captured.stderr.text();
             assert!(!stdout.contains("canary") && !stderr.contains("canary"));

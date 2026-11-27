@@ -10,6 +10,7 @@ pub mod download;
 pub mod env;
 pub mod error;
 pub mod graph;
+pub mod kql;
 pub mod model;
 pub mod origin;
 pub mod output;

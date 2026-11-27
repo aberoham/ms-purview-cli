@@ -4,6 +4,7 @@
 
 pub mod case;
 pub mod download;
+pub mod kql;
 pub mod operation;
 pub mod search;
 

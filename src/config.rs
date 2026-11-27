@@ -147,8 +147,7 @@ impl Config {
             return Err(refusal(path, "is not a regular file"));
         }
         let contents = read_verified(path, &metadata, warnings)?;
-        serde_json::from_slice(&contents)
-            .map_err(|error| PurviewError::from(error).context(format!("reading {}", shown(path))))
+        serde_json::from_slice(&contents).map_err(|error| unreadable_json(path, &error))
     }
 
     /// Writes `config.json` into `dir` atomically, creating the directory
@@ -328,7 +327,45 @@ fn read_account(path: &Path, warnings: &mut dyn Write) -> Result<Option<AccountR
         return Ok(None);
     }
     let contents = read_verified(path, &metadata, warnings)?;
-    Ok(Some(serde_json::from_slice(&contents)?))
+    Ok(Some(
+        serde_json::from_slice(&contents).map_err(|error| unreadable_json(path, &error))?,
+    ))
+}
+
+/// A file that is not the JSON it should be. Serde's message quotes the
+/// value it refused, which could be anything pasted into the file (a
+/// signed URL, a token), so only its category and position are kept.
+fn unreadable_json(path: &Path, error: &serde_json::Error) -> PurviewError {
+    // A missing field is named by the schema, not by the file, so it can
+    // be shown; only a name of lower-case letters and `_` is.
+    let text = error.to_string();
+    let missing = text
+        .strip_prefix("missing field `")
+        .and_then(|rest| rest.split('`').next())
+        .filter(|name| {
+            !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+        });
+    if let Some(name) = missing {
+        return PurviewError::message(format!(
+            "{} is missing the required field {name} (line {}, column {})",
+            shown(path),
+            error.line(),
+            error.column()
+        ));
+    }
+    let problem = match error.classify() {
+        serde_json::error::Category::Data => "holds a value of the wrong type or shape",
+        serde_json::error::Category::Eof => "ends before its JSON is complete",
+        serde_json::error::Category::Syntax | serde_json::error::Category::Io => {
+            "is not valid JSON"
+        }
+    };
+    PurviewError::message(format!(
+        "{} {problem} (line {}, column {})",
+        shown(path),
+        error.line(),
+        error.column()
+    ))
 }
 
 /// Removes an account's file. A missing file is not an error. A link at
@@ -1039,6 +1076,49 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(message.contains("config.json"), "{message}");
+    }
+
+    #[test]
+    fn a_wrong_value_in_config_is_not_repeated() {
+        let dir = tempdir().unwrap();
+        let marker = ["sample", "private"].concat();
+        fs::write(
+            dir.path().join("config.json"),
+            format!(r#"{{"clients": "{marker}"}}"#),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(
+                dir.path().join("config.json"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+        let message = Config::load(dir.path(), &mut no_warnings())
+            .unwrap_err()
+            .to_string();
+        assert!(!message.contains(&marker), "{message}");
+        assert!(
+            message.contains("wrong type") && message.contains("line 1"),
+            "{message}"
+        );
+
+        fs::write(
+            dir.path().join("config.json"),
+            format!(r#"{{"clients": {{"alex@contoso.example": {{"tenant_id": "{marker}"}}}}}}"#),
+        )
+        .unwrap();
+        let message = Config::load(dir.path(), &mut no_warnings())
+            .unwrap_err()
+            .to_string();
+        assert!(!message.contains(&marker), "{message}");
+        assert!(
+            message.contains("missing the required field client_id"),
+            "{message}"
+        );
     }
 
     #[test]

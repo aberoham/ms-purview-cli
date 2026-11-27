@@ -230,11 +230,21 @@ Builds the Keyword Query Language (KQL) string, parses it with the guard's parse
 query is narrowed, exit 1 with `GenericQuery` or `KqlNotUnderstood` otherwise. `kql` takes no
 override flag: it reports what the guard would decide.
 
+Output (settled in PR 1.6). The table has the columns `COLUMN`, `FIELD`, `VALUE`, `NEGATED`,
+`CLASS` and `RULE`, between a `kql:` line and a `verdict:` line; `--plain` prints the rows
+only. JSON `results` is `{"kql", "narrowed", "unnarrowedAt"?, "leaves": [{"column", "field",
+"value", "quoted", "negated", "class", "rule", "reason", "tokens"?}]}`. A query that is not
+narrowed prints the same report, then fails: in a table the report is on stdout and
+`Error: …` on stderr; under `--json` one document holds `{"analysis": …, "error": …}`,
+whatever `--results-only` says, as exit 3 does for a plan. The error names the column of a
+branch that is not narrowed. `KqlNotUnderstood` has no report. `kql` reads `config.json`
+for `guard` only after the query flags are checked, and never signs in.
+
 Query flags (shared with `search create`):
 
 | Flag | KQL |
 |---|---|
-| `--term T` (repeatable) | each quoted, all ORed. `"` inside a term is refused |
+| `--term T` (repeatable) | each quoted, all ORed. A `"`, a `*`, a web address (`http://` or `https://`), or a control or invisible character inside a term is refused |
 | `--participant ADDR` (repeatable) | `participants:ADDR`, all ORed. Each must be a full address (section 6.3) |
 | `--since YYYY-MM-DD` | `sent>=YYYY-MM-DD` |
 | `--until YYYY-MM-DD` | `sent<=YYYY-MM-DD` |
@@ -1445,7 +1455,8 @@ repository on purpose. Every command that writes a file prints its full path.
 ```
 
 An object or value given as `null` means unset, as if it were missing; any other value of
-the wrong type is an error.
+the wrong type is an error. `guard.specific_terms` and `guard.generic_terms` are lists of
+non-blank strings.
 
 Template variables:
 
@@ -1567,13 +1578,43 @@ date       = YYYY-MM-DD
   implicit operator is easy to misread.
 - Refused outright: prefix `+` or `-`, `NEAR`, `ONEAR`, `property:(…)`, ranges `..`,
   properties not listed above, `=`, `<`, `>`, wildcards inside a word, and `*` in an address.
-- Property names are case-insensitive. Values keep their case.
+- Property names are case-insensitive. Values keep their case. `kind:` values are compared
+  ignoring case.
+- An address that fails the address check below is refused as a value (`KqlNotUnderstood`),
+  for every address property, so every `participants:` leaf that parses is a full address.
+- A control character other than tab, line feed and carriage return, or a default-ignorable
+  code point (zero-width space, bidirectional control), is refused anywhere in the query,
+  and so is any control character inside a phrase: the terminal report removes them, so
+  the guard must not classify text the operator cannot see. `--term` refuses them too,
+  before `config.json` is read. `--since` and `--until` take exactly `YYYY-MM-DD`, as
+  `sent` does.
+- Tokens are separated only by ASCII space, tab, line feed and carriage return; other
+  Unicode spaces are refused outside a phrase. A closing quote must be followed by a space,
+  a parenthesis or the end, and a word must not be followed by a quote, so `"a"AND"b"` is
+  refused. Property names and `kind:` values are folded to lower case as ASCII only.
+- A web address is refused anywhere in a query, and in `--term`: `http://` or `https://` in
+  any case, the same test `redact::urls_in_text` uses for every output of the tool. A URL
+  can carry a signature in its query, and redacting it for display changed how the reported
+  query parsed and was classified. With none in a query, `purview kql` prints the JSON
+  `kql` as given (registered secrets are still redacted by every writer); the table's
+  `kql:` line shows tabs, line feeds and carriage returns as spaces. Other schemes, such as
+  `mailto:`, are not URLs to the redactor anywhere in the tool, and are not refused.
+- Parentheses and `NOT` nest at most 64 deep, so that a hostile query cannot exhaust the
+  stack.
+- A refusal gives the column (characters from 1) and names the construct. It quotes the
+  query only when the construct is ASCII punctuation, never a word, property name or value,
+  following the rule that diagnostics do not repeat argument values or tenant text.
+- The builder refuses a `"` or `*` in `--term`, a `--participant` or `--exclude-from` value
+  that fails the address check, and `--since` later than `--until`, naming the flag and the
+  value's position but not the value.
 - The query builder emits only this subset. Its output goes through the same parser, so the
   flags and `--kql` get the same verdicts; a test runs both forms over one table of cases.
 
 **Address check.** An address counts as narrowing only if:
 - it matches
-  ``^[A-Za-z0-9.!#$%&'+/=?^_`{|}~-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$``;
+  ``^[A-Za-z0-9][A-Za-z0-9.!#$%&'+/=?^_`{|}~-]*@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$``
+  (the part before `@` starts with a letter or digit, settled in PR 1.6, so that no
+  restriction reads `participants://…`);
 - it has no `*`;
 - the part before `@` is not empty;
 - it is not quoted.
@@ -1592,8 +1633,11 @@ First match wins:
 3. A token shorter than 4 characters → generic.
 4. A token of digits only, such as `2025` → generic.
 5. A trailing `*`: classify the stem, and a stem shorter than 6 characters → generic.
-6. A token holding a letter plus at least one of `- _ . / @ :` or a digit
-   (`orders-api`, `export_bucket`, `svc2`) → specific.
+   Rules 2 to 4 see the token with its `*`, so `a*` is decided by rule 3.
+6. A token holding a letter plus a digit, or plus one of `- _ . / @ :` with a letter or
+   digit on each side of it (`orders-api`, `export_bucket`, `svc2`; not `retention-`) →
+   specific. KQL may read such a separator as a space (Docs), so one at the edge of a word
+   is not evidence of a name.
 7. A token with at least one lower-case letter and an upper-case letter after its first
    character (`PagerDuty`, `GitHub`; not `RETENTION`) → specific.
 8. Otherwise → generic.
@@ -1602,6 +1646,7 @@ First match wins:
 `docs/safety.md` reproduces it; a test asserts the two are identical). These are common words
 that rule 6 would otherwise call specific, in trimmed lower-case form:
 
+<!-- built-in-generic-list:start -->
 ```text
 e-mail e-mails e-commerce e-learning e-signature e.g i.e etc a.m p.m n/a w/c and/or 24/7
 sign-in sign-ins sign-on sign-up sign-out log-in log-on log-off opt-in opt-out
@@ -1612,6 +1657,7 @@ month-end end-of-year end-of-month day-to-day one-to-one 1-to-1 face-to-face rea
 long-term short-term high-level low-level top-level cross-team re-send re-sent re-run
 re-open pre-sales post-sales covid-19 wi-fi
 ```
+<!-- built-in-generic-list:end -->
 
 Changing the list needs a test change and a CHANGELOG entry.
 

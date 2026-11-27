@@ -1125,7 +1125,7 @@ async fn traced_and_verbose_creates_leave_no_tokens() {
             "--yes",
             "--verbose",
             "--trace",
-            &trace,
+            trace,
         ]))
         .await;
     assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
@@ -1160,7 +1160,7 @@ async fn traced_and_verbose_creates_leave_no_tokens() {
             "--yes",
             "--verbose",
             "--trace",
-            &trace,
+            trace,
         ]))
         .await;
     assert_eq!(run.outcome.exit_code, 1);

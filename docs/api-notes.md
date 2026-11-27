@@ -311,3 +311,25 @@ registration and account. The files and traces stayed outside the repository.
 - **Response headers:** of the headers a trace keeps, the download response had
   `content-length`, `content-type` (`application/octet-stream`) and `date`, and no
   `request-id`. (Observed)
+
+### PR 2.2: `case create` and `search create`
+
+Status: **run on 27 November 2026** from a local build of the PR 2.2 branch (merged into
+the PR 2.3 branch), signed with the same local code-signing identity, against the same
+tenant and registration, after a new read-write sign-in. The case and search were left open
+for PR 2.3. Outputs and traces stayed outside the repository.
+
+- **Sign-in:** a new browser sign-in recorded `access: read-write`; the stored Graph scope
+  held both `eDiscovery.Read.All` and `eDiscovery.ReadWrite.All`. (Observed)
+- **`case create --dry-run`:** listed every case (a few hundred, one paging chain), found
+  none with the name, and printed the plan with no POST. (Observed)
+- **`case create --yes`:** one GET of the list, then one POST, answered **201** with the
+  case: `status: active`, and the keys `@odata.context`, `closedBy`, `closedDateTime`,
+  `createdDateTime`, `description`, `displayName`, `externalId`, `id`, `lastModifiedBy`,
+  `lastModifiedDateTime`, `status`. No warning. (Observed)
+- **`search create --yes`:** a GET of the case, a GET of its (empty) search list, then one
+  POST, answered **201**. The `contentQuery` came back exactly as sent, and
+  `dataSourceScopes` as `allTenantMailboxes`. The record's keys were `@odata.context`,
+  `contentQuery`, `createdBy`, `createdDateTime`, `dataSourceScopes`, `description`,
+  `displayName`, `id`, `lastModifiedBy`, `lastModifiedDateTime`. No warning. (Observed)
+- **`createdBy`:** the new search carried `createdBy`; the case record did not. (Observed)

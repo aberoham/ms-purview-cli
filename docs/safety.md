@@ -148,6 +148,21 @@ downloads its report zip and reads it:
 - An estimate can succeed while locations failed (Observed); the command
   warns, and `--strict` makes it exit 4 (`FailedLocations`, or
   `EvidenceMissing` when the collection is unchecked).
+- `volume` compares the estimate with the limits under `volume` in
+  `config.json`: more than `warn_hits` estimated items (default 5,000), a
+  location with more than `warn_hits_per_location` hits (default 1,000),
+  or an `indexedItemsSize` above `max_export_size` (default 10 GiB). Each
+  limit passed is a `warning: VOLUME:` line on stderr and an entry in
+  `volume.over`. A count that is missing or unreadable leaves its limit
+  in `volume.unchecked`. Hits per location are checked only when the
+  estimate `succeeded`, `collection` is `complete` and every location has
+  a count. An estimate
+  whose status is neither `succeeded` nor `partiallySucceeded` has every
+  limit there, with no warning. The warning does not change the exit code: it is
+  there so that a person narrows the query or confirms the scope before a
+  report or export. With Teams context on, an export held about four
+  times the estimated count (Observed, one run), so it can be several
+  times larger than the estimate's size.
 - At the wait deadline it exits 5, and on Ctrl-C (during the wait or the
   download) 130, with the commands that resume: `operation get --wait`,
   then `download`. `--wait-timeout` covers the wait; the download has its

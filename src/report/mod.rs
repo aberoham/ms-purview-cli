@@ -4,6 +4,7 @@
 pub mod csvread;
 pub mod estimate;
 pub mod summary;
+pub mod volume;
 
 use std::collections::BTreeMap;
 use std::path::Path;

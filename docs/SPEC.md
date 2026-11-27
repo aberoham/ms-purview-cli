@@ -473,6 +473,9 @@ Settled in PR 2.3:
   wait or the download, give the operation-wait shapes of section 3.3.
 - The reason of `--allow-generic` is in the plan's warnings only; the download manifest
   does not record it yet.
+- After the wait, `result.volume` holds the volume check of section 6.9: `exceeded`,
+  `limits`, `over` (each limit passed, as `{"setting", "value", "limit"}`, with
+  `locations` for the hits per location) and `unchecked`. `--no-wait` has no `volume`.
 - After approval and before the send, `WriteCommand::recheck` reads the search again
   through the same checks. A scope, sources or query that no longer pass refuse with the
   check's own code; a query or verdict that pass but differ from the plan refuse with
@@ -1573,7 +1576,8 @@ repository on purpose. Every command that writes a file prints its full path.
   "guard": { "specific_terms": [], "generic_terms": [] },
   "identity": { "internal_domains": [], "domain_aliases": {} },
   "download": { "max_size": "64GiB", "max_unknown_size": "1GiB" },
-  "limits": { "report_zip_entries": 1000, "export_zip_entries": 1000000, "csv_max_record_bytes": "64MiB" }
+  "limits": { "report_zip_entries": 1000, "export_zip_entries": 1000000, "csv_max_record_bytes": "64MiB" },
+  "volume": { "warn_hits": 5000, "warn_hits_per_location": 1000, "max_export_size": "10GiB" }
 }
 ```
 
@@ -1944,6 +1948,39 @@ the message can hold text Graph quoted back.
   access-token canaries back in an error body. Afterwards, stdout, stderr, the trace
   directory, the config directory and the data directory are scanned byte by byte, and none
   of the markers may appear.
+
+### 6.9 Volume
+
+Settled in the volume-warning PR: `estimate` warns loudly when a search finds more than a
+person can work with, so that the query is narrowed or the scope confirmed before a report
+or an export collects it. The limits are under `volume` in `config.json` (section 5.5), each
+read as `limits` is: `null` or missing keeps the default, any other value of the wrong type
+is an error before sign-in that names the key and not the value. Only `estimate` reads
+`volume`, so a bad value there stops no other write.
+
+| Key | Default | Compared with | Evidence |
+|---|---|---|---|
+| `warn_hits` | 5,000 | `indexedItemCount` | A team running subject access requests stopped for a person above 5,000 items (issue #15; Assumption for other tenants) |
+| `warn_hits_per_location` | 1,000 | each `Locations-*.csv` row's `Count` | One mailbox with that many hits usually means the query matches a person's own name or address (Assumption) |
+| `max_export_size` | `10GiB` | `indexedItemsSize` | The size threshold of the same team; an export held items on the order of gigabytes for a few thousand items (Observed) |
+
+A value above its limit, not equal to it, passes it. Each limit passed is a line on stderr
+starting `warning: VOLUME:`, then one line on what to do; the lines give counts, never a
+location's name. `result.volume` carries the same (section 3.5). A count Graph did not give
+or gave as something other than a count (which also gets the warning of section 7.1) leaves
+that limit in `unchecked`. `warn_hits_per_location` is `unchecked`, and still in `over` when a
+readable row passed it, unless the estimate `succeeded`, the zip was read, `collection` is
+`complete` and every Locations row has a count. So a failed location in either file, a row with no location, a
+file with no `Count` column and a second Locations file all leave it `unchecked`. An estimate that did not succeed or
+partly succeed has every limit `unchecked` and prints no volume warning: its counts are not
+used. The warning never changes the exit code, `--strict` included.
+
+The estimate undercounts what a report or export collects. With Teams context on, an export
+held about four times the estimated count (Observed, one run), and a report about 10 to 37
+rows per estimated item (section 6.6). So `max_export_size` compares the estimate's size, and
+the export can be several times larger. Planned for PR 2.4: `report` and `export create`
+refuse a search whose latest estimate passes `max_export_size` unless `--allow-large
+--reason` is given.
 
 ---
 

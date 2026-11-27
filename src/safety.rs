@@ -361,6 +361,8 @@ pub struct WriteSettings {
     pub guard: GuardConfig,
     /// The limits for reading report zips (`limits` in `config.json`).
     pub report: crate::report::ReportLimits,
+    /// The volume warning's limits (`volume` in `config.json`).
+    pub volume: crate::report::volume::VolumeLimits,
 }
 
 /// What preflight decided.
@@ -456,6 +458,12 @@ pub trait WriteCommand: Send {
     /// Whether the command downloads files after its write, so that the
     /// runner sets up the download client.
     fn downloads(&self) -> bool {
+        false
+    }
+
+    /// Whether the command reads `volume` from `config.json`, so that a bad
+    /// setting there stops only the commands that use it.
+    fn reads_volume(&self) -> bool {
         false
     }
 

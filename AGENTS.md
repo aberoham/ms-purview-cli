@@ -102,9 +102,11 @@ that the test files pass their own scan.
   without `--allow-concurrent` (`ConcurrentOperation`), then after the 202
   the `Location` header (`GraphClient::operation_in_location`, key or path
   form, `UnexpectedLocation` otherwise), the wait (`Poller` with a 30-second
-  not-found grace), the download through `commands::download::fetch`, and
-  the collection check; `--strict` adds `FailedLocations` or
-  `EvidenceMissing`. `commands/parse.rs` is `parse locations|failures|
+  not-found grace), the download through `commands::download::fetch`, the
+  collection check and the volume warning (`report::volume`, the `volume`
+  limits of `config.json`, read only by a command whose `reads_volume()`
+  is true); `--strict` adds `FailedLocations` or `EvidenceMissing`, never
+  a volume reason. `commands/parse.rs` is `parse locations|failures|
   summary`, local. `operation get --check` downloads the evidence file and
   sets `collection`.
 - `src/zipread.rs` opens report zips under `ZipLimits` (entries, bytes per

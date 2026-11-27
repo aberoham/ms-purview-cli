@@ -1870,6 +1870,11 @@ async fn write_command(
         } else {
             crate::report::ReportLimits::from_config(&Default::default())?
         },
+        volume: if command.reads_volume() {
+            crate::report::volume::VolumeLimits::from_config(&stored.extra)?
+        } else {
+            crate::report::volume::VolumeLimits::default()
+        },
     };
     command.check(&settings)?;
     // The download settings are checked before sign-in, as for download.

@@ -101,9 +101,23 @@ impl Naming {
             Template::parse(key, &text(key, default)?)
         };
         let marker = text("marker", DEFAULT_MARKER)?;
-        if marker.chars().any(char::is_control) {
+        if marker.chars().any(|character| {
+            character.is_control()
+                || crate::kql::lexer::is_hidden(character)
+                || matches!(character, '\u{2028}' | '\u{2029}')
+        }) {
             return Err(PurviewError::message(
-                "config.json: naming.marker must not hold control characters",
+                "config.json: naming.marker must not hold control or invisible characters",
+            ));
+        }
+        // Trimmed, as rendered text is, so that the check for the marker
+        // in a description finds it.
+        let marker = marker.trim().to_owned();
+        // The marker tells a case or search this tool made, so it cannot
+        // be blank.
+        if marker.trim().is_empty() {
+            return Err(PurviewError::message(
+                "config.json: naming.marker must not be blank",
             ));
         }
         Ok(Self {
@@ -207,7 +221,21 @@ fn value_of(name: &str, values: &Values<'_>, marker: &str) -> Option<String> {
         "user" => Some(values.user.to_owned()),
         "query_summary" => values
             .query
-            .map(|query| query.chars().take(QUERY_SUMMARY_CHARS).collect()),
+            // A line break or tab between the query's tokens becomes a
+            // space: a description holds one line.
+            .map(|query| {
+                query
+                    .chars()
+                    .take(QUERY_SUMMARY_CHARS)
+                    .map(|character| {
+                        if character.is_control() || matches!(character, '\u{2028}' | '\u{2029}') {
+                            ' '
+                        } else {
+                            character
+                        }
+                    })
+                    .collect()
+            }),
         "yyyy_mm" => date("%Y-%m"),
         "utc_date" => date("%Y-%m-%d"),
         "utc_hhmm" => date("%H%M"),
@@ -349,6 +377,15 @@ mod tests {
         assert!(naming(json!({"naming": {"case_name": 3}})).is_err());
         assert!(naming(json!({"naming": {"marker": false}})).is_err());
         assert!(naming(json!({"naming": {"marker": "a\u{7}"}})).is_err());
+        assert!(naming(json!({"naming": {"marker": ""}})).is_err());
+        assert!(naming(json!({"naming": {"marker": "  "}})).is_err());
+        assert!(naming(json!({"naming": {"marker": "[m]\u{200b}"}})).is_err());
+        assert_eq!(
+            naming(json!({"naming": {"marker": " [m] "}}))
+                .unwrap()
+                .marker,
+            "[m]"
+        );
         let defaults = naming(json!({})).unwrap();
         assert_eq!(naming(json!({"naming": null})).unwrap(), defaults);
         assert_eq!(

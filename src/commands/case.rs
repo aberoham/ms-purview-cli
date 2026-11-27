@@ -1,17 +1,25 @@
-//! `case list` and `case get` (`docs/SPEC.md` section 3.5).
+//! `case list`, `case get` and `case create` (`docs/SPEC.md` section 3.5).
 
-use chrono::NaiveDate;
+use async_trait::async_trait;
+use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::Value;
 
 use super::{
-    date_text, resolve_case, shown_fields, shown_rows, time_text, warn_incomplete, warn_unreadable,
-    Produced, Session,
+    candidates, case_status, check_sent_text, date_text, reconcile_notes, resolve_case, sent_text,
+    shown_fields, shown_rows, split_by_name, time_text, unreadable_names, warn_incomplete,
+    warn_unreadable, with_marker, Produced, Session,
 };
-use crate::error::Result;
+use crate::error::{PurviewError, Result};
+use crate::graph::WriteResponse;
+use crate::model::requests::CreateCase;
 use crate::model::valid::CaseKey;
 use crate::model::wire::{identity, CaseRecord, CaseStatus};
+use crate::naming::{Naming, Values};
 use crate::output::{write_fields, write_rows, OutputFormat};
-use crate::routes::{Query, ReadRoute};
+use crate::routes::{CaseId, Query, ReadRoute, WriteRoute};
+use crate::safety::{
+    PlanInput, Planned, Preflight, Reconciled, WriteCommand, WritePlan, WriteSettings,
+};
 use std::io::Write;
 
 /// `--status` of `case list`.
@@ -227,4 +235,268 @@ pub async fn get(session: &mut Session<'_>, key: &CaseKey) -> Result<Produced> {
     );
     write_fields(&mut session.env.stdout, &fields)?;
     Ok(Produced::success(None))
+}
+
+/// `case create` (`docs/SPEC.md` section 3.5): a new case, named by
+/// `naming.case_name` unless `--name` is given. Preflight lists every case,
+/// to the last page, and refuses a name that any case has, whatever its
+/// status, because two cases with one name make every later lookup by that
+/// name ambiguous. With `--reuse-existing`, a single active case with the
+/// name is shown instead, and nothing is sent.
+pub struct CaseCreate {
+    topic: String,
+    name: Option<String>,
+    requester: Option<String>,
+    description: Option<String>,
+    reuse_existing: bool,
+    now: DateTime<Utc>,
+    naming: Option<Naming>,
+    /// The display name in the plan, for reconciliation.
+    planned_name: Option<String>,
+}
+
+/// The flags of `case create`, as given.
+#[derive(Debug, Clone, Default)]
+pub struct CaseCreateFlags {
+    pub topic: String,
+    pub name: Option<String>,
+    pub requester: Option<String>,
+    pub description: Option<String>,
+    pub reuse_existing: bool,
+}
+
+impl CaseCreate {
+    /// Checks the flags: each is trimmed, and blank text or text with a
+    /// control or invisible character is refused. `now` gives
+    /// `{yyyy_mm}`.
+    pub fn new(flags: CaseCreateFlags, now: DateTime<Utc>) -> Result<Self> {
+        let optional = |flag: &str, value: Option<String>| -> Result<Option<String>> {
+            value.map(|value| sent_text(flag, &value)).transpose()
+        };
+        Ok(Self {
+            topic: sent_text("--topic", &flags.topic)?,
+            name: optional("--name", flags.name)?,
+            requester: optional("--requester", flags.requester)?,
+            description: optional("--description", flags.description)?,
+            reuse_existing: flags.reuse_existing,
+            now,
+            naming: None,
+            planned_name: None,
+        })
+    }
+
+    /// The display name and description the case would get.
+    fn names(&self, naming: &Naming, user: &str) -> Result<(String, String)> {
+        let values = Values {
+            topic: Some(&self.topic),
+            requester: self.requester.as_deref(),
+            user,
+            query: None,
+            action: None,
+            now: Some(self.now),
+        };
+        let name = match &self.name {
+            Some(name) => name.clone(),
+            None => naming.render(&naming.case_name, &values)?,
+        };
+        let description = match &self.description {
+            Some(description) => description.clone(),
+            None => naming.render(&naming.case_description, &values)?,
+        };
+        if name.is_empty() {
+            return Err(PurviewError::message(
+                "config.json: naming.case_name renders an empty name",
+            ));
+        }
+        check_sent_text("the case name from naming.case_name", &name)?;
+        let description = with_marker(description, &naming.marker);
+        check_sent_text(
+            "the case description from naming.case_description",
+            &description,
+        )?;
+        Ok((name, description))
+    }
+}
+
+/// The cases whose display name is exactly `name`, and how many entries
+/// have a name that cannot be read.
+fn same_name(items: Vec<Value>, name: &str) -> (Vec<CaseRecord>, usize) {
+    let (matches, unreadable) = split_by_name(items, name);
+    (
+        matches
+            .into_iter()
+            .filter_map(CaseRecord::from_value)
+            .collect(),
+        unreadable,
+    )
+}
+
+/// `id (status, created date)` for each case, never its name.
+fn case_candidates(cases: &[CaseRecord]) -> String {
+    candidates(cases.iter().map(|case| {
+        (
+            case.id
+                .as_deref()
+                .and_then(CaseId::parse)
+                .map(|id| id.to_string()),
+            case_status(&case.status),
+            case.created_date_time,
+        )
+    }))
+}
+
+#[async_trait]
+impl WriteCommand for CaseCreate {
+    fn check(&mut self, settings: &WriteSettings) -> Result<()> {
+        self.naming = Some(settings.naming.clone());
+        Ok(())
+    }
+
+    async fn plan(&mut self, preflight: &mut Preflight<'_>) -> Result<Planned> {
+        let naming = self
+            .naming
+            .clone()
+            .ok_or_else(|| PurviewError::message("case create ran without its settings"))?;
+        let (name, description) = self.names(&naming, &preflight.account.email)?;
+        let items = preflight
+            .graph
+            .list(&ReadRoute::Cases, &Query::new(), preflight.log)
+            .await?
+            .complete()
+            .map_err(|error| error.context("checking whether a case has the name already"))?;
+        let listed = items.len();
+        let (matches, unreadable) = same_name(items, &name);
+        if unreadable > 0 {
+            return Err(unreadable_names("cases", unreadable));
+        }
+        match matches.as_slice() {
+            [] => {}
+            [only] if self.reuse_existing && only.status == CaseStatus::Active => {
+                let case = crate::model::valid::CaseRef::new(only.clone())?;
+                return Ok(Planned::Existing {
+                    notice: format!(
+                        "Reused: case {} is active and has the name; nothing was sent.",
+                        case.id
+                    ),
+                    result: case.record.raw,
+                });
+            }
+            several => {
+                let reuse = if self.reuse_existing {
+                    " --reuse-existing uses only a single active case with the name."
+                } else if several.len() == 1 && several[0].status == CaseStatus::Active {
+                    " Pass --reuse-existing to use that case."
+                } else {
+                    ""
+                };
+                return Err(PurviewError::CaseNameInUse(format!(
+                    "{} with the name this case would get already exist{}, and two cases with \
+                     one name make every later lookup by name ambiguous; nothing was sent: {}. \
+                     Choose another --topic or --name.{reuse}",
+                    if several.len() == 1 {
+                        "a case".to_owned()
+                    } else {
+                        format!("{} cases", several.len())
+                    },
+                    if several.len() == 1 { "s" } else { "" },
+                    case_candidates(several),
+                )));
+            }
+        }
+        let body = serde_json::to_value(CreateCase {
+            display_name: &name,
+            description: &description,
+        })?;
+        self.planned_name = Some(name);
+        Ok(Planned::Write(WritePlan::new(PlanInput {
+            command: "case create",
+            account: preflight.account.email.clone(),
+            tenant: preflight.account.tenant_id.clone(),
+            route: WriteRoute::CreateCase,
+            body,
+            effects: vec![
+                "Creates an eDiscovery case, visible to eDiscovery administrators in the tenant."
+                    .into(),
+                "Adds no custodians, data sources or holds.".into(),
+            ],
+            warnings: Vec::new(),
+            preflight: vec![Value::String(format!(
+                "cases listed: {listed}; none has this name"
+            ))],
+        })?))
+    }
+
+    async fn applied(
+        &mut self,
+        preflight: &mut Preflight<'_>,
+        response: WriteResponse,
+    ) -> Result<Value> {
+        if response.status != 201 {
+            let _ = writeln!(
+                preflight.log,
+                "warning: Graph answered HTTP {}, where 201 was observed",
+                response.status
+            );
+        }
+        let Some(body) = response.body else {
+            let _ = writeln!(
+                preflight.log,
+                "warning: Graph's answer has no case record; 'purview case list --name <text>' \
+                 finds the new case"
+            );
+            return Ok(Value::Null);
+        };
+        let record = CaseRecord::from_value(body.clone());
+        match record.as_ref().map(|case| &case.status) {
+            Some(CaseStatus::Active) => {}
+            Some(status) => {
+                let _ = writeln!(
+                    preflight.log,
+                    "warning: the new case's status is {}, where active was observed",
+                    case_status(status)
+                );
+            }
+            None => {}
+        }
+        if record
+            .as_ref()
+            .and_then(|case| case.id.as_deref())
+            .and_then(CaseId::parse)
+            .is_none()
+        {
+            let _ = writeln!(
+                preflight.log,
+                "warning: Graph's answer carries no valid case id; 'purview case list --name \
+                 <text>' finds the new case"
+            );
+        }
+        Ok(body)
+    }
+
+    async fn reconcile(&mut self, preflight: &mut Preflight<'_>) -> Result<Reconciled> {
+        let Some(name) = self.planned_name.clone() else {
+            return Ok(Reconciled::default());
+        };
+        let (listing, failure) = preflight
+            .graph
+            .list_partial(&ReadRoute::Cases, &Query::new(), preflight.log)
+            .await?;
+        let incomplete = failure.is_some() || listing.stopped.is_some();
+        let (matches, unreadable) = same_name(listing.items, &name);
+        let candidates: Vec<String> = matches
+            .iter()
+            .map(|case| format!("case {}", case_candidates(std::slice::from_ref(case))))
+            .collect();
+        Ok(Reconciled {
+            notes: reconcile_notes(
+                "case",
+                candidates.is_empty(),
+                incomplete,
+                failure.as_ref(),
+                unreadable,
+                "purview case list".to_owned(),
+            ),
+            candidates,
+        })
+    }
 }

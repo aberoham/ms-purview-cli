@@ -144,11 +144,14 @@ pub enum PurviewError {
     /// command found that the request may have created.
     #[error(
         "the write may or may not have been applied: {reason}. It was not sent again{}",
-        candidates_text(.candidates)
+        candidates_text(.candidates, .notes)
     )]
     WriteOutcomeUnknown {
         reason: String,
         candidates: Vec<String>,
+        /// What the check found besides candidates, such as a list that
+        /// stopped early.
+        notes: Vec<String>,
     },
 
     /// The target exists and is not a verified download of the file.
@@ -207,6 +210,20 @@ pub enum PurviewError {
     /// restriction on a full address.
     #[error("{0}")]
     GenericQuery(String),
+
+    /// `case create` found cases with the display name it would use. The
+    /// message lists each match's id and status, never the name.
+    #[error("{0}")]
+    CaseNameInUse(String),
+
+    /// `search create` found a search in the case with the display name
+    /// it would use. The message lists each match's id, never the name.
+    #[error("{0}")]
+    SearchNameInUse(String),
+
+    /// A write that needs an active case found it in another status.
+    #[error("{0}")]
+    CaseNotActive(String),
 
     #[error("could not {action} the credential lock file {path}: {source}")]
     CredentialLockFailed {
@@ -346,6 +363,9 @@ impl PurviewError {
             Self::ManifestWriteFailed { .. } => ("ManifestWriteFailed", 0),
             Self::KqlNotUnderstood { .. } => ("KqlNotUnderstood", 0),
             Self::GenericQuery(_) => ("GenericQuery", 0),
+            Self::CaseNameInUse(_) => ("CaseNameInUse", 0),
+            Self::SearchNameInUse(_) => ("SearchNameInUse", 0),
+            Self::CaseNotActive(_) => ("CaseNotActive", 0),
             Self::WriteRefused => ("WriteRefused", 0),
             Self::ReadOnlySession(_) => ("ReadOnlySession", 0),
             Self::WriteOutcomeUnknown { .. } => ("WriteOutcomeUnknown", 0),
@@ -455,16 +475,22 @@ impl From<String> for PurviewError {
 
 pub type Result<T> = std::result::Result<T, PurviewError>;
 
-/// The candidates of a `WriteOutcomeUnknown`, as the end of its message.
-fn candidates_text(candidates: &[String]) -> String {
-    if candidates.is_empty() {
-        return ". Check in the Purview portal whether it took effect before running it again"
-            .to_owned();
+/// The candidates and notes of a `WriteOutcomeUnknown`, as the end of its
+/// message.
+fn candidates_text(candidates: &[String], notes: &[String]) -> String {
+    let mut text = if candidates.is_empty() {
+        ". Check in the Purview portal whether it took effect before running it again".to_owned()
+    } else {
+        format!(
+            ". It may have created: {}. Check them before running the command again",
+            candidates.join("; ")
+        )
+    };
+    for note in notes {
+        text.push_str(". ");
+        text.push_str(note);
     }
-    format!(
-        ". It may have created: {}. Check them before running the command again",
-        candidates.join("; ")
-    )
+    text
 }
 
 #[cfg(test)]

@@ -18,7 +18,9 @@ use ms_purview_cli::env::{Env, ScriptedInput};
 use ms_purview_cli::error::{PurviewError, Result};
 use ms_purview_cli::graph::WriteResponse;
 use ms_purview_cli::routes::{CaseId, Query, ReadRoute, WriteRoute};
-use ms_purview_cli::safety::{self, PlanInput, Preflight, WriteCommand, WritePlan};
+use ms_purview_cli::safety::{
+    self, PlanInput, Planned, Preflight, Reconciled, WriteCommand, WritePlan, WriteSettings,
+};
 use ms_purview_cli::secrets::store_value;
 use serde_json::{json, Value};
 use support::*;
@@ -39,14 +41,14 @@ struct StubWrite {
 
 #[async_trait]
 impl WriteCommand for StubWrite {
-    fn check(&self) -> Result<()> {
+    fn check(&mut self, _settings: &WriteSettings) -> Result<()> {
         if self.refuse_check {
             return Err(PurviewError::message("the stub's own check refused"));
         }
         Ok(())
     }
 
-    async fn plan(&mut self, preflight: &mut Preflight<'_>) -> Result<WritePlan> {
+    async fn plan(&mut self, preflight: &mut Preflight<'_>) -> Result<Planned> {
         let case = CaseId::parse(CASE).unwrap();
         let record = preflight
             .graph
@@ -70,6 +72,7 @@ impl WriteCommand for StubWrite {
             warnings: Vec::new(),
             preflight: vec![json!({"case": record["status"]})],
         })
+        .map(Planned::Write)
     }
 
     async fn applied(
@@ -83,8 +86,11 @@ impl WriteCommand for StubWrite {
         }))
     }
 
-    async fn reconcile(&mut self, _preflight: &mut Preflight<'_>) -> Result<Vec<String>> {
-        Ok(vec!["a search named Stub search".into()])
+    async fn reconcile(&mut self, _preflight: &mut Preflight<'_>) -> Result<Reconciled> {
+        Ok(Reconciled {
+            candidates: vec!["a search named Stub search".into()],
+            notes: Vec::new(),
+        })
     }
 }
 

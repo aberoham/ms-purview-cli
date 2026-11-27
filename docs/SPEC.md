@@ -486,6 +486,13 @@ Settled in PR 2.3:
 - `--wait-timeout` covers the wait. The download has its own timeouts (section 4.7); Ctrl-C
   during it gives exit 130 with the time since the POST, as `operation get --check` does.
 - Exit-4 reasons are redacted as the rest of the document, after they are added.
+- Without `--allow-concurrent`, the recheck also lists the case's operations again. An
+  error in the recheck keeps its own code, with context saying nothing was sent.
+- `operation get --check` stopped by Ctrl-C resumes with `operation get <case> <op>
+  --check` alone, never with `download`, which would fetch an export's item content.
+- A downloaded zip's declared entry count is checked against 1,000,000 (the export cap)
+  before the zip crate indexes it; a report is held to `limits.report_zip_entries` when it
+  is read.
 
 #### `purview report <case> <search>` (write: action)
 

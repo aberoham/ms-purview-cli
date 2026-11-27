@@ -704,12 +704,13 @@ async fn an_unclear_estimate_lists_operations_started_since_as_candidates() {
     setup
         .preflight_search(fixture_value(&setup.harness, "search-get-mailboxes.json"))
         .await;
-    // The preflight list is empty; the reconciliation list has the new
-    // estimate, an older one and another account's.
+    // The preflight list and its read after approval are empty; the
+    // reconciliation list has the new estimate, an older one and another
+    // account's.
     Mock::given(method("GET"))
         .and(path(format!("{CASES}/{CASE}/operations")))
         .respond_with(json_response(200, json!({"value": []})))
-        .up_to_n_times(1)
+        .up_to_n_times(2)
         .with_priority(1)
         .mount(&setup.harness.graph)
         .await;
@@ -1265,4 +1266,85 @@ async fn wrap_untrusted_marks_the_plan_query_and_report_text() {
         .as_str()
         .unwrap()
         .starts_with("[UNTRUSTED:"));
+}
+
+#[tokio::test]
+async fn an_interrupted_check_resumes_with_check_and_never_downloads_items() {
+    let setup = Setup::new().await;
+    let reports = format!(
+        "http://{ALPHA}:{}/reports?downloadType=Report",
+        setup.alpha.address().port()
+    );
+    let items = format!(
+        "http://{ALPHA}:{}/items?downloadType=Items",
+        setup.alpha.address().port()
+    );
+    let export = json!({
+        "@odata.type": "#microsoft.graph.security.ediscoverySearchExportOperation",
+        "id": OP,
+        "action": "exportResult",
+        "status": "succeeded",
+        "exportFileMetadata": [
+            {"fileName": "Reports-Orders.zip", "size": 10, "downloadUrl": reports},
+            {"fileName": "Items.1.001.Orders.zip", "size": 10, "downloadUrl": items},
+        ],
+    });
+    setup.operation(0, export).await;
+    let interrupt = Arc::new(ms_purview_cli::env::ManualInterrupt::default());
+    interrupt.fire();
+    let run = setup
+        .harness
+        .run_with(
+            &["--json", "operation", "get", CASE, OP, "--check"],
+            |env, _| {
+                setup.configure(env);
+                env.interrupt = interrupt.clone();
+            },
+        )
+        .await;
+    assert_eq!(run.outcome.exit_code, 130, "{}", run.stdout());
+    let document = run.json();
+    assert_eq!(document["error"]["code"], "Interrupted");
+    let resume: Vec<String> = document["resume"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|command| command.as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(resume.len(), 1, "{resume:?}");
+    assert!(resume[0].ends_with(&format!("operation get {CASE} {OP} --check")));
+    assert!(setup
+        .downloads()
+        .await
+        .iter()
+        .all(|request| request.url.path() != "/items"));
+}
+
+#[tokio::test]
+async fn an_estimate_started_while_the_prompt_was_open_may_be_a_duplicate() {
+    let setup = Setup::new().await;
+    setup
+        .preflight_search(fixture_value(&setup.harness, "search-get-mailboxes.json"))
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("{CASES}/{CASE}/operations")))
+        .respond_with(json_response(200, json!({"value": []})))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&setup.harness.graph)
+        .await;
+    setup
+        .get(
+            &format!("{CASES}/{CASE}/operations"),
+            json!({"value": [{"id": OTHER_OP, "action": "estimateStatistics", "status": "running"}]}),
+        )
+        .await;
+    setup.accept(&setup.key_form_location()).await;
+    let run = setup.run(&["--json", "--yes"]).await;
+    assert_eq!(run.json()["error"]["code"], "ConcurrentOperation");
+    assert!(run.json()["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("after the plan was shown"));
+    assert!(setup.posts().await.is_empty());
 }

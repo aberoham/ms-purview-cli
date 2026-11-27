@@ -748,6 +748,24 @@ fn check_zip_file(file: &fs::File) -> Result<()> {
     use std::io::Seek;
     let mut file = file;
     file.rewind()?;
+    // The declared entry count first, so that a huge central directory is
+    // refused before it is indexed. The cap is the largest any download
+    // may have (an export's items); a report is held to its own when it
+    // is read.
+    let len = file.metadata()?.len();
+    let mut handle = file.try_clone()?;
+    let declared = crate::zipread::declared_entries(&mut handle, len).map_err(|_| {
+        PurviewError::message(
+            "the downloaded file is not a zip whose central directory can be read",
+        )
+    })?;
+    if declared > crate::zipread::EXPORT_ZIP_ENTRIES {
+        return Err(PurviewError::message(format!(
+            "the downloaded zip declares {declared} entries, more than the {} any download may have",
+            crate::zipread::EXPORT_ZIP_ENTRIES
+        )));
+    }
+    file.rewind()?;
     zip::ZipArchive::new(file).map(|_| ()).map_err(|_| {
         PurviewError::message(
             "the downloaded file is not a zip whose central directory can be read",

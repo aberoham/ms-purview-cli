@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 
 use super::action::{active_operations, check_search, started_since, Checked};
 use super::download::{fetch, Request};
-use super::operation::{incomplete_reason, stopped};
+use super::operation::{incomplete_reason, stopped, Resume};
 use crate::error::{PurviewError, Result};
 use crate::graph::WriteResponse;
 use crate::kql::GuardConfig;
@@ -216,15 +216,37 @@ impl WriteCommand for Estimate {
             preflight.log,
         )
         .await
+        // The check's own error keeps its code, a read that failed
+        // included.
         .map_err(|error| {
-            let (code, _) = error.metadata();
-            changed(&format!("it no longer passes the preflight: {code}"))
+            error.context(format!(
+                "reading search {search} again after approval; nothing was sent"
+            ))
         })?;
         if again.search.id != search || again.query != query {
             return Err(changed("its query is not the one shown"));
         }
         if again.narrowed != narrowed {
             return Err(changed("the guard's verdict is not the one shown"));
+        }
+        // An estimate that another person started while the prompt was
+        // open may be a duplicate too.
+        if !self.flags.allow_concurrent {
+            let active =
+                active_operations(preflight.graph, case, "estimateStatistics", preflight.log)
+                    .await?;
+            if !active.is_empty() {
+                return Err(PurviewError::ConcurrentOperation(format!(
+                    "an estimate of case {case} was started after the plan was shown and may be \
+                     a duplicate ({}); nothing was sent. Pass --allow-concurrent to start \
+                     another",
+                    active
+                        .iter()
+                        .map(super::action::Active::describe)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )));
+            }
         }
         Ok(())
     }
@@ -298,12 +320,24 @@ impl WriteCommand for Estimate {
             PollEnd::Finished(record) => record,
             PollEnd::TimedOut { last } => {
                 return Ok(Applied::Produced(stopped(
-                    session, case, &operation, last, waited, false,
+                    session,
+                    case,
+                    &operation,
+                    last,
+                    waited,
+                    false,
+                    Resume::WaitThenDownload,
                 )?))
             }
             PollEnd::Interrupted { last } => {
                 return Ok(Applied::Produced(stopped(
-                    session, case, &operation, last, waited, true,
+                    session,
+                    case,
+                    &operation,
+                    last,
+                    waited,
+                    true,
+                    Resume::WaitThenDownload,
                 )?))
             }
         };
@@ -348,6 +382,7 @@ impl WriteCommand for Estimate {
                     Some(record),
                     waited,
                     true,
+                    Resume::WaitThenDownload,
                 )?));
             }
             reasons.extend(fetched.reasons);
@@ -416,7 +451,10 @@ impl WriteCommand for Estimate {
                     "code": "EvidenceMissing",
                     "message": format!(
                         "the collection could not be checked: {}",
-                        evidence_note.as_deref().unwrap_or("the report zip was not read")
+                        evidence_note.as_deref().unwrap_or(
+                            "the report zip lacks a file, column or row value that the check \
+                             needs, or holds two of a file"
+                        )
                     ),
                 })),
                 Collection::Complete => {}

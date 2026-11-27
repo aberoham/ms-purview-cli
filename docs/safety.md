@@ -125,8 +125,10 @@ given, whoever created it:
 
 After approval, and before anything is sent, the search is read again
 with the same checks; if its query, the guard's verdict, its scope or its
-sources differ from the plan, nothing is sent (`SearchChanged`). A change
-made after that read is still possible. The estimate is then sent once.
+sources differ from the plan, nothing is sent (`SearchChanged`). Without
+`--allow-concurrent`, the case's operations are listed again too, so an
+estimate someone else started while the prompt was open is refused as a
+possible duplicate. A change made after these reads is still possible. The estimate is then sent once.
 Its answer must be a 202 naming the new operation in the `Location`
 header, on the Graph origin and for the case posted to, and the operation
 must be an estimate; anything else stops the command with

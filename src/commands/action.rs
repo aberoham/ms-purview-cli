@@ -183,7 +183,8 @@ pub async fn active_operations(
         let other_action = record
             .action
             .as_deref()
-            .is_some_and(|found| found != action);
+            .map(str::trim)
+            .is_some_and(|found| !found.is_empty() && found != action);
         let finished = matches!(
             record.status,
             OperationStatus::Succeeded

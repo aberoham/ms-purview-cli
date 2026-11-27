@@ -1863,7 +1863,13 @@ async fn write_command(
     let settings = safety::WriteSettings {
         naming: crate::naming::Naming::from_config(&stored.extra)?,
         guard: crate::kql::GuardConfig::from_config(&stored.extra)?,
-        report: crate::report::ReportLimits::from_config(&stored.extra)?,
+        // Read only by a command that reads report zips, so that a bad
+        // `limits` setting does not stop the other writes.
+        report: if command.downloads() {
+            crate::report::ReportLimits::from_config(&stored.extra)?
+        } else {
+            crate::report::ReportLimits::from_config(&Default::default())?
+        },
     };
     command.check(&settings)?;
     // The download settings are checked before sign-in, as for download.

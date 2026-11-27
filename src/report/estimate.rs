@@ -90,9 +90,6 @@ pub fn read_locations(input: impl Read, limit: u64) -> Result<Locations> {
         ..Locations::default()
     };
     while let Some(row) = table.next_row()? {
-        if row.iter().all(|field| field.trim().is_empty()) {
-            continue;
-        }
         let Some(location) = field(&row, index[0]) else {
             locations.unusable_rows += 1;
             continue;
@@ -154,9 +151,6 @@ pub fn read_statistics_errors(input: impl Read, limit: u64) -> Result<Statistics
         ..StatisticsErrors::default()
     };
     while let Some(row) = table.next_row()? {
-        if row.iter().all(|field| field.trim().is_empty()) {
-            continue;
-        }
         let Some(kind) = field(&row, index[2]) else {
             read.unusable_rows += 1;
             continue;
@@ -282,6 +276,24 @@ mod tests {
         assert_eq!(locations.query.as_deref(), Some("\"orders-api\""));
         assert_eq!(locations.unreadable_counts, 1);
         assert!(locations.missing_columns.is_empty());
+    }
+
+    #[test]
+    fn a_row_of_empty_fields_is_unusable() {
+        let text = format!("{}\n,,,,,,,,,,\n", LOCATIONS.lines().next().unwrap());
+        assert_eq!(
+            read_locations(text.as_bytes(), 1 << 20)
+                .unwrap()
+                .unusable_rows,
+            1
+        );
+        let text = format!("{}\n,,,,,,,,\n", STATISTICS.lines().next().unwrap());
+        assert_eq!(
+            read_statistics_errors(text.as_bytes(), 1 << 20)
+                .unwrap()
+                .unusable_rows,
+            1
+        );
     }
 
     #[test]

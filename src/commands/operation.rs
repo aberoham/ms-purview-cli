@@ -383,10 +383,26 @@ pub async fn get(
             match end {
                 PollEnd::Finished(record) => record,
                 PollEnd::TimedOut { last } => {
-                    return stopped(session, case, operation, last, waited, false);
+                    return stopped(
+                        session,
+                        case,
+                        operation,
+                        last,
+                        waited,
+                        false,
+                        Resume::WaitThenDownload,
+                    );
                 }
                 PollEnd::Interrupted { last } => {
-                    return stopped(session, case, operation, last, waited, true);
+                    return stopped(
+                        session,
+                        case,
+                        operation,
+                        last,
+                        waited,
+                        true,
+                        Resume::WaitThenDownload,
+                    );
                 }
             }
         }
@@ -401,7 +417,15 @@ pub async fn get(
             Some(collection) => Some(collection),
             None => {
                 let waited = session.env.clock.elapsed().saturating_sub(command_started);
-                return stopped(session, case, operation, Some(record), waited, true);
+                return stopped(
+                    session,
+                    case,
+                    operation,
+                    Some(record),
+                    waited,
+                    true,
+                    Resume::Check,
+                );
             }
         },
         None => None,
@@ -674,6 +698,16 @@ fn show(
     })
 }
 
+/// What a stopped command resumes with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Resume {
+    /// The wait, then the download of every file.
+    WaitThenDownload,
+    /// `operation get --check`, which fetches only the evidence file: an
+    /// export's other files are item content.
+    Check,
+}
+
 /// Exit 5 at the deadline, 130 on Ctrl-C: the last status read and the
 /// command that resumes the wait (`docs/SPEC.md` section 3.3).
 pub(crate) fn stopped(
@@ -683,6 +717,7 @@ pub(crate) fn stopped(
     last: Option<OperationRecord>,
     waited: Duration,
     interrupted: bool,
+    kind: Resume,
 ) -> Result<Produced> {
     // An unknown status is Graph's text, so it is shown as tenant text.
     let status = last
@@ -703,10 +738,15 @@ pub(crate) fn stopped(
     let account = shell_word(&session.account.email);
     // Every command of this release that carries on from here: the wait,
     // then the download of the finished operation's files.
-    let resume = [
-        format!("purview --account={account} operation get {case} {operation} --wait"),
-        format!("purview --account={account} download {case} {operation}"),
-    ];
+    let resume: Vec<String> = match kind {
+        Resume::WaitThenDownload => vec![
+            format!("purview --account={account} operation get {case} {operation} --wait"),
+            format!("purview --account={account} download {case} {operation}"),
+        ],
+        Resume::Check => vec![format!(
+            "purview --account={account} operation get {case} {operation} --check"
+        )],
+    };
     let (exit_code, code, message) = if interrupted {
         (
             130,
@@ -733,17 +773,28 @@ pub(crate) fn stopped(
             })),
         });
     }
-    let _ = writeln!(
-        session.env.stderr,
-        "{message}. Operation {operation} was {}. Resume with: {}\nThen download its files \
-         with: {}",
-        status
-            .as_deref()
-            .map(sanitize)
-            .unwrap_or_else(|| "not read yet".to_owned()),
-        sanitize(&resume[0]),
-        sanitize(&resume[1])
-    );
+    let status = status
+        .as_deref()
+        .map(sanitize)
+        .unwrap_or_else(|| "not read yet".to_owned());
+    match resume.as_slice() {
+        [wait, download] => {
+            let _ = writeln!(
+                session.env.stderr,
+                "{message}. Operation {operation} was {status}. Resume with: {}\nThen download \
+                 its files with: {}",
+                sanitize(wait),
+                sanitize(download)
+            );
+        }
+        commands => {
+            let _ = writeln!(
+                session.env.stderr,
+                "{message}. Operation {operation} was {status}. Resume with: {}",
+                sanitize(&commands.join(" ; "))
+            );
+        }
+    }
     Ok(Produced {
         exit_code,
         document: None,

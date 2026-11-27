@@ -18,6 +18,9 @@ use serde_json::Value;
 
 use crate::error::{PurviewError, Result};
 
+/// The entry cap of an export's items zip (`docs/SPEC.md` section 4.8),
+/// and so of any download.
+pub const EXPORT_ZIP_ENTRIES: u64 = 1_000_000;
 /// The default entry cap of a report or estimate zip.
 pub const REPORT_ZIP_ENTRIES: usize = 1_000;
 /// Decompressed bytes one entry of a report zip may have: 4 GiB.
@@ -198,7 +201,7 @@ impl ZipReader {
 /// The number of entries the end of central directory record declares,
 /// with its ZIP64 form when the classic field is full. A file with no such
 /// record is not a zip.
-fn declared_entries(file: &mut File, len: u64) -> Result<u64> {
+pub(crate) fn declared_entries(file: &mut File, len: u64) -> Result<u64> {
     use std::io::{Seek, SeekFrom};
     let not_zip =
         || PurviewError::HostileZip("the file is not a zip archive that can be read".into());

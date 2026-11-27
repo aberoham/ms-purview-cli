@@ -314,34 +314,6 @@ fn the_built_in_generic_list_matches_the_documents() {
 }
 
 #[tokio::test]
-async fn json_redacts_url_query_values_in_both_verdicts() {
-    let link = [
-        "https://",
-        "files.contoso.example",
-        "/report?sig=",
-        "querysecret",
-    ]
-    .concat();
-    for (kql, code) in [
-        (
-            format!("\"{link}\" AND participants:alex@contoso.example"),
-            0,
-        ),
-        (format!("\"{link}\" OR retention"), 1),
-    ] {
-        for args in [
-            vec!["--json", "kql", "--kql", kql.as_str()],
-            vec!["--json", "--results-only", "kql", "--kql", kql.as_str()],
-        ] {
-            let (exit, stdout, stderr, _) = run(None, &args).await;
-            assert_eq!(exit, code, "{stderr}");
-            assert!(!stdout.contains("querysecret"), "{stdout}");
-            assert!(stdout.contains("files.contoso.example"), "{stdout}");
-        }
-    }
-}
-
-#[tokio::test]
 async fn an_unquoted_second_word_is_never_repeated() {
     for args in [
         &["kql", "--kql", "retention", "sampleword"][..],
@@ -394,58 +366,6 @@ async fn a_hidden_character_in_a_term_is_refused_before_config_json() {
 }
 
 #[tokio::test]
-async fn the_rule_column_redacts_url_queries_in_tokens() {
-    let marker = ["sample", "marker"].concat();
-    let term = format!("review {}b?sig={marker}", ["https", "://"].concat());
-    for format in [&[][..], &["--plain"][..]] {
-        let mut args = format.to_vec();
-        args.extend_from_slice(&["kql", "--term", term.as_str()]);
-        let (code, stdout, stderr, _) = run(None, &args).await;
-        assert_eq!(code, 1, "{stderr}");
-        assert!(stdout.contains("review 8"), "{stdout}");
-        assert!(!stdout.contains(&marker), "{stdout}");
-    }
-}
-
-#[tokio::test]
-async fn the_redacted_query_still_parses_and_keeps_its_quotes() {
-    let marker = ["sample", "marker"].concat();
-    let link = [
-        "https://",
-        "files.contoso.example",
-        "/report?sig=",
-        marker.as_str(),
-    ]
-    .concat();
-    for (kql, code) in [
-        (format!("\"{link}\" AND orders-api"), 0),
-        (format!("\"{link}\" OR retention"), 1),
-    ] {
-        let (exit, stdout, _, value) = run(None, &["--json", "kql", "--kql", kql.as_str()]).await;
-        assert_eq!(exit, code);
-        assert!(!stdout.contains(&marker), "{stdout}");
-        let value = value.unwrap();
-        let reported = if code == 0 {
-            value["results"]["kql"].as_str().unwrap().to_owned()
-        } else {
-            value["analysis"]["kql"].as_str().unwrap().to_owned()
-        };
-        assert!(
-            reported.starts_with("\"https://files.contoso.example/report?"),
-            "{reported}"
-        );
-        let (again, _, stderr, _) = run(None, &["kql", "--kql", reported.as_str()]).await;
-        assert_eq!(again, code, "{reported}: {stderr}");
-        let (_, stdout, _, _) = run(None, &["kql", "--kql", kql.as_str()]).await;
-        let line = stdout.lines().next().unwrap();
-        assert!(
-            line.contains("\" AND orders-api") || line.contains("\" OR retention"),
-            "{line}"
-        );
-    }
-}
-
-#[tokio::test]
 async fn an_unexpected_argument_holding_usage_is_not_repeated() {
     let marker = ["Usage:", "sample", "marker"].concat();
     for json in [true, false] {
@@ -462,4 +382,59 @@ async fn an_unexpected_argument_holding_usage_is_not_repeated() {
             "{stdout}{stderr}"
         );
     }
+}
+
+/// A URL in a phrase is refused, so no output has a URL to redact and the
+/// query is always printed as it was given. Rewriting a URL for display
+/// changed its classification, or what it parsed as.
+#[tokio::test]
+async fn a_url_in_a_phrase_is_refused_and_never_printed() {
+    let marker = ["sample", "marker"].concat();
+    let scheme = ["https", "://"].concat();
+    let link = format!("{scheme}files.contoso.example/report?sig={marker}");
+    for kql in [
+        format!("\"{link}\" AND orders-api"),
+        format!("\"{link}\""),
+        format!("subject:\"{link}\""),
+        format!(
+            "\"review {}intranet?$filter={marker}\"",
+            ["HTTP", "://"].concat()
+        ),
+        "\"ftp://files.contoso.example/x\"".to_owned(),
+    ] {
+        for json in [true, false] {
+            let mut args = if json { vec!["--json"] } else { vec![] };
+            args.extend_from_slice(&["kql", "--kql", kql.as_str()]);
+            let (code, stdout, stderr, value) = run(None, &args).await;
+            assert_eq!(code, 1, "{kql}");
+            assert!(
+                !stdout.contains(&marker) && !stderr.contains(&marker),
+                "{stdout}{stderr}"
+            );
+            assert!(
+                !stdout.contains("://") && !stderr.contains("://"),
+                "{stdout}{stderr}"
+            );
+            if json {
+                assert_eq!(value.unwrap()["error"]["code"], "KqlNotUnderstood");
+            } else {
+                assert!(stderr.contains("a URL"), "{stderr}");
+            }
+        }
+    }
+    let (code, _, stderr, _) = run(Some("{not json"), &["kql", "--term", link.as_str()]).await;
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("--term") && stderr.contains("URL"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(&marker));
+    // A host name or path without the scheme is an ordinary phrase.
+    let (code, stdout, _, _) =
+        run(None, &["kql", "--kql", "\"files.contoso.example/report\""]).await;
+    assert_eq!(code, 0);
+    assert!(
+        stdout.starts_with("kql: \"files.contoso.example/report\"\n"),
+        "{stdout}"
+    );
 }

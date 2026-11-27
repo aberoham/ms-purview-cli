@@ -254,6 +254,16 @@ impl Lexer {
         if text.trim().is_empty() {
             return Err(KqlError::new(open, "an empty quoted phrase"));
         }
+        // A URL can carry a signature in its query, and rewriting it for
+        // display changes how it reads, so none is accepted: the query is
+        // then always shown as it was given.
+        if text.contains("://") {
+            return Err(KqlError::new(
+                open,
+                "a URL in a phrase is not supported; search for its host name or path without \
+                 the scheme",
+            ));
+        }
         // KQL does not say how a word glued to a closing quote reads.
         if !is_delimiter(self.peek()) {
             return Err(KqlError::new(
@@ -721,6 +731,19 @@ mod tests {
         for query in ["NOT*", "AND*", "or*"] {
             assert!(refused(query).reason.contains("with a *"), "{query}");
         }
+    }
+
+    #[test]
+    fn a_url_in_a_phrase_is_refused_at_its_quote() {
+        for (query, column) in [
+            ("\"https://files.contoso.example/report\"", 1),
+            ("a1aa AND subject:\"x ftp://y\"", 18),
+        ] {
+            let error = refused(query);
+            assert_eq!(error.column, column, "{query}");
+            assert!(error.reason.contains("a URL"), "{query}");
+        }
+        assert_eq!(kinds("\"files.contoso.example/report\"").len(), 1);
     }
 
     #[test]

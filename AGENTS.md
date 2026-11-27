@@ -86,7 +86,8 @@ that the test files pass their own scan.
   non-blank reason and never covers a parse error; `build.rs` turns the
   query flags into KQL that goes through the same parser. A refusal names
   a column and the construct, and quotes only ASCII punctuation, never a
-  word or value from the query.
+  word or value from the query. A phrase holding `://` is refused, so a
+  query never holds a URL and `kql` prints it as given.
 - `src/model/wire.rs` holds the wire records (`CaseRecord`,
   `SearchRecord`, `OperationRecord` and its typed details), each read field
   by field from the JSON so that no field is required and a field of the

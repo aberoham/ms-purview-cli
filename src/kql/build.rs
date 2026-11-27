@@ -126,6 +126,13 @@ pub fn build(flags: &QueryFlags) -> Result<String> {
                         ordinal(index, count)
                     )));
                 }
+                if term.contains("://") {
+                    return Err(PurviewError::message(format!(
+                        "--term{} contains a URL, which a term cannot hold; search for its host \
+                         name or path without the scheme",
+                        ordinal(index, count)
+                    )));
+                }
                 if term.contains('*') {
                     return Err(PurviewError::message(format!(
                         "--term{} contains a *: a quoted term cannot hold a wildcard; use --kql \

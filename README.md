@@ -32,19 +32,24 @@ purview operation list <case> --resolve --action report
 purview operation get <case> <op> --wait --wait-timeout 30m
 ```
 
-`purview kql` builds a query from the same flags that `search create` will take, or takes one with `--kql`, and shows whether the guard would allow it, with no sign-in:
+`purview kql` builds a query from the same flags that `search create` takes, or takes one with `--kql`, and shows whether the guard would allow it, with no sign-in:
 
 ```bash
 purview kql --term orders-api --participant alex@contoso.example
 ```
 
-None of the commands below exist yet; each line is an independent example of the planned shape from [docs/SPEC.md](docs/SPEC.md), not a sequence:
+The write commands show a plan and send it only when approved; `--dry-run` shows the plan and sends nothing:
 
 ```bash
-# Independent examples of the planned shape (not yet implemented)
 purview case create --topic "Orders review" --dry-run
 purview search create "Records research - Orders review 2026-11" \
   --name "orders-api-mail" --term orders-api --participant alex@contoso.example --dry-run
+```
+
+The actions are not built yet; this line is an example of the planned shape from [docs/SPEC.md](docs/SPEC.md):
+
+```bash
+# Planned shape (not yet implemented)
 purview estimate <existing-case> <existing-search> --strict
 ```
 
@@ -81,9 +86,15 @@ Existing tools leave gaps across the eDiscovery workflow (recorded in [docs/SPEC
 - `purview kql` (query flags `--term`, `--participant`, `--since`, `--until`, `--kind`, `--exclude-from`, or `--kql`): check a query against the guard against generic tenant-wide searches locally, showing each term's class and the rule that decided it; exits 1 with `GenericQuery` if some branch of the query is not narrowed by a specific term or a `participants:` restriction on a full address.
 - Global option `--wrap-untrusted`: in JSON, wrap names, descriptions, queries and file names that tenant users wrote in `[UNTRUSTED:<id>]` markers.
 
+**Unreleased, on `main`:**
+
+- `purview case create --topic TEXT` (`--name`, `--requester`, `--description`, `--reuse-existing`): create a case named by the `naming.case_name` template; a name that any case has, in any status, is refused with `CaseNameInUse`.
+- `purview search create <case> --name NAME [query flags]` (`--description`, `--allow-generic --reason TEXT`): create a search over every tenant mailbox in an active case, after the query guard; a name in use in the case is refused with `SearchNameInUse`.
+- Both show a plan and send one POST only when approved by `--yes` or at an `Apply? [y/N]` prompt; `--dry-run` sends nothing, and `--no-write` refuses them before sign-in.
+
 **Planned roadmap (not yet built, no dates):**
 
-- **v0.2:** write commands (`case create`, `search create`, `estimate`, `report`, and `case close` if its live checks complete) with preflight checks and explicit approval, plus estimate report parsing (`parse locations`, `parse failures`, `parse summary`).
+- **v0.2:** the rest of the write commands (`estimate`, `report`, and `case close` if its live checks complete) with preflight checks and explicit approval, plus estimate report parsing (`parse locations`, `parse failures`, `parse summary`).
 - **v0.3:** item report parsing (`parse items`, `parse profile`).
 - **v0.4:** `export create` and `export index`.
 - **v0.5:** reading message bodies from export zips (`export read`).
@@ -91,7 +102,7 @@ Existing tools leave gaps across the eDiscovery workflow (recorded in [docs/SPEC
 
 ## Safety
 
-Design rules enforced in code as the write commands arrive:
+Design rules enforced in code by the write commands:
 
 - **No holds:** `purview` never places, changes or releases a hold.
 - **No destructive case changes:** `purview` never deletes or reopens a case.
@@ -100,7 +111,7 @@ Design rules enforced in code as the write commands arrive:
 Protections active today:
 
 - **Graph origin and redirects:** Microsoft Graph requests, paging links included, go only to `https://graph.microsoft.com:443` below `/v1.0/`, with redirects disabled. A test fails the build if `PATCH`, `PUT` or `DELETE` appears in the source.
-- **Query guard (`purview kql`):** a query must be narrowed in every branch by a specific term or a `participants:` restriction on a full address; syntax outside a small Keyword Query Language (KQL) subset is refused. The search commands will run the same check before sign-in. See [docs/safety.md](docs/safety.md).
+- **Query guard (`purview kql`):** a query must be narrowed in every branch by a specific term or a `participants:` restriction on a full address; syntax outside a small Keyword Query Language (KQL) subset is refused. `search create` runs the same check before sign-in. See [docs/safety.md](docs/safety.md).
 - **Download origin:** the download token goes only to the one `https` Purview download host on port 443 that each file names, never with the Graph token; a redirect to any other origin is refused without contacting it.
 
 - **Credential storage:** tokens persist only in the operating system's credential store (macOS Keychain, Windows Credential Manager or Linux kernel keyring). `config.json` and account files hold no secrets.

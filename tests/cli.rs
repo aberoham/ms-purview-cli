@@ -282,7 +282,7 @@ fn help_is_success_and_lists_exactly_the_shipped_commands() {
 }
 
 #[test]
-fn read_command_groups_list_exactly_their_shipped_commands() {
+fn command_groups_list_exactly_their_shipped_commands() {
     for group in ["case", "search", "operation"] {
         let output = purview()
             .args([group, "--help"])
@@ -299,7 +299,11 @@ fn read_command_groups_list_exactly_their_shipped_commands() {
             .take_while(|line| !line.trim().is_empty())
             .filter_map(|line| line.split_whitespace().next())
             .collect();
-        assert_eq!(commands, ["list", "get", "help"], "{group}: {text}");
+        let expected: &[&str] = match group {
+            "operation" => &["list", "get", "help"],
+            _ => &["list", "get", "create", "help"],
+        };
+        assert_eq!(commands, expected, "{group}: {text}");
     }
 }
 
@@ -435,5 +439,176 @@ fn kql_refusals_exit_1_with_their_codes() {
             .clone();
         let value: Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(value["error"]["code"], code, "{query}");
+    }
+}
+
+/// Runs a write command line that must fail before sign-in, with no
+/// configuration directory, and returns its JSON error code. Nothing may
+/// reach the credential store or the network, so the process ends before
+/// sign-in; the configuration directory is never created.
+fn refused_before_sign_in(args: &[&str]) -> String {
+    let config = tempfile::tempdir().unwrap();
+    let missing = config.path().join("missing");
+    let output = purview()
+        .env("PURVIEW_CONFIG_DIR", &missing)
+        .arg("--json")
+        .args(args)
+        .assert()
+        .code(1)
+        .stderr(predicate::str::is_empty())
+        .get_output()
+        .stdout
+        .clone();
+    assert!(!missing.exists(), "{args:?}");
+    let value: Value = serde_json::from_slice(&output).unwrap();
+    value["error"]["code"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+const SEARCH_CREATE: &[&str] = &[
+    "search",
+    "create",
+    "00000000-0000-4000-8000-000000000031",
+    "--name",
+    "orders-api-mail",
+];
+
+/// The release smoke test of v0.2.0 (`docs/SPEC.md` section 11), and the
+/// same for `search create`: --no-write refuses before anything else.
+#[test]
+fn no_write_refuses_both_create_commands_before_sign_in() {
+    assert_eq!(
+        refused_before_sign_in(&["--no-write", "case", "create", "--topic", "smoke"]),
+        "WriteRefused"
+    );
+    let mut args = vec!["--no-write"];
+    args.extend_from_slice(SEARCH_CREATE);
+    args.extend_from_slice(&[
+        "--term",
+        "orders-api",
+        "--participant",
+        "alex@contoso.example",
+    ]);
+    assert_eq!(refused_before_sign_in(&args), "WriteRefused");
+}
+
+#[test]
+fn create_argument_errors_need_no_network() {
+    let canary = "canary-argument-0077";
+    let tab = format!("Orders\treview {canary}");
+    let cases: Vec<Vec<String>> = vec![
+        vec!["case".into(), "create".into()],
+        vec![
+            "case".into(),
+            "create".into(),
+            "--topic".into(),
+            "  ".into(),
+        ],
+        vec![
+            "case".into(),
+            "create".into(),
+            "--topic".into(),
+            tab.clone(),
+        ],
+        vec![
+            "case".into(),
+            "create".into(),
+            "--topic".into(),
+            "Orders".into(),
+            "--name".into(),
+            tab.clone(),
+        ],
+        vec![
+            "case".into(),
+            "create".into(),
+            "--topic".into(),
+            "Orders".into(),
+            "--requester".into(),
+            String::new(),
+        ],
+        vec![
+            "--select".into(),
+            "ID".into(),
+            "case".into(),
+            "create".into(),
+            "--topic".into(),
+            "Orders".into(),
+        ],
+    ];
+    let search = |extra: &[&str]| -> Vec<String> {
+        SEARCH_CREATE
+            .iter()
+            .chain(extra)
+            .map(|arg| (*arg).to_owned())
+            .collect()
+    };
+    let searches = vec![
+        // No query at all.
+        search(&[]),
+        search(&["--term", "orders-api", "--reason", "needed"]),
+        search(&["--term", "orders-api", "--allow-generic"]),
+        search(&["--term", "orders-api", "--allow-generic", "--reason", " "]),
+        search(&["--term", "orders-api", "--kql", "\"orders-api\""]),
+        search(&["--term", "orders-api", "--description", &tab]),
+        vec![
+            "search".into(),
+            "create".into(),
+            "c".into(),
+            "--term".into(),
+            "x".into(),
+        ],
+        vec![
+            "search".into(),
+            "create".into(),
+            " ".into(),
+            "--name".into(),
+            "n".into(),
+            "--term".into(),
+            "orders-api".into(),
+        ],
+    ];
+    for args in cases.iter().chain(&searches) {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let config = tempfile::tempdir().unwrap();
+        let output = purview()
+            .env("PURVIEW_CONFIG_DIR", config.path().join("missing"))
+            .arg("--json")
+            .args(&args)
+            .assert()
+            .code(1)
+            .stderr(predicate::str::is_empty())
+            .get_output()
+            .stdout
+            .clone();
+        let text = String::from_utf8(output).unwrap();
+        assert!(!text.contains(canary), "{args:?}: {text}");
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["error"]["code"], "CommandFailed", "{args:?}: {text}");
+    }
+}
+
+/// The guard runs before sign-in, after --no-write: a query that is not
+/// narrowed, and one outside the grammar, are refused with their codes.
+#[test]
+fn search_create_runs_the_guard_before_sign_in() {
+    for (extra, code) in [
+        (&["--term", "retention"][..], "GenericQuery"),
+        (&["--kql", "retention policy"][..], "KqlNotUnderstood"),
+        (
+            &[
+                "--kql",
+                "retention policy",
+                "--allow-generic",
+                "--reason",
+                "needed",
+            ][..],
+            "KqlNotUnderstood",
+        ),
+    ] {
+        let mut args = SEARCH_CREATE.to_vec();
+        args.extend_from_slice(extra);
+        assert_eq!(refused_before_sign_in(&args), code, "{extra:?}");
     }
 }

@@ -24,7 +24,9 @@ use crate::output::{
 use crate::poll;
 use crate::routes::OperationId;
 use crate::routes::{Query, ReadRoute};
-use crate::safety::{self, ApprovalSettings, Decision, NotApplied, Preflight, WriteCommand};
+use crate::safety::{
+    self, ApprovalSettings, Decision, NotApplied, Planned, Preflight, WriteCommand,
+};
 use crate::secrets::{delete_value, entry_exists, token_key, CredentialLock};
 use crate::token::{Access, Credential, IdentityEndpoint, StoredPrincipal, StoredTokenProvider};
 use crate::trace::TraceSink;
@@ -171,21 +173,24 @@ Examples:
     )]
     Auth(AuthArgs),
     #[command(
-        about = "List and show eDiscovery cases",
+        about = "List, show and create eDiscovery cases",
         after_help = "\
 Examples:
   purview case list
   purview case list --status active --mine
   purview case list --name orders --created-after 2026-01-01
-  purview case get <case>"
+  purview case get <case>
+  purview case create --topic \"Orders review\" --dry-run"
     )]
     Case(CaseArgs),
     #[command(
-        about = "List and show the searches in a case",
+        about = "List, show and create the searches in a case",
         after_help = "\
 Examples:
   purview search list <case>
-  purview search get <case> <search> --json"
+  purview search get <case> <search> --json
+  purview search create <case> --name orders-api-mail --term orders-api \\
+    --participant alex@contoso.example --dry-run"
     )]
     Search(SearchArgs),
     #[command(
@@ -447,6 +452,63 @@ Examples:
         #[arg(value_name = "CASE", help = CASE_HELP)]
         case: String,
     },
+    #[command(
+        about = "Create a case for a tenant-wide mailbox search",
+        long_about = "\
+Create an eDiscovery case. Its name comes from naming.case_name in \
+config.json (by default \"Records research - {topic} {yyyy_mm}\") unless \
+--name is given, and its description from naming.case_description, always \
+ending with naming.marker. Every case is listed first: if any case, in any \
+status, has the name already, nothing is sent (CaseNameInUse), because two \
+cases with one name make every later lookup by name ambiguous. With \
+--reuse-existing, a single active case with the name is shown instead. \
+The case gets no custodians, data sources or holds.
+
+This command changes Purview: it shows a plan and sends it only when \
+approved, by --yes or by answering y at a terminal. --dry-run shows the \
+plan and sends nothing.",
+        after_help = "\
+Examples:
+  purview case create --topic \"Orders review\" --dry-run
+  purview case create --topic \"Orders review\" --requester \"Legal team\" --yes
+  purview case create --topic \"Orders review\" --reuse-existing --yes --json"
+    )]
+    Create(CaseCreateArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct CaseCreateArgs {
+    #[arg(
+        long,
+        value_name = "TEXT",
+        help = "What the research is about; {topic} in naming.case_name"
+    )]
+    topic: String,
+    #[arg(
+        long,
+        value_name = "NAME",
+        help = "The case's display name, instead of naming.case_name"
+    )]
+    name: Option<String>,
+    #[arg(
+        long,
+        value_name = "TEXT",
+        help = "Who asked for the research; {requester} in naming.case_description \
+(default: the signed-in account)"
+    )]
+    requester: Option<String>,
+    #[arg(
+        long,
+        value_name = "TEXT",
+        help = "The case's description, instead of naming.case_description; \
+naming.marker is added to it"
+    )]
+    description: Option<String>,
+    #[arg(
+        long,
+        help = "If a single active case has the name already, show it and send nothing"
+    )]
+    reuse_existing: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -533,6 +595,67 @@ Examples:
         #[arg(value_name = "SEARCH", help = SEARCH_HELP)]
         search: String,
     },
+    #[command(
+        about = "Create a search over every tenant mailbox in a case",
+        long_about = "\
+Create a search in an active case, over every mailbox in the tenant \
+(email, and Teams chat and channel messages). The query is built from the \
+query flags, or taken from --kql, and checked by the guard against generic \
+tenant-wide searches before sign-in, as 'purview kql' checks it: every \
+branch must be narrowed by a specific term or by participants: on a full \
+address. --allow-generic with --reason overrides a query that is not \
+narrowed, and the reason is recorded in the search's description. The \
+case's searches are listed first, and a name one of them has is refused \
+(SearchNameInUse). The description comes from naming.search_description \
+unless --description is given, and always ends with naming.marker.
+
+Creating a search runs nothing: an estimate, report or export does. The \
+search gets no custodians, data sources or holds. This command changes \
+Purview: it shows a plan and sends it only when approved, by --yes or by \
+answering y at a terminal. --dry-run shows the plan and sends nothing.",
+        after_help = "\
+Examples:
+  purview search create <case> --name orders-api-mail --term orders-api \\
+    --participant alex@contoso.example --since 2025-01-01 --dry-run
+  purview search create <case> --name orders-api-mail \\
+    --kql '\"orders-api\" AND participants:alex@contoso.example' --yes"
+    )]
+    Create(SearchCreateArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct SearchCreateArgs {
+    #[arg(value_name = "CASE", help = CASE_HELP)]
+    case: String,
+    #[arg(
+        long,
+        value_name = "NAME",
+        help = "The search's display name, which no other search in the case may have"
+    )]
+    name: String,
+    #[command(flatten)]
+    query: QueryArgs,
+    #[arg(
+        long,
+        value_name = "TEXT",
+        help = "The search's description, instead of naming.search_description; \
+naming.marker is added to it"
+    )]
+    description: Option<String>,
+    #[arg(
+        long,
+        requires = "reason",
+        help = "Create the search even though the guard finds the query not narrowed; \
+needs --reason"
+    )]
+    allow_generic: bool,
+    #[arg(
+        long,
+        value_name = "TEXT",
+        requires = "allow_generic",
+        help = "Why a query that is not narrowed is needed; recorded in the description"
+    )]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1156,8 +1279,44 @@ async fn run(
             AuthCommand::List => auth_list(env, output),
             AuthCommand::Logout => auth_logout(env, output, globals).await,
         },
+        Command::Case(CaseArgs {
+            command: CaseCommand::Create(args),
+        }) => {
+            let mut command = commands::case::CaseCreate::new(
+                commands::case::CaseCreateFlags {
+                    topic: args.topic,
+                    name: args.name,
+                    requester: args.requester,
+                    description: args.description,
+                    reuse_existing: args.reuse_existing,
+                },
+                env.clock.now(),
+            )?;
+            write_command(env, output, globals, &mut command).await
+        }
         Command::Case(case) => {
             read_command(env, output, globals, ReadCommand::case(case.command)?).await
+        }
+        Command::Search(SearchArgs {
+            command: SearchCommand::Create(args),
+        }) => {
+            let case = CaseKey::parse(&args.case)?;
+            let kql = crate::kql::build::build(&args.query.flags())?;
+            let mut command = commands::search::SearchCreate::new(
+                commands::search::SearchCreateFlags {
+                    case,
+                    name: args.name,
+                    kql,
+                    description: args.description,
+                    override_reason: if args.allow_generic {
+                        args.reason
+                    } else {
+                        None
+                    },
+                },
+                env.clock.now(),
+            )?;
+            write_command(env, output, globals, &mut command).await
         }
         Command::Search(search) => {
             read_command(env, output, globals, ReadCommand::search(search.command)?).await
@@ -1237,6 +1396,9 @@ impl ReadCommand {
                 mine: list.mine,
             }),
             CaseCommand::Get { case } => Self::CaseGet(CaseKey::parse(&case)?),
+            CaseCommand::Create(_) => {
+                return Err(PurviewError::message("case create is a write command"))
+            }
         })
     }
 
@@ -1245,6 +1407,9 @@ impl ReadCommand {
             SearchCommand::List { case } => Self::SearchList(CaseKey::parse(&case)?),
             SearchCommand::Get { case, search } => {
                 Self::SearchGet(CaseKey::parse(&case)?, SearchKey::parse(&search)?)
+            }
+            SearchCommand::Create(_) => {
+                return Err(PurviewError::message("search create is a write command"))
             }
         })
     }
@@ -1424,11 +1589,16 @@ async fn write_command(
              out",
         ));
     }
-    command.check()?;
-    // The naming templates are checked before sign-in, as the settings
-    // every write may render.
+    // The naming templates and the guard's lists are checked before
+    // sign-in, as the settings every write may use, then the command's own
+    // checks run with them.
     let dir = configuration_dir(env)?;
-    crate::naming::Naming::from_config(&load_config(env, &dir)?.extra)?;
+    let stored = load_config(env, &dir)?;
+    let settings = safety::WriteSettings {
+        naming: crate::naming::Naming::from_config(&stored.extra)?,
+        guard: crate::kql::GuardConfig::from_config(&stored.extra)?,
+    };
+    command.check(&settings)?;
     let (account, credential) = signed_in(env, globals)?;
     let email = account.email.clone();
     let may_write = crate::auth::graph_permissions(&credential.graph.scope)
@@ -1498,7 +1668,7 @@ async fn run_write(
     };
     let input = env.input.clone();
     let redactor = env.redactor.clone();
-    let plan = command
+    let planned = command
         .plan(&mut Preflight {
             graph,
             account,
@@ -1506,6 +1676,21 @@ async fn run_write(
             verbose: globals.verbose,
         })
         .await?;
+    let plan = match planned {
+        Planned::Write(plan) => plan,
+        Planned::Existing { result, notice } => {
+            if json {
+                let value =
+                    output.untrusted_json_value(safety::existing_value(result), 1, &redactor)?;
+                return Ok(Outcome::success(Some(value)));
+            }
+            writeln!(env.stdout, "{}", sanitize(&notice))?;
+            let shown = redactor.redact_value(&crate::trace::redact_urls(&result, &redactor));
+            let text = serde_json::to_string_pretty(&shown)?;
+            writeln!(env.stdout, "{}", sanitize_multiline(&text))?;
+            return Ok(Outcome::success(None));
+        }
+    };
     if !plan.account().eq_ignore_ascii_case(&account.email)
         || !plan.tenant().eq_ignore_ascii_case(&account.tenant_id)
     {

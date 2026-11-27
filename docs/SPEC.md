@@ -311,6 +311,21 @@ Then:
 - **Any other match:** refuse with `CaseNameInUse`, listing id and status of each match. Two
   cases with one name, even if one is closed, would make every later name lookup ambiguous.
 
+Settled in PR 2.2:
+- The flags are trimmed; blank text, or a control or invisible character, is an argument
+  error. The templates are rendered before the first request, so a template that uses a
+  variable with no value (`{query_summary}` in `case_name`) fails before any request.
+- `naming.marker` is added to the description, `--description` included, when it does not
+  hold it already, so that `case close` can rely on it (section 3.5, `case close`, step 2).
+- The `CaseNameInUse` message lists id, status and creation date, never the name. With one
+  active match and no `--reuse-existing`, it names that flag.
+- `--reuse-existing` with its one active match prints `{"applied": false, "plan": null,
+  "result": <the case as Graph listed it>, "reused": true}` in the exit-0 envelope, or a
+  `Reused: case <id> …` line and the record in a table, and sends nothing, `--dry-run`
+  included.
+- After the 201, a status other than 201, a case status other than `active`, or a missing
+  case id is a warning on stderr. `result` is Graph's record as it came.
+
 #### `purview case close <case>` (write: state)
 
 Flags: `--any-case`, `--wait`, `--wait-timeout DUR` (default 15 minutes), `--poll-interval
@@ -364,6 +379,20 @@ Further flags: `--description TEXT`, `--allow-generic --reason TEXT`.
    the type system enforces (section 7.5).
 5. Compare the echoed `contentQuery` with what was sent. It was echoed unchanged (Observed);
    a difference is a warning.
+
+Settled in PR 2.2:
+- The KQL is built, and its arguments checked, before `--no-write`; the guard runs after
+  `--no-write` and before sign-in, with `guard` from `config.json`.
+- Preflight reads the case (`GET` on it, after the name match for a `<case>` name) and
+  refuses one that is not `active` with `CaseNotActive`, then lists its searches.
+  `SearchNameInUse` lists ids and creation dates, never the name.
+- The description is `--description`, or `naming.search_description`; with
+  `--allow-generic`, `Guard overridden with --allow-generic: <reason>` follows it; then
+  `naming.marker` is added when it is not there already. The plan carries a warning for an
+  override.
+- A difference in the echoed `contentQuery` or `dataSourceScopes`, a status other than 201,
+  or a missing search id is a warning on stderr; it never repeats the query.
+  `result` is Graph's record as it came.
 
 #### Actions on a search
 
@@ -1529,8 +1558,11 @@ account (Docs).
   - To the identity provider: token exchanges are allowed (a refresh of an expired token is
     a `POST` to the token endpoint). They change no tenant state.
   - Nothing else.
-- **What runs offline, before sign-in:** `--no-write`, argument validation, `--select`
-  validation (a write has no columns, so any `--select` is refused), the naming templates, and the KQL guard for a query supplied on the command
+- **What runs offline, before sign-in,** in this order (settled in PR 2.2): argument
+  validation, including building the KQL from the query flags; `--no-write`; `--select`
+  validation (a write has no columns, so any `--select` is refused); `config.json`'s
+  `naming` templates and `guard` lists, which `WriteCommand::check` receives as
+  `WriteSettings`; then `check`, which runs the KQL guard for a query supplied on the command
   line. Then the read-only check (section 5.1), still before any network call. The KQL of an
   existing search can only be checked after the preflight `GET` that fetches it.
 - **`WritePlan`** holds:

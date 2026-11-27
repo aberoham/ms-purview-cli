@@ -11,12 +11,13 @@ downloads, and offline parsing of the resulting zips.
 implements one item of its section 11 and nothing from later items. Today
 the binary has `purview version`, `purview auth login` (device code, or
 `--browser`), `auth refresh`, `auth status`, `auth list` and `auth logout`,
-`case list`, `case get`, `search list`, `search get`, `operation list` and
-`operation get` (with `--wait`), `download`, `kql`, and the global options `--verbose`,
-`--timeout`, `--trace` and `--wrap-untrusted`. The write options `--yes`,
-`--dry-run` and `--no-write` are parsed, and the safety framework they drive
-is in place (`src/safety.rs`), but no command uses them until the write
-commands arrive. Do not add stubs for commands that a later pull request owns.
+`case list`, `case get`, `case create`, `search list`, `search get`,
+`search create`, `operation list` and `operation get` (with `--wait`),
+`download`, `kql`, and the global options `--verbose`, `--timeout`,
+`--trace` and `--wrap-untrusted`. `case create` and `search create` are the
+write commands so far; they run through the safety framework
+(`src/safety.rs`) with `--yes`, `--dry-run` and `--no-write`. Do not add
+stubs for commands that a later pull request owns.
 
 The tool never places, changes or releases a hold, never deletes or reopens a
 case, and sends a Purview write only after a plan has been approved
@@ -67,9 +68,21 @@ that the test files pass their own scan.
   `execute_with(Env, args) -> Outcome` runs a whole command in-process; it
   is `#[doc(hidden)]` and exists for tests. It checks a read command's
   arguments (`ReadCommand`) before sign-in, then signs in and hands the
-  command a `commands::Session`.
+  command a `commands::Session`. A write subcommand is checked into its
+  `WriteCommand` (flags trimmed; blank text, or a control or invisible
+  character, refused; the query built) and handed to `write_command`.
 - `src/commands/` holds the bodies of the read commands: `case.rs`,
-  `search.rs` and `operation.rs`, with key resolution in `mod.rs`. A
+  `search.rs` and `operation.rs`, with key resolution in `mod.rs`.
+  `case.rs` also holds `CaseCreate` and `search.rs` `SearchCreate`, the
+  `WriteCommand`s of `case create` and `search create`: each lists the
+  cases or the case's searches to the last page and refuses a name in use
+  (`CaseNameInUse` in any status, `SearchNameInUse`), lists the same again
+  to name candidates after an unclear outcome, and warns when Graph's
+  answer differs from what was observed (201, `status: active`, the echoed
+  `contentQuery` and `dataSourceScopes`). `search create` runs
+  `kql::enforce` in `check`, and refuses a case that is not active
+  (`CaseNotActive`). A `--description` or rendered description always
+  ends up holding `naming.marker`. A
   `<case>` or `<search>` that is an id is used as given, with no read; a
   name is matched exactly against the whole list, which must reach its
   last page. A command returns `Produced { exit_code, document }`, and
@@ -96,7 +109,10 @@ that the test files pass their own scan.
   by field from the JSON so that no field is required and a field of the
   wrong type is `None`; each keeps the JSON it came from in `raw`.
   `src/model/valid.rs` holds the validated inputs (`CaseKey`, `SearchKey`,
-  `CaseRef`, `SearchRef`, `PollTarget`).
+  `CaseRef`, `SearchRef`, `PollTarget`). `src/model/requests.rs` holds the
+  request bodies (`CreateCase`, `CreateSearch`); a search's
+  `dataSourceScopes` is `AllTenantMailboxes`, which serialises only as
+  `allTenantMailboxes`.
 - `src/poll.rs` is the operation wait of `docs/SPEC.md` section 4.6: one
   deadline over reads, sleeps and retries (a read in flight is abandoned
   with tokio's timer), the interval schedule, a 404 grace only for a
@@ -199,15 +215,18 @@ timeout. It carries the Graph base URL (`origin::GRAPH_BASE` in production,
   `--yes`, the `Apply? [y/N]` prompt through `Env`'s `Input`, exit 3 as
   `ConfirmationRequired` or `Declined`), `ApprovedWrite`, which only
   `approve` builds from an `Approval` only this module makes, and the
-  `WriteCommand` trait (`check`, `plan`, `applied`, `reconcile`), whose
-  methods get a `Preflight` (the Graph client, the signed-in account,
-  shared, and stderr), never `Env`, so a command cannot touch the terminal
-  state, the approval input or the prompt. `cli`'s
-  `write_command` runs one: `--no-write`, `check` and the naming templates
-  before sign-in, then the read-only check on the credential's `access`,
-  then preflight, decision, send and output. `cli::execute_write_with`
-  (`#[doc(hidden)]`) runs a `WriteCommand` with the global options, for
-  tests, so the framework is tested before any write subcommand exists.
+  `WriteCommand` trait (`check`, `plan`, `applied`, `reconcile`). `check`
+  gets the `WriteSettings` (`naming` and `guard` from `config.json`);
+  `plan` returns `Planned::Write(WritePlan)` or, when nothing needs to be
+  sent, `Planned::Existing` (printed as `{"applied": false, "plan": null,
+  "result", "reused": true}`). The methods after `check` get a `Preflight`
+  (the Graph client, the signed-in account, shared, and stderr), never
+  `Env`, so a command cannot touch the terminal state, the approval input
+  or the prompt. `cli`'s `write_command` runs one: `--no-write`, the
+  settings and `check` before sign-in, then the read-only check on the
+  credential's `access`, then preflight, decision, send and output.
+  `cli::execute_write_with` (`#[doc(hidden)]`) runs a `WriteCommand` with
+  the global options, for the framework tests in `tests/writes.rs`.
 - `src/naming.rs` parses and renders the `naming` templates of
   `config.json` (`docs/SPEC.md` section 5.5); an unknown variable is
   refused without being repeated.
@@ -243,6 +262,9 @@ timeout. It carries the Graph base URL (`origin::GRAPH_BASE` in production,
   wiremock with a fake token provider; `tests/writes.rs` runs a write
   command that exists only in the test through `execute_write_with`,
   recording every request to the mock Graph and identity platform;
+  `tests/creates.rs` runs `case create` and `search create` through
+  `execute_with` the same way (flows 1, 2 and 7 of `docs/SPEC.md`
+  section 8.5);
   `tests/write_allow_list.rs` scans `src/` and `build.rs` for HTTP write
   methods, and allows a POST to be built only in `send_write` and the
   identity client; `tests/fixture_lint.rs` is the public-data lint.
@@ -382,8 +404,8 @@ These rules apply to Graph and to downloads. Do not weaken them.
 Every Purview write is a `WriteRoute` variant, and `WriteRoute::ALL` is the
 six POSTs in `docs/SPEC.md` section 4.3: create case, close case, create
 search, estimate statistics, export report and export result. They are sent
-only by `GraphClient::send_write`, which takes an `ApprovedWrite`; no
-command sends one yet. No
+only by `GraphClient::send_write`, which takes an `ApprovedWrite`;
+`case create` and `search create` send create case and create search. No
 `PATCH`, `PUT` or `DELETE` may exist in the crate, in code, strings or
 comments, and `tests/write_allow_list.rs` scans the source tree for them
 and for calls that would choose a method at run time. Adding a write needs a

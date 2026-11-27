@@ -20,6 +20,8 @@ use crate::config::AccountRecord;
 use crate::env::Input;
 use crate::error::{PurviewError, Result};
 use crate::graph::{GraphClient, WriteResponse};
+use crate::kql::GuardConfig;
+use crate::naming::Naming;
 use crate::output::{sanitize, sanitize_multiline};
 use crate::redact::Redactor;
 use crate::routes::WriteRoute;
@@ -340,6 +342,25 @@ pub(crate) async fn decide(
     })
 }
 
+/// The settings from `config.json` that a write reads before sign-in:
+/// the naming templates and the guard's term lists, each checked.
+#[derive(Debug, Clone)]
+pub struct WriteSettings {
+    pub naming: Naming,
+    pub guard: GuardConfig,
+}
+
+/// What preflight decided.
+#[derive(Debug)]
+pub enum Planned {
+    /// A write to decide on.
+    Write(WritePlan),
+    /// Nothing to send, because what the command would create exists
+    /// already and may be used (`case create --reuse-existing`). `result`
+    /// is shown as the command's result, after `notice`.
+    Existing { result: Value, notice: String },
+}
+
 /// What a write command gets while it plans, reconciles or reads its
 /// result: the Graph client, the signed-in account and a log for notices.
 /// Not `Env`: the terminal, the approval input and the prompt belong to the
@@ -359,14 +380,16 @@ pub struct Preflight<'a> {
 #[async_trait]
 pub trait WriteCommand: Send {
     /// Checks that need no sign-in, such as the KQL guard on a query given
-    /// on the command line. Runs before sign-in.
-    fn check(&self) -> Result<()> {
+    /// on the command line, with the settings from `config.json`. Runs
+    /// before sign-in; a command keeps what it needs from `settings`.
+    fn check(&mut self, _settings: &WriteSettings) -> Result<()> {
         Ok(())
     }
 
-    /// The read-only preflight, then the plan. Only Graph GETs and token
-    /// refreshes may be sent here.
-    async fn plan(&mut self, preflight: &mut Preflight<'_>) -> Result<WritePlan>;
+    /// The read-only preflight, then the plan, or what already exists when
+    /// nothing needs to be sent. Only Graph GETs and token refreshes may be
+    /// sent here.
+    async fn plan(&mut self, preflight: &mut Preflight<'_>) -> Result<Planned>;
 
     /// The result shown after Graph accepted the write.
     async fn applied(
@@ -392,6 +415,17 @@ pub fn not_applied_value(plan: &WritePlan, reason: NotApplied) -> Value {
             "status": 0,
             "message": reason.message(),
         }
+    })
+}
+
+/// The `results` of a write that was not needed (exit 0): `{"applied":
+/// false, "plan": null, "result", "reused": true}`.
+pub fn existing_value(result: Value) -> Value {
+    json!({
+        "applied": false,
+        "plan": Value::Null,
+        "result": result,
+        "reused": true,
     })
 }
 

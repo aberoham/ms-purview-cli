@@ -208,6 +208,20 @@ pub enum PurviewError {
     #[error("{0}")]
     GenericQuery(String),
 
+    /// `case create` found cases with the display name it would use. The
+    /// message lists each match's id and status, never the name.
+    #[error("{0}")]
+    CaseNameInUse(String),
+
+    /// `search create` found a search in the case with the display name
+    /// it would use. The message lists each match's id, never the name.
+    #[error("{0}")]
+    SearchNameInUse(String),
+
+    /// A write that needs an active case found it in another status.
+    #[error("{0}")]
+    CaseNotActive(String),
+
     #[error("could not {action} the credential lock file {path}: {source}")]
     CredentialLockFailed {
         action: &'static str,
@@ -346,6 +360,9 @@ impl PurviewError {
             Self::ManifestWriteFailed { .. } => ("ManifestWriteFailed", 0),
             Self::KqlNotUnderstood { .. } => ("KqlNotUnderstood", 0),
             Self::GenericQuery(_) => ("GenericQuery", 0),
+            Self::CaseNameInUse(_) => ("CaseNameInUse", 0),
+            Self::SearchNameInUse(_) => ("SearchNameInUse", 0),
+            Self::CaseNotActive(_) => ("CaseNotActive", 0),
             Self::WriteRefused => ("WriteRefused", 0),
             Self::ReadOnlySession(_) => ("ReadOnlySession", 0),
             Self::WriteOutcomeUnknown { .. } => ("WriteOutcomeUnknown", 0),

@@ -1,18 +1,27 @@
-//! `search list` and `search get` (`docs/SPEC.md` section 3.5).
+//! `search list`, `search get` and `search create` (`docs/SPEC.md`
+//! section 3.5).
 
 use std::io::Write;
 
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use super::{
-    case_id, cut, date_text, resolve_search, shown, shown_fields, time_text, warn_incomplete,
-    warn_unreadable, Produced, Session,
+    candidates, case_id, case_status, check_sent_text, cut, date_text, resolve_case,
+    resolve_search, sent_text, shown, shown_fields, time_text, warn_incomplete, warn_unreadable,
+    with_marker, Produced, Session,
 };
-use crate::error::Result;
+use crate::error::{PurviewError, Result};
+use crate::graph::WriteResponse;
+use crate::kql::{enforce, Override};
+use crate::model::requests::{AllTenantMailboxes, CreateSearch};
 use crate::model::valid::{CaseKey, SearchKey};
-use crate::model::wire::{identity, SearchRecord};
+use crate::model::wire::{identity, CaseStatus, SearchRecord};
+use crate::naming::{Naming, Values};
 use crate::output::{sanitize, write_fields, write_rows, OutputFormat};
-use crate::routes::{Query, ReadRoute, SearchSources};
+use crate::routes::{CaseId, Query, ReadRoute, SearchId, SearchSources, WriteRoute};
+use crate::safety::{PlanInput, Planned, Preflight, WriteCommand, WritePlan, WriteSettings};
 
 pub const LIST_COLUMNS: &[&str] = &["ID", "NAME", "SCOPE", "CREATED", "QUERY"];
 /// The `QUERY` column's width; JSON keeps the whole query.
@@ -220,4 +229,312 @@ pub async fn get(
     let fields = shown_fields(session, fields);
     write_fields(&mut session.env.stdout, &fields)?;
     Ok(Produced::success(None))
+}
+
+/// `search create` (`docs/SPEC.md` section 3.5): a search over every
+/// tenant mailbox in an active case. The query is built from the query
+/// flags and put through the guard before sign-in; preflight reads the
+/// case, lists its searches to the last page and refuses a name one of
+/// them has.
+pub struct SearchCreate {
+    case: CaseKey,
+    name: String,
+    kql: String,
+    description: Option<String>,
+    /// `--reason` with `--allow-generic`.
+    override_reason: Option<String>,
+    now: DateTime<Utc>,
+    naming: Option<Naming>,
+    /// Whether the guard found the query narrowed; known after `check`.
+    narrowed: Option<bool>,
+    /// The case the plan writes to, for reconciliation.
+    planned_case: Option<CaseId>,
+}
+
+/// The flags of `search create`, with the query already built.
+#[derive(Debug, Clone)]
+pub struct SearchCreateFlags {
+    pub case: CaseKey,
+    pub name: String,
+    pub kql: String,
+    pub description: Option<String>,
+    /// `--allow-generic --reason TEXT`.
+    pub override_reason: Option<String>,
+}
+
+impl SearchCreate {
+    /// Checks the flags: the name, description and reason are trimmed,
+    /// and blank text or text with a control or invisible character is
+    /// refused. `now` gives the date variables of the naming templates.
+    pub fn new(flags: SearchCreateFlags, now: DateTime<Utc>) -> Result<Self> {
+        Ok(Self {
+            case: flags.case,
+            name: sent_text("--name", &flags.name)?,
+            kql: flags.kql,
+            description: flags
+                .description
+                .map(|description| sent_text("--description", &description))
+                .transpose()?,
+            override_reason: flags
+                .override_reason
+                .map(|reason| sent_text("--reason", &reason))
+                .transpose()?,
+            now,
+            naming: None,
+            narrowed: None,
+            planned_case: None,
+        })
+    }
+
+    /// The description the search would get: `--description`, or
+    /// `naming.search_description`; then the override's reason, when the
+    /// guard was overridden, and the marker.
+    fn description(&self, naming: &Naming, user: &str, overridden: bool) -> Result<String> {
+        let mut description = match &self.description {
+            Some(description) => description.clone(),
+            None => naming.render(
+                &naming.search_description,
+                &Values {
+                    topic: None,
+                    requester: None,
+                    user,
+                    query: Some(&self.kql),
+                    action: None,
+                    now: Some(self.now),
+                },
+            )?,
+        };
+        if overridden {
+            if let Some(reason) = &self.override_reason {
+                if !description.is_empty() {
+                    description.push(' ');
+                }
+                description.push_str("Guard overridden with --allow-generic: ");
+                description.push_str(reason);
+            }
+        }
+        let description = with_marker(description, &naming.marker);
+        check_sent_text(
+            "the search description from naming.search_description",
+            &description,
+        )?;
+        Ok(description)
+    }
+}
+
+/// The searches whose display name is exactly `name`.
+fn same_name(items: Vec<Value>, name: &str) -> Vec<SearchRecord> {
+    items
+        .into_iter()
+        .filter_map(SearchRecord::from_value)
+        .filter(|search| search.display_name.as_deref() == Some(name))
+        .collect()
+}
+
+/// `id (created date)` for each search, never its name.
+fn search_candidates(searches: &[SearchRecord]) -> String {
+    candidates(searches.iter().map(|search| {
+        (
+            search
+                .id
+                .as_deref()
+                .and_then(SearchId::parse)
+                .map(|id| id.to_string()),
+            String::new(),
+            search.created_date_time,
+        )
+    }))
+}
+
+#[async_trait]
+impl WriteCommand for SearchCreate {
+    /// The guard, with `guard` from `config.json`. A query that is not
+    /// narrowed is refused unless `--allow-generic` gives a reason; a
+    /// query outside the grammar is always refused.
+    fn check(&mut self, settings: &WriteSettings) -> Result<()> {
+        let allow = match &self.override_reason {
+            Some(reason) => Override::AllowGeneric { reason },
+            None => Override::None,
+        };
+        let analysis = enforce(&self.kql, &settings.guard, allow)?;
+        self.narrowed = Some(analysis.narrowed);
+        self.naming = Some(settings.naming.clone());
+        Ok(())
+    }
+
+    async fn plan(&mut self, preflight: &mut Preflight<'_>) -> Result<Planned> {
+        let (Some(naming), Some(narrowed)) = (self.naming.clone(), self.narrowed) else {
+            return Err(PurviewError::message(
+                "search create ran without its checks",
+            ));
+        };
+        let description = self.description(&naming, &preflight.account.email, !narrowed)?;
+        let case = resolve_case(preflight.graph, &self.case, preflight.log).await?;
+        if case.record.status != CaseStatus::Active {
+            return Err(PurviewError::CaseNotActive(format!(
+                "case {} is {}, not active, and a search can be added only to an active case; \
+                 nothing was sent",
+                case.id,
+                case_status(&case.record.status)
+            )));
+        }
+        let items = preflight
+            .graph
+            .list(&ReadRoute::Searches(case.id), &Query::new(), preflight.log)
+            .await?
+            .complete()
+            .map_err(|error| error.context("checking whether a search has the name already"))?;
+        let listed = items.len();
+        let matches = same_name(items, &self.name);
+        if !matches.is_empty() {
+            return Err(PurviewError::SearchNameInUse(format!(
+                "{} in case {} already {} the name given with --name; nothing was sent: {}. \
+                 Choose another --name",
+                if matches.len() == 1 {
+                    "a search".to_owned()
+                } else {
+                    format!("{} searches", matches.len())
+                },
+                case.id,
+                if matches.len() == 1 { "has" } else { "have" },
+                search_candidates(&matches),
+            )));
+        }
+        let body = serde_json::to_value(CreateSearch {
+            display_name: &self.name,
+            description: &description,
+            content_query: &self.kql,
+            data_source_scopes: AllTenantMailboxes,
+        })?;
+        self.planned_case = Some(case.id);
+        let mut warnings = Vec::new();
+        if !narrowed {
+            warnings.push(
+                "the guard found the query not narrowed; --allow-generic overrides it, and the \
+                 reason is recorded in the search's description"
+                    .to_owned(),
+            );
+        }
+        Ok(Planned::Write(WritePlan::new(PlanInput {
+            command: "search create",
+            account: preflight.account.email.clone(),
+            tenant: preflight.account.tenant_id.clone(),
+            route: WriteRoute::CreateSearch(case.id),
+            body,
+            effects: vec![
+                format!(
+                    "Creates a search over all tenant mailboxes in case {}.",
+                    case.id
+                ),
+                "Runs nothing: an estimate, report or export runs the search.".into(),
+                "Adds no custodians, data sources or holds.".into(),
+            ],
+            warnings,
+            preflight: vec![
+                Value::String(format!("case {}: active", case.id)),
+                Value::String(format!(
+                    "searches listed in the case: {listed}; none has this name"
+                )),
+                Value::String(if narrowed {
+                    "guard: the query is narrowed".to_owned()
+                } else {
+                    "guard: the query is not narrowed; overridden with --allow-generic".to_owned()
+                }),
+            ],
+        })?))
+    }
+
+    async fn applied(
+        &mut self,
+        preflight: &mut Preflight<'_>,
+        response: WriteResponse,
+    ) -> Result<Value> {
+        if response.status != 201 {
+            let _ = writeln!(
+                preflight.log,
+                "warning: Graph answered HTTP {}, where 201 was observed",
+                response.status
+            );
+        }
+        let Some(body) = response.body else {
+            let _ = writeln!(
+                preflight.log,
+                "warning: Graph's answer has no search record; 'purview search list <case>' \
+                 finds the new search"
+            );
+            return Ok(Value::Null);
+        };
+        let record = SearchRecord::from_value(body.clone());
+        let check = |what: &str, echoed: Option<&str>, sent: &str, log: &mut dyn Write| {
+            if echoed != Some(sent) {
+                let _ = writeln!(
+                    log,
+                    "warning: Graph's answer {} {what} that differs from the one sent; check \
+                     the search with 'purview search get' before running an action on it",
+                    if echoed.is_some() { "has a" } else { "has no" },
+                );
+            }
+        };
+        check(
+            "contentQuery",
+            record.as_ref().and_then(|r| r.content_query.as_deref()),
+            &self.kql,
+            preflight.log,
+        );
+        check(
+            "dataSourceScopes",
+            record
+                .as_ref()
+                .and_then(|r| r.data_source_scopes.as_deref()),
+            "allTenantMailboxes",
+            preflight.log,
+        );
+        if record
+            .as_ref()
+            .and_then(|search| search.id.as_deref())
+            .and_then(SearchId::parse)
+            .is_none()
+        {
+            let _ = writeln!(
+                preflight.log,
+                "warning: Graph's answer carries no valid search id; 'purview search list \
+                 <case>' finds the new search"
+            );
+        }
+        Ok(body)
+    }
+
+    async fn reconcile(&mut self, preflight: &mut Preflight<'_>) -> Result<Vec<String>> {
+        let Some(case) = self.planned_case else {
+            return Ok(Vec::new());
+        };
+        let listing = preflight
+            .graph
+            .list(&ReadRoute::Searches(case), &Query::new(), preflight.log)
+            .await?;
+        let incomplete = listing.stopped.is_some();
+        let matches = same_name(listing.items, &self.name);
+        let mut found: Vec<String> = matches
+            .iter()
+            .map(|search| {
+                format!(
+                    "search {} in case {case}",
+                    search_candidates(std::slice::from_ref(search))
+                )
+            })
+            .collect();
+        if found.is_empty() {
+            found.push(format!(
+                "no search with the name was listed in case {case}; Purview may not list a new \
+                 search at once, so check 'purview search list {case}' again before running the \
+                 command again"
+            ));
+        }
+        if incomplete {
+            found.push(
+                "the search list stopped before its last page, so others may exist".to_owned(),
+            );
+        }
+        Ok(found)
+    }
 }

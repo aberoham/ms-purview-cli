@@ -1,20 +1,20 @@
 # Safety
 
-This page describes how `purview` plans and approves a write, and how it
-keeps a tenant-wide search narrow. The rest of the safety design (what each
-write changes, the action preflight, holds and duplicates) is added here
-with the write commands. Until then, `docs/SPEC.md` section 6 is the
-design.
+This page describes how `purview` plans and approves a write, what each
+write command changes and checks, and how it keeps a tenant-wide search
+narrow. The rest of the safety design (the action preflight, holds and
+concurrent operations) is added here with the commands that need it. Until
+then, `docs/SPEC.md` section 6 is the design.
 
 ## Plan, approve, send
 
-No release has a write command yet; this is the framework they will run
-through. Every write runs the same steps, in this order:
+Every write runs the same steps, in this order:
 
-1. **Before sign-in.** `--no-write` (or `PURVIEW_NO_WRITE=true`) refuses the
-   command with `WriteRefused`. Then the command's own arguments are checked,
-   including the guard for a query given on the command line, and the naming
-   templates in `config.json`.
+1. **Before sign-in.** The arguments are checked, and a query given with the
+   query flags is built. Then `--no-write` (or `PURVIEW_NO_WRITE=true`)
+   refuses the command with `WriteRefused`. Then the naming templates and
+   the guard's lists in `config.json` are read, and the guard checks a query
+   given on the command line.
 2. **The session.** The stored credential must record a read-write sign-in.
    A `--read-only` sign-in, or a credential from v0.1 that records neither,
    is refused with `ReadOnlySession` before any request is sent. See
@@ -51,6 +51,61 @@ exit 3 prints `{"plan", "applied": false, "error": {"code", "status",
 plan on standard output; exit 3 puts the plan and the reason on standard
 error.
 
+## What each write changes
+
+| Command | What it changes |
+|---|---|
+| `case create` | A new case, visible to eDiscovery administrators. No custodians, data sources or holds. |
+| `search create` | A search over every tenant mailbox in an active case. Nothing runs until an estimate, report or export is started. No custodians, data sources or holds. |
+
+### `case create`
+
+- The name is `naming.case_name` rendered with `--topic` (by default
+  `Records research - {topic} {yyyy_mm}`), or `--name`. The description is
+  `naming.case_description`, or `--description`; `naming.marker` is added
+  to it when it does not hold the marker already, so that a later
+  `case close` can tell the case was made by `purview`.
+- Preflight lists every case, to the last page. If any case has the name,
+  whatever its status, nothing is sent and the command fails with
+  `CaseNameInUse`, listing each match's id and status but not the name.
+  Two cases with one name would make every later lookup by that name
+  ambiguous. A list that stops before its last page refuses too.
+- `--reuse-existing`: if exactly one case has the name and it is active,
+  the command shows it and exits 0 without sending anything
+  (`"reused": true`, `"applied": false`). A closed or closing match, or
+  several matches, are still refused.
+
+### `search create`
+
+- The query is built from the query flags, or taken from `--kql`, and the
+  guard below checks it before sign-in. A query that is not narrowed is
+  refused with `GenericQuery` unless `--allow-generic` gives a `--reason`;
+  the reason is then recorded in the search's description, and the plan
+  carries a warning. A query outside the grammar (`KqlNotUnderstood`) is
+  refused with or without the override.
+- Preflight reads the case, which must be active (`CaseNotActive`
+  otherwise), and lists its searches to the last page. A search with the
+  same name refuses with `SearchNameInUse`.
+- The body's `dataSourceScopes` is always `allTenantMailboxes`: the request
+  type has no other value and no field for custodians or other sources.
+- The description is `naming.search_description` (by default the first 200
+  characters of the query, then the marker), or `--description`, with the
+  marker added as for a case.
+- After a 201, the echoed `contentQuery` and `dataSourceScopes` are
+  compared with what was sent; a difference is a warning on standard
+  error. Check the search with `purview search get` before running an
+  action on it.
+
+### Unclear outcomes
+
+If the POST gets no answer, times out, or gets HTTP 429 or a 5xx, it is not
+sent again. `case create` lists the cases with the planned name, and
+`search create` the case's searches with the planned name, and the command
+fails with `WriteOutcomeUnknown`, naming each by id. Names are not unique,
+so a match is only a candidate: check it with `purview case get` or
+`purview search get` before running the command again. Purview may not list
+a new case or search at once.
+
 ## The guard against generic tenant-wide searches
 
 Every search this tool creates covers every mailbox in the tenant. A search
@@ -85,14 +140,14 @@ that is not narrowed prints one document holding both
 `{"analysis": {…}, "error": {…}}`, with or without `--results-only`.
 
 `purview kql` takes no override: it reports what the guard would decide.
-The search commands of a later release accept `--allow-generic` with a
-`--reason` that is not blank, and record the reason in the search
-description. The override never accepts a query outside the grammar.
+`purview search create` accepts `--allow-generic` with a `--reason` that
+is not blank, and records the reason in the search description. The
+override never accepts a query outside the grammar. The actions on a
+search, from a later release, will take the same override.
 
 ### Building a query from flags
 
-`purview kql` and, from a later release, `purview search create` take the
-same query flags. The groups are ANDed in this order:
+`purview kql` and `purview search create` take the same query flags. The groups are ANDed in this order:
 
 | Flag | KQL |
 |---|---|

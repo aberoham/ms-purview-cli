@@ -188,7 +188,7 @@ async fn match_case_name(
 }
 
 /// A case status for a diagnostic: one Graph documents, else `other`.
-fn case_status(status: &CaseStatus) -> String {
+pub(crate) fn case_status(status: &CaseStatus) -> String {
     match status {
         CaseStatus::Active | CaseStatus::Closing | CaseStatus::Closed => status.as_str().to_owned(),
         CaseStatus::Missing => "?".to_owned(),
@@ -267,7 +267,7 @@ async fn match_search_name(
 /// `id (status, created date)` for each match, never the name, which is
 /// the same for all of them and is tenant text. Ids and statuses arrive
 /// parsed or as `?`, so no tenant text reaches the message.
-fn candidates(
+pub(crate) fn candidates(
     matches: impl Iterator<Item = (Option<String>, String, Option<DateTime<Utc>>)>,
 ) -> String {
     matches
@@ -286,6 +286,47 @@ fn candidates(
         })
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+/// Text a write command sends to the tenant, given as `flag`: trimmed, and
+/// refused when blank or when it holds a control or invisible character.
+/// Errors name the flag, never the value.
+pub fn sent_text(flag: &str, value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(PurviewError::message(format!(
+            "{flag} was given an empty value"
+        )));
+    }
+    check_sent_text(flag, value)?;
+    Ok(value.to_owned())
+}
+
+/// Refuses text for the tenant that holds a control or invisible
+/// character. `what` names where the text came from.
+pub fn check_sent_text(what: &str, value: &str) -> Result<()> {
+    if value
+        .chars()
+        .any(|character| character.is_control() || crate::kql::lexer::is_hidden(character))
+    {
+        return Err(PurviewError::message(format!(
+            "{what} contains a control or invisible character, such as a tab, a line break or a \
+             zero-width space; type it again without one"
+        )));
+    }
+    Ok(())
+}
+
+/// `text` with `marker` appended after a space, unless it holds the marker
+/// already or the marker is empty.
+pub fn with_marker(text: String, marker: &str) -> String {
+    if marker.is_empty() || text.contains(marker) {
+        text
+    } else if text.is_empty() {
+        marker.to_owned()
+    } else {
+        format!("{text} {marker}")
+    }
 }
 
 /// Text cut to `limit` characters on a character boundary, with `…` in

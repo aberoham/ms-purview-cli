@@ -902,3 +902,38 @@ async fn check_on_a_running_operation_downloads_nothing() {
     assert!(run.stderr().contains("not finished"), "{}", run.stderr());
     assert!(setup.downloads().await.is_empty());
 }
+
+/// A fresh operation that is not visible yet answers 404 at first; the
+/// wait reads it again instead of failing.
+#[tokio::test]
+async fn a_new_operation_not_yet_visible_is_read_again() {
+    let setup = Setup::new().await;
+    setup
+        .preflight(
+            fixture_value(&setup.harness, "search-get-mailboxes.json"),
+            json!({"value": []}),
+        )
+        .await;
+    setup.accept(&setup.key_form_location()).await;
+    Mock::given(method("GET"))
+        .and(path(operation_path()))
+        .respond_with(json_response(
+            404,
+            json!({"error": {"code": "NotFound", "message": "not found"}}),
+        ))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&setup.harness.graph)
+        .await;
+    setup.operation(0, setup.succeeded()).await;
+    setup.serve(estimate_zip(false)).await;
+    let run = setup.run(&["--json", "--yes"]).await;
+    assert_eq!(
+        run.outcome.exit_code,
+        0,
+        "{} {}",
+        run.stdout(),
+        run.stderr()
+    );
+    assert!(run.stderr().contains("not visible yet"), "{}", run.stderr());
+}

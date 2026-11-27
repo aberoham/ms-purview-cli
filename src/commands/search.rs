@@ -537,6 +537,7 @@ impl WriteCommand for SearchCreate {
                 "search",
                 candidates.is_empty(),
                 incomplete,
+                failure.as_ref(),
                 unreadable,
                 format!("purview search list {case}"),
             ),

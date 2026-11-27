@@ -993,7 +993,8 @@ async fn reconciliation_keeps_candidates_from_pages_before_a_failure() {
         "{message}"
     );
     assert!(
-        message.contains("stopped before its last page"),
+        message
+            .contains("stopped before its last page, at a read that failed (BadRequest, HTTP 400)"),
         "{message}"
     );
     assert!(!message.contains("canary-name-0091"), "{message}");

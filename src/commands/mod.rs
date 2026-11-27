@@ -342,6 +342,7 @@ pub fn reconcile_notes(
     what: &str,
     none_found: bool,
     incomplete: bool,
+    failure: Option<&PurviewError>,
     unreadable: usize,
     again: String,
 ) -> Vec<String> {
@@ -352,7 +353,20 @@ pub fn reconcile_notes(
              run '{again}' again before running the command again"
         ));
     }
-    if incomplete {
+    if let Some(failure) = failure {
+        // The code and status only: the message can hold text Graph
+        // quoted back.
+        let (code, status) = failure.metadata();
+        notes.push(format!(
+            "The {what} list stopped before its last page, at a read that failed ({code}{}), so \
+             others may exist",
+            if status == 0 {
+                String::new()
+            } else {
+                format!(", HTTP {status}")
+            }
+        ));
+    } else if incomplete {
         notes.push(format!(
             "The {what} list stopped before its last page, so others may exist"
         ));

@@ -492,6 +492,7 @@ impl WriteCommand for CaseCreate {
                 "case",
                 candidates.is_empty(),
                 incomplete,
+                failure.as_ref(),
                 unreadable,
                 "purview case list".to_owned(),
             ),

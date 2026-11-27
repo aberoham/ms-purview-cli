@@ -4,6 +4,10 @@
 //! `src/` and `build.rs` for them. Adding a write needs a reviewed design,
 //! a change to this test and an update to `docs/safety.md`.
 //!
+//! A POST is sent from two places only: `GraphClient::send_write`, which
+//! takes an approved plan, and the identity platform's token and
+//! device-code endpoints in `auth.rs`.
+//!
 //! The forbidden words are joined from pieces at run time, so this file
 //! could be scanned too without finding itself.
 
@@ -150,4 +154,51 @@ fn the_scan_finds_each_forbidden_form() {
     ] {
         assert!(scan("sample.rs", &text).is_empty(), "{text}");
     }
+}
+
+/// The files and the number of lines in each that build an HTTP POST
+/// with reqwest's `.post(`. Calls of the identity client's own `post`
+/// wrapper (`self.post(`) are not requests built here.
+fn post_builders(root: &Path) -> Vec<(String, usize)> {
+    let mut files = vec![root.join("build.rs")];
+    rust_files(&root.join("src"), &mut files);
+    let call = [".po", "st("].concat();
+    let wrapper = ["self.po", "st("].concat();
+    let mut found: Vec<(String, usize)> = files
+        .iter()
+        .filter_map(|path| {
+            let text = std::fs::read_to_string(path).unwrap();
+            let count = text
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .filter(|line| line.contains(&call) && !line.contains(&wrapper))
+                .count();
+            (count > 0).then(|| {
+                (
+                    path.strip_prefix(root).unwrap().display().to_string(),
+                    count,
+                )
+            })
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+#[test]
+fn a_post_is_built_only_in_send_write_and_the_token_client() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let separator = std::path::MAIN_SEPARATOR.to_string();
+    assert_eq!(
+        post_builders(root),
+        [
+            (["src", "auth.rs"].join(&separator), 1),
+            (["src", "graph.rs"].join(&separator), 1),
+        ]
+    );
+    // In graph.rs, the one POST is inside send_write.
+    let graph = std::fs::read_to_string(root.join("src").join("graph.rs")).unwrap();
+    let start = graph.find("pub async fn send_write(").unwrap();
+    let end = start + graph[start..].find("\n    }\n").unwrap();
+    assert!(graph[start..end].contains(&[".po", "st("].concat()));
 }

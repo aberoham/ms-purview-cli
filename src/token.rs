@@ -210,6 +210,46 @@ pub struct Credential {
     pub refresh_token: SecretString,
     pub graph: AccessToken,
     pub download: Option<AccessToken>,
+    /// How the account signed in, which decides whether it may write. The
+    /// token's scope cannot: the identity platform grants every consented
+    /// permission whatever was asked for (Observed, PR 1.4). `None` for a
+    /// credential stored before this was recorded, which may not write.
+    pub access: Option<Access>,
+}
+
+/// Whether a sign-in may write to Purview: `auth login` without or with
+/// `--read-only`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    ReadWrite,
+    ReadOnly,
+}
+
+impl Access {
+    pub fn from_read_only(read_only: bool) -> Self {
+        if read_only {
+            Self::ReadOnly
+        } else {
+            Self::ReadWrite
+        }
+    }
+
+    /// The stored form.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadWrite => "read-write",
+            Self::ReadOnly => "read-only",
+        }
+    }
+
+    /// The stored form read back; anything else is unrecorded.
+    fn parse(text: &str) -> Option<Self> {
+        match text {
+            "read-write" => Some(Self::ReadWrite),
+            "read-only" => Some(Self::ReadOnly),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Debug for Credential {
@@ -224,6 +264,7 @@ impl fmt::Debug for Credential {
             .field("refresh_token", &self.refresh_token)
             .field("graph", &self.graph)
             .field("download", &self.download)
+            .field("access", &self.access)
             .finish()
     }
 }
@@ -242,6 +283,8 @@ struct StoredRecord<'a> {
     graph: StoredToken<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     download: Option<StoredToken<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    access: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -267,6 +310,10 @@ struct LoadedRecord {
     graph: LoadedToken,
     #[serde(default)]
     download: Option<LoadedToken>,
+    /// Not required, and read leniently: a credential without it, or with
+    /// a value this release does not know, can read but not write.
+    #[serde(default)]
+    access: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -369,6 +416,7 @@ impl Credential {
             refresh_token: self.refresh_token.expose(),
             graph: stored(&self.graph),
             download: self.download.as_ref().map(stored),
+            access: self.access.map(Access::as_str),
         };
         Ok(serde_json::to_string(&record)?)
     }
@@ -405,6 +453,11 @@ impl Credential {
                 .download
                 .map(LoadedToken::into_access_token)
                 .filter(|token| !token.token.is_empty()),
+            access: record
+                .access
+                .as_ref()
+                .and_then(serde_json::Value::as_str)
+                .and_then(Access::parse),
         };
         credential.register(redactor);
         let damaged = |what: &str| {
@@ -942,6 +995,7 @@ mod tests {
                 "eDiscovery.ReadWrite.All openid",
             ),
             download: download.map(|seconds| token(seconds, "canary-download-0001", "d")),
+            access: Some(Access::ReadWrite),
         }
     }
 
@@ -1036,7 +1090,7 @@ mod tests {
                  \"{TENANT}\", refresh_token: [redacted], graph: AccessToken {{ token: \
                  [redacted], expires_at: 2026-01-05T09:01:40Z, scope: \"eDiscovery.ReadWrite.All \
                  openid\" }}, download: Some(AccessToken {{ token: [redacted], expires_at: \
-                 2026-01-05T09:01:40Z, scope: \"d\" }}) }}"
+                 2026-01-05T09:01:40Z, scope: \"d\" }}), access: Some(ReadWrite) }}"
             )
         );
     }
@@ -1060,14 +1114,51 @@ mod tests {
                     "expires_at": "2026-01-05T10:00:00Z",
                     "scope": "eDiscovery.ReadWrite.All openid",
                 },
+                "access": "read-write",
             })
         );
         let redactor = Redactor::new();
         let loaded = Credential::from_json(&original.to_json().unwrap(), &redactor).unwrap();
+        assert_eq!(loaded.access, Some(Access::ReadWrite));
         assert_eq!(loaded.graph.expires_at, original.graph.expires_at);
         assert!(loaded.download.is_none());
         assert!(redactor.recognises("canary-refresh-0001"));
         assert!(redactor.recognises("canary-graph-0001"));
+    }
+
+    #[test]
+    fn access_is_read_back_and_anything_unknown_is_unrecorded() {
+        let redactor = Redactor::new();
+        let stored = |access: Option<Value>| {
+            let mut value: Value =
+                serde_json::from_str(&credential(3600, None).to_json().unwrap()).unwrap();
+            match access {
+                Some(access) => value["access"] = access,
+                None => {
+                    value.as_object_mut().unwrap().remove("access");
+                }
+            }
+            Credential::from_json(&value.to_string(), &redactor)
+                .unwrap()
+                .access
+        };
+        assert_eq!(stored(Some(json!("read-write"))), Some(Access::ReadWrite));
+        assert_eq!(stored(Some(json!("read-only"))), Some(Access::ReadOnly));
+        for unrecorded in [
+            None,
+            Some(json!("Read-Write")),
+            Some(json!(true)),
+            Some(Value::Null),
+        ] {
+            assert_eq!(stored(unrecorded.clone()), None, "{unrecorded:?}");
+        }
+        let mut read_only = credential(3600, None);
+        read_only.access = Some(Access::ReadOnly);
+        let value: Value = serde_json::from_str(&read_only.to_json().unwrap()).unwrap();
+        assert_eq!(value["access"], "read-only");
+        read_only.access = None;
+        let value: Value = serde_json::from_str(&read_only.to_json().unwrap()).unwrap();
+        assert!(value.get("access").is_none());
     }
 
     #[test]

@@ -8,7 +8,7 @@
 //! endpoint, so the release binary has no path that could send a token to
 //! another host.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, IsTerminal, Write};
@@ -273,6 +273,71 @@ pub fn test_epoch() -> DateTime<Utc> {
         .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
 }
 
+/// Where a write's `Apply? [y/N]` answer is read from: standard input in
+/// production, scripted answers in tests.
+#[async_trait]
+pub trait Input: Send + Sync {
+    /// One line, without its line ending, or `None` at the end of input.
+    async fn read_line(&self) -> io::Result<Option<String>>;
+}
+
+/// The process's standard input, read on a blocking thread.
+pub struct Stdin;
+
+#[async_trait]
+impl Input for Stdin {
+    async fn read_line(&self) -> io::Result<Option<String>> {
+        tokio::task::spawn_blocking(|| {
+            let mut line = String::new();
+            match io::stdin().read_line(&mut line)? {
+                0 => Ok(None),
+                _ => Ok(Some(line.trim_end_matches(['\r', '\n']).to_owned())),
+            }
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+}
+
+/// Answers given in order, then the end of input. Each read is counted.
+#[derive(Debug, Default)]
+pub struct ScriptedInput {
+    answers: Mutex<VecDeque<String>>,
+    reads: Mutex<usize>,
+}
+
+impl ScriptedInput {
+    pub fn new(answers: &[&str]) -> Self {
+        Self {
+            answers: Mutex::new(answers.iter().map(|answer| (*answer).to_owned()).collect()),
+            reads: Mutex::new(0),
+        }
+    }
+
+    /// How many lines were asked for.
+    pub fn reads(&self) -> usize {
+        *self
+            .reads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+#[async_trait]
+impl Input for ScriptedInput {
+    async fn read_line(&self) -> io::Result<Option<String>> {
+        *self
+            .reads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) += 1;
+        Ok(self
+            .answers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pop_front())
+    }
+}
+
 #[doc(hidden)]
 pub struct Env {
     /// Holds every secret seen, for the life of the process.
@@ -284,6 +349,8 @@ pub struct Env {
     pub stdin_is_terminal: bool,
     pub stdout_is_terminal: bool,
     pub stderr_is_terminal: bool,
+    /// Where a write's approval is read at a terminal.
+    pub input: Arc<dyn Input>,
     /// `PURVIEW_CONFIG_DIR`; `None` means the platform default.
     pub config_dir: Option<PathBuf>,
     /// The `PURVIEW_*` variables that set flag defaults, as captured by
@@ -364,6 +431,8 @@ pub const FLAG_VARIABLES: &[&str] = &[
     "PURVIEW_TIMEOUT",
     "PURVIEW_TRACE_DIR",
     "PURVIEW_WRAP_UNTRUSTED",
+    "PURVIEW_YES",
+    "PURVIEW_NO_WRITE",
     "PURVIEW_CLIENT_ID",
     "PURVIEW_TENANT_ID",
 ];
@@ -396,6 +465,7 @@ impl Env {
             stdin_is_terminal: io::stdin().is_terminal(),
             stdout_is_terminal: io::stdout().is_terminal(),
             stderr_is_terminal: io::stderr().is_terminal(),
+            input: Arc::new(Stdin),
             config_dir: std::env::var_os("PURVIEW_CONFIG_DIR")
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from),
@@ -448,6 +518,7 @@ impl Env {
             stdin_is_terminal: false,
             stdout_is_terminal: false,
             stderr_is_terminal: false,
+            input: Arc::new(ScriptedInput::default()),
             config_dir: None,
             vars: BTreeMap::new(),
             identity_base: unreachable_identity_base(),

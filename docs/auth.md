@@ -27,6 +27,14 @@ A read-only session (`--read-only`) refuses every write before any request is
 sent. Whether the service would accept an action under `eDiscovery.Read.All` is
 not known, and the tool does not try.
 
+The token cannot say which kind of session it is: the identity platform grants
+every permission consented for the app, whatever the sign-in asked for
+(Observed). So `auth login` records the kind in the stored credential, as
+`"access": "read-write"` or `"read-only"`, and the write commands go by that
+record. A credential stored by v0.1, which has no record, can read and download
+as before, but every write refuses it with `ReadOnlySession` until you run
+`purview auth login` again. A refresh keeps the record as it was.
+
 Permissions are not enough on their own. The person signing in also needs a
 Purview role: membership of the eDiscovery Manager or eDiscovery Administrator
 subgroup of the eDiscovery Manager role group, assigned in the Microsoft Purview

@@ -743,7 +743,9 @@ Adding a write needs a reviewed design, a change to that test and an update to
   body, 429, 500, 502, 503 and 504. `Retry-After` is honoured in seconds or HTTP-date form,
   up to 60 s; a longer one ends the GET with Graph's error rather than wait. Otherwise the wait is 250 ms × 2^(attempt−1), capped at 30 s. A 401 makes the token
   provider refresh once, then the GET is retried once, within the same three attempts.
-- **POST: never retried automatically**, whatever the status or error. A `Retry-After` header
+- **POST: never retried automatically**, whatever the status or error. A connection that
+  could not be opened sent nothing and is `GraphUnreachable`; a 2xx whose body cannot be
+  read, or is not a JSON object, was applied and is `WriteOutcomeUnknown`. A `Retry-After` header
   says when to try again; it does not prove the first request had no effect. If the outcome
   is unclear (timeout, reset, 5xx, 429), the command runs the reconciliation in section 6.7
   and exits 1 with `WriteOutcomeUnknown`. A 401 on a POST is reported and not retried. Before
@@ -1255,7 +1257,8 @@ whatever properties can be read, with `error: "unsupportedClass"` when they have
 {"version":1,"email":"alex@contoso.example","tid":"<tenant-id>","oid":"<object-id>",
  "client_id":"<application-client-id>","tenant_id":"<tenant-id>","refresh_token":"…",
  "graph":{"access_token":"…","expires_at":"…","scope":"…"},
- "download":{"access_token":"…","expires_at":"…","scope":"…"}}
+ "download":{"access_token":"…","expires_at":"…","scope":"…"},
+ "access":"read-write"}
 ```
 
 `download` may be absent. `tid` and `oid` are the id token's claims for the identity the
@@ -1272,8 +1275,15 @@ the macOS label `purview — <email>`, and the description `Microsoft Purview eD
 token`. Windows chunking and Linux keyutils behave as in `entra`. The credential store is the
 only place a token is ever persisted.
 
-**Read-only sessions.** If the stored Graph scope lacks `eDiscovery.ReadWrite.All`, every
-write fails before any network call with `ReadOnlySession`. Whether the service would
+`access` records how the account signed in: `read-write`, or `read-only` after `auth login
+--read-only` (from PR 2.1). A refresh keeps it. A credential without it, as v0.1 stored, or
+with any other value, is read and refreshed as before but counts as neither.
+
+**Read-only sessions.** The stored scope cannot tell: a `--read-only` sign-in was granted
+`eDiscovery.ReadWrite.All` too, because the identity platform grants every consented
+permission (Observed, PR 1.4). So a write needs `access` to be `read-write`; otherwise it
+fails before any network call with `ReadOnlySession`, whose message says whether the
+sign-in was read-only or predates the record. Signing in again records it. Whether the service would
 accept actions under `eDiscovery.Read.All` is unknown and is not tested: the tool refuses
 them anyway. Read-only sessions are documented as able to read and download only (download
 itself is checked in PR 1.5).
@@ -1471,7 +1481,10 @@ Template variables:
 | `{action}` | `estimate`, `report` or `export` |
 | `{marker}` | `naming.marker` |
 
-An unknown variable is an error when the config loads.
+An unknown variable, or a `{` or `}` outside one, is an error when a write command reads
+the configuration, before sign-in. A template that uses a variable with no value for that
+name (`{topic}` in `export_name`, say) is an error when it is rendered. Runs of spaces left
+by an empty value are collapsed.
 
 `export_name` uses UTC because the service builds the zip file name from the display name.
 In the prototype the caller's local time ended up in that file name (Observed).
@@ -1507,7 +1520,8 @@ account (Docs).
     a `POST` to the token endpoint). They change no tenant state.
   - Nothing else.
 - **What runs offline, before sign-in:** `--no-write`, argument validation, `--select`
-  validation, and the KQL guard for a query supplied on the command line. The KQL of an
+  validation, the naming templates, and the KQL guard for a query supplied on the command
+  line. Then the read-only check (section 5.1), still before any network call. The KQL of an
   existing search can only be checked after the preflight `GET` that fetches it.
 - **`WritePlan`** holds:
   - the account and tenant;
@@ -1519,8 +1533,11 @@ account (Docs).
   - warnings and the preflight results.
 - **Approval:**
   - `--dry-run`: print, exit 0.
-  - Interactive (stdin and stderr are terminals) and no `--yes`: print, then `Apply? [y/N]`.
-    For `case close`, the prompt asks for the case name instead.
+  - Interactive (stdin and stderr are terminals), no `--yes` and no `--no-input`: print the
+    plan on stderr, then `Apply? [y/N]`; only `y` or `yes`, in any case, approves, and
+    anything else, end of input included, is `Declined` (exit 3). This holds under `--json`
+    too: the prompt is on stderr and the document on stdout. For `case close`, the prompt
+    asks for the case name instead (PR 2.7).
   - `--yes`: approve.
   - Non-interactive or `--no-input` without `--yes`: exit 3.
 - **`ApprovedWrite`** can only be built by `safety::approve(plan, Approval)`.

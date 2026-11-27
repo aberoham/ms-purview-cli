@@ -125,6 +125,32 @@ pub enum PurviewError {
     #[error("{0}")]
     FileNotDownloadable(String),
 
+    /// `--no-write` (or `PURVIEW_NO_WRITE`) refused a write command before
+    /// sign-in.
+    #[error(
+        "this command changes Purview, and --no-write (or PURVIEW_NO_WRITE) refuses every \
+         write; nothing was sent"
+    )]
+    WriteRefused,
+
+    /// The account cannot write: it signed in with `--read-only`, or its
+    /// credential predates the record of how it signed in. Refused before
+    /// any network call.
+    #[error("{0}")]
+    ReadOnlySession(String),
+
+    /// A POST whose outcome is unknown: no response, a timeout, HTTP 429
+    /// or a 5xx. It is never sent again. `candidates` names what the
+    /// command found that the request may have created.
+    #[error(
+        "the write may or may not have been applied: {reason}. It was not sent again{}",
+        candidates_text(.candidates)
+    )]
+    WriteOutcomeUnknown {
+        reason: String,
+        candidates: Vec<String>,
+    },
+
     /// The target exists and is not a verified download of the file.
     #[error(
         "{path} already exists and is not a verified download of this file; pass --overwrite to \
@@ -320,6 +346,9 @@ impl PurviewError {
             Self::ManifestWriteFailed { .. } => ("ManifestWriteFailed", 0),
             Self::KqlNotUnderstood { .. } => ("KqlNotUnderstood", 0),
             Self::GenericQuery(_) => ("GenericQuery", 0),
+            Self::WriteRefused => ("WriteRefused", 0),
+            Self::ReadOnlySession(_) => ("ReadOnlySession", 0),
+            Self::WriteOutcomeUnknown { .. } => ("WriteOutcomeUnknown", 0),
             Self::Message(_)
             | Self::GraphUnreachable { .. }
             | Self::Io(_)
@@ -425,6 +454,18 @@ impl From<String> for PurviewError {
 }
 
 pub type Result<T> = std::result::Result<T, PurviewError>;
+
+/// The candidates of a `WriteOutcomeUnknown`, as the end of its message.
+fn candidates_text(candidates: &[String]) -> String {
+    if candidates.is_empty() {
+        return ". Check in the Purview portal whether it took effect before running it again"
+            .to_owned();
+    }
+    format!(
+        ". It may have created: {}. Check them before running the command again",
+        candidates.join("; ")
+    )
+}
 
 #[cfg(test)]
 mod tests {

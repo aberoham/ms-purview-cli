@@ -24,8 +24,9 @@ use crate::output::{
 use crate::poll;
 use crate::routes::OperationId;
 use crate::routes::{Query, ReadRoute};
+use crate::safety::{self, ApprovalSettings, Decision, NotApplied, WriteCommand};
 use crate::secrets::{delete_value, entry_exists, token_key, CredentialLock};
-use crate::token::{Credential, IdentityEndpoint, StoredPrincipal, StoredTokenProvider};
+use crate::token::{Access, Credential, IdentityEndpoint, StoredPrincipal, StoredTokenProvider};
 use crate::trace::TraceSink;
 
 /// The command line. Clap never reads the process environment here: flag
@@ -48,6 +49,17 @@ Examples:
     next_help_heading = "Global Options"
 )]
 struct Cli {
+    #[command(flatten)]
+    globals: GlobalArgs,
+    #[command(subcommand)]
+    command: Command,
+}
+
+/// The options every command takes. Kept apart from `Cli` so that the
+/// write runner's test entry, `execute_write_with`, parses the same ones.
+#[derive(Debug, Clone, Args)]
+#[command(next_help_heading = "Global Options")]
+struct GlobalArgs {
     #[arg(
         long,
         global = true,
@@ -120,8 +132,26 @@ request headers; the files hold tenant data [env: PURVIEW_TRACE_DIR]"
 names) in [UNTRUSTED:<id>] markers [env: PURVIEW_WRAP_UNTRUSTED=true]"
     )]
     wrap_untrusted: bool,
-    #[command(subcommand)]
-    command: Command,
+    #[arg(
+        long,
+        global = true,
+        help = "Approve a write without being asked [env: PURVIEW_YES=true]"
+    )]
+    yes: bool,
+    #[arg(
+        long,
+        global = true,
+        help = "For a write: run the read-only checks, print the plan and send nothing; wins \
+over --yes"
+    )]
+    dry_run: bool,
+    #[arg(
+        long,
+        global = true,
+        help = "Refuse every command that would change Purview, before sign-in \
+[env: PURVIEW_NO_WRITE=true]"
+    )]
+    no_write: bool,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -667,6 +697,8 @@ struct FlagDefaults {
     no_input: bool,
     verbose: bool,
     wrap_untrusted: bool,
+    yes: bool,
+    no_write: bool,
     select: Option<String>,
     account: Option<String>,
     timeout: Option<String>,
@@ -698,6 +730,8 @@ impl FlagDefaults {
             no_input: flag("PURVIEW_NO_INPUT")?,
             verbose: flag("PURVIEW_VERBOSE")?,
             wrap_untrusted: flag("PURVIEW_WRAP_UNTRUSTED")?,
+            yes: flag("PURVIEW_YES")?,
+            no_write: flag("PURVIEW_NO_WRITE")?,
             select: text("PURVIEW_SELECT")?,
             account: text("PURVIEW_ACCOUNT")?,
             timeout: text("PURVIEW_TIMEOUT")?,
@@ -714,6 +748,12 @@ impl FlagDefaults {
 struct Globals {
     account: Option<String>,
     no_input: bool,
+    /// `--yes`: approve a write.
+    yes: bool,
+    /// `--dry-run`: plan a write and send nothing. Wins over `--yes`.
+    dry_run: bool,
+    /// `--no-write`: refuse every write command before sign-in.
+    no_write: bool,
     verbose: bool,
     /// The per-request Graph timeout, already resolved (`0` is 60 s).
     timeout: Duration,
@@ -726,13 +766,16 @@ impl Globals {
     /// An explicit flag wins over its variable. An explicit flag that is
     /// blank is an error, never a fall back to the variable or the
     /// default: `--account "$unset"` must not act on the default account.
-    fn new(cli: &Cli, defaults: &FlagDefaults) -> Result<Self> {
+    fn new(cli: &GlobalArgs, defaults: &FlagDefaults) -> Result<Self> {
         Ok(Self {
             account: match cli.account.as_deref() {
                 Some(value) => Some(explicit("--account", value)?),
                 None => defaults.account.clone(),
             },
             no_input: cli.no_input || defaults.no_input,
+            yes: cli.yes || defaults.yes,
+            dry_run: cli.dry_run,
+            no_write: cli.no_write || defaults.no_write,
             verbose: cli.verbose || defaults.verbose,
             timeout: match cli.timeout.as_deref() {
                 Some(value) => graph_timeout("--timeout", &explicit("--timeout", value)?)?,
@@ -819,12 +862,66 @@ pub async fn execute() -> i32 {
 /// is redacted as a value before it is serialised. A failure to write or
 /// flush stdout makes the exit code 1.
 #[doc(hidden)]
-pub async fn execute_with<I, T>(mut env: Env, args: I) -> Outcome
+pub async fn execute_with<I, T>(env: Env, args: I) -> Outcome
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
     let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    drive(
+        env,
+        &args,
+        Cli::try_parse_from(&args).map(|cli| (cli.globals, cli.command)),
+        async |env: &mut Env, options: &OutputOptions, globals: &Globals, command: Command| {
+            run(env, options, globals, command).await
+        },
+    )
+    .await
+}
+
+/// The options a write takes, and nothing else: the command line of
+/// `execute_write_with`.
+#[derive(Debug, Clone, Parser)]
+#[command(name = "purview", bin_name = "purview")]
+struct WriteCli {
+    #[command(flatten)]
+    globals: GlobalArgs,
+}
+
+/// Runs `command` through the write runner, with the global options in
+/// `args`, as a write subcommand would run. For tests of the safety
+/// framework (`docs/SPEC.md` section 8.4), which needs a write command that
+/// no release has.
+#[doc(hidden)]
+pub async fn execute_write_with<I, T>(env: Env, args: I, command: Box<dyn WriteCommand>) -> Outcome
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    drive(
+        env,
+        &args,
+        WriteCli::try_parse_from(&args).map(|cli| (cli.globals, command)),
+        async |env: &mut Env,
+               options: &OutputOptions,
+               globals: &Globals,
+               mut command: Box<dyn WriteCommand>| {
+            write_command(env, options, globals, command.as_mut()).await
+        },
+    )
+    .await
+}
+
+/// Parses, runs and prints one command line: the flag defaults from
+/// `Env::vars`, the output options and globals, the command, then the
+/// document or error, and the checks that both streams were written.
+async fn drive<P>(
+    mut env: Env,
+    args: &[OsString],
+    parsed: std::result::Result<(GlobalArgs, P), clap::Error>,
+    command: impl AsyncFnOnce(&mut Env, &OutputOptions, &Globals, P) -> Result<Outcome>,
+) -> Outcome {
     let defaults = FlagDefaults::from_vars(&env.vars);
     // Read on its own, so that an invalid PURVIEW_PLAIN or
     // PURVIEW_RESULTS_ONLY still gets its error in JSON when asked.
@@ -833,14 +930,14 @@ where
         .get("PURVIEW_JSON")
         .is_some_and(|value| value == "true");
     let mut printer = Printer::default();
-    let mut outcome = match (Cli::try_parse_from(&args), defaults) {
-        (Ok(cli), Ok(defaults)) => {
-            let json_mode = cli.json || defaults.json;
+    let mut outcome = match (parsed, defaults) {
+        (Ok((globals, payload)), Ok(defaults)) => {
+            let json_mode = globals.json || defaults.json;
             let result = match (
-                output_options(&cli, &defaults),
-                Globals::new(&cli, &defaults),
+                output_options(&globals, &defaults),
+                Globals::new(&globals, &defaults),
             ) {
-                (Ok(options), Ok(globals)) => run(&mut env, &options, &globals, cli.command).await,
+                (Ok(options), Ok(globals)) => command(&mut env, &options, &globals, payload).await,
                 (Err(error), _) | (_, Err(error)) => Err(error),
             };
             match result {
@@ -854,7 +951,7 @@ where
                 Err(error) => printer.fail(&mut env, json_mode, &error),
             }
         }
-        (Ok(cli), Err(message)) => {
+        (Ok((globals, _)), Err(message)) => {
             let usage = Cli::command().render_usage().to_string();
             let message = format!(
                 "{message}\n\n{}\n\nFor more information, try '--help'.",
@@ -862,11 +959,11 @@ where
             );
             printer.fail(
                 &mut env,
-                cli.json || json_default,
+                globals.json || json_default,
                 &PurviewError::message(message),
             )
         }
-        (Err(error), _) => printer.parse_failure(&mut env, &args, json_default, error),
+        (Err(error), _) => printer.parse_failure(&mut env, args, json_default, error),
     };
     if let Err(error) = env.stdout.finish() {
         outcome = printer.output_failed(&mut env, &error);
@@ -877,7 +974,7 @@ where
     outcome
 }
 
-fn output_options(cli: &Cli, defaults: &FlagDefaults) -> Result<OutputOptions> {
+fn output_options(cli: &GlobalArgs, defaults: &FlagDefaults) -> Result<OutputOptions> {
     let json = cli.json || defaults.json;
     let plain = cli.plain || defaults.plain;
     let select = match cli.select.as_deref() {
@@ -1303,6 +1400,175 @@ async fn read_command(
         exit_code: produced.exit_code,
         stdout_value: produced.document,
     })
+}
+
+/// Runs one write command (`docs/SPEC.md` section 6.2). Before sign-in:
+/// `--no-write`, then the command's own checks. Then the session must be
+/// one that may write, before any network call. The command's preflight
+/// sends only GETs; the plan is decided on, and only an approved plan is
+/// sent, once.
+async fn write_command(
+    env: &mut Env,
+    output: &OutputOptions,
+    globals: &Globals,
+    command: &mut dyn WriteCommand,
+) -> Result<Outcome> {
+    if globals.no_write {
+        return Err(PurviewError::WriteRefused);
+    }
+    command.check()?;
+    // The naming templates are checked before sign-in, as the settings
+    // every write may render.
+    let dir = configuration_dir(env)?;
+    crate::naming::Naming::from_config(&load_config(env, &dir)?.extra)?;
+    let (account, credential) = signed_in(env, globals)?;
+    let email = account.email.clone();
+    match credential.access {
+        Some(Access::ReadWrite) => {}
+        Some(Access::ReadOnly) => {
+            return Err(PurviewError::ReadOnlySession(format!(
+                "{} signed in with --read-only, so it cannot change Purview; nothing was sent. \
+                 Sign in again without --read-only to write",
+                sanitize(&email)
+            )))
+        }
+        None => {
+            return Err(PurviewError::ReadOnlySession(format!(
+                "the sign-in stored for {} does not record whether it may write (it was made by \
+                 an earlier release), so it cannot change Purview; nothing was sent. Run \
+                 'purview auth login' again to write; reading works as before",
+                sanitize(&email)
+            )))
+        }
+    }
+    let provider = Arc::new(token_provider(env, credential)?);
+    let trace = open_trace(env, globals)?;
+    let graph = Arc::new(graph_client(env, globals, provider, trace)?);
+    let mut session = Session {
+        env,
+        output,
+        graph,
+        account,
+        verbose: globals.verbose,
+    };
+    run_write(&mut session, globals, command)
+        .await
+        .map_err(|error| {
+            if error.is_token_unavailable() {
+                error.context(format!(
+                    "getting a Graph token for {} (if the identity platform refused the refresh, \
+                     sign in again with 'purview auth login')",
+                    sanitize(&email)
+                ))
+            } else {
+                error
+            }
+        })
+}
+
+/// Preflight, decision, send and output for one signed-in write.
+async fn run_write(
+    session: &mut Session<'_>,
+    globals: &Globals,
+    command: &mut dyn WriteCommand,
+) -> Result<Outcome> {
+    let json = matches!(session.output.format, OutputFormat::Json);
+    let plan = command.plan(session).await?;
+    let settings = ApprovalSettings {
+        dry_run: globals.dry_run,
+        yes: globals.yes,
+        no_input: globals.no_input,
+        interactive: session.env.stdin_is_terminal && session.env.stderr_is_terminal,
+    };
+    let input = session.env.input.clone();
+    let decision = safety::decide(plan, settings, input.as_ref(), &mut session.env.stderr).await?;
+    let redactor = session.env.redactor.clone();
+    match decision {
+        Decision::DryRun(plan) => {
+            if json {
+                let value = session.output.untrusted_json_value(
+                    safety::results_value(&plan, false, None),
+                    1,
+                    &redactor,
+                )?;
+                return Ok(Outcome::success(Some(value)));
+            }
+            plan.write_text(&mut session.env.stdout)?;
+            writeln!(session.env.stdout, "Dry run: nothing was sent.")?;
+            Ok(Outcome::success(None))
+        }
+        Decision::NotApplied(plan, reason) => {
+            if json {
+                // The whole document, whatever --results-only says: it is
+                // not a success envelope. Built as one, then unwrapped,
+                // keeping the notice that --wrap-untrusted adds.
+                let options = OutputOptions {
+                    results_only: false,
+                    ..session.output.clone()
+                };
+                let mut envelope = options.untrusted_json_value(
+                    safety::not_applied_value(&plan, reason),
+                    1,
+                    &redactor,
+                )?;
+                let mut value = envelope["results"].take();
+                if let (Some(notice), Some(object)) =
+                    (envelope.get("untrustedNotice"), value.as_object_mut())
+                {
+                    object.insert("untrustedNotice".into(), notice.clone());
+                }
+                return Ok(Outcome {
+                    exit_code: 3,
+                    stdout_value: Some(value),
+                });
+            }
+            // A declined plan was shown with the question.
+            if reason == NotApplied::ConfirmationRequired {
+                plan.write_text(&mut session.env.stderr)?;
+            }
+            writeln!(session.env.stderr, "{}", reason.message())?;
+            Ok(Outcome {
+                exit_code: 3,
+                stdout_value: None,
+            })
+        }
+        Decision::Approved(write) => {
+            if write.by_flag() && !json {
+                write.plan().write_text(&mut session.env.stderr)?;
+            }
+            let graph = session.graph.clone();
+            let response = match graph.send_write(&write, &mut session.env.stderr).await {
+                Ok(response) => response,
+                Err(PurviewError::WriteOutcomeUnknown { reason, .. }) => {
+                    let candidates = match command.reconcile(session).await {
+                        Ok(candidates) => candidates,
+                        Err(error) => vec![format!(
+                            "nothing could be listed, because the check failed: {error}"
+                        )],
+                    };
+                    return Err(PurviewError::WriteOutcomeUnknown { reason, candidates });
+                }
+                Err(error) => return Err(error),
+            };
+            let plan = write.into_plan();
+            let result = command.applied(session, response).await.map_err(|error| {
+                error.context("the write was applied, but its result could not be read")
+            })?;
+            if json {
+                let value = session.output.untrusted_json_value(
+                    safety::results_value(&plan, true, Some(result)),
+                    1,
+                    &redactor,
+                )?;
+                return Ok(Outcome::success(Some(value)));
+            }
+            writeln!(session.env.stdout, "Applied: purview {}", plan.command())?;
+            let shown = crate::trace::redact_urls(&result, &redactor);
+            let text = serde_json::to_string_pretty(&shown)?;
+            writeln!(session.env.stdout, "{}", sanitize_multiline(&text))?;
+            Ok(Outcome::success(None))
+        }
+    }
 }
 
 /// `value` unchanged, or the blank-value error `explicit` gives.

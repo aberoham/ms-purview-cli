@@ -33,6 +33,8 @@ const SEARCHES: &str =
 /// A write that exists only here.
 struct StubWrite {
     refuse_check: bool,
+    /// An account for the plan other than the signed-in one.
+    plan_account: Option<&'static str>,
 }
 
 #[async_trait]
@@ -56,7 +58,9 @@ impl WriteCommand for StubWrite {
             .await?;
         WritePlan::new(PlanInput {
             command: "stub create",
-            account: session.account.email.clone(),
+            account: self
+                .plan_account
+                .map_or_else(|| session.account.email.clone(), str::to_owned),
             tenant: session.account.tenant_id.clone(),
             route: WriteRoute::CreateSearch(case),
             body: json!({
@@ -89,6 +93,7 @@ impl WriteCommand for StubWrite {
 fn stub() -> Box<dyn WriteCommand> {
     Box::new(StubWrite {
         refuse_check: false,
+        plan_account: None,
     })
 }
 
@@ -342,7 +347,10 @@ async fn the_commands_own_check_runs_before_sign_in() {
     let run = run_with(
         &harness,
         &["--json", "--yes"],
-        Box::new(StubWrite { refuse_check: true }),
+        Box::new(StubWrite {
+            refuse_check: true,
+            plan_account: None,
+        }),
         |_| {},
     )
     .await;
@@ -419,6 +427,22 @@ async fn a_read_only_or_unrecorded_session_is_refused_before_any_request() {
         let read = harness.run(&["--json", "case", "get", CASE]).await;
         assert_eq!(read.outcome.exit_code, 0, "{access}: {}", read.stdout());
     }
+}
+
+#[tokio::test]
+async fn a_read_write_record_without_the_read_write_permission_is_refused() {
+    let harness = ready(created()).await;
+    change_credential(&harness, |stored| {
+        stored["graph"]["scope"] =
+            "https://graph.microsoft.com/eDiscovery.Read.All openid profile".into();
+    });
+    let run = run(&harness, &["--json", "--yes"]).await;
+    assert_eq!(run.json()["error"]["code"], "ReadOnlySession");
+    assert!(run.json()["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("eDiscovery.ReadWrite.All"));
+    assert!(requests(&harness.graph).await.is_empty());
 }
 
 #[tokio::test]
@@ -544,6 +568,13 @@ async fn an_unclear_outcome_is_never_retried_and_lists_candidates() {
             .insert_header("Retry-After", "1"),
         json_response(500, json!({})),
         ResponseTemplate::new(201).set_body_string("not json"),
+        // A create answered with no object.
+        ResponseTemplate::new(201),
+        ResponseTemplate::new(200).set_body_string("  "),
+        // A redirect is not followed, and the POST may have been processed.
+        ResponseTemplate::new(303).insert_header("Location", "/v1.0/security/cases"),
+        ResponseTemplate::new(307).insert_header("Location", "/v1.0/security/cases"),
+        ResponseTemplate::new(408),
     ] {
         let harness = ready(response).await;
         let run = run(&harness, &["--json", "--yes"]).await;
@@ -554,6 +585,8 @@ async fn an_unclear_outcome_is_never_retried_and_lists_candidates() {
         assert!(message.contains("a search named Stub search"), "{message}");
         assert!(message.contains("not sent again"), "{message}");
         assert_eq!(writes(&harness).await.len(), 1);
+        // Nothing was read after the POST: a redirect is not followed.
+        assert_eq!(gets(&harness).await, 1);
     }
 }
 
@@ -639,4 +672,65 @@ async fn wrap_untrusted_wraps_the_plan_body_in_every_shape() {
         .as_str()
         .unwrap();
     assert!(name.starts_with("[UNTRUSTED:"), "{name}");
+}
+
+#[tokio::test]
+async fn select_is_refused_for_a_write_before_sign_in() {
+    for (args, variable) in [
+        (&["--json", "--yes", "--select", "id"][..], None),
+        (&["--json", "--yes"], Some(("PURVIEW_SELECT", "id"))),
+    ] {
+        let harness = ready(created()).await;
+        let identity_before = requests(&harness.identity).await.len();
+        let run = run_with(&harness, args, stub(), |env| {
+            if let Some((name, value)) = variable {
+                env.vars.insert(name.into(), value.into());
+            }
+        })
+        .await;
+        assert_eq!(run.outcome.exit_code, 1, "{args:?}");
+        assert!(run.json()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--select"));
+        assert!(requests(&harness.graph).await.is_empty());
+        assert_eq!(requests(&harness.identity).await.len(), identity_before);
+    }
+}
+
+#[tokio::test]
+async fn a_plan_for_another_account_is_refused_before_approval() {
+    let harness = ready(created()).await;
+    let run = run_with(
+        &harness,
+        &["--json", "--yes"],
+        Box::new(StubWrite {
+            refuse_check: false,
+            plan_account: Some("sam.taylor@contoso.example"),
+        }),
+        |_| {},
+    )
+    .await;
+    assert_eq!(run.outcome.exit_code, 1);
+    assert!(run.json()["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("another account or tenant"));
+    assert!(writes(&harness).await.is_empty());
+}
+
+#[tokio::test]
+async fn the_question_comes_after_the_preflight_results() {
+    let harness = ready(created()).await;
+    let (run, _) = at_a_terminal(&harness, &[], &["n"]).await;
+    assert_eq!(run.outcome.exit_code, 3);
+    let stderr = run.stderr();
+    let preflight = stderr
+        .find("  preflight:\n")
+        .expect("the preflight is shown");
+    let question = stderr.find("Apply? [y/N] ").unwrap();
+    assert!(preflight < question, "{stderr}");
+    assert!(stderr.contains("\"case\":\"active\""), "{stderr}");
+    // A declined plan is shown once.
+    assert_eq!(stderr.matches("Plan: purview stub create").count(), 1);
 }

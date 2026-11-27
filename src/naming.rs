@@ -167,30 +167,35 @@ impl Template {
         Ok(Self { setting, parts })
     }
 
-    /// The rendered text, with runs of spaces left by empty values
-    /// collapsed and the ends trimmed.
+    /// The rendered text. Where a variable is empty, a space on both sides
+    /// of it would be left doubled, so one is dropped; the ends of the
+    /// result are trimmed. Spaces anywhere else are kept as they are.
     pub fn render(&self, values: &Values<'_>, marker: &str) -> Result<String> {
         let mut out = String::new();
+        let mut after_empty = false;
         for part in &self.parts {
-            match part {
-                Part::Text(text) => out.push_str(text),
-                Part::Variable(name) => {
-                    let value = value_of(name, values, marker).ok_or_else(|| {
-                        PurviewError::message(format!(
-                            "config.json: naming.{} uses {{{name}}}, which has no value for this \
-                             name",
-                            self.setting
-                        ))
-                    })?;
-                    out.push_str(&value);
-                }
+            let piece = match part {
+                Part::Text(text) => text.clone(),
+                Part::Variable(name) => value_of(name, values, marker).ok_or_else(|| {
+                    PurviewError::message(format!(
+                        "config.json: naming.{} uses {{{name}}}, which has no value for this \
+                         name",
+                        self.setting
+                    ))
+                })?,
+            };
+            if piece.is_empty() {
+                after_empty = true;
+                continue;
             }
+            if after_empty && out.ends_with(' ') && piece.starts_with(' ') {
+                out.push_str(&piece[1..]);
+            } else {
+                out.push_str(&piece);
+            }
+            after_empty = false;
         }
-        Ok(out
-            .split(' ')
-            .filter(|word| !word.is_empty())
-            .collect::<Vec<_>>()
-            .join(" "))
+        Ok(out.trim().to_owned())
     }
 }
 
@@ -355,12 +360,23 @@ mod tests {
     }
 
     #[test]
-    fn empty_values_leave_no_double_spaces() {
-        let template = Template::parse("case_name", " a {topic}  b ").unwrap();
-        let values = Values {
+    fn an_empty_value_leaves_no_double_space_and_other_spaces_stay() {
+        let template = Template::parse("case_name", " a {topic} b  c ").unwrap();
+        let empty = Values {
             topic: Some(""),
             ..values()
         };
-        assert_eq!(template.render(&values, "m").unwrap(), "a b");
+        assert_eq!(template.render(&empty, "m").unwrap(), "a b  c");
+        let spaced = Values {
+            topic: Some("x  y"),
+            ..values()
+        };
+        assert_eq!(template.render(&spaced, "m").unwrap(), "a x  y b  c");
+        let query = Template::parse("search_description", "{query_summary} {marker}").unwrap();
+        let phrase = Values {
+            query: Some("\"stock  report\""),
+            ..values()
+        };
+        assert_eq!(query.render(&phrase, "m").unwrap(), "\"stock  report\" m");
     }
 }

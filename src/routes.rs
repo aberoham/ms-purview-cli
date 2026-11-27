@@ -226,6 +226,12 @@ impl WriteRoute {
         Self::ExportResult(CaseId::NIL, SearchId::NIL),
     ];
 
+    /// Whether Graph answers with the created object (Docs): a create
+    /// does, an action or a close does not.
+    pub fn answers_with_object(&self) -> bool {
+        matches!(self, Self::CreateCase | Self::CreateSearch(_))
+    }
+
     /// The HTTP method: always `POST`.
     pub fn method(&self) -> &'static str {
         "POST"

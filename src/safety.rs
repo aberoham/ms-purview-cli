@@ -21,6 +21,7 @@ use crate::env::Input;
 use crate::error::{PurviewError, Result};
 use crate::graph::WriteResponse;
 use crate::output::{sanitize, sanitize_multiline};
+use crate::redact::Redactor;
 use crate::routes::WriteRoute;
 
 /// One write, as preflight planned it.
@@ -86,6 +87,14 @@ impl WritePlan {
         self.route
     }
 
+    pub fn account(&self) -> &str {
+        &self.account
+    }
+
+    pub fn tenant(&self) -> &str {
+        &self.tenant
+    }
+
     pub fn method(&self) -> &'static str {
         self.route.method()
     }
@@ -127,28 +136,49 @@ impl WritePlan {
         })
     }
 
-    /// The plan for a person, every value sanitised. Tenant text in the
-    /// body is shown as JSON, which escapes control characters.
-    pub fn write_text(&self, out: &mut dyn Write) -> Result<()> {
-        writeln!(out, "Plan: purview {}", self.command)?;
-        writeln!(out, "  account: {}", sanitize(&self.account))?;
-        writeln!(out, "  tenant:  {}", sanitize(&self.tenant))?;
-        writeln!(out, "  request: {} {}", self.method(), sanitize(&self.path))?;
-        let body = serde_json::from_slice::<Value>(&self.body)
-            .ok()
-            .and_then(|value| serde_json::to_string_pretty(&value).ok())
-            .unwrap_or_default();
+    /// The plan for a person. It is built from the JSON form after the
+    /// redaction every printed document gets (URLs as in the trace, then
+    /// the secrets the tool holds, as values, before anything is escaped),
+    /// and every value is then sanitised.
+    pub fn write_text(&self, out: &mut dyn Write, redactor: &Redactor) -> Result<()> {
+        let shown = redactor.redact_value(&crate::trace::redact_urls(&self.to_value(), redactor));
+        let text = |key: &str| sanitize(shown[key].as_str().unwrap_or_default());
+        let list = |key: &str| -> Vec<Value> { shown[key].as_array().cloned().unwrap_or_default() };
+        writeln!(out, "Plan: purview {}", text("command"))?;
+        writeln!(out, "  account: {}", text("account"))?;
+        writeln!(out, "  tenant:  {}", text("tenant"))?;
+        writeln!(out, "  request: {} {}", text("method"), text("path"))?;
+        let body = serde_json::to_string_pretty(&shown["body"]).unwrap_or_default();
         writeln!(out, "  body:")?;
         for line in sanitize_multiline(&body).lines() {
             writeln!(out, "    {line}")?;
         }
-        writeln!(out, "  digest:  sha256:{}", self.digest)?;
+        writeln!(out, "  digest:  sha256:{}", text("digest"))?;
         writeln!(out, "  effects:")?;
-        for effect in &self.effects {
-            writeln!(out, "    - {}", sanitize(effect))?;
+        for effect in list("effects") {
+            writeln!(
+                out,
+                "    - {}",
+                sanitize(effect.as_str().unwrap_or_default())
+            )?;
         }
-        for warning in &self.warnings {
-            writeln!(out, "  warning: {}", sanitize(warning))?;
+        let preflight = list("preflight");
+        if !preflight.is_empty() {
+            writeln!(out, "  preflight:")?;
+            for result in preflight {
+                let line = match &result {
+                    Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                };
+                writeln!(out, "    - {}", sanitize(&line))?;
+            }
+        }
+        for warning in list("warnings") {
+            writeln!(
+                out,
+                "  warning: {}",
+                sanitize(warning.as_str().unwrap_or_default())
+            )?;
         }
         Ok(())
     }
@@ -181,9 +211,10 @@ enum Approver {
     Prompt,
 }
 
-/// A plan that may be sent. `GraphClient::send_write` takes it and sends
-/// its method, path and bytes as they are.
-#[derive(Debug, Clone, PartialEq)]
+/// A plan that may be sent, once. `GraphClient::send_write` takes it by
+/// value and sends its method, path and bytes as they are. It is not
+/// `Clone`, so one approval cannot be sent twice.
+#[derive(Debug, PartialEq)]
 pub struct ApprovedWrite {
     plan: WritePlan,
     approval: Approval,
@@ -216,8 +247,9 @@ impl ApprovedWrite {
     }
 }
 
-/// The only way to an `ApprovedWrite`.
-pub fn approve(plan: WritePlan, approval: Approval) -> ApprovedWrite {
+/// The only way to an `ApprovedWrite`, and only `decide` holds an
+/// `Approval` to give it.
+fn approve(plan: WritePlan, approval: Approval) -> ApprovedWrite {
     ApprovedWrite { plan, approval }
 }
 
@@ -260,7 +292,7 @@ impl NotApplied {
 }
 
 /// What happens to a plan.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum Decision {
     /// `--dry-run`: printed, not sent. It wins over `--yes`.
     DryRun(WritePlan),
@@ -273,12 +305,14 @@ pub enum Decision {
 /// input and standard error are terminals and `--no-input` is not given.
 /// The prompt is `Apply? [y/N]` on `prompt`, after the plan; `y` or `yes`,
 /// in any case, approves, and anything else, end of input included,
-/// declines.
-pub async fn decide(
+/// declines. Only `cli`'s write runner calls it, with the parsed flags;
+/// `tests/write_allow_list.rs` checks that.
+pub(crate) async fn decide(
     plan: WritePlan,
     settings: ApprovalSettings,
     input: &dyn Input,
     prompt: &mut dyn Write,
+    redactor: &Redactor,
 ) -> Result<Decision> {
     if settings.dry_run {
         return Ok(Decision::DryRun(plan));
@@ -292,7 +326,7 @@ pub async fn decide(
     if settings.no_input || !settings.interactive {
         return Ok(Decision::NotApplied(plan, NotApplied::ConfirmationRequired));
     }
-    plan.write_text(prompt)?;
+    plan.write_text(prompt, redactor)?;
     write!(prompt, "Apply? [y/N] ")?;
     prompt.flush()?;
     let answer = input.read_line().await?;
@@ -455,7 +489,9 @@ mod tests {
     async fn decision(settings: ApprovalSettings, answers: &[&str]) -> (Decision, String) {
         let input = ScriptedInput::new(answers);
         let mut prompt = Vec::new();
-        let decision = decide(plan(), settings, &input, &mut prompt).await.unwrap();
+        let decision = decide(plan(), settings, &input, &mut prompt, &Redactor::new())
+            .await
+            .unwrap();
         (decision, String::from_utf8(prompt).unwrap())
     }
 
@@ -537,6 +573,18 @@ mod tests {
         }
     }
 
+    /// Compiles only while `ApprovedWrite` is not `Clone`: with a `Clone`
+    /// impl, the call below would be ambiguous.
+    #[test]
+    fn an_approved_write_cannot_be_copied() {
+        trait AmbiguousIfClone<A> {
+            fn check() {}
+        }
+        impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+        impl<T: Clone> AmbiguousIfClone<u8> for T {}
+        <ApprovedWrite as AmbiguousIfClone<_>>::check();
+    }
+
     #[test]
     fn the_exit_3_document_has_the_plan_and_the_reason() {
         let value = not_applied_value(&plan(), NotApplied::ConfirmationRequired);
@@ -564,9 +612,41 @@ mod tests {
         };
         input.account.push('\u{1b}');
         let mut out = Vec::new();
-        WritePlan::new(input).unwrap().write_text(&mut out).unwrap();
+        WritePlan::new(input)
+            .unwrap()
+            .write_text(&mut out, &Redactor::new())
+            .unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(!text.contains('\u{1b}'), "{text:?}");
         assert!(!text.contains('\u{7}'), "{text:?}");
+    }
+
+    #[test]
+    fn the_plan_text_is_redacted_and_shows_the_preflight() {
+        let secret = ["canary", "\"quoted\\secret-0042"].concat();
+        let redactor = Redactor::new();
+        redactor.register(&secret);
+        let signed = ["https://", "files.contoso.example/a?sig=canary-sig-0043"].concat();
+        let input = PlanInput {
+            command: "case create",
+            account: "alex@contoso.example".into(),
+            tenant: "t".into(),
+            route: WriteRoute::CreateCase,
+            body: json!({"description": format!("see {signed} and {secret}")}),
+            effects: vec![format!("e {secret}")],
+            warnings: vec![format!("w {signed}")],
+            preflight: vec![json!({"case": "none with that name"}), json!("holds: none")],
+        };
+        let mut out = Vec::new();
+        WritePlan::new(input)
+            .unwrap()
+            .write_text(&mut out, &redactor)
+            .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("canary-sig-0043"), "{text}");
+        assert!(!text.contains("secret-0042"), "{text}");
+        assert!(text.contains("  preflight:\n"), "{text}");
+        assert!(text.contains("none with that name"), "{text}");
+        assert!(text.contains("    - holds: none\n"), "{text}");
     }
 }

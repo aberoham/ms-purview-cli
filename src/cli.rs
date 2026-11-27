@@ -1416,6 +1416,14 @@ async fn write_command(
     if globals.no_write {
         return Err(PurviewError::WriteRefused);
     }
+    // A write prints a plan and a result, not a table, so it has no
+    // columns to choose.
+    if !output.select.is_empty() {
+        return Err(PurviewError::message(
+            "--select (or PURVIEW_SELECT) chooses table columns, and a write has none; leave it \
+             out",
+        ));
+    }
     command.check()?;
     // The naming templates are checked before sign-in, as the settings
     // every write may render.
@@ -1423,7 +1431,17 @@ async fn write_command(
     crate::naming::Naming::from_config(&load_config(env, &dir)?.extra)?;
     let (account, credential) = signed_in(env, globals)?;
     let email = account.email.clone();
+    let may_write = crate::auth::graph_permissions(&credential.graph.scope)
+        .contains(&crate::auth::SCOPE_READ_WRITE.to_ascii_lowercase());
     match credential.access {
+        Some(Access::ReadWrite) if !may_write => {
+            return Err(PurviewError::ReadOnlySession(format!(
+                "the Graph token stored for {} does not grant eDiscovery.ReadWrite.All, so it \
+                 cannot change Purview; nothing was sent. Grant the permission to the app \
+                 registration, then sign in again",
+                sanitize(&email)
+            )))
+        }
         Some(Access::ReadWrite) => {}
         Some(Access::ReadOnly) => {
             return Err(PurviewError::ReadOnlySession(format!(
@@ -1474,6 +1492,18 @@ async fn run_write(
 ) -> Result<Outcome> {
     let json = matches!(session.output.format, OutputFormat::Json);
     let plan = command.plan(session).await?;
+    // The plan shown is the session's: a command cannot name another
+    // account or tenant than the one that signed in.
+    if !plan.account().eq_ignore_ascii_case(&session.account.email)
+        || !plan
+            .tenant()
+            .eq_ignore_ascii_case(&session.account.tenant_id)
+    {
+        return Err(PurviewError::message(
+            "the write's plan names another account or tenant than the signed-in one; nothing \
+             was sent",
+        ));
+    }
     let settings = ApprovalSettings {
         dry_run: globals.dry_run,
         yes: globals.yes,
@@ -1481,8 +1511,15 @@ async fn run_write(
         interactive: session.env.stdin_is_terminal && session.env.stderr_is_terminal,
     };
     let input = session.env.input.clone();
-    let decision = safety::decide(plan, settings, input.as_ref(), &mut session.env.stderr).await?;
     let redactor = session.env.redactor.clone();
+    let decision = safety::decide(
+        plan,
+        settings,
+        input.as_ref(),
+        &mut session.env.stderr,
+        &redactor,
+    )
+    .await?;
     match decision {
         Decision::DryRun(plan) => {
             if json {
@@ -1493,7 +1530,7 @@ async fn run_write(
                 )?;
                 return Ok(Outcome::success(Some(value)));
             }
-            plan.write_text(&mut session.env.stdout)?;
+            plan.write_text(&mut session.env.stdout, &redactor)?;
             writeln!(session.env.stdout, "Dry run: nothing was sent.")?;
             Ok(Outcome::success(None))
         }
@@ -1524,7 +1561,7 @@ async fn run_write(
             }
             // A declined plan was shown with the question.
             if reason == NotApplied::ConfirmationRequired {
-                plan.write_text(&mut session.env.stderr)?;
+                plan.write_text(&mut session.env.stderr, &redactor)?;
             }
             writeln!(session.env.stderr, "{}", reason.message())?;
             Ok(Outcome {
@@ -1534,11 +1571,13 @@ async fn run_write(
         }
         Decision::Approved(write) => {
             if write.by_flag() && !json {
-                write.plan().write_text(&mut session.env.stderr)?;
+                write
+                    .plan()
+                    .write_text(&mut session.env.stderr, &redactor)?;
             }
             let graph = session.graph.clone();
-            let response = match graph.send_write(&write, &mut session.env.stderr).await {
-                Ok(response) => response,
+            let (plan, response) = match graph.send_write(write, &mut session.env.stderr).await {
+                Ok(sent) => sent,
                 Err(PurviewError::WriteOutcomeUnknown { reason, .. }) => {
                     let candidates = match command.reconcile(session).await {
                         Ok(candidates) => candidates,
@@ -1550,7 +1589,6 @@ async fn run_write(
                 }
                 Err(error) => return Err(error),
             };
-            let plan = write.into_plan();
             let result = command.applied(session, response).await.map_err(|error| {
                 error.context("the write was applied, but its result could not be read")
             })?;
@@ -1563,7 +1601,7 @@ async fn run_write(
                 return Ok(Outcome::success(Some(value)));
             }
             writeln!(session.env.stdout, "Applied: purview {}", plan.command())?;
-            let shown = crate::trace::redact_urls(&result, &redactor);
+            let shown = redactor.redact_value(&crate::trace::redact_urls(&result, &redactor));
             let text = serde_json::to_string_pretty(&shown)?;
             writeln!(session.env.stdout, "{}", sanitize_multiline(&text))?;
             Ok(Outcome::success(None))

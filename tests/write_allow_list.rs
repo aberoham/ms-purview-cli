@@ -33,6 +33,11 @@ fn forbidden_calls() -> Vec<String> {
         ["Method::from_", "bytes"].concat(),
         ["Method::from_", "str"].concat(),
         ["Method::try_", "from"].concat(),
+        // A request built by hand and sent with `execute`.
+        ["Request::", "new"].concat(),
+        ["from_pa", "rts("].concat(),
+        [".exec", "ute("].concat(),
+        ["Method::PO", "ST"].concat(),
     ]
 }
 
@@ -156,49 +161,137 @@ fn the_scan_finds_each_forbidden_form() {
     }
 }
 
-/// The files and the number of lines in each that build an HTTP POST
-/// with reqwest's `.post(`. Calls of the identity client's own `post`
-/// wrapper (`self.post(`) are not requests built here.
-fn post_builders(root: &Path) -> Vec<(String, usize)> {
-    let mut files = vec![root.join("build.rs")];
-    rust_files(&root.join("src"), &mut files);
+/// The functions allowed to build an HTTP POST with reqwest's `.post(`,
+/// by file: `GraphClient::send_write`, and the identity client's `post`.
+fn allowed_posts() -> Vec<(&'static str, String)> {
+    vec![
+        ("auth.rs", ["async fn po", "st("].concat()),
+        ("graph.rs", ["pub async fn send_wr", "ite("].concat()),
+    ]
+}
+
+/// Where `text` builds a POST outside the function allowed in `file`, or
+/// builds more than one. A call of the identity client's own wrapper,
+/// `self.post(`, is not a request built here, and is allowed only in
+/// `auth.rs`.
+fn misplaced_posts(file: &str, text: &str) -> Vec<String> {
     let call = [".po", "st("].concat();
     let wrapper = ["self.po", "st("].concat();
-    let mut found: Vec<(String, usize)> = files
+    let code = text.split("#[cfg(test)]").next().unwrap_or_default();
+    let allowed = allowed_posts()
+        .into_iter()
+        .find(|(name, _)| file.ends_with(name))
+        .map(|(_, function)| function);
+    // The span of the allowed function: from its signature to the first
+    // line that closes a method body at its indentation.
+    let span = allowed.as_ref().and_then(|function| {
+        let start = code.find(function.as_str())?;
+        let end = start + code[start..].find("\n    }\n")?;
+        Some(start..end)
+    });
+    let mut problems = Vec::new();
+    let mut inside = 0;
+    let mut offset = 0;
+    for line in code.split_inclusive('\n') {
+        let at = offset;
+        offset += line.len();
+        if line.trim_start().starts_with("//") || !line.contains(&call) {
+            continue;
+        }
+        if line.contains(&wrapper) && file.ends_with("auth.rs") {
+            continue;
+        }
+        match &span {
+            Some(span) if span.contains(&at) => inside += 1,
+            _ => problems.push(format!("{file}: a POST at byte {at}")),
+        }
+    }
+    if inside > 1 {
+        problems.push(format!("{file}: {inside} POSTs in the allowed function"));
+    }
+    problems
+}
+
+#[test]
+fn a_post_is_built_only_in_send_write_and_the_token_client() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = vec![root.join("build.rs")];
+    rust_files(&root.join("src"), &mut files);
+    let mut problems = Vec::new();
+    let mut found = 0;
+    for path in &files {
+        let text = std::fs::read_to_string(path).unwrap();
+        let name = path.strip_prefix(root).unwrap().display().to_string();
+        problems.extend(misplaced_posts(&name, &text));
+        if allowed_posts().iter().any(|(file, _)| name.ends_with(file)) {
+            found += 1;
+        }
+    }
+    assert!(problems.is_empty(), "{problems:#?}");
+    assert_eq!(found, 2);
+}
+
+#[test]
+fn the_post_check_finds_a_post_in_the_wrong_place() {
+    let post = [".po", "st("].concat();
+    let send = ["pub async fn send_wr", "ite("].concat();
+    let wrapper = ["self.po", "st("].concat();
+    let good = format!("impl X {{\n    {send}) {{\n        c{post}u);\n    }}\n}}\n");
+    assert!(misplaced_posts("src/graph.rs", &good).is_empty());
+    for (file, text) in [
+        // In another function of an allowed file.
+        (
+            "src/graph.rs",
+            format!("{good}impl Y {{\n    fn other() {{\n        c{post}u);\n    }}\n}}\n"),
+        ),
+        // Twice in the allowed function.
+        (
+            "src/graph.rs",
+            format!(
+                "impl X {{\n    {send}) {{\n        c{post}u);\n        c{post}v);\n    }}\n}}\n"
+            ),
+        ),
+        // In a file with no allowed function.
+        ("src/download.rs", format!("fn f() {{ c{post}u); }}\n")),
+        // The wrapper's spelling outside auth.rs.
+        ("src/download.rs", format!("fn f() {{ {wrapper}u); }}\n")),
+    ] {
+        assert!(!misplaced_posts(file, &text).is_empty(), "{file}: {text}");
+    }
+}
+
+/// The files outside tests that call `name(`, by path.
+fn callers(root: &Path, name: &str) -> Vec<String> {
+    let mut files = Vec::new();
+    rust_files(&root.join("src"), &mut files);
+    let mut found: Vec<String> = files
         .iter()
-        .filter_map(|path| {
+        .filter(|path| {
             let text = std::fs::read_to_string(path).unwrap();
-            let count = text
-                .lines()
+            // Unit tests sit after `#[cfg(test)]` and may call anything.
+            let code = text.split("#[cfg(test)]").next().unwrap_or_default();
+            code.lines()
                 .filter(|line| !line.trim_start().starts_with("//"))
-                .filter(|line| line.contains(&call) && !line.contains(&wrapper))
-                .count();
-            (count > 0).then(|| {
-                (
-                    path.strip_prefix(root).unwrap().display().to_string(),
-                    count,
-                )
-            })
+                .any(|line| {
+                    line.contains(&format!("{name}(")) && !line.contains(&format!("fn {name}("))
+                })
         })
+        .map(|path| path.strip_prefix(root).unwrap().display().to_string())
         .collect();
     found.sort();
     found
 }
 
 #[test]
-fn a_post_is_built_only_in_send_write_and_the_token_client() {
+fn only_the_write_runner_decides_and_sends() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let separator = std::path::MAIN_SEPARATOR.to_string();
+    let cli = ["src", "cli.rs"].join(std::path::MAIN_SEPARATOR_STR);
     assert_eq!(
-        post_builders(root),
-        [
-            (["src", "auth.rs"].join(&separator), 1),
-            (["src", "graph.rs"].join(&separator), 1),
-        ]
+        callers(root, &["safety::dec", "ide"].concat()),
+        std::slice::from_ref(&cli)
     );
-    // In graph.rs, the one POST is inside send_write.
-    let graph = std::fs::read_to_string(root.join("src").join("graph.rs")).unwrap();
-    let start = graph.find("pub async fn send_write(").unwrap();
-    let end = start + graph[start..].find("\n    }\n").unwrap();
-    assert!(graph[start..end].contains(&[".po", "st("].concat()));
+    assert_eq!(callers(root, &[".send_wr", "ite"].concat()), [cli]);
+    assert!(callers(root, &["appr", "ove"].concat())
+        .iter()
+        .all(|file| file.ends_with("safety.rs")));
 }

@@ -800,13 +800,18 @@ impl StoredTokenProvider {
     }
 
     /// Refuses to write over the key unless it holds a credential of the
-    /// same principal through the same registration as `expected`.
+    /// same principal through the same registration as `expected`, with the
+    /// same access: a sign-in that changed it while this provider ran (a
+    /// `--read-only` sign-in, say) must not be undone by an older session's
+    /// refresh.
     fn verify_owner(&self, expected: &Credential) -> Result<()> {
         let stored = Credential::load(self.store.as_ref(), &expected.email, &self.redactor)
             .ok()
             .flatten();
         match stored {
-            Some(stored) if stored.same_owner(expected) => Ok(()),
+            Some(stored) if stored.same_owner(expected) && stored.access == expected.access => {
+                Ok(())
+            }
             _ => Err(PurviewError::message(format!(
                 "the credential for {} was replaced or removed by another command while this \
                  one ran, so nothing was stored; run the command again",
@@ -836,8 +841,9 @@ impl StoredTokenProvider {
                     crate::output::sanitize(&email)
                 ))
             })?;
-        if !loaded.same_owner(&state.credential) {
-            // Refused before any redemption with someone else's tokens.
+        if !loaded.same_owner(&state.credential) || loaded.access != state.credential.access {
+            // Refused before any redemption with someone else's tokens, or
+            // with a session whose access another sign-in changed.
             return Err(PurviewError::message(
                 "the stored credential now belongs to another app registration or identity; \
                  nothing was sent. Run 'purview auth logout' for this account, then sign in \
@@ -903,6 +909,19 @@ impl TokenProvider for StoredTokenProvider {
         {
             let refreshed = self.refresh_graph(&state.credential).await?;
             self.commit(&mut state, refreshed, WriteKind::Graph).await?;
+            // The new token is stored either way, but a request that needs
+            // it to last longer than the identity platform gave is not sent.
+            if !state
+                .credential
+                .graph
+                .valid_for(self.clock.now(), min_validity)
+            {
+                return Err(PurviewError::message(format!(
+                    "the refreshed Graph token is valid for less than the {} seconds this \
+                     request needs, so it was not sent; try again later",
+                    min_validity.as_secs()
+                )));
+            }
         }
         Ok(GraphToken(state.credential.graph.token.clone()))
     }
@@ -1892,6 +1911,65 @@ mod tests {
             "{error}"
         );
         assert_eq!(stored(&setup)["refresh_token"], "canary-refresh-0099");
+    }
+
+    #[tokio::test]
+    async fn a_refreshed_token_too_short_for_the_request_is_not_used() {
+        let setup = setup(credential(0, None)).await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "canary-graph-0002",
+                "refresh_token": "canary-refresh-0002",
+                "expires_in": 120,
+                "scope": "eDiscovery.ReadWrite.All openid",
+            })))
+            .expect(1)
+            .mount(&setup.server)
+            .await;
+        let error = setup
+            .provider
+            .graph(Duration::from_secs(300))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("less than the 300 seconds"),
+            "{error}"
+        );
+        // The rotation was stored, so the newest refresh token is kept.
+        assert_eq!(stored(&setup)["refresh_token"], "canary-refresh-0002");
+        // A request that needs less can use it, without another redemption.
+        let token = setup.provider.graph(Duration::from_secs(60)).await.unwrap();
+        assert_eq!(token.expose(), "canary-graph-0002");
+    }
+
+    #[tokio::test]
+    async fn a_refresh_is_not_committed_over_a_sign_in_that_changed_access() {
+        let setup = setup(credential(0, None)).await;
+        Mock::given(method("POST"))
+            .respond_with(response("canary-graph-0002", "canary-refresh-0002"))
+            .expect(1)
+            .mount(&setup.server)
+            .await;
+        // While this read-write provider runs, the same person signs in
+        // again with --read-only through the same registration.
+        let mut read_only = credential(3600, None);
+        read_only.access = Some(Access::ReadOnly);
+        read_only.refresh_token = SecretString::new("canary-refresh-0098");
+        read_only.save(setup.memory.as_ref()).unwrap();
+        let error = setup
+            .provider
+            .graph(Duration::from_secs(60))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("replaced or removed by another command"),
+            "{error}"
+        );
+        let stored = stored(&setup);
+        assert_eq!(stored["access"], "read-only");
+        assert_eq!(stored["refresh_token"], "canary-refresh-0098");
     }
 
     #[test]

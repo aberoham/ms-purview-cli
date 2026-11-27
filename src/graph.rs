@@ -35,7 +35,7 @@ use crate::origin::Origin;
 use crate::output::sanitize;
 use crate::redact::{self, Redactor};
 use crate::routes::{build_url, Query, ReadRoute};
-use crate::safety::ApprovedWrite;
+use crate::safety::{ApprovedWrite, WritePlan};
 use crate::token::TokenProvider;
 use crate::trace::{Exchange, TraceSink, TracedBody, TracedResponse};
 
@@ -412,9 +412,9 @@ impl GraphClient {
     /// `GraphUnreachable`.
     pub async fn send_write(
         &self,
-        write: &ApprovedWrite,
+        write: ApprovedWrite,
         log: &mut (dyn Write + Send),
-    ) -> Result<WriteResponse> {
+    ) -> Result<(WritePlan, WriteResponse)> {
         let url = build_url(&self.base, &write.route().segments(), &Query::new())?;
         if !self.admits(&url) {
             return Err(PurviewError::ForeignOrigin {
@@ -453,7 +453,7 @@ impl GraphClient {
                 )),
                 Err(error) if error.is_connect() => {
                     let reason = transport_failure(&error);
-                    self.record_write(&url, write, None, Some(&reason), log);
+                    self.record_write(&url, &write, None, Some(&reason), log);
                     return Err(PurviewError::GraphUnreachable {
                         reason,
                         attempts: 1,
@@ -461,7 +461,7 @@ impl GraphClient {
                 }
                 Err(error) => {
                     let reason = transport_failure(&error);
-                    self.record_write(&url, write, None, Some(&reason), log);
+                    self.record_write(&url, &write, None, Some(&reason), log);
                     self.log(log, &reason);
                     return Err(unknown(format!("{reason} before Graph answered")));
                 }
@@ -478,7 +478,7 @@ impl GraphClient {
         let took = self.clock.elapsed().saturating_sub(started);
         self.record_write(
             &url,
-            write,
+            &write,
             Some((status, &headers, body.as_deref().unwrap_or_default())),
             None,
             log,
@@ -503,7 +503,13 @@ impl GraphClient {
             };
             let body = match serde_json::from_slice::<Value>(&body) {
                 Ok(value @ Value::Object(_)) => Some(value),
-                _ if body.iter().all(u8::is_ascii_whitespace) => None,
+                // An empty answer is expected only where Graph sends no
+                // object; a create that answers with nothing is unclear.
+                _ if body.iter().all(u8::is_ascii_whitespace)
+                    && !write.route().answers_with_object() =>
+                {
+                    None
+                }
                 _ => {
                     return Err(unknown(format!(
                         "Graph accepted the request (HTTP {}), but its response is not a JSON \
@@ -512,14 +518,24 @@ impl GraphClient {
                     )))
                 }
             };
-            return Ok(WriteResponse {
-                status: status.as_u16(),
-                location: header_text(&headers, LOCATION.as_str()),
-                body,
-            });
+            return Ok((
+                write.into_plan(),
+                WriteResponse {
+                    status: status.as_u16(),
+                    location: header_text(&headers, LOCATION.as_str()),
+                    body,
+                },
+            ));
         }
         let error = self.graph_error(status, &headers, body.as_deref().unwrap_or_default());
-        if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+        // A redirect is not followed, and the POST before it may have been
+        // processed (a 303 says so), so it is unclear too.
+        // Only a client error says the request was refused; 408 and 429
+        // say nothing about whether it ran.
+        let refused = status.is_client_error()
+            && status != StatusCode::REQUEST_TIMEOUT
+            && status != StatusCode::TOO_MANY_REQUESTS;
+        if !refused {
             return Err(unknown(format!(
                 "Graph answered HTTP {} ({})",
                 status.as_u16(),

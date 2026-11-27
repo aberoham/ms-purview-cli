@@ -512,6 +512,33 @@ After polling, it downloads the zip (whose `size` is real; Observed) and reports
 `collection` by the report check above. With `--profile` it runs `parse profile` on the zip.
 The plan carries the row-count warning in section 6.6.
 
+Settled in PR 2.4:
+- Further flags: `--allow-generic`, `--allow-large`, one `--reason` that either override
+  needs and that needs one of them, `--allow-concurrent`, `--no-wait`, `--wait-timeout`,
+  `--poll-interval` and `--out`, with the conflicts of `estimate`. `--profile` arrives with
+  `parse profile` (phase 3).
+- `displayName` is `--name`, else `naming.export_name` rendered with `{action}` `report`
+  and the time preflight ends. `description` is sent only with an override, as
+  `--allow-generic: <reason>`, `--allow-large: <reason>` or `--allow-generic and
+  --allow-large: <reason>`.
+- `defaults.teams_context` is read before sign-in, only by `report`: `null` or missing is
+  `true`; a value that is not a boolean is an error naming the key.
+- The size limit of section 6.9, against the search's latest estimate. A plan it blocks is
+  shown by a dry run and refused otherwise with `TooLarge` or `VolumeUnchecked`, ahead of
+  `ConcurrentOperation`.
+- The concurrency check counts operations listed as `exportResult` or `exportReport`.
+- After approval and before the send, the recheck of `estimate`, and the latest estimate
+  read again: another estimate than the plan's refuses with `SearchChanged`, and the size
+  limit applies again.
+- The answer must be 202, and the operation the `Location` header names must be an
+  `exportReport` operation with export detail before any file is fetched.
+- `result` is `{"operationId", "operationStatus", "collection", "displayName",
+  "teamsContext", "estimateId", "locationsWithHits", "failedLocations", "files"}`;
+  `locationsWithHits` is the number of Locations rows. `--no-wait` gives `operationId`,
+  `collection: unchecked`, `displayName`, `teamsContext` and `resume`.
+- Reconciliation lists operations shown as `exportResult` or `exportReport` created since
+  just before the request, and reads each of the first 10 for its true action.
+
 #### `purview export create <case> <search>` (write: action; phase 4)
 
 Further flags: `--name`, `--no-teams-context`, `--no-download`, `--strict`.
@@ -811,7 +838,8 @@ one at a time through `url::Url`.
 | `ExportResult(case, search)` | `POST …/{case}/searches/{search}/exportResult` |
 
 `ReadRoute`: list and get cases, searches and operations; the search's `custodianSources`,
-`noncustodialSources` and `additionalSources` (Docs, section 6.4); and the case's
+`noncustodialSources` and `additionalSources` (Docs, section 6.4); the search's
+`lastEstimateStatisticsOperation` (Docs, section 6.9; from PR 2.4); and the case's
 `custodians`, `noncustodialDataSources`, `legalHolds`, `legalHolds/{id}/userSources` and
 `legalHolds/{id}/siteSources` (Docs). Every read route is `GET`.
 
@@ -1978,9 +2006,21 @@ used. The warning never changes the exit code, `--strict` included.
 The estimate undercounts what a report or export collects. With Teams context on, an export
 held about four times the estimated count (Observed, one run), and a report about 10 to 37
 rows per estimated item (section 6.6). So `max_export_size` compares the estimate's size, and
-the export can be several times larger. Planned for PR 2.4: `report` and `export create`
-refuse a search whose latest estimate passes `max_export_size` unless `--allow-large
---reason` is given.
+the export can be several times larger.
+
+Settled in PR 2.4: `report` refuses a search whose latest estimate passes `max_export_size`
+unless `--allow-large --reason` is given (`TooLarge`; `export create` will do the same). The
+latest estimate is the search's `lastEstimateStatisticsOperation` (Docs; not yet observed).
+With no size to compare, it refuses too (`VolumeUnchecked`): an HTTP error on that read (by
+code and status only; 404 is read as "no estimate", an Assumption), an answer that is not an
+`estimateStatistics` operation with estimate detail, one not finished or that did not
+succeed, a partial success within the limit (its size is a lower bound; above the limit it
+is `TooLarge`), an estimate created before the search's `lastModifiedDateTime` (it may count
+another query), either time missing, no readable id, or no `indexedItemsSize`. Whether
+running an estimate changes the search's `lastModifiedDateTime` is not known; if it does,
+this rule refuses every report and must change. `--allow-large --reason` overrides all of
+these, and the plan warns `VOLUME:`. A read that gets no answer from Graph is the command's
+error.
 
 ---
 

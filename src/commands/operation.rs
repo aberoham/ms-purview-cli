@@ -397,7 +397,7 @@ fn short_id(operation: &OperationId) -> String {
 
 /// The exit-4 reason for a finished operation that did not succeed, or
 /// `None` when it succeeded.
-fn incomplete_reason(record: &OperationRecord) -> Option<Value> {
+pub(crate) fn incomplete_reason(record: &OperationRecord) -> Option<Value> {
     let code = match &record.status {
         OperationStatus::Succeeded => return None,
         OperationStatus::PartiallySucceeded => "OperationPartiallySucceeded",
@@ -583,10 +583,13 @@ fn stopped(
     // The account is named, attached with `=` so that a name beginning
     // with `-` stays its value, and the command resumes as the same
     // identity whatever the default is then.
-    let resume = format!(
-        "purview --account={} operation get {case} {operation} --wait",
-        shell_word(&session.account.email)
-    );
+    let account = shell_word(&session.account.email);
+    // Every command of this release that carries on from here: the wait,
+    // then the download of the finished operation's files.
+    let resume = [
+        format!("purview --account={account} operation get {case} {operation} --wait"),
+        format!("purview --account={account} download {case} {operation}"),
+    ];
     let (exit_code, code, message) = if interrupted {
         (
             130,
@@ -608,19 +611,21 @@ fn stopped(
                 "operationId": operation.to_string(),
                 "status": status,
                 "elapsedSeconds": waited.as_secs(),
-                "resume": [resume],
+                "resume": resume,
                 "error": {"code": code, "status": 0, "message": message},
             })),
         });
     }
     let _ = writeln!(
         session.env.stderr,
-        "{message}. Operation {operation} was {}. Resume with: {}",
+        "{message}. Operation {operation} was {}. Resume with: {}\nThen download its files \
+         with: {}",
         status
             .as_deref()
             .map(sanitize)
             .unwrap_or_else(|| "not read yet".to_owned()),
-        sanitize(&resume)
+        sanitize(&resume[0]),
+        sanitize(&resume[1])
     );
     Ok(Produced {
         exit_code,

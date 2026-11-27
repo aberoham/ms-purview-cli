@@ -1,12 +1,12 @@
 # purview
 
-**Drive Microsoft Purview eDiscovery (Premium) through Microsoft Graph v1.0 from a terminal. On `main` it signs in, stores credentials, checks the Purview role, and lists and shows cases, searches and operations; download, write, export and parsing commands are planned.**
+**Drive Microsoft Purview eDiscovery (Premium) through Microsoft Graph v1.0 from a terminal. On `main` it signs in, stores credentials, checks the Purview role, lists and shows cases, searches and operations, and downloads an operation's files; write, export and parsing commands are planned.**
 
 [![Latest release](https://img.shields.io/github/v/release/aberoham/ms-purview-cli?include_prereleases)](https://github.com/aberoham/ms-purview-cli/releases)
 [![CI](https://img.shields.io/github/actions/workflow/status/aberoham/ms-purview-cli/ci.yml?branch=main&label=CI)](https://github.com/aberoham/ms-purview-cli/actions/workflows/ci.yml)
 [![Licence](https://img.shields.io/github/license/aberoham/ms-purview-cli)](LICENSE)
 
-Status: release candidate (`v0.1.0-rc.1`, published 2026-11-26). Today the binary implements `purview version` and authentication (`purview auth login`, `auth refresh`, `auth list` and `auth logout`), with global options `--json`, `--results-only`, `--plain`, `--select`, `--account` and `--no-input`. Browser sign-in (`auth login --browser`), `auth status`, the read commands for cases, searches and operations (`case list`, `case get`, `search list`, `search get`, `operation list`, `operation get`), the Microsoft Graph transport, the global options `--verbose`, `--timeout`, `--trace` and `--wrap-untrusted`, the app registration script and authentication documentation are on `main` since the release candidate. Download, write, export and parsing commands are planned in [docs/SPEC.md](docs/SPEC.md).
+Status: release candidate (`v0.1.0-rc.1`, published 2026-11-26). Today the binary implements `purview version` and authentication (`purview auth login`, `auth refresh`, `auth list` and `auth logout`), with global options `--json`, `--results-only`, `--plain`, `--select`, `--account` and `--no-input`. Browser sign-in (`auth login --browser`), `auth status`, the read commands for cases, searches and operations (`case list`, `case get`, `search list`, `search get`, `operation list`, `operation get`), `download`, the Microsoft Graph transport, the global options `--verbose`, `--timeout`, `--trace` and `--wrap-untrusted`, the app registration script and authentication documentation are on `main` since the release candidate. Write, export and parsing commands are planned in [docs/SPEC.md](docs/SPEC.md).
 
 Sibling project of [ms-entra-cli](https://github.com/aberoham/ms-entra-cli), sharing output, configuration and credential-storage conventions.
 
@@ -75,11 +75,12 @@ Existing tools leave gaps across the eDiscovery workflow (recorded in [docs/SPEC
 - `purview case list` (filters `--status`, `--name`, `--created-before`, `--created-after`, `--mine`) and `purview case get`. A case is named by its id or its exact display name; names are not unique, and several matches fail with `AmbiguousCase`.
 - `purview search list` and `purview search get`, which also reads the search's custodian, non-custodial and additional sources.
 - `purview operation list` (filters `--action`, `--status`; `--resolve` reads each operation for its true action, because the list shows item reports and exports alike) and `purview operation get`, with `--wait`, `--wait-timeout` and `--poll-interval`. A finished operation that did not succeed exits 4 with the reasons; the wait deadline exits 5 and Ctrl-C exits 130, each with the command that resumes the wait.
+- `purview download <case> <op>` (`--out`, `--file`, `--overwrite`): download an operation's files into the user data directory, each checked for its size and as a zip before it is published, and recorded with its SHA-256 in `manifest.json`; a recorded file that is unchanged is not fetched again.
 - Global option `--wrap-untrusted`: in JSON, wrap names, descriptions, queries and file names that tenant users wrote in `[UNTRUSTED:<id>]` markers.
 
 **Planned roadmap (not yet built, no dates):**
 
-- **v0.1 (remaining items):** `download`; the Keyword Query Language (KQL) guard and `purview kql`.
+- **v0.1 (remaining items):** the Keyword Query Language (KQL) guard and `purview kql`.
 - **v0.2:** write commands (`case create`, `search create`, `estimate`, `report`, and `case close` if its live checks complete) with preflight checks and explicit approval, plus estimate report parsing (`parse locations`, `parse failures`, `parse summary`).
 - **v0.3:** item report parsing (`parse items`, `parse profile`).
 - **v0.4:** `export create` and `export index`.
@@ -93,11 +94,11 @@ Design rules enforced in code as the download and write commands arrive:
 - **No holds:** `purview` never places, changes or releases a hold.
 - **No destructive case changes:** `purview` never deletes or reopens a case.
 - **Plan before every write:** a Purview write is sent only after its plan is shown and approved (`--dry-run` previews without writing; interactive runs prompt for confirmation, and non-interactive runs require `--yes`).
-- **Download origin:** the download token goes only to the one download origin named by each operation (from the download pull request onwards).
 
 Protections active today:
 
 - **Graph origin and redirects (on `main`):** Microsoft Graph requests, paging links included, go only to `https://graph.microsoft.com:443` below `/v1.0/`, with redirects disabled. A test fails the build if `PATCH`, `PUT` or `DELETE` appears in the source.
+- **Download origin (on `main`):** the download token goes only to the one `https` Purview download host on port 443 that each file names, never with the Graph token; a redirect to any other origin is refused without contacting it.
 
 - **Credential storage:** tokens persist only in the operating system's credential store (macOS Keychain, Windows Credential Manager or Linux kernel keyring). `config.json` and account files hold no secrets.
 - **Redaction:** everything the tool prints passes through a redactor that removes tokens it has seen; JavaScript Object Notation (JSON) is redacted as a value before serialisation, and `config.json` refuses to save a value the redactor recognises.

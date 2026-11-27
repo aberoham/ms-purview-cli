@@ -498,6 +498,30 @@ Fetches the operation again for current `downloadUrl` values, then downloads eac
 matching its recorded size and SHA-256 is reported as already downloaded and not fetched
 again, unless `--overwrite` is given. A URL cannot be passed on the command line.
 
+- An operation that has not finished (`notStarted`, `running`) is refused, naming
+  `operation get --wait`; nothing is downloaded.
+- `--out DIR` is the directory the files go to, as given. Without it they go to
+  `cases/<case-id>/<operation-id>/` below the data root (section 5.4). `--file NAME` keeps
+  the one file whose server `fileName` is exactly `NAME`; no match is an error that does not
+  repeat the name.
+- Every file is planned before any download request: its local name (section 4.7.1), and
+  whether its target is absent, a verified download (skipped), a file with no manifest
+  entry that verifies (recorded as `recovered`), or anything else (`TargetExists` without
+  `--overwrite`). A link at a target is refused even with `--overwrite`. Any refusal ends
+  the command before a download request or a download-token refresh.
+- A file with no `fileName`, no `downloadUrl`, one that does not parse, one the host rule
+  refuses, or a `fileName` another file of the operation shares exactly, is left out with
+  a `FileNotDownloadable` reason, and the other files are still downloaded. Such a reason,
+  or an operation that finished without succeeding (its exit-4 reason as in `operation
+  get`), makes the command exit 4 after the other files are written; the envelope is
+  printed whole even under `--results-only`.
+- Files are fetched one at a time. A failure while fetching ends the command with exit 1;
+  files already published stay recorded, and the next run skips them. A download is not
+  retried automatically.
+- JSON `results` has one object per file: `fileName` (the server name), `path`, `size`,
+  `sha256` and `status` (`downloaded`, `alreadyDownloaded` or `recovered`). The table has
+  `STATUS`, `SIZE` and `PATH`.
+
 #### `purview parse <subcommand> <zip>` (local)
 
 No sign-in. The kind of zip is detected from its entry names: `Statistics-*.csv` means an
@@ -855,9 +879,9 @@ Graph token cannot be given to the download client by mistake. A 401 or 403 is
   signature query never logged.
 
 **Timeouts.** The download `reqwest::Client` has no total `.timeout()`. It has
-`.connect_timeout(30 s)`. A per-chunk `tokio::time::timeout(120 s)` around each
-`bytes_stream()` item gives an idle timeout. If the pinned `reqwest` offers `read_timeout`,
-that may be used instead.
+`.connect_timeout(30 s)` and `.read_timeout(120 s)`, which reqwest resets after each read, as
+the idle timeout. It does not decompress (`no_gzip`), so the size and SHA-256 are those of
+the bytes the service sent.
 
 **Writing a file.**
 1. Sanitise the server file name (section 4.7.1) and check for collisions within the
@@ -874,7 +898,8 @@ that may be used instead.
    `download.max_size` (default 64 GiB).
 5. Check the length against `size` when known, or against `Content-Length` when present.
 6. Run `sync_all` (on a blocking thread).
-7. Open the zip's central directory from the temporary file.
+7. Open the zip's central directory from the temporary file. Every file the service offers
+   is a zip (Observed), so a file that is not one is refused.
 8. Only after steps 4 to 7 pass, publish it under the final name.
    - **Default, no replace:** `std::fs::hard_link(temp, final)`, which fails atomically with
      `AlreadyExists` if another process created the name in the meantime. Then the temporary
@@ -894,8 +919,8 @@ that may be used instead.
 - Before publication, the temporary file is removed and the final name is left untouched.
 - If publication succeeded but the manifest update failed, the verified file stays. The
   command exits 1 with `ManifestWriteFailed`, naming the file.
-- **Recovery:** the next `download` or `--check` in that directory finds files that have no
-  manifest entry. It verifies each one (size when known, central directory, SHA-256) and adds
+- **Recovery:** the next `download` or `--check` in that directory finds, under the local
+  names of the operation's files, files that have no manifest entry. It verifies each one (size when known, central directory, SHA-256) and adds
   an entry marked `recovered: true`. A file that fails verification is left in place and
   reported, and is never overwritten without `--overwrite`.
 
@@ -1366,7 +1391,9 @@ and 0700, and writes are atomic, as in `entra`.
 ### 5.4 Data directory
 
 Downloads go to `dirs::data_local_dir()/purview/cases/<case-id>/<operation-id>/` (mode 0700),
-unless `--out` or `defaults.data_dir` says otherwise. That directory is outside any
+unless `--out` or `defaults.data_dir` says otherwise. `defaults.data_dir` replaces the root
+(`<data_dir>/cases/<case-id>/<operation-id>/`); `--out` is the directory itself. A missing
+directory is created with mode 0700; an existing one keeps its mode, and a link is refused. That directory is outside any
 repository on purpose. Every command that writes a file prints its full path.
 
 ### 5.5 Settings
@@ -1719,8 +1746,8 @@ Two layers, so a sparse or changed response does not break a whole list:
   - `PollTarget` (id and status);
   - `DownloadableFile` (`fileName` and a `downloadUrl` that passes section 4.7).
 
-  A file with a missing `downloadUrl` still shows in `operation get`; `download` then fails
-  for that file only, with `FileNotDownloadable`.
+  A file with a missing `downloadUrl` still shows in `operation get`; `download` then leaves
+  that file out with a `FileNotDownloadable` reason and exit 4 (section 3.5).
 
 Because records are read by hand, no Cargo feature is added for them.
 
@@ -2363,15 +2390,14 @@ The `aberoham/homebrew-tap` formula `purview` reads releases, as it does for `en
 | `dirs` | | 0.1 |
 | `keyring` | `apple-native`, `linux-native`, `windows-native` | 1.1 |
 | `security-framework` (macOS) | | 1.1 |
-| `reqwest` | `json`, `rustls-tls`, `gzip`; no default features. `stream` is added in 1.5 with the download client | 1.1 |
+| `reqwest` | `json`, `rustls-tls`, `gzip`; no default features. `stream` is added in 1.5 with the download client, which turns gzip off | 1.1 |
 | `url`, `uuid`, `chrono` | (default features); add `serde` only where a later PR serialises one of these types | 1.1 |
 | `base64` | | 1.1 |
 | `async-trait` | | 1.1 |
 | `sha2` | | 1.1 (account lock file names) |
 | `getrandom` | | 1.2 (PKCE) |
 | (no browser crate) | `auth login --browser` runs the platform's opener (`open`, `rundll32 url.dll,FileProtocolHandler`, `xdg-open`) with null standard streams, so a browser cannot write into the command's output | 1.2 |
-| `futures-util` | | 1.5 |
-| `zip` | `deflate` (plus `deflate64` only if PR 4.1 finds it) | 1.5 |
+| `zip` | no default features; `deflate-flate2-zlib-rs` only, which reads and writes deflate without the compression-only `zopfli` that `deflate` adds (plus `deflate64` only if PR 4.1 finds it) | 1.5 |
 | `regex` | | 1.6 |
 | `csv` | | 2.3 |
 | `cfb` | | 5.1 |
@@ -2449,10 +2475,11 @@ live check a feature depends on cannot be done, the feature is left out of that 
 
 **PR 1.5: Download.**
 - Scope: `download.rs`, `purview download`, temporary-file publishing, manifest, file names;
-  adds `zip` (`deflate`) for the central-directory check.
+  adds `zip` (deflate through `flate2`) for the central-directory check.
 - Tests: download flows (section 8.5, item 6), file names, canary sweep.
 - Acceptance: live download of an existing estimate file with redirects disabled; whether a
-  redirect happened is recorded.
+  redirect happened is recorded. (Observed: none; the proxy answered 200 directly. See
+  `docs/api-notes.md`.)
 
 **PR 1.6: KQL parser and guard.**
 - Scope: `kql/`; `purview kql`; `docs/safety.md` (guard section).
@@ -2637,7 +2664,8 @@ that does not depend on whether the claim is true. The table says which:
    case-wide.
 3. `eDiscovery.Read.All` reach. PR 1.4 checks list and get. Whether actions would be
    accepted is not tested, because the tool refuses them under a read-only session.
-4. Redirects on download (PR 1.5).
+4. Redirects on download. PR 1.5 saw none for an estimate report; export parts are not
+   checked until PR 4.1.
 5. Reports and exports without Teams context (PR 2.5, PR 4.1).
 6. Case close on a case with holds, and hold reads on an empty case (PR 2.6). Observed for a
    case with no holds or custodians: `POST .../close` returned 204 with an empty body and no

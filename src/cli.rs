@@ -168,6 +168,27 @@ Examples:
     )]
     Operation(OperationArgs),
     #[command(
+        about = "Download an operation's files: estimate and item reports, export parts",
+        long_about = "\
+Download an operation's files. The operation is read again for current \
+download addresses, and each file is streamed to a temporary file, checked \
+(its size, and that it is a zip), then published under a name made safe for \
+the file system. manifest.json in the directory records each file's size \
+and SHA-256; a file already recorded and unchanged is not fetched again.
+
+Files go to cases/<case-id>/<operation-id>/ under the user data directory \
+(config.json defaults.data_dir changes it), or to --out. An existing file \
+that is not a recorded download is never replaced without --overwrite. A \
+file that cannot be downloaded, or an operation that finished without \
+succeeding, exits 4 after the other files are written.",
+        after_help = "\
+Examples:
+  purview download <case> <op>
+  purview download <case> <op> --out ./evidence --json
+  purview download <case> <op> --file <name> --overwrite"
+    )]
+    Download(DownloadArgs),
+    #[command(
         about = "Show the version, commit and build target",
         after_help = "\
 Examples:
@@ -427,6 +448,31 @@ Examples:
   purview operation get <case> <op> --wait --wait-timeout 30m --json"
     )]
     Get(OperationGet),
+}
+
+#[derive(Debug, Clone, Args)]
+struct DownloadArgs {
+    #[arg(value_name = "CASE", help = CASE_HELP)]
+    case: String,
+    #[arg(value_name = "OP", help = "An operation id: 32 hexadecimal characters")]
+    operation: String,
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Write the files here instead of the data directory"
+    )]
+    out: Option<String>,
+    #[arg(
+        long,
+        value_name = "NAME",
+        help = "Download only the file with this exact name, as 'operation get' shows it"
+    )]
+    file: Option<String>,
+    #[arg(
+        long,
+        help = "Replace files that exist, including verified downloads, instead of refusing"
+    )]
+    overwrite: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -914,6 +960,9 @@ async fn run(
             )
             .await
         }
+        Command::Download(download) => {
+            read_command(env, output, globals, ReadCommand::download(download)?).await
+        }
         Command::Version => version(env, output),
     }
 }
@@ -927,6 +976,7 @@ enum ReadCommand {
     SearchGet(CaseKey, SearchKey),
     OperationList(CaseKey, commands::operation::ListFilters),
     OperationGet(CaseKey, OperationId, Option<commands::operation::Wait>),
+    Download(commands::download::Request),
 }
 
 impl ReadCommand {
@@ -936,6 +986,7 @@ impl ReadCommand {
             Self::CaseList(_) => Some(commands::case::LIST_COLUMNS),
             Self::SearchList(_) => Some(commands::search::LIST_COLUMNS),
             Self::OperationList(..) => Some(commands::operation::LIST_COLUMNS),
+            Self::Download(_) => Some(commands::download::COLUMNS),
             Self::CaseGet(_) | Self::SearchGet(..) | Self::OperationGet(..) => None,
         }
     }
@@ -969,6 +1020,24 @@ impl ReadCommand {
                 Self::SearchGet(CaseKey::parse(&case)?, SearchKey::parse(&search)?)
             }
         })
+    }
+
+    fn download(args: DownloadArgs) -> Result<Self> {
+        Ok(Self::Download(commands::download::Request {
+            case: CaseKey::parse(&args.case)?,
+            operation: valid::operation_id(&args.operation)?,
+            out: args
+                .out
+                .as_deref()
+                .map(|out| explicit("--out", out).map(PathBuf::from))
+                .transpose()?,
+            file: args
+                .file
+                .as_deref()
+                .map(|file| explicit("--file", file))
+                .transpose()?,
+            overwrite: args.overwrite,
+        }))
     }
 
     fn operation(command: OperationCommand) -> Result<Self> {
@@ -1034,10 +1103,36 @@ async fn read_command(
     if let Some(columns) = command.columns() {
         crate::output::selected_indices(&output.select, columns)?;
     }
+    // The download settings in config.json are checked before sign-in.
+    let download_setup = match &command {
+        ReadCommand::Download(_) => Some(download_setup(env)?),
+        _ => None,
+    };
     let (account, credential) = signed_in(env, globals)?;
     let email = account.email.clone();
     let provider = Arc::new(token_provider(env, credential)?);
-    let graph = Arc::new(graph_client(env, globals, provider)?);
+    let trace = open_trace(env, globals)?;
+    let graph = Arc::new(graph_client(env, globals, provider.clone(), trace.clone())?);
+    let download_context = match download_setup {
+        Some((limits, data_root)) => Some(commands::download::Context {
+            client: crate::download::DownloadClient::new(
+                crate::download::DownloadSettings {
+                    rule: env.download_rule.clone(),
+                    resolve: env.download_resolve.clone(),
+                    idle_timeout: env.download_idle_timeout,
+                    verbose: globals.verbose,
+                    trace,
+                },
+                provider,
+                env.redactor.clone(),
+                env.clock.clone(),
+            )?,
+            limits,
+            data_root,
+            faults: env.download_faults.clone(),
+        }),
+        None => None,
+    };
     let mut session = Session {
         env,
         output,
@@ -1058,6 +1153,10 @@ async fn read_command(
         ReadCommand::OperationGet(case, operation, wait) => {
             commands::operation::get(&mut session, case, operation, *wait).await
         }
+        ReadCommand::Download(request) => match &download_context {
+            Some(context) => commands::download::run(&mut session, request, context).await,
+            None => Err(PurviewError::message("the download client was not set up")),
+        },
     }
     .map_err(|error| {
         if error.is_token_unavailable() {
@@ -1772,14 +1871,10 @@ fn token_provider(env: &Env, credential: Credential) -> Result<StoredTokenProvid
     .with_account_locks(env.account_locks.clone()))
 }
 
-/// The Graph client for a command, opening the trace directory first when
-/// `--trace` was given, which prints its warnings.
-fn graph_client(
-    env: &mut Env,
-    globals: &Globals,
-    tokens: Arc<dyn crate::token::TokenProvider>,
-) -> Result<GraphClient> {
-    let trace = match &globals.trace_dir {
+/// The trace directory, opened when `--trace` was given, which prints its
+/// warnings. The Graph and download clients share it.
+fn open_trace(env: &mut Env, globals: &Globals) -> Result<Option<Arc<TraceSink>>> {
+    Ok(match &globals.trace_dir {
         Some(dir) => Some(Arc::new(TraceSink::open(
             dir,
             env.redactor.clone(),
@@ -1787,7 +1882,48 @@ fn graph_client(
             &mut env.stderr,
         )?)),
         None => None,
+    })
+}
+
+/// The download limits and the data root from `config.json`
+/// (`download.max_size`, `download.max_unknown_size`,
+/// `defaults.data_dir`), else the defaults.
+fn download_setup(env: &mut Env) -> Result<(crate::download::Limits, PathBuf)> {
+    let dir = configuration_dir(env)?;
+    let stored = load_config(env, &dir)?;
+    let limits = crate::download::Limits::from_config(&stored.extra)?;
+    let configured = match stored
+        .extra
+        .get("defaults")
+        .and_then(|defaults| defaults.get("data_dir"))
+    {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(text)) if !text.trim().is_empty() => {
+            Some(PathBuf::from(text))
+        }
+        Some(_) => {
+            return Err(PurviewError::message(
+                "config.json: defaults.data_dir must be a directory path or null",
+            ))
+        }
     };
+    let root = match configured {
+        Some(root) => root,
+        None => match &env.data_dir {
+            Some(root) => root.clone(),
+            None => config::data_dir()?,
+        },
+    };
+    Ok((limits, root))
+}
+
+/// The Graph client for a command.
+fn graph_client(
+    env: &mut Env,
+    globals: &Globals,
+    tokens: Arc<dyn crate::token::TokenProvider>,
+    trace: Option<Arc<TraceSink>>,
+) -> Result<GraphClient> {
     GraphClient::new(
         GraphSettings {
             base: env.graph_base.clone(),
@@ -1854,7 +1990,8 @@ async fn auth_refresh(env: &mut Env, output: &OutputOptions, globals: &Globals) 
 async fn auth_status(env: &mut Env, output: &OutputOptions, globals: &Globals) -> Result<Outcome> {
     let (account, credential) = signed_in(env, globals)?;
     let provider = Arc::new(token_provider(env, credential)?);
-    let graph = graph_client(env, globals, provider.clone())?;
+    let trace = open_trace(env, globals)?;
+    let graph = graph_client(env, globals, provider.clone(), trace)?;
     let probe = graph
         .get_page(&ReadRoute::Cases, &Query::new().top(1), &mut env.stderr)
         .await;

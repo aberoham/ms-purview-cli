@@ -928,7 +928,10 @@ async fn the_deadline_exits_5_with_the_last_status_and_the_resume_command() {
             "operationId": ESTIMATE,
             "status": "running",
             "elapsedSeconds": 25,
-            "resume": [format!("purview --account={ALEX} operation get {CASE} {ESTIMATE} --wait")],
+            "resume": [
+                format!("purview --account={ALEX} operation get {CASE} {ESTIMATE} --wait"),
+                format!("purview --account={ALEX} download {CASE} {ESTIMATE}"),
+            ],
             "error": {
                 "code": "WaitTimeout",
                 "status": 0,
@@ -966,7 +969,8 @@ async fn the_deadline_exits_5_with_the_last_status_and_the_resume_command() {
         human.stderr(),
         format!(
             "stopped waiting after 20s; the service carries on running the operation. Operation \
-             {ESTIMATE} was running. Resume with: purview --account={ALEX} operation get {CASE} {ESTIMATE} --wait\n"
+             {ESTIMATE} was running. Resume with: purview --account={ALEX} operation get {CASE} {ESTIMATE} --wait\n\
+             Then download its files with: purview --account={ALEX} download {CASE} {ESTIMATE}\n"
         )
     );
 }
@@ -1128,9 +1132,10 @@ async fn ctrl_c_ends_the_wait_with_exit_130_and_the_resume_command() {
     assert_eq!(document["status"], "running");
     assert_eq!(
         document["resume"],
-        json!([format!(
-            "purview --account={ALEX} operation get {CASE} {ESTIMATE} --wait"
-        )])
+        json!([
+            format!("purview --account={ALEX} operation get {CASE} {ESTIMATE} --wait"),
+            format!("purview --account={ALEX} download {CASE} {ESTIMATE}"),
+        ])
     );
     assert_eq!(requests(&harness).await.len(), 2);
     assert_eq!(sleeps_since(&harness, before), [Duration::from_secs(10)]);
@@ -1163,7 +1168,7 @@ async fn ctrl_c_during_the_first_read_abandons_it() {
         format!(
             "interrupted after 0s. Operation \
              {ESTIMATE} was not read yet. Resume with: purview --account={ALEX} operation get {CASE} {ESTIMATE} \
-             --wait\n"
+             --wait\nThen download its files with: purview --account={ALEX} download {CASE} {ESTIMATE}\n"
         )
     );
     assert!(sleeps_since(&harness, before).is_empty());

@@ -6,6 +6,7 @@ pub mod auth;
 pub mod cli;
 pub mod commands;
 pub mod config;
+pub mod download;
 pub mod env;
 pub mod error;
 pub mod graph;

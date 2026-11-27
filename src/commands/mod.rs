@@ -3,6 +3,7 @@
 //! `Session`; nothing here reads the process environment.
 
 pub mod case;
+pub mod download;
 pub mod operation;
 pub mod search;
 

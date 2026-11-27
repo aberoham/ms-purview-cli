@@ -8,7 +8,8 @@
 //!   through `redact::url`.
 //! - The whole record is redacted as a value, then checked again as bytes.
 //! - Token endpoint exchanges are never traced: only `GraphClient` (and,
-//!   later, the download client) records.
+//!   the download client records.
+//! - A downloaded file's body is never written; only its length is.
 //! - New directories are created 0700 and files 0600 on Unix.
 
 use std::fs::OpenOptions;
@@ -46,7 +47,16 @@ const NAME_SEGMENT_CHARS: usize = 40;
 pub struct TracedResponse<'a> {
     pub status: u16,
     pub headers: &'a reqwest::header::HeaderMap,
-    pub body: &'a [u8],
+    pub body: TracedBody<'a>,
+}
+
+/// What a trace keeps of a response body.
+#[derive(Debug, Clone, Copy)]
+pub enum TracedBody<'a> {
+    /// A Graph body: parsed as JSON, with its URLs redacted.
+    Json(&'a [u8]),
+    /// A downloaded file: only its length is recorded, never its bytes.
+    Omitted { bytes: u64 },
 }
 
 /// One request and what came back: a response, or the error that took its
@@ -254,14 +264,20 @@ fn response_value(response: TracedResponse<'_>, request: &Url, redactor: &Redact
             }
         }
     }
-    let body = serde_json::from_slice::<Value>(response.body)
-        .map(|value| redact_urls(&value, redactor))
-        .unwrap_or(Value::Null);
+    let (body, bytes) = match response.body {
+        TracedBody::Json(body) => (
+            serde_json::from_slice::<Value>(body)
+                .map(|value| redact_urls(&value, redactor))
+                .unwrap_or(Value::Null),
+            body.len() as u64,
+        ),
+        TracedBody::Omitted { bytes } => (Value::Null, bytes),
+    };
     json!({
         "status": response.status,
         "headers": headers,
         "body": body,
-        "bytes": response.body.len(),
+        "bytes": bytes,
     })
 }
 
@@ -418,7 +434,7 @@ mod tests {
                 response: Some(TracedResponse {
                     status: 200,
                     headers: &headers,
-                    body: &body,
+                    body: TracedBody::Json(&body),
                 }),
                 error: None,
             })

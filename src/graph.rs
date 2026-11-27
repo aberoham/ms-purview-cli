@@ -34,7 +34,7 @@ use crate::output::sanitize;
 use crate::redact::{self, Redactor};
 use crate::routes::{build_url, Query, ReadRoute};
 use crate::token::TokenProvider;
-use crate::trace::{Exchange, TraceSink, TracedResponse};
+use crate::trace::{Exchange, TraceSink, TracedBody, TracedResponse};
 
 /// The largest Graph response body read.
 pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
@@ -549,7 +549,7 @@ impl GraphClient {
                 Some(TracedResponse {
                     status: status.as_u16(),
                     headers,
-                    body,
+                    body: TracedBody::Json(body),
                 }),
                 None,
             ),

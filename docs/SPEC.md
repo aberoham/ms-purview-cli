@@ -1129,7 +1129,9 @@ more as a backstop.
 - `Settings-*.csv` has the header `"Setting Name","Value","Description"`, and some rows have
   two fields (Observed).
 
-**Locations and Statistics.** Columns and meanings as in the notes (Observed):
+**Locations and Statistics.** Columns and meanings as in the notes (Observed, and again by
+the PR 2.3 live check, which also saw Summary's `LocationCount` equal the number of
+Locations rows):
 
 - `Locations-*.csv` has one row per location searched. `LocationSubType` is one of
   `PrimaryMailBox`, `ArchiveMailBox`, `SystemMailbox`. `Status` is `Succeeded` or `Failed`.

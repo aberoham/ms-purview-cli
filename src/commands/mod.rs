@@ -166,7 +166,7 @@ async fn match_case_name(
         .map_err(|error| error.context("matching the case name"))?;
     let (matches, unreadable) = split_by_name(items, name);
     if unreadable > 0 {
-        return Err(unreadable_names("cases", unreadable));
+        return Err(unreadable_lookup("cases", unreadable));
     }
     let matches: Vec<CaseRecord> = matches
         .into_iter()
@@ -249,7 +249,7 @@ async fn match_search_name(
         .map_err(|error| error.context("matching the search name"))?;
     let (matches, unreadable) = split_by_name(items, name);
     if unreadable > 0 {
-        return Err(unreadable_names("searches", unreadable));
+        return Err(unreadable_lookup("searches", unreadable));
     }
     let matches: Vec<SearchRecord> = matches
         .into_iter()
@@ -388,11 +388,21 @@ pub fn reconcile_notes(
     notes
 }
 
-/// The refusal when a name check met entries whose name cannot be read.
+/// The refusal when a create's name check met entries whose name cannot
+/// be read.
 pub fn unreadable_names(what: &str, count: usize) -> PurviewError {
     PurviewError::message(format!(
         "{count} {what} in Graph's list have a display name that cannot be read, so it cannot be \
-         shown that none of them has the name; pass the id instead. Nothing was sent"
+         shown that none of them has the name; nothing was sent"
+    ))
+}
+
+/// The refusal when a lookup by name met entries whose name cannot be
+/// read: an id names the case or search without the list.
+fn unreadable_lookup(what: &str, count: usize) -> PurviewError {
+    PurviewError::message(format!(
+        "{count} {what} in Graph's list have a display name that cannot be read, so the name \
+         given may match more than one; pass the id instead"
     ))
 }
 

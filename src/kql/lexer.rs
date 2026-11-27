@@ -122,6 +122,13 @@ impl KqlError {
     }
 }
 
+/// The spaces that separate tokens: ASCII space, tab, line feed and
+/// carriage return. Other Unicode spaces (no-break space, ideographic
+/// space) are refused outside a phrase, because KQL may not split on them.
+fn is_space(character: char) -> bool {
+    matches!(character, ' ' | '\t' | '\n' | '\r')
+}
+
 /// The characters a word may hold after its first, which must be a letter
 /// or a digit.
 fn is_word_char(character: char) -> bool {
@@ -132,7 +139,7 @@ fn is_word_char(character: char) -> bool {
 fn is_delimiter(character: Option<char>) -> bool {
     match character {
         None => true,
-        Some(character) => character.is_whitespace() || character == '(' || character == ')',
+        Some(character) => is_space(character) || character == '(' || character == ')',
     }
 }
 
@@ -171,7 +178,7 @@ impl Lexer {
     }
 
     fn next_token(&mut self) -> Result<Option<Token>, KqlError> {
-        while self.peek().is_some_and(char::is_whitespace) {
+        while self.peek().is_some_and(is_space) {
             self.position += 1;
         }
         let Some(character) = self.peek() else {
@@ -247,6 +254,13 @@ impl Lexer {
         if text.trim().is_empty() {
             return Err(KqlError::new(open, "an empty quoted phrase"));
         }
+        // KQL does not say how a word glued to a closing quote reads.
+        if !is_delimiter(self.peek()) {
+            return Err(KqlError::new(
+                self.column(),
+                "a closing quote must be followed by a space, a parenthesis or the end",
+            ));
+        }
         Ok(text)
     }
 
@@ -276,6 +290,10 @@ impl Lexer {
                          search for it",
                     ))
                 }
+                _ if text.len() != word.len() => Err(KqlError::new(
+                    column,
+                    "an operator word with a *; quote the word to search for it",
+                )),
                 _ => Err(KqlError::new(
                     column,
                     "an operator word that is not upper case; write AND, OR or NOT, or quote \
@@ -294,6 +312,7 @@ impl Lexer {
             self.position += 1;
             text.push('*');
             if !is_delimiter(self.peek()) && self.peek() != Some('"') {
+                // A quote after the `*` is refused below.
                 return Err(KqlError::new(
                     Self::column_of(start),
                     "a wildcard is supported only once, at the end of a word",
@@ -308,10 +327,14 @@ impl Lexer {
         }
         match self.peek() {
             None => {}
-            Some(character) if character.is_whitespace() || matches!(character, '(' | ')') => {}
-            // A phrase right after a word is juxtaposition, which the
-            // parser refuses with its own reason.
-            Some('"') => {}
+            Some(character) if is_space(character) || matches!(character, '(' | ')') => {}
+            // KQL does not say how a quote glued to a word reads.
+            Some('"') => {
+                return Err(KqlError::new(
+                    self.column(),
+                    "a quote straight after a word; put a space or a parenthesis between them",
+                ))
+            }
             Some(character) if is_symbol(character) => {
                 return Err(KqlError::new(
                     self.column(),
@@ -366,7 +389,7 @@ impl Lexer {
         column: usize,
         symbol: char,
     ) -> Result<TokenKind, KqlError> {
-        let name = property.to_lowercase();
+        let name = property.to_ascii_lowercase();
         let address_property = match name.as_str() {
             "participants" => Some(AddressProperty::Participants),
             "from" => Some(AddressProperty::From),
@@ -450,7 +473,7 @@ impl Lexer {
         }
         if name == "kind" {
             let value = self.take_while(|character| !is_delimiter(Some(character)));
-            let kind = match value.to_lowercase().as_str() {
+            let kind = match value.to_ascii_lowercase().as_str() {
                 "email" => KindValue::Email,
                 "microsoftteams" => KindValue::MicrosoftTeams,
                 _ => {
@@ -655,6 +678,49 @@ mod tests {
         }
         // Tab, line feed and carriage return separate tokens.
         assert_eq!(kinds("a1aa\tAND\r\nb2bb").len(), 3);
+    }
+
+    #[test]
+    fn operators_and_words_glued_to_quotes_are_refused() {
+        for (query, column) in [
+            ("\"retention\"AND\"orders-api\"", 12),
+            ("retention AND\"orders-api\"", 14),
+            ("\"orders-api\"retention", 13),
+            ("orders-api*\"x\"", 12),
+            ("subject:\"x y\"z", 14),
+        ] {
+            assert_eq!(refused(query).column, column, "{query}");
+        }
+        for query in ["retention AND\"orders-api\"", "orders-api*\"x\""] {
+            assert!(
+                refused(query)
+                    .reason
+                    .contains("quote straight after a word"),
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_ascii_spaces_separate_and_properties_fold_ascii_only() {
+        for (query, column) in [
+            ("a1aa\u{00A0}AND b2bb", 5),
+            ("a1aa AND\u{3000}b2bb", 9),
+            ("a1aa\u{0085}OR b2bb", 5),
+            ("\u{212A}ind:email", 1),
+            ("kind:\u{212A}email", 6),
+        ] {
+            assert_eq!(refused(query).column, column, "{query:?}");
+        }
+        // Inside a phrase a no-break space is text.
+        assert_eq!(kinds("\"stock\u{00A0}report\"").len(), 1);
+    }
+
+    #[test]
+    fn an_operator_word_with_a_star_says_so() {
+        for query in ["NOT*", "AND*", "or*"] {
+            assert!(refused(query).reason.contains("with a *"), "{query}");
+        }
     }
 
     #[test]

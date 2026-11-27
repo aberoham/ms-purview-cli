@@ -244,7 +244,7 @@ Query flags (shared with `search create`):
 
 | Flag | KQL |
 |---|---|
-| `--term T` (repeatable) | each quoted, all ORed. `"` inside a term is refused |
+| `--term T` (repeatable) | each quoted, all ORed. A `"`, a `*`, or a control or invisible character inside a term is refused |
 | `--participant ADDR` (repeatable) | `participants:ADDR`, all ORed. Each must be a full address (section 6.3) |
 | `--since YYYY-MM-DD` | `sent>=YYYY-MM-DD` |
 | `--until YYYY-MM-DD` | `sent<=YYYY-MM-DD` |
@@ -1588,6 +1588,10 @@ date       = YYYY-MM-DD
   the guard must not classify text the operator cannot see. `--term` refuses them too,
   before `config.json` is read. `--since` and `--until` take exactly `YYYY-MM-DD`, as
   `sent` does.
+- Tokens are separated only by ASCII space, tab, line feed and carriage return; other
+  Unicode spaces are refused outside a phrase. A closing quote must be followed by a space,
+  a parenthesis or the end, and a word must not be followed by a quote, so `"a"AND"b"` is
+  refused. Property names and `kind:` values are folded to lower case as ASCII only.
 - Parentheses and `NOT` nest at most 64 deep, so that a hostile query cannot exhaust the
   stack.
 - A refusal gives the column (characters from 1) and names the construct. It quotes the

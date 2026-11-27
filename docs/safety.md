@@ -51,7 +51,7 @@ same query flags. The groups are ANDed in this order:
 
 | Flag | KQL |
 |---|---|
-| `--term T` (repeatable) | each quoted, all ORed. A `"` or `*` inside a term is refused |
+| `--term T` (repeatable) | each quoted, all ORed. A `"`, a `*`, or a control or invisible character inside a term is refused |
 | `--participant ADDR` (repeatable) | `participants:ADDR`, all ORed. Each must be a full address |
 | `--since YYYY-MM-DD` | `sent>=YYYY-MM-DD` |
 | `--until YYYY-MM-DD` | `sent<=YYYY-MM-DD` |
@@ -109,6 +109,9 @@ date       = YYYY-MM-DD
 - A digit is any character Unicode counts as numeric, in words and in the
   classifier alike.
 - A restriction is written with no space after the `:` or the comparison.
+- Tokens are separated by spaces, tabs or line breaks; other Unicode spaces,
+  such as a no-break space, are refused outside a phrase. A quote must not
+  touch a word or an operator: `"a"AND"b"` is refused.
 - Property names are compared ignoring case. Values keep their case.
 - `kind:` accepts `email` and `microsoftteams` in any case.
 - A `sent` date must be a real date written as `YYYY-MM-DD`.

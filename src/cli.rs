@@ -1620,26 +1620,9 @@ async fn read_command(
     let provider = Arc::new(token_provider(env, credential)?);
     let trace = open_trace(env, globals)?;
     let graph = Arc::new(graph_client(env, globals, provider.clone(), trace.clone())?);
-    let download_context = match download_setup {
-        Some((limits, data_root)) => Some(commands::download::Context {
-            client: crate::download::DownloadClient::new(
-                crate::download::DownloadSettings {
-                    rule: env.download_rule.clone(),
-                    resolve: env.download_resolve.clone(),
-                    idle_timeout: env.download_idle_timeout,
-                    verbose: globals.verbose,
-                    trace,
-                },
-                provider,
-                env.redactor.clone(),
-                env.clock.clone(),
-            )?,
-            limits,
-            data_root,
-            faults: env.download_faults.clone(),
-        }),
-        None => None,
-    };
+    let download_context = download_setup
+        .map(|setup| download_context(env, globals, provider, trace, setup))
+        .transpose()?;
     let mut session = Session {
         env,
         output,
@@ -1682,6 +1665,33 @@ async fn read_command(
     })
 }
 
+/// The download client and settings for a command that downloads.
+fn download_context(
+    env: &Env,
+    globals: &Globals,
+    provider: Arc<StoredTokenProvider>,
+    trace: Option<Arc<TraceSink>>,
+    (limits, data_root): (crate::download::Limits, Option<PathBuf>),
+) -> Result<commands::download::Context> {
+    Ok(commands::download::Context {
+        client: crate::download::DownloadClient::new(
+            crate::download::DownloadSettings {
+                rule: env.download_rule.clone(),
+                resolve: env.download_resolve.clone(),
+                idle_timeout: env.download_idle_timeout,
+                verbose: globals.verbose,
+                trace,
+            },
+            provider,
+            env.redactor.clone(),
+            env.clock.clone(),
+        )?,
+        limits,
+        data_root,
+        faults: env.download_faults.clone(),
+    })
+}
+
 /// Runs one write command (`docs/SPEC.md` section 6.2). Before sign-in:
 /// `--no-write`, then the command's own checks. Then the session must be
 /// one that may write, before any network call. The command's preflight
@@ -1714,6 +1724,12 @@ async fn write_command(
         guard: crate::kql::GuardConfig::from_config(&stored.extra)?,
     };
     command.check(&settings)?;
+    // The download settings are checked before sign-in, as for download.
+    let download_setup = if command.downloads() {
+        Some(download_setup(env)?)
+    } else {
+        None
+    };
     let (account, credential) = signed_in_with(env, globals, &dir, &stored)?;
     let email = account.email.clone();
     let may_write = crate::auth::graph_permissions(&credential.graph.scope)
@@ -1746,20 +1762,31 @@ async fn write_command(
     }
     let provider = Arc::new(token_provider(env, credential)?);
     let trace = open_trace(env, globals)?;
-    let graph = Arc::new(graph_client(env, globals, provider, trace)?);
-    run_write(env, output, globals, &account, &graph, command)
-        .await
-        .map_err(|error| {
-            if error.is_token_unavailable() {
-                error.context(format!(
-                    "getting a Graph token for {} (if the identity platform refused the refresh, \
+    let graph = Arc::new(graph_client(env, globals, provider.clone(), trace.clone())?);
+    let download = download_setup
+        .map(|setup| download_context(env, globals, provider, trace, setup))
+        .transpose()?;
+    run_write(
+        env,
+        output,
+        globals,
+        &account,
+        &graph,
+        download.as_ref(),
+        command,
+    )
+    .await
+    .map_err(|error| {
+        if error.is_token_unavailable() {
+            error.context(format!(
+                "getting a Graph token for {} (if the identity platform refused the refresh, \
                      sign in again with 'purview auth login')",
-                    sanitize(&email)
-                ))
-            } else {
-                error
-            }
-        })
+                sanitize(&email)
+            ))
+        } else {
+            error
+        }
+    })
 }
 
 /// Preflight, decision, send and output for one signed-in write. The
@@ -1772,9 +1799,11 @@ async fn run_write(
     globals: &Globals,
     account: &AccountRecord,
     graph: &Arc<GraphClient>,
+    download: Option<&commands::download::Context>,
     command: &mut dyn WriteCommand,
 ) -> Result<Outcome> {
     let json = matches!(output.format, OutputFormat::Json);
+    let clock = env.clock.clone();
     let settings = ApprovalSettings {
         dry_run: globals.dry_run,
         yes: globals.yes,
@@ -1789,6 +1818,7 @@ async fn run_write(
             account,
             log: &mut env.stderr,
             verbose: globals.verbose,
+            clock: clock.as_ref(),
         })
         .await?;
     let plan = match planned {
@@ -1813,6 +1843,11 @@ async fn run_write(
             "the write's plan names another account or tenant than the signed-in one; nothing \
              was sent",
         ));
+    }
+    // A blocked plan is shown by a dry run, and refused otherwise, before
+    // anyone is asked.
+    if let (Some(reason), false) = (plan.blocked(), settings.dry_run) {
+        return Err(PurviewError::ConcurrentOperation(reason.to_owned()));
     }
     let decision =
         safety::decide(plan, settings, input.as_ref(), &mut env.stderr, &redactor).await?;
@@ -1878,6 +1913,7 @@ async fn run_write(
                             account,
                             log: &mut env.stderr,
                             verbose: globals.verbose,
+                            clock: clock.as_ref(),
                         })
                         .await;
                     // The error's code and status only: its message can
@@ -1904,13 +1940,17 @@ async fn run_write(
                 }
                 Err(error) => return Err(error),
             };
-            let result = command
+            let applied = command
                 .applied(
-                    &mut Preflight {
-                        graph,
-                        account,
-                        log: &mut env.stderr,
-                        verbose: globals.verbose,
+                    &mut safety::After {
+                        session: commands::Session {
+                            env: &mut *env,
+                            output,
+                            graph: graph.clone(),
+                            account: account.clone(),
+                            verbose: globals.verbose,
+                        },
+                        download,
                     },
                     response,
                 )
@@ -1918,19 +1958,54 @@ async fn run_write(
                 .map_err(|error| {
                     error.context("the write was applied, but its result could not be read")
                 })?;
+            let (result, reasons) = match applied {
+                safety::Applied::Result { result, reasons } => (result, reasons),
+                safety::Applied::Produced(produced) => {
+                    return Ok(Outcome {
+                        exit_code: produced.exit_code,
+                        stdout_value: produced.document,
+                    })
+                }
+            };
+            let exit_code = if reasons.is_empty() { 0 } else { 4 };
             if json {
-                let value = output.untrusted_json_value(
+                // Exit 4 prints the whole envelope, whatever --results-only
+                // says, so that the outcome has somewhere to go.
+                let options = OutputOptions {
+                    results_only: output.results_only && reasons.is_empty(),
+                    ..output.clone()
+                };
+                let mut value = options.untrusted_json_value(
                     safety::results_value(&plan, true, Some(result)),
                     1,
                     &redactor,
                 )?;
-                return Ok(Outcome::success(Some(value)));
+                if let (false, Value::Object(object)) = (reasons.is_empty(), &mut value) {
+                    object.insert(
+                        "outcome".into(),
+                        serde_json::json!({"code": "Incomplete", "reasons": reasons}),
+                    );
+                }
+                return Ok(Outcome {
+                    exit_code,
+                    stdout_value: Some(value),
+                });
             }
             writeln!(env.stdout, "Applied: purview {}", plan.command())?;
             let shown = redactor.redact_value(&crate::trace::redact_urls(&result, &redactor));
             let text = serde_json::to_string_pretty(&shown)?;
             writeln!(env.stdout, "{}", sanitize_multiline(&text))?;
-            Ok(Outcome::success(None))
+            for reason in &reasons {
+                writeln!(
+                    env.stderr,
+                    "incomplete: {}",
+                    sanitize(reason["message"].as_str().unwrap_or_default())
+                )?;
+            }
+            Ok(Outcome {
+                exit_code,
+                stdout_value: None,
+            })
         }
     }
 }

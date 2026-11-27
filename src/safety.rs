@@ -39,6 +39,7 @@ pub struct WritePlan {
     effects: Vec<String>,
     warnings: Vec<String>,
     preflight: Vec<Value>,
+    blocked: Option<String>,
 }
 
 /// What a command gives to build its plan.
@@ -55,6 +56,10 @@ pub struct PlanInput {
     pub warnings: Vec<String>,
     /// What each preflight read found.
     pub preflight: Vec<Value>,
+    /// Why the plan may be shown but not sent, such as an operation that
+    /// may be a duplicate without `--allow-concurrent`. A dry run prints
+    /// the plan; any other run fails with `ConcurrentOperation`.
+    pub blocked: Option<String>,
 }
 
 impl WritePlan {
@@ -78,6 +83,7 @@ impl WritePlan {
             effects: input.effects,
             warnings: input.warnings,
             preflight: input.preflight,
+            blocked: input.blocked,
         })
     }
 
@@ -118,6 +124,11 @@ impl WritePlan {
 
     pub fn warnings(&self) -> &[String] {
         &self.warnings
+    }
+
+    /// Why the plan may not be sent, when it may not.
+    pub fn blocked(&self) -> Option<&str> {
+        self.blocked.as_deref()
     }
 
     /// The plan as JSON: `{"command", "account", "tenant", "method",
@@ -352,6 +363,7 @@ pub struct WriteSettings {
 
 /// What preflight decided.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // One per command run; never stored.
 pub enum Planned {
     /// A write to decide on.
     Write(WritePlan),
@@ -380,6 +392,38 @@ pub struct Preflight<'a> {
     pub account: &'a AccountRecord,
     pub log: &'a mut (dyn Write + Send),
     pub verbose: bool,
+    pub clock: &'a dyn crate::env::Clock,
+}
+
+/// What a write command gets after Graph accepted the write, to read and
+/// show its result: the session (streams, output settings, Graph client,
+/// account) and, for a command that asked for it, the download client.
+/// The approval has been used by then, and the runner sends nothing more.
+pub struct After<'a> {
+    pub session: crate::commands::Session<'a>,
+    pub download: Option<&'a crate::commands::download::Context>,
+}
+
+/// What the result of a write is.
+#[derive(Debug)]
+pub enum Applied {
+    /// The result, printed in the write envelope. A reason, such as an
+    /// operation that did not succeed, makes the exit 4, with the reasons
+    /// as the envelope's `outcome`.
+    Result { result: Value, reasons: Vec<Value> },
+    /// A document the command printed in its own shape, such as the wait
+    /// deadline's exit 5 (`docs/SPEC.md` section 3.3).
+    Produced(crate::commands::Produced),
+}
+
+impl Applied {
+    /// A result with no reasons.
+    pub fn result(result: Value) -> Self {
+        Self::Result {
+            result,
+            reasons: Vec::new(),
+        }
+    }
 }
 
 /// The body of one write command, run by `cli`'s write runner, which
@@ -399,12 +443,14 @@ pub trait WriteCommand: Send {
     /// sent here.
     async fn plan(&mut self, preflight: &mut Preflight<'_>) -> Result<Planned>;
 
+    /// Whether the command downloads files after its write, so that the
+    /// runner sets up the download client.
+    fn downloads(&self) -> bool {
+        false
+    }
+
     /// The result shown after Graph accepted the write.
-    async fn applied(
-        &mut self,
-        preflight: &mut Preflight<'_>,
-        response: WriteResponse,
-    ) -> Result<Value>;
+    async fn applied(&mut self, after: &mut After<'_>, response: WriteResponse) -> Result<Applied>;
 
     /// After an unclear outcome: what the write may have created, for the
     /// person to check. Reads only.
@@ -465,6 +511,7 @@ mod tests {
             effects: vec!["Creates a search over all tenant mailboxes. Places no hold.".into()],
             warnings: vec!["w".into()],
             preflight: vec![json!({"read": "case", "status": "active"})],
+            blocked: None,
         })
         .unwrap()
     }
@@ -535,6 +582,7 @@ mod tests {
             effects: Vec::new(),
             warnings: Vec::new(),
             preflight: Vec::new(),
+            blocked: None,
         };
         assert!(WritePlan::new(input.clone()).is_err());
         input.body = json!({});
@@ -664,6 +712,7 @@ mod tests {
             effects: vec!["e\u{7}".into()],
             warnings: vec!["w\u{1b}".into()],
             preflight: Vec::new(),
+            blocked: None,
         };
         input.account.push('\u{1b}');
         let mut out = Vec::new();
@@ -695,6 +744,7 @@ mod tests {
                 json!("holds: none"),
                 json!({ signed.clone(): "a signed link used as a key" }),
             ],
+            blocked: None,
         };
         let mut out = Vec::new();
         WritePlan::new(input)

@@ -225,6 +225,11 @@ pub enum PurviewError {
     #[error("{0}")]
     CaseNotActive(String),
 
+    /// An action whose plan names an operation that may be a duplicate,
+    /// without `--allow-concurrent` (`docs/SPEC.md` section 6.7).
+    #[error("{0}")]
+    ConcurrentOperation(String),
+
     /// A zip that is refused before or while it is read: not a zip, too
     /// many entries, a name that would leave its folder, or more bytes, or
     /// a higher ratio, than the limits allow. Never names an entry.
@@ -381,6 +386,7 @@ impl PurviewError {
             Self::CaseNameInUse(_) => ("CaseNameInUse", 0),
             Self::SearchNameInUse(_) => ("SearchNameInUse", 0),
             Self::CaseNotActive(_) => ("CaseNotActive", 0),
+            Self::ConcurrentOperation(_) => ("ConcurrentOperation", 0),
             Self::HostileZip(_) => ("HostileZip", 0),
             Self::RecordTooLarge { .. } => ("RecordTooLarge", 0),
             Self::NotAReportZip(_) => ("NotAReportZip", 0),

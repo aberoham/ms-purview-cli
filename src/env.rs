@@ -2,9 +2,8 @@
 //! arguments, injected so that `cli::execute_with` can run a whole command
 //! in-process under test.
 //!
-//! It carries the identity-platform and Graph base URLs, the credential
-//! store, the clock, the browser opener and Ctrl-C. A later release adds the
-//! download host rule.
+//! It carries the identity-platform and Graph base URLs, the download host
+//! rule, the credential store, the clock, the browser opener and Ctrl-C.
 //! The production `Env` reads no environment variable that could change an
 //! endpoint, so the release binary has no path that could send a token to
 //! another host.
@@ -323,6 +322,25 @@ pub struct Env {
     /// Ctrl-C while a command waits for an operation: the process's own in
     /// production, a `ManualInterrupt` that never fires in `in_memory()`.
     pub interrupt: Arc<dyn Interrupt>,
+    /// Which `downloadUrl` may receive the download token:
+    /// `DownloadRule::production()` in production and in `in_memory()`;
+    /// tests allow `http` and any port to reach their mocks.
+    pub download_rule: crate::download::DownloadRule,
+    /// Host names resolved to fixed addresses for downloads. Empty in
+    /// production; tests map download host names to mock listeners.
+    pub download_resolve: Vec<(String, std::net::SocketAddr)>,
+    /// How long a download may go without data: `download::IDLE_TIMEOUT`
+    /// in production; tests shorten it.
+    pub download_idle_timeout: Duration,
+    /// The root that downloads go below when neither `--out` nor
+    /// `defaults.data_dir` names a directory: `None` in production, for
+    /// the platform's local data directory; an unusable path in
+    /// `in_memory()` until a test sets a temporary directory.
+    pub data_dir: Option<PathBuf>,
+    /// Test hooks for publishing and the manifest. Always off in
+    /// production.
+    #[doc(hidden)]
+    pub download_faults: crate::download::DownloadFaults,
 }
 
 /// One of the writes that store a sign-in, in the order they are made.
@@ -395,6 +413,11 @@ impl Env {
             login_write_fault: None,
             account_locks: crate::secrets::AccountLocks::production(),
             interrupt: Arc::new(CtrlC),
+            download_rule: crate::download::DownloadRule::production(),
+            download_resolve: Vec::new(),
+            download_idle_timeout: crate::download::IDLE_TIMEOUT,
+            data_dir: None,
+            download_faults: crate::download::DownloadFaults::default(),
         }
     }
 
@@ -437,6 +460,11 @@ impl Env {
             login_write_fault: None,
             account_locks: None,
             interrupt: Arc::new(ManualInterrupt::default()),
+            download_rule: crate::download::DownloadRule::production(),
+            download_resolve: Vec::new(),
+            download_idle_timeout: crate::download::IDLE_TIMEOUT,
+            data_dir: Some(unusable_data_dir()),
+            download_faults: crate::download::DownloadFaults::default(),
         }
     }
 }
@@ -458,6 +486,15 @@ fn unreachable_identity_base() -> Url {
 fn unreachable_graph_base() -> Url {
     Url::parse("http://graph-unset.example/v1.0/")
         .unwrap_or_else(|_| unreachable!("a valid URL literal"))
+}
+
+/// A data directory below a file that cannot be a directory, so that a
+/// test that forgets to set one fails instead of writing to the person's
+/// own data directory.
+fn unusable_data_dir() -> PathBuf {
+    std::env::temp_dir()
+        .join("purview-test-data-unset")
+        .join("\u{0}")
 }
 
 /// The streams of an in-memory `Env`, readable after the command ends.

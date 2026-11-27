@@ -265,7 +265,15 @@ fn help_is_success_and_lists_exactly_the_shipped_commands() {
         .collect();
     assert_eq!(
         commands,
-        ["auth", "case", "search", "operation", "version", "help"],
+        [
+            "auth",
+            "case",
+            "search",
+            "operation",
+            "download",
+            "version",
+            "help"
+        ],
         "{text}"
     );
 }

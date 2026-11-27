@@ -545,7 +545,7 @@ pub(crate) fn normalise(path: &Path) -> PathBuf {
 
 /// Whether metadata read without following links shows a link: a symlink,
 /// or on Windows any reparse point, junctions included.
-fn is_link_like(metadata: &fs::Metadata) -> bool {
+pub(crate) fn is_link_like(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_symlink() || is_reparse_point(metadata)
 }
 

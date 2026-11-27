@@ -105,6 +105,57 @@ pub enum PurviewError {
     #[error("{0}")]
     ResolveRequired(String),
 
+    /// The download service answered the download token with HTTP 401 or
+    /// 403.
+    #[error(
+        "the download service refused the download token (HTTP {status}): the account needs \
+         the Purview eDiscovery permission eDiscovery.Download.Read and an eDiscovery role; \
+         run 'purview auth refresh' and try again"
+    )]
+    DownloadRefused { status: u16 },
+
+    /// A download redirected to another origin. `target` is that origin
+    /// alone (scheme, host and port), never its path or query.
+    #[error("the download service redirected to another origin ({target}); refusing to follow it")]
+    CrossOriginRedirect { target: String },
+
+    /// A file of the operation that cannot be downloaded: no name, no
+    /// `downloadUrl`, or one the download host rule refuses. The other
+    /// files are still downloaded.
+    #[error("{0}")]
+    FileNotDownloadable(String),
+
+    /// The target exists and is not a verified download of the file.
+    #[error(
+        "{path} already exists and is not a verified download of this file; pass --overwrite to \
+         replace it"
+    )]
+    TargetExists { path: String },
+
+    /// Another writer created the target while the download ran. Its file
+    /// is kept.
+    #[error(
+        "{path} was created by another writer while the download ran; it was kept, and the \
+         download was not published"
+    )]
+    TargetAppeared { path: String },
+
+    /// The file system cannot make the hard link that publishing without
+    /// replacement needs.
+    #[error(
+        "the file system holding {path} does not support hard links, which publishing without \
+         --overwrite needs; pass --overwrite to publish by renaming"
+    )]
+    PublishUnsupported { path: String },
+
+    /// The file was published and verified, but the manifest could not be
+    /// updated. The next download in the directory records it.
+    #[error(
+        "{path} was downloaded and verified, but manifest.json could not be updated ({reason}); \
+         the next download in that directory records it"
+    )]
+    ManifestWriteFailed { path: String, reason: String },
+
     /// A stored password entry that its backend cannot decode (on Windows,
     /// a blob that is not UTF-16LE). Kept apart from access failures, so
     /// that a repair the ownership check authorised can replace it.
@@ -246,6 +297,13 @@ impl PurviewError {
             Self::CaseNotFound(_) => ("CaseNotFound", 0),
             Self::SearchNotFound(_) => ("SearchNotFound", 0),
             Self::ResolveRequired(_) => ("ResolveRequired", 0),
+            Self::DownloadRefused { status } => ("DownloadRefused", *status),
+            Self::CrossOriginRedirect { .. } => ("CrossOriginRedirect", 0),
+            Self::FileNotDownloadable(_) => ("FileNotDownloadable", 0),
+            Self::TargetExists { .. } => ("TargetExists", 0),
+            Self::TargetAppeared { .. } => ("TargetAppeared", 0),
+            Self::PublishUnsupported { .. } => ("PublishUnsupported", 0),
+            Self::ManifestWriteFailed { .. } => ("ManifestWriteFailed", 0),
             Self::Message(_)
             | Self::GraphUnreachable { .. }
             | Self::Io(_)

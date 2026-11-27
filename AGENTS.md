@@ -12,7 +12,7 @@ implements one item of its section 11 and nothing from later items. Today
 the binary has `purview version`, `purview auth login` (device code, or
 `--browser`), `auth refresh`, `auth status`, `auth list` and `auth logout`,
 `case list`, `case get`, `search list`, `search get`, `operation list` and
-`operation get` (with `--wait`), and the global options `--verbose`,
+`operation get` (with `--wait`), `download`, and the global options `--verbose`,
 `--timeout`, `--trace` and `--wrap-untrusted`. Do not add stubs for commands
 that a later pull request owns.
 
@@ -109,7 +109,13 @@ redirect against the loopback listener, in flows) and that sign-in's
 timeout. It carries the Graph base URL (`origin::GRAPH_BASE` in production,
   an unreachable `.example` host in `Env::in_memory()`, and the harness's
   Graph mock in flows), whose origin is the only one Graph requests go to.
-  A later pull request adds the download host rule. `Env::production()` reads no
+  It carries the download host rule (`DownloadRule::production()`
+  everywhere but flows, which allow `http` and any port), the host names
+  resolved to mock listeners for downloads (empty in production), the
+  download idle timeout, the data directory root (`None` in production,
+  for the platform's own; an unusable path in `Env::in_memory()`, so a test
+  must set one) and the test-only `download_faults`, always off in
+  production. `Env::production()` reads no
   environment variable that could change an endpoint, so the release binary
   has no test path that could send a token to another host.
 - `src/auth.rs` holds the device-code flow, the browser flow (authorization
@@ -162,8 +168,23 @@ timeout. It carries the Graph base URL (`origin::GRAPH_BASE` in production,
   Every request method takes the command's stderr for `--verbose` lines.
   A token the provider cannot supply is `PurviewError::TokenUnavailable`,
   so a caller can tell a broken sign-in from Graph's answer.
+- `src/download.rs` is `DownloadRule` (the host pattern of `docs/SPEC.md`
+  section 4.7), `DownloadClient` (the download token and
+  `X-AllowWithAADToken` only, same-origin redirects followed by hand, no
+  decompression, streaming with SHA-256 under the size limits, reqwest's
+  `read_timeout` as the idle timeout), and publishing: a `.part` file, the
+  length and zip central-directory checks, then a hard link (or a rename
+  under `--overwrite`). Never turn a `reqwest::Error` into an error with
+  `?`: its message names the URL. `src/download/names.rs` makes local file
+  names (section 4.7.1); `src/download/manifest.rs` is `manifest.json`.
+  `src/commands/download.rs` holds the directory lock (`DirLock`) from
+  reading the manifest to its last write, plans every file before any
+  download request, recovers verified files that no manifest entry
+  reaches, exits 4 when a file cannot be downloaded or the operation did
+  not succeed, and 130 on Ctrl-C.
 - `src/trace.rs` is `TraceSink` (`docs/SPEC.md` section 4.9). Only
-  `GraphClient` records; token-endpoint exchanges are never traced.
+  `GraphClient` and `DownloadClient` record, and a download's body never;
+  token-endpoint exchanges are never traced.
 - `build.rs` records the target triple for `purview version`. The release
   workflow sets `PURVIEW_BUILD_COMMIT`.
 - `tests/cli.rs` holds offline process contracts (`assert_cmd`);
@@ -172,6 +193,8 @@ timeout. It carries the Graph base URL (`origin::GRAPH_BASE` in production,
   `tests/support/` and hand-written fixtures in `tests/fixtures/`;
   `tests/reads.rs` runs the read commands the same way, with the
   sign-in helpers it shares with `tests/flows.rs` in `tests/support/`;
+  `tests/downloads.rs` runs `download` against mock download origins whose
+  host names match the production pattern;
   `tests/graph.rs` drives `GraphClient`, and `Poller` over it, against
   wiremock with a fake token provider; `tests/write_allow_list.rs` scans `src/` and `build.rs` for
   HTTP write methods; `tests/fixture_lint.rs` is the public-data lint.
@@ -273,8 +296,7 @@ check whether the other repository needs the same fix.
 
 ## Transport guarantees
 
-The Graph rules apply now; the download rules apply from the pull request
-that adds the download client. Do not weaken them.
+These rules apply to Graph and to downloads. Do not weaken them.
 
 - Requests go only to an exact origin: scheme, host and effective port. The
   Graph origin is `https://graph.microsoft.com:443`, and Graph requests must

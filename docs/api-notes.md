@@ -98,8 +98,13 @@ From the queries sampled in one tenant (Observed):
   (Assumption)
 - `Authorization: Bearer <download token>` with `X-AllowWithAADToken: true` returned 200. A
   Graph token returned 401. (Observed)
-- The prototype followed redirects without inspecting them, so whether any occur is not
-  known. PR 1.5 checks this.
+- With redirects disabled, a report download answered 200 directly, with
+  `Content-Type: application/octet-stream` and a `Content-Length`. (Observed, PR 1.5) No
+  redirect has been seen.
+- The `downloadUrl` path ends in `exportaedblobFileResult(<base64 JSON>)`; the JSON holds
+  `PackagingJobId`, `CaseId`, `FileName`, `IsDirectDownloadProxy`, `Extension` and
+  `FolderType`, and no signature or token. Its only query key is `downloadType`. (Observed,
+  PR 1.5)
 - Estimate report files had `size: 0` and were well under a megabyte; item report zips had
   their real size. (Observed)
 - An export's `exportFileMetadata` listed two files: a `Reports-…zip` in the item report
@@ -140,7 +145,6 @@ From the queries sampled in one tenant (Observed):
 
 1. Whether a missing eDiscovery role gives 403 (not checked in PR 1.4; Assumption).
 2. Non-empty custodian, non-custodial and additional source lists.
-4. Redirects on download (PR 1.5).
 5. Reports and exports without Teams context (PR 2.5, PR 4.1).
 6. Case close on a case with holds, and hold reads on an empty case (PR 2.6).
 7. Throttling.
@@ -290,3 +294,20 @@ repository.
   sign-in had added a consent for `eDiscovery.Read.All` that persists. (Observed)
 - **Missing role:** not checked; whether an account without an eDiscovery role gets 403
   stays an Assumption.
+
+### PR 1.5: download
+
+Status: **run on 27 November 2026** from a local build of the PR 1.5 branch, signed with the
+same local code-signing identity as the earlier checks, against the same tenant,
+registration and account. The files and traces stayed outside the repository.
+
+- **Estimate report download:** `download` of an existing succeeded estimate read the
+  operation, then sent one download `GET`, which answered 200 with no redirect (redirects
+  are disabled in the client). (Observed) The file was under a megabyte though Graph gave
+  `size: 0`, opened as a zip with `Locations-`, `Settings-`, `Statistics-` and `Summary-`
+  CSV files, and was published and recorded. (Observed)
+- **Second run:** the same command read the operation, found the file recorded and
+  unchanged, and sent no download request and no token request. (Observed)
+- **Response headers:** of the headers a trace keeps, the download response had
+  `content-length`, `content-type` (`application/octet-stream`) and `date`, and no
+  `request-id`. (Observed)

@@ -526,9 +526,13 @@ again, unless `--overwrite` is given. A URL cannot be passed on the command line
   printed whole even under `--results-only`.
 - Files are fetched one at a time. A failure while fetching ends the command with exit 1;
   files already published stay recorded, and the next run skips them. A download is not
-  retried automatically. Under `--overwrite`, a file's old manifest entry is removed before
-  its replacement is fetched, so a manifest write that fails after the replacement leaves
-  a file the next run recovers.
+  retried automatically.
+- Under `--overwrite`, the replacement is fetched and checked first. The manifest is then
+  written ahead of the rename: it names the replacement, with its size and SHA-256, and
+  drops every entry that reaches the target (under its name or another for the same file).
+  If that write fails, nothing is replaced. If the rename fails after it, the entry's hash
+  does not match the file left in place, so no later run takes that file for this
+  operation's. Without `--overwrite`, the file is published first and recorded after.
 - Ctrl-C ends the run with exit 130: the file in flight is abandoned and its temporary
   file removed, and the files already published are printed, with `"error": {"code":
   "Interrupted", …}` beside `results` under `--json`.

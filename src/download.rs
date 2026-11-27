@@ -552,17 +552,33 @@ pub struct Placement<'a> {
     pub overwrite: bool,
 }
 
-/// Downloads `file` to `placement` (section 4.7, steps 3 to 8). The
-/// caller has checked the target: absent, or replaceable under
-/// `overwrite`.
-pub async fn download_into(
+/// A file fetched and checked into its temporary file, not yet
+/// published (section 4.7, steps 3 to 7). Dropping it removes the
+/// temporary file.
+#[derive(Debug)]
+pub struct Staged {
+    part: PartFile,
+    target: PathBuf,
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+impl std::fmt::Debug for PartFile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_tuple("PartFile").field(&self.0).finish()
+    }
+}
+
+/// Fetches `file` for `placement` into a temporary file in its directory,
+/// then checks its length and zip central directory. The caller has
+/// checked the target: absent, or replaceable under `overwrite`.
+pub async fn stage(
     client: &DownloadClient,
     file: &DownloadableFile,
     placement: &Placement<'_>,
     limits: Limits,
-    faults: &DownloadFaults,
     log: &mut (dyn Write + Send),
-) -> Result<Published> {
+) -> Result<Staged> {
     let target = placement.dir.join(placement.name);
     let (part, guard) = create_part(placement.dir, placement.name)?;
     let mut sink = tokio::fs::File::from_std(part);
@@ -581,21 +597,42 @@ pub async fn download_into(
     .await
     .map_err(|_| PurviewError::message("the zip check stopped unexpectedly"))?;
     checked?;
-    if let Some(hook) = &faults.before_publish {
-        hook(&target);
-    }
-    if let Some(left) = publish(guard, &target, placement.overwrite, faults.no_hard_links)? {
-        let _ = writeln!(
-            log,
-            "warning: the temporary file {} could not be removed",
-            sanitize(&left.display().to_string())
-        );
-    }
-    Ok(Published {
-        path: target,
+    Ok(Staged {
+        part: guard,
+        target,
         bytes: fetched.bytes,
         sha256: fetched.sha256,
     })
+}
+
+impl Staged {
+    pub fn target(&self) -> &Path {
+        &self.target
+    }
+
+    /// Publishes the file under its final name (section 4.7, step 8).
+    pub fn publish(
+        self,
+        overwrite: bool,
+        faults: &DownloadFaults,
+        log: &mut (dyn Write + Send),
+    ) -> Result<Published> {
+        if let Some(hook) = &faults.before_publish {
+            hook(&self.target);
+        }
+        if let Some(left) = publish(self.part, &self.target, overwrite, faults.no_hard_links)? {
+            let _ = writeln!(
+                log,
+                "warning: the temporary file {} could not be removed",
+                sanitize(&left.display().to_string())
+            );
+        }
+        Ok(Published {
+            path: self.target,
+            bytes: self.bytes,
+            sha256: self.sha256,
+        })
+    }
 }
 
 /// A temporary file this process created; removed when dropped unless

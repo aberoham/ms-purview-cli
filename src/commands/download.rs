@@ -234,44 +234,59 @@ pub async fn run(
                 replace,
             } => (file, name, replace),
         };
-        if replace && manifest.entry(&name).is_some() {
-            // The old entry goes first, so that if the manifest cannot be
-            // written after the replacement, the next run finds a file with
-            // no entry and recovers it.
-            manifest.files.retain(|entry| entry.file_name != name);
-            save_manifest(&manifest, &dir, session, context, None)?;
-        }
         let placement = download::Placement {
             dir: &dir,
             name: &name,
             overwrite: replace,
         };
-        let fetched = tokio::select! {
-            fetched = download::download_into(
+        let staged = tokio::select! {
+            staged = download::stage(
                 &context.client,
                 &file,
                 &placement,
                 context.limits,
-                &context.faults,
                 &mut session.env.stderr,
-            ) => fetched,
+            ) => staged,
             () = &mut interrupted => return finish(session, done, reasons, true),
         };
-        let published = fetched.map_err(|error| {
-            error.context(format!(
-                "downloading {}",
-                sanitize(&shown(session, &file.server_name))
-            ))
-        })?;
+        let what = format!(
+            "downloading {}",
+            sanitize(&shown(session, &file.server_name))
+        );
+        let context_for = |error: PurviewError| error.context(what.clone());
+        let staged = staged.map_err(context_for)?;
         let finished = Done {
-            server_name: file.server_name,
-            path: published.path,
-            bytes: published.bytes,
-            sha256: published.sha256,
+            server_name: file.server_name.clone(),
+            path: staged.target().to_path_buf(),
+            bytes: staged.bytes,
+            sha256: staged.sha256.clone(),
             status: Status::Downloaded,
         };
-        manifest.record(entry(&ids, &finished, &session.env.clock.now(), false));
-        save_manifest(&manifest, &dir, session, context, Some(&finished.path))?;
+        let recorded = entry(&ids, &finished, &session.env.clock.now(), false);
+        if replace {
+            // Written ahead: the manifest names the replacement, and no
+            // longer the file it replaces (under this name or another for
+            // the same file), before the rename. If the manifest cannot be
+            // written, nothing is replaced; if the rename fails, the entry's
+            // hash does not match the old file, so no later run takes it
+            // for this one.
+            let replaced = owners(&dir, &manifest, &name);
+            manifest
+                .files
+                .retain(|entry| !replaced.contains(&entry.file_name));
+            manifest.record(recorded);
+            save_manifest(&manifest, &dir, session, context, None)
+                .map_err(|error| error.context("nothing was replaced"))?;
+            staged
+                .publish(true, &context.faults, &mut session.env.stderr)
+                .map_err(context_for)?;
+        } else {
+            staged
+                .publish(false, &context.faults, &mut session.env.stderr)
+                .map_err(context_for)?;
+            manifest.record(recorded);
+            save_manifest(&manifest, &dir, session, context, Some(&finished.path))?;
+        }
         done.push(finished);
     }
     finish(session, done, reasons, false)
@@ -322,7 +337,8 @@ fn downloadable(
         };
         // A name that holds a web address or a secret would carry it into
         // the local path and the manifest.
-        if crate::redact::urls_in_text(server_name, redactor) != server_name
+        if server_name.contains("://")
+            || crate::redact::urls_in_text(server_name, redactor) != server_name
             || redactor.redact(server_name) != server_name
         {
             refuse(reasons, "its fileName holds a web address or a secret");
@@ -384,6 +400,25 @@ fn entry_for<'m>(
                 .is_ok_and(|other| same_file(metadata, &other))
         })
     })
+}
+
+/// The local names of every manifest entry that reaches the file at
+/// `dir/name`: the entry under that name, and any under another name for
+/// the same file.
+fn owners(dir: &Path, manifest: &Manifest, name: &str) -> Vec<String> {
+    let target = fs::symlink_metadata(dir.join(name)).ok();
+    manifest
+        .files
+        .iter()
+        .filter(|entry| {
+            entry.file_name == name
+                || target.as_ref().is_some_and(|target| {
+                    fs::symlink_metadata(dir.join(&entry.file_name))
+                        .is_ok_and(|other| same_file(target, &other))
+                })
+        })
+        .map(|entry| entry.file_name.clone())
+        .collect()
 }
 
 /// Whether two metadata describe one file: the same device and inode on
@@ -512,7 +547,7 @@ fn save_manifest(
     context: &Context,
     published: Option<&Path>,
 ) -> Result<()> {
-    let saved = if context.faults.manifest_write && published.is_some() {
+    let saved = if context.faults.manifest_write {
         Err(PurviewError::message("the manifest write was made to fail"))
     } else {
         manifest.save(dir, &session.env.redactor)

@@ -1016,9 +1016,10 @@ async fn file_gives_a_colliding_file_the_name_a_full_download_does_and_is_not_tr
 }
 
 #[tokio::test]
-async fn an_overwrite_whose_manifest_write_fails_is_recovered_by_the_next_run() {
+async fn an_overwrite_whose_manifest_write_fails_replaces_nothing() {
     let setup = Setup::new().await;
-    setup.serve(zip_bytes("v1\n")).await;
+    let first = zip_bytes("v1\n");
+    setup.serve(first.clone()).await;
     setup
         .operation("succeeded", json!([file(NAME, 0, &setup.file_url())]))
         .await;
@@ -1027,18 +1028,96 @@ async fn an_overwrite_whose_manifest_write_fails_is_recovered_by_the_next_run() 
         0
     );
     setup.alpha.reset().await;
-    let body = zip_bytes("v2, a different body\n");
-    setup.serve(body.clone()).await;
+    setup.serve(zip_bytes("v2, a different body\n")).await;
     let failed = setup
         .run_with(&["--json", "download", CASE, OP, "--overwrite"], |env| {
             env.download_faults.manifest_write = true;
         })
         .await;
     assert_eq!(failed.outcome.exit_code, 1);
+    assert!(failed.json()["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("nothing was replaced"));
+    assert_eq!(std::fs::read(setup.target_dir().join(NAME)).unwrap(), first);
+    assert_eq!(entries(&setup.target_dir()), [NAME, "manifest.json"]);
     let again = setup.run(&["--json", "download", CASE, OP]).await;
     assert_eq!(again.outcome.exit_code, 0, "{}", again.stdout());
-    assert_eq!(again.json()["results"][0]["status"], "recovered");
-    assert_eq!(again.json()["results"][0]["sha256"], sha256(&body));
+    assert_eq!(again.json()["results"][0]["status"], "alreadyDownloaded");
+    assert_eq!(again.json()["results"][0]["sha256"], sha256(&first));
+}
+
+#[tokio::test]
+async fn a_failed_overwrite_never_gives_the_old_file_to_the_new_operation() {
+    const OTHER: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaa0002";
+    let setup = Setup::new().await;
+    setup.serve(zip_bytes("operation one\n")).await;
+    let out = setup.harness.root.path().join("shared");
+    let out_text = out.to_str().unwrap().to_owned();
+    let failing = setup.url(&setup.alpha, ALPHA, "/fails");
+    setup
+        .operation("succeeded", json!([file(NAME, 0, &setup.file_url())]))
+        .await;
+    setup
+        .add_operation(OTHER, "succeeded", json!([file(NAME, 0, &failing)]))
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/fails"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&setup.alpha)
+        .await;
+    let first = setup.run(&["download", CASE, OP, "--out", &out_text]).await;
+    assert_eq!(first.outcome.exit_code, 0, "{}", first.stderr());
+    let overwrite = setup
+        .run(&["download", CASE, OTHER, "--out", &out_text, "--overwrite"])
+        .await;
+    assert_eq!(overwrite.outcome.exit_code, 1);
+    let retry = setup
+        .run(&["--json", "download", CASE, OTHER, "--out", &out_text])
+        .await;
+    assert_eq!(retry.outcome.exit_code, 1);
+    assert_eq!(retry.json()["error"]["code"], "TargetExists");
+    let recorded = manifest(&out);
+    assert_eq!(recorded["files"].as_array().unwrap().len(), 1);
+    assert_eq!(recorded["files"][0]["operationId"], OP);
+}
+
+#[tokio::test]
+async fn an_overwrite_under_an_equivalent_name_takes_over_the_entry() {
+    const OTHER: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaa0002";
+    let setup = Setup::new().await;
+    setup.serve(zip_bytes("one\n")).await;
+    Mock::given(method("GET"))
+        .and(path("/second"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes("two\n")))
+        .mount(&setup.alpha)
+        .await;
+    let out = setup.harness.root.path().join("shared");
+    let out_text = out.to_str().unwrap().to_owned();
+    setup
+        .operation(
+            "succeeded",
+            json!([file("Report.zip", 0, &setup.file_url())]),
+        )
+        .await;
+    let second = setup.url(&setup.alpha, ALPHA, "/second");
+    setup
+        .add_operation(OTHER, "succeeded", json!([file("report.zip", 0, &second)]))
+        .await;
+    let first = setup.run(&["download", CASE, OP, "--out", &out_text]).await;
+    assert_eq!(first.outcome.exit_code, 0);
+    let insensitive = out.join("REPORT.ZIP").exists();
+    let replaced = setup
+        .run(&["download", CASE, OTHER, "--out", &out_text, "--overwrite"])
+        .await;
+    assert_eq!(replaced.outcome.exit_code, 0, "{}", replaced.stderr());
+    let again = setup
+        .run(&["--json", "download", CASE, OTHER, "--out", &out_text])
+        .await;
+    assert_eq!(again.outcome.exit_code, 0, "{}", again.stdout());
+    assert_eq!(again.json()["results"][0]["status"], "alreadyDownloaded");
+    let left = manifest(&out)["files"].as_array().unwrap().len();
+    assert_eq!(left, if insensitive { 1 } else { 2 });
 }
 
 #[tokio::test]
@@ -1088,15 +1167,22 @@ async fn a_file_name_that_holds_a_web_address_is_left_out() {
         ".zip",
     ]
     .concat();
+    let plain = ["report ", "https", "://h.example/f.zip"].concat();
+    let url = setup.file_url();
     setup
-        .operation("succeeded", json!([file(&named, 0, &setup.file_url())]))
+        .operation(
+            "succeeded",
+            json!([file(&named, 0, &url), file(&plain, 0, &url)]),
+        )
         .await;
     let run = setup.run(&["--json", "download", CASE, OP]).await;
     assert_eq!(run.outcome.exit_code, 4);
-    assert_eq!(
-        run.json()["outcome"]["reasons"][0]["code"],
-        "FileNotDownloadable"
-    );
+    let reasons = run.json()["outcome"]["reasons"].clone();
+    let reasons = reasons.as_array().unwrap();
+    assert_eq!(reasons.len(), 2, "{reasons:?}");
+    assert!(reasons
+        .iter()
+        .all(|reason| reason["code"] == "FileNotDownloadable"));
     setup.harness.assert_absent(&run, &["canary-sig-0002"]);
 }
 

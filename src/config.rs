@@ -336,6 +336,23 @@ fn read_account(path: &Path, warnings: &mut dyn Write) -> Result<Option<AccountR
 /// value it refused, which could be anything pasted into the file (a
 /// signed URL, a token), so only its category and position are kept.
 fn unreadable_json(path: &Path, error: &serde_json::Error) -> PurviewError {
+    // A missing field is named by the schema, not by the file, so it can
+    // be shown; only a name of lower-case letters and `_` is.
+    let text = error.to_string();
+    let missing = text
+        .strip_prefix("missing field `")
+        .and_then(|rest| rest.split('`').next())
+        .filter(|name| {
+            !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+        });
+    if let Some(name) = missing {
+        return PurviewError::message(format!(
+            "{} is missing the required field {name} (line {}, column {})",
+            shown(path),
+            error.line(),
+            error.column()
+        ));
+    }
     let problem = match error.classify() {
         serde_json::error::Category::Data => "holds a value of the wrong type or shape",
         serde_json::error::Category::Eof => "ends before its JSON is complete",
@@ -1086,6 +1103,20 @@ mod tests {
         assert!(!message.contains(&marker), "{message}");
         assert!(
             message.contains("wrong type") && message.contains("line 1"),
+            "{message}"
+        );
+
+        fs::write(
+            dir.path().join("config.json"),
+            format!(r#"{{"clients": {{"alex@contoso.example": {{"tenant_id": "{marker}"}}}}}}"#),
+        )
+        .unwrap();
+        let message = Config::load(dir.path(), &mut no_warnings())
+            .unwrap_err()
+            .to_string();
+        assert!(!message.contains(&marker), "{message}");
+        assert!(
+            message.contains("missing the required field client_id"),
             "{message}"
         );
     }

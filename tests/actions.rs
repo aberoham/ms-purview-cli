@@ -1374,3 +1374,43 @@ async fn a_wait_with_check_that_times_out_resumes_with_check() {
         .unwrap()
         .ends_with(&format!("operation get {CASE} {OP} --wait --check")));
 }
+
+/// A status that Graph does not document is not repeated in the
+/// candidates: it is Graph's text.
+#[tokio::test]
+async fn an_unknown_status_in_a_candidate_is_not_repeated() {
+    let setup = Setup::new().await;
+    setup
+        .preflight_search(fixture_value(&setup.harness, "search-get-mailboxes.json"))
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("{CASES}/{CASE}/operations")))
+        .respond_with(json_response(200, json!({"value": []})))
+        .up_to_n_times(2)
+        .with_priority(1)
+        .mount(&setup.harness.graph)
+        .await;
+    setup
+        .get(
+            &format!("{CASES}/{CASE}/operations"),
+            json!({"value": [
+                {"id": OP, "action": "estimateStatistics", "status": "see canary-status-0091", "createdDateTime": "2026-01-05T09:00:30Z"},
+            ]}),
+        )
+        .await;
+    Mock::given(method("POST"))
+        .and(path(search_path("/estimateStatistics")))
+        .respond_with(json_response(
+            503,
+            json!({"error": {"code": "ServiceUnavailable"}}),
+        ))
+        .mount(&setup.harness.graph)
+        .await;
+    let run = setup.run(&["--json", "--yes"]).await;
+    let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
+    assert!(
+        message.contains(&format!("estimate {OP} (unknown status")),
+        "{message}"
+    );
+    assert!(!message.contains("canary-status-0091"), "{message}");
+}

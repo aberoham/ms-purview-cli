@@ -124,8 +124,10 @@ given, whoever created it:
   is not enough. A dry run shows the plan either way.
 
 After approval, and before anything is sent, the search is read again
-with the same checks; if its query, the guard's verdict, its scope or its
-sources differ from the plan, nothing is sent (`SearchChanged`). Without
+with the same checks, and nothing is sent if it no longer passes them
+(with the check's own error, such as `ScopeNotAllowed` or
+`SearchHasSources`) or if its query or the guard's verdict differ from the
+plan (`SearchChanged`). Without
 `--allow-concurrent`, the case's operations are listed again too, so an
 estimate someone else started while the prompt was open is refused as a
 possible duplicate. A change made after these reads is still possible. The estimate is then sent once.

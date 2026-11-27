@@ -474,7 +474,8 @@ Settled in PR 2.3:
 - The reason of `--allow-generic` is in the plan's warnings only; the download manifest
   does not record it yet.
 - After approval and before the send, `WriteCommand::recheck` reads the search again
-  through the same checks; a different query, verdict, scope or sources refuse with
+  through the same checks. A scope, sources or query that no longer pass refuse with the
+  check's own code; a query or verdict that pass but differ from the plan refuse with
   `SearchChanged`. A change after that read is not caught: Graph offers no conditional
   action (Assumption).
 - The answer must be 202, and the operation the `Location` header names must be an

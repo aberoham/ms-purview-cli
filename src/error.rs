@@ -241,8 +241,9 @@ pub enum PurviewError {
     #[error("{0}")]
     SearchHasSources(String),
 
-    /// An action's search that changed between the plan and the send: its
-    /// query, scope or sources differ from what was approved.
+    /// An action's search whose query, or the guard's verdict on it,
+    /// changed between the plan and the send, while still passing the
+    /// checks; a search that no longer passes gets that check's error.
     #[error("{0}")]
     SearchChanged(String),
 

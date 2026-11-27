@@ -198,52 +198,64 @@ impl ZipReader {
     }
 }
 
-/// The number of entries the end of central directory record declares,
-/// with its ZIP64 form when the classic field is full. A file with no such
-/// record is not a zip.
+/// The number of entries the zip's end of central directory record
+/// declares, or its ZIP64 record when one is there. A record counts only
+/// when its comment length reaches the end of the file exactly; when a
+/// comment holds something that also looks like one, every such record is
+/// read and the largest count is the answer, so neither can hide a large
+/// directory. A file with no such record is not a zip.
 pub(crate) fn declared_entries(file: &mut File, len: u64) -> Result<u64> {
     use std::io::{Seek, SeekFrom};
     let not_zip =
         || PurviewError::HostileZip("the file is not a zip archive that can be read".into());
+    let read_at = |file: &mut File, at: u64, buffer: &mut [u8]| -> Result<()> {
+        file.seek(SeekFrom::Start(at)).map_err(|_| not_zip())?;
+        file.read_exact(buffer).map_err(|_| not_zip())
+    };
     // The record is 22 bytes, followed by a comment of at most 65,535.
     let tail_len = len.min(22 + 65_535);
+    let tail_start = len - tail_len;
     let mut tail = vec![0_u8; tail_len as usize];
-    file.seek(SeekFrom::Start(len - tail_len))?;
-    file.read_exact(&mut tail)?;
-    let at = (0..tail.len().saturating_sub(21))
-        .rev()
-        .find(|at| tail[*at..].starts_with(b"PK\x05\x06"))
-        .ok_or_else(not_zip)?;
-    let u16_at = |offset: usize| u16::from_le_bytes([tail[at + offset], tail[at + offset + 1]]);
-    let classic = u64::from(u16_at(10));
-    if classic != 0xFFFF {
-        file.seek(SeekFrom::Start(0))?;
-        return Ok(classic);
-    }
-    // ZIP64: the locator is the 20 bytes before the record, and names the
-    // ZIP64 end of central directory record.
-    // A classic zip may hold exactly 65,535 entries, with no locator.
-    let Some(locator_at) = (len - tail_len + at as u64).checked_sub(20) else {
-        file.seek(SeekFrom::Start(0))?;
-        return Ok(classic);
-    };
-    let mut locator = [0_u8; 20];
-    file.seek(SeekFrom::Start(locator_at))?;
-    file.read_exact(&mut locator)?;
-    if !locator.starts_with(b"PK\x06\x07") {
-        file.seek(SeekFrom::Start(0))?;
-        return Ok(classic);
-    }
-    let record_at = u64::from_le_bytes(locator[8..16].try_into().map_err(|_| not_zip())?);
-    let mut record = [0_u8; 40];
-    file.seek(SeekFrom::Start(record_at))?;
-    file.read_exact(&mut record).map_err(|_| not_zip())?;
-    if !record.starts_with(b"PK\x06\x06") {
+    read_at(file, tail_start, &mut tail)?;
+    let records: Vec<usize> = (0..tail.len().saturating_sub(21))
+        .filter(|at| {
+            let at = *at;
+            tail[at..].starts_with(b"PK\x05\x06")
+                && at + 22 + usize::from(u16::from_le_bytes([tail[at + 20], tail[at + 21]]))
+                    == tail.len()
+        })
+        .collect();
+    if records.is_empty() {
         return Err(not_zip());
     }
-    let total = u64::from_le_bytes(record[32..40].try_into().map_err(|_| not_zip())?);
-    file.seek(SeekFrom::Start(0))?;
-    Ok(total)
+    let mut declared = 0;
+    for at in records {
+        declared = declared.max(u64::from(u16::from_le_bytes([
+            tail[at + 10],
+            tail[at + 11],
+        ])));
+        // A ZIP64 locator, when there is one, is the 20 bytes before the
+        // end record and names the ZIP64 end record.
+        let Some(locator_at) = (tail_start + at as u64).checked_sub(20) else {
+            continue;
+        };
+        let mut locator = [0_u8; 20];
+        read_at(file, locator_at, &mut locator)?;
+        if !locator.starts_with(b"PK\x06\x07") {
+            continue;
+        }
+        let record_at = u64::from_le_bytes(locator[8..16].try_into().map_err(|_| not_zip())?);
+        let mut record = [0_u8; 40];
+        read_at(file, record_at, &mut record)?;
+        if !record.starts_with(b"PK\x06\x06") {
+            return Err(not_zip());
+        }
+        declared = declared.max(u64::from_le_bytes(
+            record[32..40].try_into().map_err(|_| not_zip())?,
+        ));
+    }
+    file.seek(SeekFrom::Start(0)).map_err(|_| not_zip())?;
+    Ok(declared)
 }
 
 /// A reader that counts the bytes it gives and fails past the limits.
@@ -454,6 +466,37 @@ mod tests {
         std::fs::write(file.path(), &bytes).unwrap();
         let error = ZipReader::open(file.path(), limits()).err().unwrap();
         assert_eq!(error.metadata().0, "HostileZip", "{error}");
+    }
+
+    #[test]
+    fn an_end_record_inside_a_comment_cannot_lower_the_count() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut writer = zip::ZipWriter::new(file.reopen().unwrap());
+        writer
+            .start_file("Locations-a.csv", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"1").unwrap();
+        // A forged end record declaring 1,000 entries, as the zip's
+        // comment: the larger count is the one that counts.
+        let mut forged = b"PK\x05\x06".to_vec();
+        forged.extend_from_slice(&[0; 6]);
+        forged.extend_from_slice(&1000_u16.to_le_bytes());
+        forged.extend_from_slice(&[0; 10]);
+        writer.set_raw_comment(forged.into_boxed_slice()).unwrap();
+        writer.finish().unwrap();
+        let mut handle = File::open(file.path()).unwrap();
+        let len = handle.metadata().unwrap().len();
+        assert_eq!(declared_entries(&mut handle, len).unwrap(), 1000);
+        let mut small = limits();
+        small.entries = 10;
+        assert_eq!(
+            ZipReader::open(file.path(), small)
+                .err()
+                .unwrap()
+                .metadata()
+                .0,
+            "HostileZip"
+        );
     }
 
     #[test]

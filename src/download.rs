@@ -766,11 +766,20 @@ fn check_zip_file(file: &fs::File) -> Result<()> {
         )));
     }
     file.rewind()?;
-    zip::ZipArchive::new(file).map(|_| ()).map_err(|_| {
+    let archive = zip::ZipArchive::new(file).map_err(|_| {
         PurviewError::message(
             "the downloaded file is not a zip whose central directory can be read",
         )
-    })
+    })?;
+    // The index holds one entry per name: fewer than declared means a name
+    // is listed twice.
+    if archive.len() as u64 != declared || archive.len() as u64 > crate::zipread::EXPORT_ZIP_ENTRIES
+    {
+        return Err(PurviewError::message(
+            "the downloaded zip's central directory does not match its entries",
+        ));
+    }
+    Ok(())
 }
 
 /// Publishes the temporary file under `target`. Without `overwrite`, a

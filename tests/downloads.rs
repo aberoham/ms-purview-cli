@@ -1457,3 +1457,85 @@ async fn ctrl_c_during_the_zip_check_publishes_nothing() {
         sha256(&first)
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_linked_data_root_is_refused_with_or_without_a_trailing_separator() {
+    let setup = Setup::new().await;
+    setup.serve(zip_bytes("x\n")).await;
+    setup
+        .operation("succeeded", json!([file(NAME, 0, &setup.file_url())]))
+        .await;
+    let elsewhere = setup.harness.root.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let linked = setup.harness.root.path().join("linked");
+    std::os::unix::fs::symlink(&elsewhere, &linked).unwrap();
+    for root in [
+        linked.display().to_string(),
+        format!("{}/", linked.display()),
+    ] {
+        let mut config = setup.harness.config();
+        config["defaults"] = json!({"data_dir": root});
+        std::fs::write(
+            setup.harness.config_dir().join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        let run = setup.run(&["download", CASE, OP]).await;
+        assert_eq!(run.outcome.exit_code, 1, "{root}");
+        assert!(run.stderr().contains("is a link"), "{}", run.stderr());
+    }
+    assert!(entries(&elsewhere).is_empty());
+}
+
+#[tokio::test]
+async fn defaults_that_is_not_an_object_is_refused_before_sign_in_work() {
+    let setup = Setup::new().await;
+    let mut config = setup.harness.config();
+    config["defaults"] = json!("/somewhere");
+    std::fs::write(
+        setup.harness.config_dir().join("config.json"),
+        serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
+    let run = setup.run(&["download", CASE, OP]).await;
+    assert_eq!(run.outcome.exit_code, 1);
+    assert!(
+        run.stderr().contains("defaults must be an object"),
+        "{}",
+        run.stderr()
+    );
+    assert!(Setup::requests(&setup.harness.graph).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_new_file_takes_over_a_stale_entry_for_the_same_file() {
+    const OTHER: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaa0002";
+    let setup = Setup::new().await;
+    setup.serve(zip_bytes("x\n")).await;
+    let out = setup.harness.root.path().join("shared");
+    let out_text = out.to_str().unwrap().to_owned();
+    setup
+        .operation(
+            "succeeded",
+            json!([file("Report.zip", 0, &setup.file_url())]),
+        )
+        .await;
+    setup
+        .add_operation(
+            OTHER,
+            "succeeded",
+            json!([file("report.zip", 0, &setup.file_url())]),
+        )
+        .await;
+    let first = setup.run(&["download", CASE, OP, "--out", &out_text]).await;
+    assert_eq!(first.outcome.exit_code, 0);
+    let insensitive = out.join("REPORT.ZIP").exists();
+    std::fs::remove_file(out.join("Report.zip")).unwrap();
+    let second = setup
+        .run(&["download", CASE, OTHER, "--out", &out_text])
+        .await;
+    assert_eq!(second.outcome.exit_code, 0, "{}", second.stderr());
+    let left = manifest(&out)["files"].as_array().unwrap().len();
+    assert_eq!(left, if insensitive { 1 } else { 2 });
+}

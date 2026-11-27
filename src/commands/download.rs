@@ -182,7 +182,9 @@ pub async fn run(
                 Some(root) => root.clone(),
                 None => crate::config::data_dir()?,
             };
-            let root = std::path::absolute(root)?;
+            // Normalised first, as --out is, so a trailing separator
+            // cannot make the link check follow a linked root.
+            let root = std::path::absolute(crate::config::normalise(&root))?;
             prepare_dir(&root)?;
             let mut dir = root;
             for part in [
@@ -294,6 +296,13 @@ pub async fn run(
             staged
                 .publish(false, &context.faults, &mut session.env.stderr)
                 .map_err(context_for)?;
+            // A stale entry under another name for the same file, such as
+            // one whose file was deleted by hand, goes too: at most one
+            // entry reaches a file.
+            let stale = owners(&dir, &manifest, &name);
+            manifest
+                .files
+                .retain(|entry| !stale.contains(&entry.file_name));
             manifest.record(recorded);
             save_manifest(
                 &manifest,

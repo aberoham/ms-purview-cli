@@ -1898,11 +1898,16 @@ fn download_setup(env: &mut Env) -> Result<(crate::download::Limits, Option<Path
     let dir = configuration_dir(env)?;
     let stored = load_config(env, &dir)?;
     let limits = crate::download::Limits::from_config(&stored.extra)?;
-    let configured = match stored
-        .extra
-        .get("defaults")
-        .and_then(|defaults| defaults.get("data_dir"))
-    {
+    let defaults = match stored.extra.get("defaults") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Object(defaults)) => Some(defaults),
+        Some(_) => {
+            return Err(PurviewError::message(
+                "config.json: defaults must be an object",
+            ))
+        }
+    };
+    let configured = match defaults.and_then(|defaults| defaults.get("data_dir")) {
         None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(text)) if !text.trim().is_empty() => {
             Some(PathBuf::from(text))

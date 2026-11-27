@@ -479,7 +479,7 @@ impl WriteCommand for CaseCreate {
         let (listing, failure) = preflight
             .graph
             .list_partial(&ReadRoute::Cases, &Query::new(), preflight.log)
-            .await;
+            .await?;
         let incomplete = failure.is_some() || listing.stopped.is_some();
         let (matches, unreadable) = same_name(listing.items, &name);
         let candidates: Vec<String> = matches

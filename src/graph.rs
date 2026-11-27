@@ -235,7 +235,7 @@ impl GraphClient {
         query: &Query,
         log: &mut (dyn Write + Send),
     ) -> Result<Listing> {
-        match self.list_partial(route, query, log).await {
+        match self.list_pages(route, query, log, false).await? {
             (listing, None) => Ok(listing),
             (_, Some(error)) => Err(error),
         }
@@ -244,13 +244,14 @@ impl GraphClient {
     /// `list`, keeping the items of the pages read before a page failed,
     /// with that failure. For reconciliation after an unclear write, where
     /// a candidate on an earlier page is worth showing; a decision that
-    /// needs the whole list uses `list`.
+    /// needs the whole list uses `list`. A failure before any page was
+    /// read is the error itself: there is nothing partial to keep.
     pub async fn list_partial(
         &self,
         route: &ReadRoute,
         query: &Query,
         log: &mut (dyn Write + Send),
-    ) -> (Listing, Option<PurviewError>) {
+    ) -> Result<(Listing, Option<PurviewError>)> {
         self.list_pages(route, query, log, false).await
     }
 
@@ -264,7 +265,7 @@ impl GraphClient {
         query: &Query,
         log: &mut (dyn Write + Send),
     ) -> Result<Listing> {
-        match self.list_pages(route, query, log, true).await {
+        match self.list_pages(route, query, log, true).await? {
             (listing, None) => Ok(listing),
             (_, Some(error)) => Err(error),
         }
@@ -276,23 +277,12 @@ impl GraphClient {
         query: &Query,
         log: &mut (dyn Write + Send),
         bound: bool,
-    ) -> (Listing, Option<PurviewError>) {
+    ) -> Result<(Listing, Option<PurviewError>)> {
         let mut items = Vec::new();
-        let mut url = match self.url(route, query) {
-            Ok(url) => url,
-            Err(error) => {
-                return (
-                    Listing {
-                        items,
-                        stopped: None,
-                    },
-                    Some(error),
-                )
-            }
-        };
+        let mut url = self.url(route, query)?;
         let mut seen = std::collections::HashSet::new();
         let own_path = url.path().to_ascii_lowercase();
-        for _ in 0..MAX_PAGES {
+        for page_number in 0..MAX_PAGES {
             seen.insert(url.as_str().to_owned());
             let page = match self
                 .get_url(&url, log)
@@ -300,29 +290,30 @@ impl GraphClient {
                 .and_then(|body| self.page(body))
             {
                 Ok(page) => page,
+                Err(error) if page_number == 0 => return Err(error),
                 Err(error) => {
-                    return (
+                    return Ok((
                         Listing {
                             items,
                             stopped: None,
                         },
                         Some(error),
-                    )
+                    ))
                 }
             };
             items.extend(page.value);
             match page.next_link {
                 None => {
-                    return (
+                    return Ok((
                         Listing {
                             items,
                             stopped: None,
                         },
                         None,
-                    )
+                    ))
                 }
                 Some(next) if bound && next.path().to_ascii_lowercase() != own_path => {
-                    return (
+                    return Ok((
                         Listing {
                             items,
                             stopped: None,
@@ -330,27 +321,27 @@ impl GraphClient {
                         Some(PurviewError::message(
                             "Graph's paging link leads to another collection than the one listed",
                         )),
-                    )
+                    ))
                 }
                 Some(next) if seen.contains(next.as_str()) => {
-                    return (
+                    return Ok((
                         Listing {
                             items,
                             stopped: Some(ListStop::RepeatedLink),
                         },
                         None,
-                    )
+                    ))
                 }
                 Some(next) => url = next,
             }
         }
-        (
+        Ok((
             Listing {
                 items,
                 stopped: Some(ListStop::PageLimit),
             },
             None,
-        )
+        ))
     }
 
     /// A collection page from a response body.

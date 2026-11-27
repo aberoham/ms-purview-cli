@@ -164,10 +164,13 @@ async fn match_case_name(
         .await?
         .complete()
         .map_err(|error| error.context("matching the case name"))?;
-    let matches: Vec<CaseRecord> = items
+    let (matches, unreadable) = split_by_name(items, name);
+    if unreadable > 0 {
+        return Err(unreadable_names("cases", unreadable));
+    }
+    let matches: Vec<CaseRecord> = matches
         .into_iter()
         .filter_map(CaseRecord::from_value)
-        .filter(|case| case.display_name.as_deref() == Some(name))
         .collect();
     match matches.as_slice() {
         [] => Err(PurviewError::CaseNotFound(
@@ -244,10 +247,13 @@ async fn match_search_name(
         .await?
         .complete()
         .map_err(|error| error.context("matching the search name"))?;
-    let matches: Vec<SearchRecord> = items
+    let (matches, unreadable) = split_by_name(items, name);
+    if unreadable > 0 {
+        return Err(unreadable_names("searches", unreadable));
+    }
+    let matches: Vec<SearchRecord> = matches
         .into_iter()
         .filter_map(SearchRecord::from_value)
-        .filter(|search| search.display_name.as_deref() == Some(name))
         .collect();
     match matches.as_slice() {
         [] => Err(PurviewError::SearchNotFound(format!(
@@ -386,17 +392,18 @@ pub fn reconcile_notes(
 pub fn unreadable_names(what: &str, count: usize) -> PurviewError {
     PurviewError::message(format!(
         "{count} {what} in Graph's list have a display name that cannot be read, so it cannot be \
-         shown that none of them has the name; nothing was sent"
+         shown that none of them has the name; pass the id instead. Nothing was sent"
     ))
 }
 
 /// Refuses text for the tenant that holds a control or invisible
 /// character. `what` names where the text came from.
 pub fn check_sent_text(what: &str, value: &str) -> Result<()> {
-    if value
-        .chars()
-        .any(|character| character.is_control() || crate::kql::lexer::is_hidden(character))
-    {
+    if value.chars().any(|character| {
+        character.is_control()
+            || crate::kql::lexer::is_hidden(character)
+            || matches!(character, '\u{2028}' | '\u{2029}')
+    }) {
         return Err(PurviewError::message(format!(
             "{what} contains a control or invisible character, such as a tab, a line break or a \
              zero-width space; type it again without one"

@@ -484,7 +484,7 @@ impl WriteCommand for Estimate {
             preflight.account,
             preflight.log,
         )
-        .await;
+        .await?;
         let candidates: Vec<String> = found
             .iter()
             .map(|operation| format!("estimate {} in case {case}", operation.describe()))

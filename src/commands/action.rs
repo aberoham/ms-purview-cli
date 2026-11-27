@@ -228,10 +228,10 @@ pub async fn started_since(
     since: DateTime<Utc>,
     account: &crate::config::AccountRecord,
     log: &mut (dyn Write + Send),
-) -> (Vec<Active>, bool, Option<PurviewError>) {
+) -> Result<(Vec<Active>, bool, Option<PurviewError>)> {
     let (listing, failure) = graph
         .list_partial(&ReadRoute::Operations(case), &Query::new(), log)
-        .await;
+        .await?;
     let incomplete = failure.is_some() || listing.stopped.is_some();
     let mut found = Vec::new();
     for item in listing.items {
@@ -257,11 +257,17 @@ pub async fn started_since(
                 .and_then(OperationId::parse)
                 .map(|id| id.to_string())
                 .unwrap_or_else(|| "?".into()),
-            status: record.status.as_str().to_owned(),
+            // Only a status Graph documents is repeated: anything else is
+            // Graph's text.
+            status: match &record.status {
+                OperationStatus::Missing => "?".to_owned(),
+                OperationStatus::Other(_) => "unknown status".to_owned(),
+                known => known.as_str().to_owned(),
+            },
             created: record.created_date_time,
         });
     }
-    (found, incomplete, failure)
+    Ok((found, incomplete, failure))
 }
 
 /// Whether `creator` (a `createdBy` identity set) is the account: by user

@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Errors about `--account`, `--client-id` and `--tenant-id` no longer repeat the value given; they name the option instead.
+- Errors about `--account`, `--client-id` and `--tenant-id`, and their `PURVIEW_ACCOUNT`, `PURVIEW_CLIENT_ID` and `PURVIEW_TENANT_ID` variables, no longer repeat the value given; they name the flag or variable instead.
 
 ## v0.1.0 - 2026-11-27
 

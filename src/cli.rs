@@ -1334,20 +1334,28 @@ async fn auth_login(
     // An explicit flag is checked first, blank included, and only an
     // absent one falls back to its variable.
     let client_flag = match login.client_id.as_deref() {
-        Some(value) => Some(auth::validate_client_id(&explicit("--client-id", value)?)?),
+        Some(value) => Some(
+            auth::validate_client_id(&explicit("--client-id", value)?)
+                .map_err(|error| error.context("--client-id"))?,
+        ),
         None => globals
             .client_id
             .as_deref()
             .map(auth::validate_client_id)
-            .transpose()?,
+            .transpose()
+            .map_err(|error| error.context("PURVIEW_CLIENT_ID"))?,
     };
     let tenant_flag = match login.tenant_id.as_deref() {
-        Some(value) => Some(auth::validate_tenant_id(&explicit("--tenant-id", value)?)?),
+        Some(value) => Some(
+            auth::validate_tenant_id(&explicit("--tenant-id", value)?)
+                .map_err(|error| error.context("--tenant-id"))?,
+        ),
         None => globals
             .tenant_id
             .as_deref()
             .map(auth::validate_tenant_id)
-            .transpose()?,
+            .transpose()
+            .map_err(|error| error.context("PURVIEW_TENANT_ID"))?,
     };
     if globals.no_input {
         return Err(PurviewError::message(
@@ -1410,9 +1418,9 @@ async fn auth_login(
     if let Some(wanted) = &wanted {
         if !wanted.is(&record) {
             return Err(PurviewError::message(format!(
-                "the browser signed in as {}, which is not the account --account names; \
-                 nothing was stored. Sign in as that account in the browser, or leave --account \
-                 out",
+                "the browser signed in as {}, which is not the account that --account or \
+                 PURVIEW_ACCOUNT names; nothing was stored. Sign in as that account in the \
+                 browser, or leave out --account and PURVIEW_ACCOUNT",
                 sanitize(&record.email)
             )));
         }
@@ -1527,7 +1535,8 @@ fn matching_accounts<'a>(
     };
     if matches.len() > 1 {
         return Err(PurviewError::message(format!(
-            "--account matches several signed-in accounts ({}); pass the account's address",
+            "the --account or PURVIEW_ACCOUNT value matches several signed-in accounts ({}); \
+             pass the account's address",
             matches
                 .iter()
                 .map(|account| sanitize(&account.email))
@@ -1866,8 +1875,8 @@ fn saved_tenant_for(
         [] => Ok(None),
         [only] => Ok(Some(only.clone())),
         _ => Err(PurviewError::message(format!(
-            "app registration {client_id} is saved against several tenants ({}); pass \
-             --tenant-id or --account",
+            "that app registration is saved against several tenants ({}); pass --tenant-id \
+             or --account",
             tenants
                 .iter()
                 .map(|tenant| sanitize(tenant))
@@ -1894,8 +1903,8 @@ fn saved_registration<'a>(
     if let Some(account) = non_empty(account) {
         return lookup(account).ok_or_else(|| {
             PurviewError::message(
-                "no app registration is saved for the --account given; pass --client-id \
-                 <application-client-id> and --tenant-id <tenant-id>",
+                "no app registration is saved for the --account or PURVIEW_ACCOUNT value; \
+                 pass --client-id <application-client-id> and --tenant-id <tenant-id>",
             )
         });
     }
@@ -1941,7 +1950,8 @@ fn select_account(
         return match matching_accounts(accounts, requested)?.as_slice() {
             [only] => Ok((*only).clone()),
             _ => Err(PurviewError::message(
-                "no signed-in account matches --account; 'purview auth list' shows the accounts",
+                "no signed-in account matches the --account or PURVIEW_ACCOUNT value; 'purview \
+                 auth list' shows the accounts",
             )),
         };
     }
@@ -2235,10 +2245,10 @@ async fn auth_logout(env: &mut Env, output: &OutputOptions, globals: &Globals) -
             // before anything is deleted.
             let file_exists = match std::fs::symlink_metadata(&path) {
                 Ok(metadata) if metadata.file_type().is_symlink() => {
-                    return Err(PurviewError::message(format!(
-                        "the account file for {} is a link; refusing to sign it out",
-                        sanitize(&key)
-                    )));
+                    return Err(PurviewError::message(
+                        "the account file for the --account or PURVIEW_ACCOUNT value is a \
+                         link; refusing to sign it out",
+                    ));
                 }
                 Ok(_) => true,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,

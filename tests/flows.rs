@@ -2265,9 +2265,13 @@ async fn exact_key_logout_refuses_a_linked_account_file_before_deleting() {
     let elsewhere = harness.root.path().join("elsewhere.json");
     std::fs::rename(&path, &elsewhere).unwrap();
     std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
-    let run = harness.run(&["auth", "logout", "--account", ALEX]).await;
+    let run = harness
+        .run(&["--json", "auth", "logout", "--account", ALEX])
+        .await;
     assert_eq!(run.outcome.exit_code, 1);
-    assert!(run.stderr().contains("is a link"), "{}", run.stderr());
+    let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
+    assert!(message.contains("is a link"), "{message}");
+    assert!(!message.contains(ALEX), "{message}");
     assert_eq!(harness.credentials(), [ALEX]);
     assert!(elsewhere.exists());
 }
@@ -3077,30 +3081,83 @@ async fn account_and_registration_errors_do_not_repeat_the_value() {
     let canary = "canary-7f3e";
     let address = format!("{canary}@contoso.example");
     let guid = "00000000-0000-4000-8000-000000000001";
-    let cases: [&[&str]; 6] = [
-        &["auth", "logout", "--account", &address],
-        &["auth", "refresh", "--account", &address],
-        &["case", "list", "--account", &address],
-        &["auth", "login", "--account", &address],
-        &["auth", "login", "--no-input", "--client-id", canary],
-        &[
-            "auth",
-            "login",
-            "--no-input",
-            "--client-id",
-            guid,
-            "--tenant-id",
-            canary,
-        ],
+    // Each case: arguments, a variable to set, and the message it must reach.
+    type Case<'a> = (&'a [&'a str], Option<(&'a str, &'a str)>, &'a str);
+    let cases: [Case; 10] = [
+        (
+            &["auth", "logout", "--account", &address],
+            None,
+            "no signed-in account matches",
+        ),
+        (
+            &["auth", "refresh", "--account", &address],
+            None,
+            "no signed-in account matches",
+        ),
+        (
+            &["case", "list", "--account", &address],
+            None,
+            "no signed-in account matches",
+        ),
+        (
+            &["case", "list"],
+            Some(("PURVIEW_ACCOUNT", &address)),
+            "no signed-in account matches",
+        ),
+        (
+            &["auth", "login", "--account", &address],
+            None,
+            "no app registration is saved",
+        ),
+        (
+            &["auth", "login"],
+            Some(("PURVIEW_ACCOUNT", &address)),
+            "no app registration is saved",
+        ),
+        (
+            &["auth", "login", "--no-input", "--client-id", canary],
+            None,
+            "--client-id: invalid client id",
+        ),
+        (
+            &["auth", "login", "--no-input"],
+            Some(("PURVIEW_CLIENT_ID", canary)),
+            "PURVIEW_CLIENT_ID: invalid client id",
+        ),
+        (
+            &[
+                "auth",
+                "login",
+                "--no-input",
+                "--client-id",
+                guid,
+                "--tenant-id",
+                canary,
+            ],
+            None,
+            "--tenant-id: invalid tenant id",
+        ),
+        (
+            &["auth", "login", "--no-input", "--client-id", guid],
+            Some(("PURVIEW_TENANT_ID", canary)),
+            "PURVIEW_TENANT_ID: invalid tenant id",
+        ),
     ];
-    for args in cases {
+    for (args, variable, expected) in cases {
         for json in [false, true] {
             let mut full: Vec<&str> = if json { vec!["--json"] } else { vec![] };
             full.extend_from_slice(args);
-            let run = harness.run(&full).await;
-            assert_eq!(run.outcome.exit_code, 1, "{full:?}");
+            let run = harness
+                .run_with(&full, |env, _| {
+                    if let Some((name, value)) = variable {
+                        env.vars.insert(name.into(), value.into());
+                    }
+                })
+                .await;
+            assert_eq!(run.outcome.exit_code, 1, "{full:?} {variable:?}");
             let shown = format!("{}{}", run.stdout(), run.stderr());
-            assert!(!shown.contains(canary), "{full:?}: {shown}");
+            assert!(shown.contains(expected), "{full:?} {variable:?}: {shown}");
+            assert!(!shown.contains(canary), "{full:?} {variable:?}: {shown}");
         }
     }
 }

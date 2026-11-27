@@ -19,7 +19,8 @@ use ms_purview_cli::error::{PurviewError, Result};
 use ms_purview_cli::graph::WriteResponse;
 use ms_purview_cli::routes::{CaseId, Query, ReadRoute, WriteRoute};
 use ms_purview_cli::safety::{
-    self, PlanInput, Planned, Preflight, Reconciled, WriteCommand, WritePlan, WriteSettings,
+    self, After, Applied, PlanInput, Planned, Preflight, Reconciled, WriteCommand, WritePlan,
+    WriteSettings,
 };
 use ms_purview_cli::secrets::store_value;
 use serde_json::{json, Value};
@@ -71,19 +72,20 @@ impl WriteCommand for StubWrite {
             effects: vec!["Creates a search over all tenant mailboxes. Places no hold.".into()],
             warnings: Vec::new(),
             preflight: vec![json!({"case": record["status"]})],
+            blocked: None,
         })
         .map(Planned::Write)
     }
 
     async fn applied(
         &mut self,
-        _preflight: &mut Preflight<'_>,
+        _after: &mut After<'_>,
         response: WriteResponse,
-    ) -> Result<Value> {
-        Ok(json!({
+    ) -> Result<Applied> {
+        Ok(Applied::result(json!({
             "status": response.status,
             "id": response.body.as_ref().map(|body| body["id"].clone()),
-        }))
+        })))
     }
 
     async fn reconcile(&mut self, _preflight: &mut Preflight<'_>) -> Result<Reconciled> {

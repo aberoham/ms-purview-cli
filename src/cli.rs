@@ -225,6 +225,30 @@ Examples:
     )]
     Download(DownloadArgs),
     #[command(
+        about = "Run a search's estimate: hit counts per location, without collecting items",
+        long_about = "\
+Run an estimate of a search over every tenant mailbox: the counts of items \
+and locations with hits, without collecting any item. Before anything is \
+sent, the search must cover all tenant mailboxes and nothing else, with no \
+custodian, non-custodial or additional sources, and its query must pass the \
+guard against generic tenant-wide searches (--allow-generic with --reason \
+overrides a query that is not narrowed). An estimate of the case not yet \
+finished may be a duplicate, and needs --allow-concurrent.
+
+After approval, the estimate is polled to its end, then its report zip is \
+downloaded and read: collection is complete when every location was \
+searched, incomplete when one failed, and unchecked when the zip was not \
+read. An estimate can succeed while locations failed; --strict makes that \
+exit 4. This command changes Purview: it shows a plan and sends it only \
+when approved, by --yes or by answering y at a terminal.",
+        after_help = "\
+Examples:
+  purview estimate <case> <search> --dry-run
+  purview estimate <case> <search> --yes --strict
+  purview estimate <case> <search> --yes --no-wait --json"
+    )]
+    Estimate(EstimateArgs),
+    #[command(
         about = "Check a query against the guard against generic tenant-wide searches",
         long_about = "\
 Build a Keyword Query Language (KQL) query from the query flags, or take one \
@@ -243,6 +267,20 @@ Examples:
     )]
     Kql(QueryArgs),
     #[command(
+        about = "Read an estimate or report zip on this computer",
+        long_about = "\
+Read an estimate or item report zip that 'purview download' wrote, with no \
+sign-in: the locations searched with their hits, the locations that failed, \
+or the summary and settings. The zip is read in memory through limits on \
+its entries and sizes (config.json limits), and nothing is extracted.",
+        after_help = "\
+Examples:
+  purview parse locations <zip> --top 10 --with-hits
+  purview parse failures <zip> --json
+  purview parse summary <zip>"
+    )]
+    Parse(ParseArgs),
+    #[command(
         about = "Show the version, commit and build target",
         after_help = "\
 Examples:
@@ -250,6 +288,67 @@ Examples:
   purview version --json"
     )]
     Version,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ParseArgs {
+    #[command(subcommand)]
+    command: ParseCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum ParseCommand {
+    #[command(
+        about = "List the locations searched, most hits first",
+        long_about = "\
+List the rows of the zip's Locations-*.csv, sorted by Count, most first, \
+then by location and subtype.",
+        after_help = "\
+Examples:
+  purview parse locations <zip> --top 10
+  purview parse locations <zip> --with-hits --subtype archive --json"
+    )]
+    Locations {
+        #[arg(value_name = "ZIP", help = "An estimate or report zip")]
+        zip: PathBuf,
+        #[arg(long, value_name = "N", help = "Only the first N locations")]
+        top: Option<usize>,
+        #[arg(long, help = "Only locations with at least one hit")]
+        with_hits: bool,
+        #[arg(long, value_enum, help = "Only primary, archive or system mailboxes")]
+        subtype: Option<SubTypeArg>,
+    },
+    #[command(
+        about = "List the locations that were not searched in full",
+        long_about = "\
+List the failed locations: the Locations-*.csv rows with Status Failed and \
+the Statistics-*.csv rows with StatType Error, joined by location and \
+subtype. An operation can succeed while locations failed.",
+        after_help = "\
+Examples:
+  purview parse failures <zip>"
+    )]
+    Failures {
+        #[arg(value_name = "ZIP", help = "An estimate or report zip")]
+        zip: PathBuf,
+    },
+    #[command(
+        about = "Show the summary and settings",
+        after_help = "\
+Examples:
+  purview parse summary <zip> --json"
+    )]
+    Summary {
+        #[arg(value_name = "ZIP", help = "An estimate or report zip")]
+        zip: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum SubTypeArg {
+    Primary,
+    Archive,
+    System,
 }
 
 /// The query flags, shared with `search create` (`docs/SPEC.md` section
@@ -780,6 +879,76 @@ struct OperationGet {
 minutes, then 60s after 10)"
     )]
     poll_interval: Option<String>,
+    #[arg(
+        long,
+        help = "Download the evidence file of an estimate, item report or export and check \
+whether every location was searched"
+    )]
+    check: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+struct EstimateArgs {
+    #[arg(value_name = "CASE", help = CASE_HELP)]
+    case: String,
+    #[arg(value_name = "SEARCH", help = SEARCH_HELP)]
+    search: String,
+    #[arg(
+        long,
+        requires = "reason",
+        help = "Run even though the guard finds the search's query not narrowed; needs --reason"
+    )]
+    allow_generic: bool,
+    #[arg(
+        long,
+        value_name = "TEXT",
+        requires = "allow_generic",
+        help = "Why a query that is not narrowed is needed; shown in the plan"
+    )]
+    reason: Option<String>,
+    #[arg(
+        long,
+        help = "Run even though an estimate of the case is not yet finished and may be a duplicate"
+    )]
+    allow_concurrent: bool,
+    #[arg(
+        long,
+        help = "Submit the estimate and stop, printing the commands that carry on"
+    )]
+    no_wait: bool,
+    #[arg(
+        long,
+        help = "Wait for the estimate, but do not download or read its report zip"
+    )]
+    no_download: bool,
+    #[arg(
+        long,
+        conflicts_with_all = ["no_download", "no_wait"],
+        help = "Exit 4 when a location failed or the report zip could not be checked"
+    )]
+    strict: bool,
+    #[arg(
+        long,
+        value_name = "DUR",
+        conflicts_with = "no_wait",
+        help = "How long to wait for the estimate, such as 30m or 2h (default 2h, at most 24h)"
+    )]
+    wait_timeout: Option<String>,
+    #[arg(
+        long,
+        value_name = "DUR",
+        conflicts_with = "no_wait",
+        help = "A fixed interval between reads, at least 5s (default: 10s, then 30s after 2 \
+minutes, then 60s after 10)"
+    )]
+    poll_interval: Option<String>,
+    #[arg(
+        long,
+        value_name = "DIR",
+        conflicts_with_all = ["no_download", "no_wait"],
+        help = "Write the report zip here instead of the data directory"
+    )]
+    out: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1333,7 +1502,34 @@ async fn run(
         Command::Download(download) => {
             read_command(env, output, globals, ReadCommand::download(download)?).await
         }
+        Command::Estimate(args) => {
+            let override_reason = match (args.allow_generic, args.reason) {
+                (true, Some(reason)) => Some(commands::sent_text("--reason", &reason)?),
+                _ => None,
+            };
+            let mut command =
+                commands::estimate::Estimate::new(commands::estimate::EstimateFlags {
+                    case: CaseKey::parse(&args.case)?,
+                    search: SearchKey::parse(&args.search)?,
+                    override_reason,
+                    allow_concurrent: args.allow_concurrent,
+                    no_wait: args.no_wait,
+                    no_download: args.no_download,
+                    strict: args.strict,
+                    timing: poll::timing(
+                        args.wait_timeout.as_deref(),
+                        args.poll_interval.as_deref(),
+                        poll::DEFAULT_WAIT_TIMEOUT,
+                    )?,
+                    out: args
+                        .out
+                        .map(|out| not_blank("--out", out).map(PathBuf::from))
+                        .transpose()?,
+                });
+            write_command(env, output, globals, &mut command).await
+        }
         Command::Kql(query) => kql(env, output, query),
+        Command::Parse(parse) => parse_zip(env, output, parse.command),
         Command::Version => version(env, output),
     }
 }
@@ -1353,6 +1549,45 @@ fn kql(env: &mut Env, output: &OutputOptions, query: QueryArgs) -> Result<Outcom
     })
 }
 
+/// `purview parse`: local. `--select` is checked, then config.json's
+/// limits, then the zip is read.
+fn parse_zip(env: &mut Env, output: &OutputOptions, command: ParseCommand) -> Result<Outcome> {
+    use commands::parse::{LocationFilters, SubType, What};
+    let (zip, what) = match command {
+        ParseCommand::Locations {
+            zip,
+            top,
+            with_hits,
+            subtype,
+        } => (
+            zip,
+            What::Locations(LocationFilters {
+                top,
+                with_hits,
+                sub_type: subtype.map(|subtype| match subtype {
+                    SubTypeArg::Primary => SubType::Primary,
+                    SubTypeArg::Archive => SubType::Archive,
+                    SubTypeArg::System => SubType::System,
+                }),
+            }),
+        ),
+        ParseCommand::Failures { zip } => (zip, What::Failures),
+        ParseCommand::Summary { zip } => (zip, What::Summary),
+    };
+    if zip.as_os_str().is_empty() {
+        return Err(PurviewError::message("<ZIP> was given an empty value"));
+    }
+    crate::output::selected_indices(&output.select, what.columns())?;
+    let dir = configuration_dir(env)?;
+    let stored = load_config(env, &dir)?;
+    let limits = crate::report::ReportLimits::from_config(&stored.extra)?;
+    let produced = commands::parse::run(env, output, &zip, limits, what)?;
+    Ok(Outcome {
+        exit_code: produced.exit_code,
+        stdout_value: produced.document,
+    })
+}
+
 /// A read command with its arguments checked, before any sign-in or
 /// network call.
 enum ReadCommand {
@@ -1361,7 +1596,12 @@ enum ReadCommand {
     SearchList(CaseKey),
     SearchGet(CaseKey, SearchKey),
     OperationList(CaseKey, commands::operation::ListFilters),
-    OperationGet(CaseKey, OperationId, Option<commands::operation::Wait>),
+    OperationGet(
+        CaseKey,
+        OperationId,
+        Option<commands::operation::Wait>,
+        bool,
+    ),
     Download(commands::download::Request),
 }
 
@@ -1476,7 +1716,7 @@ impl ReadCommand {
                 } else {
                     None
                 };
-                Self::OperationGet(case, operation, wait)
+                Self::OperationGet(case, operation, wait, get.check)
             }
         })
     }
@@ -1497,7 +1737,17 @@ async fn read_command(
     }
     // The download settings in config.json are checked before sign-in.
     let download_setup = match &command {
-        ReadCommand::Download(_) => Some(download_setup(env)?),
+        ReadCommand::Download(_) | ReadCommand::OperationGet(.., true) => {
+            Some(download_setup(env)?)
+        }
+        _ => None,
+    };
+    let report_limits = match &command {
+        ReadCommand::OperationGet(.., true) => {
+            let dir = configuration_dir(env)?;
+            let stored = load_config(env, &dir)?;
+            Some(crate::report::ReportLimits::from_config(&stored.extra)?)
+        }
         _ => None,
     };
     let (account, credential) = signed_in(env, globals)?;
@@ -1505,26 +1755,9 @@ async fn read_command(
     let provider = Arc::new(token_provider(env, credential)?);
     let trace = open_trace(env, globals)?;
     let graph = Arc::new(graph_client(env, globals, provider.clone(), trace.clone())?);
-    let download_context = match download_setup {
-        Some((limits, data_root)) => Some(commands::download::Context {
-            client: crate::download::DownloadClient::new(
-                crate::download::DownloadSettings {
-                    rule: env.download_rule.clone(),
-                    resolve: env.download_resolve.clone(),
-                    idle_timeout: env.download_idle_timeout,
-                    verbose: globals.verbose,
-                    trace,
-                },
-                provider,
-                env.redactor.clone(),
-                env.clock.clone(),
-            )?,
-            limits,
-            data_root,
-            faults: env.download_faults.clone(),
-        }),
-        None => None,
-    };
+    let download_context = download_setup
+        .map(|setup| download_context(env, globals, provider, trace, setup))
+        .transpose()?;
     let mut session = Session {
         env,
         output,
@@ -1542,8 +1775,14 @@ async fn read_command(
         ReadCommand::OperationList(case, filters) => {
             commands::operation::list(&mut session, case, filters).await
         }
-        ReadCommand::OperationGet(case, operation, wait) => {
-            commands::operation::get(&mut session, case, operation, *wait).await
+        ReadCommand::OperationGet(case, operation, wait, _) => {
+            let check = match (&download_context, report_limits) {
+                (Some(download), Some(limits)) => {
+                    Some(commands::operation::Check { download, limits })
+                }
+                _ => None,
+            };
+            commands::operation::get(&mut session, case, operation, *wait, check).await
         }
         ReadCommand::Download(request) => match &download_context {
             Some(context) => commands::download::run(&mut session, request, context).await,
@@ -1564,6 +1803,33 @@ async fn read_command(
     Ok(Outcome {
         exit_code: produced.exit_code,
         stdout_value: produced.document,
+    })
+}
+
+/// The download client and settings for a command that downloads.
+fn download_context(
+    env: &Env,
+    globals: &Globals,
+    provider: Arc<StoredTokenProvider>,
+    trace: Option<Arc<TraceSink>>,
+    (limits, data_root): (crate::download::Limits, Option<PathBuf>),
+) -> Result<commands::download::Context> {
+    Ok(commands::download::Context {
+        client: crate::download::DownloadClient::new(
+            crate::download::DownloadSettings {
+                rule: env.download_rule.clone(),
+                resolve: env.download_resolve.clone(),
+                idle_timeout: env.download_idle_timeout,
+                verbose: globals.verbose,
+                trace,
+            },
+            provider,
+            env.redactor.clone(),
+            env.clock.clone(),
+        )?,
+        limits,
+        data_root,
+        faults: env.download_faults.clone(),
     })
 }
 
@@ -1597,8 +1863,21 @@ async fn write_command(
     let settings = safety::WriteSettings {
         naming: crate::naming::Naming::from_config(&stored.extra)?,
         guard: crate::kql::GuardConfig::from_config(&stored.extra)?,
+        // Read only by a command that reads report zips, so that a bad
+        // `limits` setting does not stop the other writes.
+        report: if command.downloads() {
+            crate::report::ReportLimits::from_config(&stored.extra)?
+        } else {
+            crate::report::ReportLimits::from_config(&Default::default())?
+        },
     };
     command.check(&settings)?;
+    // The download settings are checked before sign-in, as for download.
+    let download_setup = if command.downloads() {
+        Some(download_setup(env)?)
+    } else {
+        None
+    };
     let (account, credential) = signed_in_with(env, globals, &dir, &stored)?;
     let email = account.email.clone();
     let may_write = crate::auth::graph_permissions(&credential.graph.scope)
@@ -1631,20 +1910,31 @@ async fn write_command(
     }
     let provider = Arc::new(token_provider(env, credential)?);
     let trace = open_trace(env, globals)?;
-    let graph = Arc::new(graph_client(env, globals, provider, trace)?);
-    run_write(env, output, globals, &account, &graph, command)
-        .await
-        .map_err(|error| {
-            if error.is_token_unavailable() {
-                error.context(format!(
-                    "getting a Graph token for {} (if the identity platform refused the refresh, \
+    let graph = Arc::new(graph_client(env, globals, provider.clone(), trace.clone())?);
+    let download = download_setup
+        .map(|setup| download_context(env, globals, provider, trace, setup))
+        .transpose()?;
+    run_write(
+        env,
+        output,
+        globals,
+        &account,
+        &graph,
+        download.as_ref(),
+        command,
+    )
+    .await
+    .map_err(|error| {
+        if error.is_token_unavailable() {
+            error.context(format!(
+                "getting a Graph token for {} (if the identity platform refused the refresh, \
                      sign in again with 'purview auth login')",
-                    sanitize(&email)
-                ))
-            } else {
-                error
-            }
-        })
+                sanitize(&email)
+            ))
+        } else {
+            error
+        }
+    })
 }
 
 /// Preflight, decision, send and output for one signed-in write. The
@@ -1657,9 +1947,11 @@ async fn run_write(
     globals: &Globals,
     account: &AccountRecord,
     graph: &Arc<GraphClient>,
+    download: Option<&commands::download::Context>,
     command: &mut dyn WriteCommand,
 ) -> Result<Outcome> {
     let json = matches!(output.format, OutputFormat::Json);
+    let clock = env.clock.clone();
     let settings = ApprovalSettings {
         dry_run: globals.dry_run,
         yes: globals.yes,
@@ -1674,6 +1966,7 @@ async fn run_write(
             account,
             log: &mut env.stderr,
             verbose: globals.verbose,
+            clock: clock.as_ref(),
         })
         .await?;
     let plan = match planned {
@@ -1698,6 +1991,11 @@ async fn run_write(
             "the write's plan names another account or tenant than the signed-in one; nothing \
              was sent",
         ));
+    }
+    // A blocked plan is shown by a dry run, and refused otherwise, before
+    // anyone is asked.
+    if let (Some(reason), false) = (plan.blocked(), settings.dry_run) {
+        return Err(PurviewError::ConcurrentOperation(reason.to_owned()));
     }
     let decision =
         safety::decide(plan, settings, input.as_ref(), &mut env.stderr, &redactor).await?;
@@ -1754,6 +2052,15 @@ async fn run_write(
             if write.by_flag() && !json {
                 write.plan().write_text(&mut env.stderr, &redactor)?;
             }
+            command
+                .recheck(&mut Preflight {
+                    graph,
+                    account,
+                    log: &mut env.stderr,
+                    verbose: globals.verbose,
+                    clock: clock.as_ref(),
+                })
+                .await?;
             let (plan, response) = match graph.send_write(write, &mut env.stderr).await {
                 Ok(sent) => sent,
                 Err(PurviewError::WriteOutcomeUnknown { reason, .. }) => {
@@ -1763,6 +2070,7 @@ async fn run_write(
                             account,
                             log: &mut env.stderr,
                             verbose: globals.verbose,
+                            clock: clock.as_ref(),
                         })
                         .await;
                     // The error's code and status only: its message can
@@ -1789,13 +2097,17 @@ async fn run_write(
                 }
                 Err(error) => return Err(error),
             };
-            let result = command
+            let applied = command
                 .applied(
-                    &mut Preflight {
-                        graph,
-                        account,
-                        log: &mut env.stderr,
-                        verbose: globals.verbose,
+                    &mut safety::After {
+                        session: commands::Session {
+                            env: &mut *env,
+                            output,
+                            graph: graph.clone(),
+                            account: account.clone(),
+                            verbose: globals.verbose,
+                        },
+                        download,
                     },
                     response,
                 )
@@ -1803,19 +2115,60 @@ async fn run_write(
                 .map_err(|error| {
                     error.context("the write was applied, but its result could not be read")
                 })?;
+            let (result, reasons) = match applied {
+                safety::Applied::Result { result, reasons } => (result, reasons),
+                safety::Applied::Produced(produced) => {
+                    return Ok(Outcome {
+                        exit_code: produced.exit_code,
+                        stdout_value: produced.document,
+                    })
+                }
+            };
+            let exit_code = if reasons.is_empty() { 0 } else { 4 };
             if json {
-                let value = output.untrusted_json_value(
+                // Exit 4 prints the whole envelope, whatever --results-only
+                // says, so that the outcome has somewhere to go.
+                let options = OutputOptions {
+                    results_only: output.results_only && reasons.is_empty(),
+                    ..output.clone()
+                };
+                let mut value = options.untrusted_json_value(
                     safety::results_value(&plan, true, Some(result)),
                     1,
                     &redactor,
                 )?;
-                return Ok(Outcome::success(Some(value)));
+                if let (false, Value::Object(object)) = (reasons.is_empty(), &mut value) {
+                    // A reason can quote Graph's message, which can hold a
+                    // signed URL: redacted as the rest of the document is.
+                    let outcome = serde_json::json!({"code": "Incomplete", "reasons": reasons});
+                    object.insert(
+                        "outcome".into(),
+                        redactor.redact_value(&crate::trace::redact_urls(&outcome, &redactor)),
+                    );
+                }
+                return Ok(Outcome {
+                    exit_code,
+                    stdout_value: Some(value),
+                });
             }
             writeln!(env.stdout, "Applied: purview {}", plan.command())?;
             let shown = redactor.redact_value(&crate::trace::redact_urls(&result, &redactor));
             let text = serde_json::to_string_pretty(&shown)?;
             writeln!(env.stdout, "{}", sanitize_multiline(&text))?;
-            Ok(Outcome::success(None))
+            for reason in &reasons {
+                writeln!(
+                    env.stderr,
+                    "incomplete: {}",
+                    sanitize(&crate::redact::shown(
+                        reason["message"].as_str().unwrap_or_default(),
+                        &redactor
+                    ))
+                )?;
+            }
+            Ok(Outcome {
+                exit_code,
+                stdout_value: None,
+            })
         }
     }
 }

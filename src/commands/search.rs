@@ -22,7 +22,8 @@ use crate::naming::{Naming, Values};
 use crate::output::{sanitize, write_fields, write_rows, OutputFormat};
 use crate::routes::{CaseId, Query, ReadRoute, SearchId, SearchSources, WriteRoute};
 use crate::safety::{
-    PlanInput, Planned, Preflight, Reconciled, WriteCommand, WritePlan, WriteSettings,
+    After, Applied, PlanInput, Planned, Preflight, Reconciled, WriteCommand, WritePlan,
+    WriteSettings,
 };
 
 pub const LIST_COLUMNS: &[&str] = &["ID", "NAME", "SCOPE", "CREATED", "QUERY"];
@@ -450,28 +451,26 @@ impl WriteCommand for SearchCreate {
                     "guard: the query is not narrowed; overridden with --allow-generic".to_owned()
                 }),
             ],
+            blocked: None,
         })?))
     }
 
-    async fn applied(
-        &mut self,
-        preflight: &mut Preflight<'_>,
-        response: WriteResponse,
-    ) -> Result<Value> {
+    async fn applied(&mut self, after: &mut After<'_>, response: WriteResponse) -> Result<Applied> {
+        let log = &mut after.session.env.stderr;
         if response.status != 201 {
             let _ = writeln!(
-                preflight.log,
+                log,
                 "warning: Graph answered HTTP {}, where 201 was observed",
                 response.status
             );
         }
         let Some(body) = response.body else {
             let _ = writeln!(
-                preflight.log,
+                log,
                 "warning: Graph's answer has no search record; 'purview search list <case>' \
                  finds the new search"
             );
-            return Ok(Value::Null);
+            return Ok(Applied::result(Value::Null));
         };
         let record = SearchRecord::from_value(body.clone());
         let check = |what: &str, echoed: Option<&str>, sent: &str, log: &mut dyn Write| {
@@ -490,7 +489,7 @@ impl WriteCommand for SearchCreate {
             "contentQuery",
             record.as_ref().and_then(|r| r.content_query.as_deref()),
             &self.kql,
-            preflight.log,
+            log,
         );
         check(
             "dataSourceScopes",
@@ -498,7 +497,7 @@ impl WriteCommand for SearchCreate {
                 .as_ref()
                 .and_then(|r| r.data_source_scopes.as_deref()),
             "allTenantMailboxes",
-            preflight.log,
+            log,
         );
         if record
             .as_ref()
@@ -507,12 +506,12 @@ impl WriteCommand for SearchCreate {
             .is_none()
         {
             let _ = writeln!(
-                preflight.log,
+                log,
                 "warning: Graph's answer carries no valid search id; 'purview search list \
                  <case>' finds the new search"
             );
         }
-        Ok(body)
+        Ok(Applied::result(body))
     }
 
     async fn reconcile(&mut self, preflight: &mut Preflight<'_>) -> Result<Reconciled> {

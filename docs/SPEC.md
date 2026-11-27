@@ -454,6 +454,47 @@ An operation can report `succeeded` while some locations failed (Observed). The 
 warns about this on stderr, and `--strict` turns it into exit 4 (see the collection check
 above).
 
+Settled in PR 2.3:
+- Further flags: `--allow-generic --reason`, `--allow-concurrent`, `--no-wait`,
+  `--wait-timeout`, `--poll-interval` and `--out`. `--strict` and `--out` conflict with
+  `--no-download` and `--no-wait`; the timing flags conflict with `--no-wait`.
+- A plan whose concurrency check (section 6.7) found an estimate not yet finished is
+  `blocked`: a dry run prints it with a warning per operation, and any other run fails with
+  `ConcurrentOperation` before anyone is asked, unless `--allow-concurrent` is given.
+- `result` is `{"operationId", "operationStatus", "collection", "indexedItemCount",
+  "indexedItemsSize", "unindexedItemCount", "mailboxCount", "locationsSearched",
+  "topLocations", "failedLocations", "files"}`: the 10 locations with most hits (at least
+  one), each failed location with `sources` (`locations`, `statistics` or both), and each
+  file with its path, size, SHA-256 and download status. `--no-wait` gives `operationId`,
+  `collection: unchecked` and `resume`, the commands that carry on.
+- A finished estimate that did not succeed, a file that cannot be downloaded, or `--strict`
+  with `FailedLocations` or `EvidenceMissing`, exits 4 with the write envelope and an
+  `outcome`, whole even under `--results-only`. The wait deadline and Ctrl-C, during the
+  wait or the download, give the operation-wait shapes of section 3.3.
+- The reason of `--allow-generic` is in the plan's warnings only; the download manifest
+  does not record it yet.
+- After approval and before the send, `WriteCommand::recheck` reads the search again
+  through the same checks. A scope, sources or query that no longer pass refuse with the
+  check's own code; a query or verdict that pass but differ from the plan refuse with
+  `SearchChanged`. A change after that read is not caught: Graph offers no conditional
+  action (Assumption).
+- The answer must be 202, and the operation the `Location` header names must be an
+  `estimateStatistics` operation with estimate detail before any file is fetched; anything
+  else is `UnexpectedLocation`.
+- The concurrency check and the source lists use `GraphClient::list_bound`, which refuses a
+  paging link to another path. An operation entry whose action or status cannot be read
+  counts as a possible duplicate.
+- `--wait-timeout` covers the wait. The download has its own timeouts (section 4.7); Ctrl-C
+  during it gives exit 130 with the time since the POST, as `operation get --check` does.
+- Exit-4 reasons are redacted as the rest of the document, after they are added.
+- Without `--allow-concurrent`, the recheck also lists the case's operations again. An
+  error in the recheck keeps its own code, with context saying nothing was sent.
+- `operation get --check` stopped by Ctrl-C resumes with `operation get <case> <op>
+  --check` alone, never with `download`, which would fetch an export's item content.
+- A downloaded zip's declared entry count is checked against 1,000,000 (the export cap)
+  before the zip crate indexes it; a report is held to `limits.report_zip_entries` when it
+  is read.
+
 #### `purview report <case> <search>` (write: action)
 
 Further flags: `--name NAME`, `--no-teams-context`, `--no-download`, `--strict`, `--profile`.
@@ -533,6 +574,12 @@ not apply here: a wrong id fails at once.
 status is not `succeeded` exits 4, with or without `--wait`. `--wait-timeout` takes whole
 seconds or a duration such as `90s`, `15m`, `2h` or `1h30m`, from 1 second to 24 hours;
 `--wait-timeout` and `--poll-interval` need `--wait`.
+
+Settled in PR 2.3: `--check` downloads every file of an estimate or item report through the
+same code as `download`, into the data directory, and reads the first that is a report zip;
+for an export it downloads only the file whose name starts with `Reports-` (Assumption).
+An operation that is not finished is `unchecked`, with a notice. `--check` changes no exit
+code by itself.
 
 #### `purview download <case> <op>` (read)
 
@@ -1052,10 +1099,29 @@ if PR 4.1 finds it.
   prototype's Python reader needed one raised.
 - Headers are indexed by name. A missing column is a named warning, not a failure.
 
+Settled in PR 2.3: the ratio is checked once an entry has given 1 MiB, so that a small,
+very repetitive file is not refused; the entry cap is `limits.report_zip_entries`; a zip
+that is not a zip, has too many entries or a name that leaves its folder, or passes a
+limit, is `HostileZip`, whose message never names an entry. The column names, read by
+name, are those of the notes: `Locations-*.csv` `DataSourceName`, `DataSourceType`,
+`Location`, `LocationId`, `LocationType`, `LocationSubType`, `Count`, `Size`, `Status`,
+`ErrorWarning`, `Query`; `Statistics-*.csv` `DataSourceName`, `DataSourceType`, `Location`,
+`LocationType`, `LocationSubType`, `StatType`, `StatName`, `OriginalStatName`, `Value`
+(Observed). The collection check is `unchecked` when the file it reads, or its `Location`,
+`Status` or `StatType` column, is missing, when a row lacks the location, status or
+`StatType` it needs, or when the zip holds more than one Locations or Statistics file. The
+entry count declared by the end of central directory record (or its ZIP64 form) is read
+before the zip is indexed, and an index with fewer entries than declared (a name listed
+twice) is `HostileZip`. The ratio's compressed size is at most the file's size. The record
+budget is checked on each record's own bytes; the reader below allows two 64 KiB buffers
+more as a backstop.
+
 **Summary and Settings.** These are parsed as before:
 
 - `Summary-*.csv` has no header. It is key, value, description rows, with blank lines
-  between groups (Observed). Item-report summaries add a help link, `Export Name`, an item
+  between groups (Observed). It is read whole, up to `limits.csv_max_record_bytes`, and
+  split at blank lines outside quoted fields (settled in PR 2.3: the `csv` crate skips blank
+  lines and its line numbers do not show them). Item-report summaries add a help link, `Export Name`, an item
   count table, an "Informational" table and a "Consumption summary" (Observed). The parser
   returns groups and a map of known keys.
 - `StartTime (UTC)` uses the format `03/14/2026 9:07:41 AM` (an invented example; format Observed). It is parsed with
@@ -1063,7 +1129,9 @@ if PR 4.1 finds it.
 - `Settings-*.csv` has the header `"Setting Name","Value","Description"`, and some rows have
   two fields (Observed).
 
-**Locations and Statistics.** Columns and meanings as in the notes (Observed):
+**Locations and Statistics.** Columns and meanings as in the notes (Observed, and again by
+the PR 2.3 live check, which also saw Summary's `LocationCount` equal the number of
+Locations rows):
 
 - `Locations-*.csv` has one row per location searched. `LocationSubType` is one of
   `PrimaryMailBox`, `ArchiveMailBox`, `SystemMailbox`. `Status` is `Succeeded` or `Failed`.

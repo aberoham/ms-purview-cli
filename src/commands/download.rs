@@ -75,12 +75,20 @@ impl Status {
     }
 }
 
-struct Done {
-    server_name: String,
-    path: PathBuf,
-    bytes: u64,
-    sha256: String,
+/// One file written or found already downloaded.
+pub struct Done {
+    pub server_name: String,
+    pub path: PathBuf,
+    pub bytes: u64,
+    pub sha256: String,
     status: Status,
+}
+
+impl Done {
+    /// `downloaded`, `alreadyDownloaded` or `recovered`.
+    pub fn status(&self) -> &'static str {
+        self.status.as_str()
+    }
 }
 
 /// One file's plan.
@@ -119,6 +127,29 @@ pub async fn run(
         &mut session.env.stderr,
         std::iter::once(&record),
     );
+    let fetched = fetch(session, case, &record, request, context).await?;
+    finish(session, fetched.done, fetched.reasons, fetched.interrupted)
+}
+
+/// What `fetch` wrote, and why the download is incomplete, if it is.
+pub struct Fetched {
+    pub done: Vec<Done>,
+    /// Exit-4 reasons: the operation did not succeed, or a file cannot be
+    /// downloaded.
+    pub reasons: Vec<Value>,
+    /// Ctrl-C stopped it; the files already published are kept.
+    pub interrupted: bool,
+}
+
+/// Downloads the files of `record`, a finished operation of `case` read
+/// just before, as `request` asks, printing nothing but notices.
+pub async fn fetch(
+    session: &mut Session<'_>,
+    case: CaseId,
+    record: &crate::model::wire::OperationRecord,
+    request: &Request,
+    context: &Context,
+) -> Result<Fetched> {
     let files: Vec<FileRecord> = record
         .detail()
         .map(|detail| detail.files().to_vec())
@@ -136,7 +167,7 @@ pub async fn run(
         }
     }
     let mut reasons: Vec<Value> = Vec::new();
-    if let Some(reason) = super::operation::incomplete_reason(&record) {
+    if let Some(reason) = super::operation::incomplete_reason(record) {
         let message = shown(session, reason["message"].as_str().unwrap_or_default());
         reasons.push(json!({"code": reason["code"], "message": message}));
     }
@@ -155,7 +186,11 @@ pub async fn run(
                 request.operation
             );
         }
-        return finish(session, Vec::new(), reasons, false);
+        return Ok(Fetched {
+            done: Vec::new(),
+            reasons,
+            interrupted: false,
+        });
     }
     // A known size over the limit is refused before anything is written.
     for (index, (file, _)) in candidates.iter().enumerate() {
@@ -266,7 +301,11 @@ pub async fn run(
         .await
         .map_err(context_for)?;
         let Some(staged) = staged else {
-            return finish(session, done, reasons, true);
+            return Ok(Fetched {
+                done,
+                reasons,
+                interrupted: true,
+            });
         };
         let finished = Done {
             server_name: file.server_name.clone(),
@@ -314,7 +353,11 @@ pub async fn run(
         }
         done.push(finished);
     }
-    finish(session, done, reasons, false)
+    Ok(Fetched {
+        done,
+        reasons,
+        interrupted: false,
+    })
 }
 
 struct Ids {

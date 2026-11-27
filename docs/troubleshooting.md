@@ -215,9 +215,10 @@ zip:
 - for an item report: `Locations-*.csv` rows with `Status=Failed` (an item
   report has no `Statistics-*.csv`).
 
-From v0.2, `purview parse failures <zip>` lists both, and the actions take
-`--strict`, which exits 4 when a run has failed locations or its evidence
-cannot be read.
+`purview parse failures <zip>` lists both, `purview operation get <case>
+<op> --check` downloads the evidence and reports `collection`, and
+`purview estimate` takes `--strict`, which exits 4 when a run has failed
+locations or its evidence cannot be read.
 
 `purview operation get` exits 4 when the operation itself did not succeed
 (`partiallySucceeded`, `failed` or `submissionFailed`), with the reasons.

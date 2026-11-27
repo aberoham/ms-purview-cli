@@ -333,3 +333,36 @@ for PR 2.3. Outputs and traces stayed outside the repository.
   `contentQuery`, `createdBy`, `createdDateTime`, `dataSourceScopes`, `description`,
   `displayName`, `id`, `lastModifiedBy`, `lastModifiedDateTime`. No warning. (Observed)
 - **`createdBy`:** the new search carried `createdBy`; the case record did not. (Observed)
+
+### PR 2.3: `estimate`
+
+Status: **run on 27 November 2026** from a local build of the PR 2.3 branch, on the search
+that the PR 2.2 check created (a narrow query: a phrase and one participant). Outputs,
+traces and the report zip stayed outside the repository.
+
+- **Preflight:** the search `GET`, then its `custodianSources`, `noncustodialSources` and
+  `additionalSources` (each 200, empty) and the case's operations, then the same five
+  reads again after approval, then one POST. (Observed)
+- **POST:** `estimateStatistics` answered **202** with a `Location` header in the key form
+  `https://graph.microsoft.com/v1.0/security/cases/ediscoverycases('<case>')/operations('<op>')`,
+  which the parser accepts. (Observed) This settles the check SPEC section 4.4 asks of
+  PR 2.3.
+- **Wait:** 15 reads of the operation, then `succeeded`. (Observed)
+- **Download:** one download `GET` to the regional proxy host, 200, a file of about half a
+  megabyte. (Observed)
+- **Zip contents:** `Locations-<time>.csv`, `Settings-<time>.csv`, `Statistics-<time>.csv`
+  and `Summary-<time>.csv`, each with a byte-order mark. The headers were exactly those
+  the parser reads: Locations `DataSourceName,DataSourceType,Location,LocationId,
+  LocationType,LocationSubType,Count,Size,Status,ErrorWarning,Query`; Statistics
+  `DataSourceName,DataSourceType,Location,LocationType,LocationSubType,StatType,StatName,
+  OriginalStatName,Value`; Settings `"Setting Name","Value","Description"`; Summary has no
+  header row. (Observed)
+- **Locations:** on the order of fourteen thousand rows, one per location and subtype
+  (primary mailboxes most, then system and archive mailboxes); Summary's `LocationCount`
+  equalled the number of Locations rows. (Observed)
+- **Statistics:** for this query, the only rows were `StatType: Error`. (Observed)
+- **Collection:** one location failed, in both files, with a message saying the failure
+  could be transient; the operation still reported `succeeded`, and the command warned and
+  reported `collection: incomplete`. (Observed) This is the case `--strict` exists for.
+- **Counts:** the result's `mailboxCount` (locations with hits) was a few dozen, with a
+  few hundred indexed items and no unindexed items. (Observed)

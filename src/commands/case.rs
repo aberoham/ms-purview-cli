@@ -18,7 +18,8 @@ use crate::naming::{Naming, Values};
 use crate::output::{write_fields, write_rows, OutputFormat};
 use crate::routes::{CaseId, Query, ReadRoute, WriteRoute};
 use crate::safety::{
-    PlanInput, Planned, Preflight, Reconciled, WriteCommand, WritePlan, WriteSettings,
+    After, Applied, PlanInput, Planned, Preflight, Reconciled, WriteCommand, WritePlan,
+    WriteSettings,
 };
 use std::io::Write;
 
@@ -423,35 +424,33 @@ impl WriteCommand for CaseCreate {
             preflight: vec![Value::String(format!(
                 "cases listed: {listed}; none has this name"
             ))],
+            blocked: None,
         })?))
     }
 
-    async fn applied(
-        &mut self,
-        preflight: &mut Preflight<'_>,
-        response: WriteResponse,
-    ) -> Result<Value> {
+    async fn applied(&mut self, after: &mut After<'_>, response: WriteResponse) -> Result<Applied> {
+        let log = &mut after.session.env.stderr;
         if response.status != 201 {
             let _ = writeln!(
-                preflight.log,
+                log,
                 "warning: Graph answered HTTP {}, where 201 was observed",
                 response.status
             );
         }
         let Some(body) = response.body else {
             let _ = writeln!(
-                preflight.log,
+                log,
                 "warning: Graph's answer has no case record; 'purview case list --name <text>' \
                  finds the new case"
             );
-            return Ok(Value::Null);
+            return Ok(Applied::result(Value::Null));
         };
         let record = CaseRecord::from_value(body.clone());
         match record.as_ref().map(|case| &case.status) {
             Some(CaseStatus::Active) => {}
             Some(status) => {
                 let _ = writeln!(
-                    preflight.log,
+                    log,
                     "warning: the new case's status is {}, where active was observed",
                     case_status(status)
                 );
@@ -465,12 +464,12 @@ impl WriteCommand for CaseCreate {
             .is_none()
         {
             let _ = writeln!(
-                preflight.log,
+                log,
                 "warning: Graph's answer carries no valid case id; 'purview case list --name \
                  <text>' finds the new case"
             );
         }
-        Ok(body)
+        Ok(Applied::result(body))
     }
 
     async fn reconcile(&mut self, preflight: &mut Preflight<'_>) -> Result<Reconciled> {

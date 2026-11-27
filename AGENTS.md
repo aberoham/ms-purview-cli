@@ -12,11 +12,12 @@ implements one item of its section 11 and nothing from later items. Today
 the binary has `purview version`, `purview auth login` (device code, or
 `--browser`), `auth refresh`, `auth status`, `auth list` and `auth logout`,
 `case list`, `case get`, `case create`, `search list`, `search get`,
-`search create`, `operation list` and `operation get` (with `--wait`),
-`download`, `kql`, and the global options `--verbose`, `--timeout`,
-`--trace` and `--wrap-untrusted`. `case create` and `search create` are the
-write commands so far; they run through the safety framework
-(`src/safety.rs`) with `--yes`, `--dry-run` and `--no-write`. Do not add
+`search create`, `estimate`, `operation list` and `operation get` (with
+`--wait` and `--check`), `download`, `parse locations`, `parse failures`,
+`parse summary`, `kql`, and the global options `--verbose`, `--timeout`,
+`--trace` and `--wrap-untrusted`. `case create`, `search create` and
+`estimate` are the write commands so far; they run through the safety
+framework (`src/safety.rs`) with `--yes`, `--dry-run` and `--no-write`. Do not add
 stubs for commands that a later pull request owns.
 
 The tool never places, changes or releases a hold, never deletes or reopens a
@@ -89,6 +90,33 @@ that the test files pass their own scan.
   `cli` prints the document. `commands/kql.rs` is `purview kql`, which is
   local: `cli` builds the query and reads `guard` from `config.json`, with
   no sign-in.
+- `src/commands/action.rs` is the action preflight of `docs/SPEC.md`
+  sections 6.4 and 6.7: `check_search` (the search by id or unique name,
+  `dataSourceScopes` exactly `allTenantMailboxes` or `ScopeUnverified` /
+  `ScopeNotAllowed`, the three source lists empty to their last page or
+  `SearchHasSources` / `ScopeUnverified`, and the guard on its current
+  query), `active_operations` (operations of an action not yet finished,
+  which may be duplicates: `$expand=search` is refused, Observed) and
+  `started_since` (reconciliation by `createdBy` and creation time).
+  `commands/estimate.rs` is `estimate`: a plan that a duplicate blocks
+  without `--allow-concurrent` (`ConcurrentOperation`), then after the 202
+  the `Location` header (`GraphClient::operation_in_location`, key or path
+  form, `UnexpectedLocation` otherwise), the wait (`Poller` with a 30-second
+  not-found grace), the download through `commands::download::fetch`, and
+  the collection check; `--strict` adds `FailedLocations` or
+  `EvidenceMissing`. `commands/parse.rs` is `parse locations|failures|
+  summary`, local. `operation get --check` downloads the evidence file and
+  sets `collection`.
+- `src/zipread.rs` opens report zips under `ZipLimits` (entries, bytes per
+  entry and in total, and a 1,000:1 ratio checked past 1 MiB, all counted
+  on bytes read), refusing a name that fails `enclosed_name()` as
+  `HostileZip`; nothing is extracted. `src/report/` reads the files:
+  `csvread.rs` (flexible records, the byte-order mark, a per-record byte
+  budget, `RecordTooLarge`), `estimate.rs` (Locations, Statistics errors,
+  their union as failed locations, `Collection`), `summary.rs` (Summary
+  groups split at blank lines outside quotes, known keys, Settings), and
+  `mod.rs` (`ReportFiles`, the zip's `Kind`, `ReportLimits` from
+  `limits`).
 - `src/kql/` is the guard of `docs/SPEC.md` section 6.3. `lexer.rs` lexes
   each restriction (`participants:…`, `subject:…`, `kind:…`, `sent>=…`)
   as one token with its value checked; `parser.rs` is the
@@ -218,13 +246,20 @@ timeout. It carries the Graph base URL (`origin::GRAPH_BASE` in production,
   `approve` builds from an `Approval` only this module makes, and the
   `WriteCommand` trait (`check`, `plan`, `applied`, `reconcile`, which
   returns `Reconciled`: candidates by id, and notes). `check`
-  gets the `WriteSettings` (`naming` and `guard` from `config.json`);
-  `plan` returns `Planned::Write(WritePlan)` or, when nothing needs to be
-  sent, `Planned::Existing` (printed as `{"applied": false, "plan": null,
-  "result", "reused": true}`). The methods after `check` get a `Preflight`
-  (the Graph client, the signed-in account, shared, and stderr), never
-  `Env`, so a command cannot touch the terminal state, the approval input
-  or the prompt. `cli`'s `write_command` runs one: `--no-write`, the
+  gets the `WriteSettings` (`naming`, `guard` and the report limits from
+  `config.json`); `plan` returns `Planned::Write(WritePlan)` or, when
+  nothing needs to be sent, `Planned::Existing` (printed as `{"applied":
+  false, "plan": null, "result", "reused": true}`). A plan may be
+  `blocked`: a dry run prints it, any other run fails with
+  `ConcurrentOperation` before anyone is asked. `plan` and `reconcile` get
+  a `Preflight` (the Graph client, the signed-in account, shared, stderr
+  and the clock), never `Env`, so a command cannot touch the terminal
+  state, the approval input or the prompt. `applied` runs after the one
+  send, when the approval is spent: it gets `After` (a `commands::Session`
+  and, when `downloads()` says so, the download client) and returns
+  `Applied::Result` (with exit-4 reasons, printed as the envelope's
+  `outcome`) or `Applied::Produced` (its own document, such as the wait
+  deadline's exit 5). `cli`'s `write_command` runs one: `--no-write`, the
   settings and `check` before sign-in, then the read-only check on the
   credential's `access`, then preflight, decision, send and output.
   `cli::execute_write_with` (`#[doc(hidden)]`) runs a `WriteCommand` with
@@ -266,7 +301,9 @@ timeout. It carries the Graph base URL (`origin::GRAPH_BASE` in production,
   recording every request to the mock Graph and identity platform;
   `tests/creates.rs` runs `case create` and `search create` through
   `execute_with` the same way (flows 1, 2 and 7 of `docs/SPEC.md`
-  section 8.5);
+  section 8.5); `tests/actions.rs` runs `estimate` and `operation get
+  --check` against the mock Graph and a mock download origin (flows 3, 4
+  and 5);
   `tests/write_allow_list.rs` scans `src/` and `build.rs` for HTTP write
   methods, and allows a POST to be built only in `send_write` and the
   identity client; `tests/fixture_lint.rs` is the public-data lint.
@@ -407,7 +444,8 @@ Every Purview write is a `WriteRoute` variant, and `WriteRoute::ALL` is the
 six POSTs in `docs/SPEC.md` section 4.3: create case, close case, create
 search, estimate statistics, export report and export result. They are sent
 only by `GraphClient::send_write`, which takes an `ApprovedWrite`;
-`case create` and `search create` send create case and create search. No
+`case create`, `search create` and `estimate` send create case, create
+search and estimate statistics. No
 `PATCH`, `PUT` or `DELETE` may exist in the crate, in code, strings or
 comments, and `tests/write_allow_list.rs` scans the source tree for them
 and for calls that would choose a method at run time. Adding a write needs a

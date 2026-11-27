@@ -34,7 +34,7 @@ use crate::error::{GraphErrorDetails, PurviewError, Result};
 use crate::origin::Origin;
 use crate::output::sanitize;
 use crate::redact::{self, Redactor};
-use crate::routes::{build_url, Query, ReadRoute};
+use crate::routes::{build_url, CaseId, OperationId, Query, ReadRoute};
 use crate::safety::{ApprovedWrite, WritePlan};
 use crate::token::TokenProvider;
 use crate::trace::{Exchange, TraceSink, TracedBody, TracedResponse};
@@ -235,7 +235,7 @@ impl GraphClient {
         query: &Query,
         log: &mut (dyn Write + Send),
     ) -> Result<Listing> {
-        match self.list_partial(route, query, log).await? {
+        match self.list_pages(route, query, log, false).await? {
             (listing, None) => Ok(listing),
             (_, Some(error)) => Err(error),
         }
@@ -252,9 +252,36 @@ impl GraphClient {
         query: &Query,
         log: &mut (dyn Write + Send),
     ) -> Result<(Listing, Option<PurviewError>)> {
+        self.list_pages(route, query, log, false).await
+    }
+
+    /// `list`, refusing a paging link to any path other than the
+    /// collection's own, ignoring case: for a check whose answer depends
+    /// on that collection being read to its end, such as a search's
+    /// sources.
+    pub async fn list_bound(
+        &self,
+        route: &ReadRoute,
+        query: &Query,
+        log: &mut (dyn Write + Send),
+    ) -> Result<Listing> {
+        match self.list_pages(route, query, log, true).await? {
+            (listing, None) => Ok(listing),
+            (_, Some(error)) => Err(error),
+        }
+    }
+
+    async fn list_pages(
+        &self,
+        route: &ReadRoute,
+        query: &Query,
+        log: &mut (dyn Write + Send),
+        bound: bool,
+    ) -> Result<(Listing, Option<PurviewError>)> {
         let mut items = Vec::new();
         let mut url = self.url(route, query)?;
         let mut seen = std::collections::HashSet::new();
+        let own_path = url.path().to_ascii_lowercase();
         for page_number in 0..MAX_PAGES {
             seen.insert(url.as_str().to_owned());
             let page = match self
@@ -283,6 +310,17 @@ impl GraphClient {
                             stopped: None,
                         },
                         None,
+                    ))
+                }
+                Some(next) if bound && next.path().to_ascii_lowercase() != own_path => {
+                    return Ok((
+                        Listing {
+                            items,
+                            stopped: None,
+                        },
+                        Some(PurviewError::message(
+                            "Graph's paging link leads to another collection than the one listed",
+                        )),
                     ))
                 }
                 Some(next) if seen.contains(next.as_str()) => {
@@ -336,6 +374,18 @@ impl GraphClient {
             });
         }
         Ok(url)
+    }
+
+    /// The operation a 202's `Location` header names, for a POST to
+    /// `case` (`docs/SPEC.md` section 4.4): on the Graph origin, below the
+    /// Graph base, in the key form or the path form, for that case.
+    pub fn operation_in_location(&self, location: &str, case: CaseId) -> Option<OperationId> {
+        let url = Url::parse(location.trim()).ok()?;
+        if !self.admits(&url) || url.query().is_some() || url.fragment().is_some() {
+            return None;
+        }
+        let rest = url.path().get(self.base.path().len()..)?;
+        crate::routes::operation_in_path(rest, case)
     }
 
     fn admits(&self, url: &Url) -> bool {

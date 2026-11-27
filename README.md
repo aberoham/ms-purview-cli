@@ -44,13 +44,8 @@ The write commands show a plan and send it only when approved; `--dry-run` shows
 purview case create --topic "Orders review" --dry-run
 purview search create "Records research - Orders review 2026-11" \
   --name "orders-api-mail" --term orders-api --participant alex@contoso.example --dry-run
-```
-
-The actions are not built yet; this line is an example of the planned shape from [docs/SPEC.md](docs/SPEC.md):
-
-```bash
-# Planned shape (not yet implemented)
-purview estimate <existing-case> <existing-search> --strict
+purview estimate <case> <search> --dry-run
+purview parse failures <estimate-zip>
 ```
 
 ## Why it exists
@@ -90,11 +85,13 @@ Existing tools leave gaps across the eDiscovery workflow (recorded in [docs/SPEC
 
 - `purview case create --topic TEXT` (`--name`, `--requester`, `--description`, `--reuse-existing`): create a case named by the `naming.case_name` template; a name that any case has, in any status, is refused with `CaseNameInUse`.
 - `purview search create <case> --name NAME [query flags]` (`--description`, `--allow-generic --reason TEXT`): create a search over every tenant mailbox in an active case, after the query guard; a name in use in the case is refused with `SearchNameInUse`.
-- Both show a plan and send one POST only when approved by `--yes` or at an `Apply? [y/N]` prompt; `--dry-run` sends nothing, and `--no-write` refuses them before sign-in.
+- `purview estimate <case> <search>`: run a search's estimate after checking that it covers every tenant mailbox with no sources and that its query passes the guard, wait for it, download its report zip and report `collection` (`complete`, `incomplete` or `unchecked`) with the failed locations; `--strict` exits 4 when a location failed.
+- The write commands show a plan and send one POST only when approved by `--yes` or at an `Apply? [y/N]` prompt; `--dry-run` sends nothing, and `--no-write` refuses them before sign-in.
+- `purview operation get --check`, and `purview parse locations`, `parse failures` and `parse summary` on a downloaded estimate or report zip, with no sign-in.
 
 **Planned roadmap (not yet built, no dates):**
 
-- **v0.2:** the rest of the write commands (`estimate`, `report`, and `case close` if its live checks complete) with preflight checks and explicit approval, plus estimate report parsing (`parse locations`, `parse failures`, `parse summary`).
+- **v0.2:** the rest of the write commands (`report`, and `case close` if its live checks complete) with preflight checks and explicit approval, plus estimate report parsing (`parse locations`, `parse failures`, `parse summary`).
 - **v0.3:** item report parsing (`parse items`, `parse profile`).
 - **v0.4:** `export create` and `export index`.
 - **v0.5:** reading message bodies from export zips (`export read`).

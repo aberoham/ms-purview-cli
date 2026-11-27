@@ -184,10 +184,11 @@ again.
 
 ## `CrossOriginRedirect` on a download
 
-The download service answered with a redirect to another origin (scheme,
-host or port). `purview` follows redirects only within the origin that the
-operation named, so it refused the redirect without contacting the other
-host, and the download token never left that origin. No redirect has been
+The download service answered with a redirect whose target has a different
+origin (scheme, host or port), or no origin the tool accepts. `purview`
+follows redirects only within the origin that the operation named, so it
+stopped before sending a request to that target, and the download token
+never left that origin. No redirect has been
 observed on a download (Observed). Why one would point elsewhere is not
 known; a change in the service, or a proxy between you and it that
 rewrites answers, are possible causes (Assumption).

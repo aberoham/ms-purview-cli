@@ -230,29 +230,38 @@ pub(crate) fn declared_entries(file: &mut File, len: u64) -> Result<u64> {
     }
     let mut declared = 0;
     for at in records {
-        declared = declared.max(u64::from(u16::from_le_bytes([
-            tail[at + 10],
-            tail[at + 11],
-        ])));
+        let classic = u64::from(u16::from_le_bytes([tail[at + 10], tail[at + 11]]));
         // A ZIP64 locator, when there is one, is the 20 bytes before the
         // end record and names the ZIP64 end record.
-        let Some(locator_at) = (tail_start + at as u64).checked_sub(20) else {
-            continue;
+        let zip64 = match (tail_start + at as u64).checked_sub(20) {
+            None => None,
+            Some(locator_at) => {
+                let mut locator = [0_u8; 20];
+                read_at(file, locator_at, &mut locator)?;
+                if locator.starts_with(b"PK\x06\x07") {
+                    let record_at =
+                        u64::from_le_bytes(locator[8..16].try_into().map_err(|_| not_zip())?);
+                    let mut record = [0_u8; 40];
+                    read_at(file, record_at, &mut record)?;
+                    if !record.starts_with(b"PK\x06\x06") {
+                        return Err(not_zip());
+                    }
+                    Some(u64::from_le_bytes(
+                        record[32..40].try_into().map_err(|_| not_zip())?,
+                    ))
+                } else {
+                    None
+                }
+            }
         };
-        let mut locator = [0_u8; 20];
-        read_at(file, locator_at, &mut locator)?;
-        if !locator.starts_with(b"PK\x06\x07") {
-            continue;
-        }
-        let record_at = u64::from_le_bytes(locator[8..16].try_into().map_err(|_| not_zip())?);
-        let mut record = [0_u8; 40];
-        read_at(file, record_at, &mut record)?;
-        if !record.starts_with(b"PK\x06\x06") {
-            return Err(not_zip());
-        }
-        declared = declared.max(u64::from_le_bytes(
-            record[32..40].try_into().map_err(|_| not_zip())?,
-        ));
+        // 0xFFFF in the classic field says "see ZIP64"; otherwise the two
+        // counts must both be honoured.
+        let count = match zip64 {
+            Some(total) if classic == 0xFFFF => total,
+            Some(total) => classic.max(total),
+            None => classic,
+        };
+        declared = declared.max(count);
     }
     file.seek(SeekFrom::Start(0)).map_err(|_| not_zip())?;
     Ok(declared)
@@ -497,6 +506,41 @@ mod tests {
                 .0,
             "HostileZip"
         );
+    }
+
+    #[test]
+    fn a_zip64_sentinel_is_resolved_to_the_zip64_count() {
+        let file = zip_with(&[("Locations-a.csv", b"1")], zip::CompressionMethod::Stored);
+        let bytes = std::fs::read(file.path()).unwrap();
+        // Split off the classic end record and put a ZIP64 end record and
+        // locator before it, with the classic counts set to the sentinel.
+        let (body, end) = bytes.split_at(bytes.len() - 22);
+        let mut end = end.to_vec();
+        let cd_size = u32::from_le_bytes(end[12..16].try_into().unwrap()) as u64;
+        let cd_offset = u32::from_le_bytes(end[16..20].try_into().unwrap()) as u64;
+        end[8..10].copy_from_slice(&0xFFFF_u16.to_le_bytes());
+        end[10..12].copy_from_slice(&0xFFFF_u16.to_le_bytes());
+        let zip64_at = body.len() as u64;
+        let mut out = body.to_vec();
+        out.extend_from_slice(b"PK\x06\x06");
+        out.extend_from_slice(&44_u64.to_le_bytes());
+        out.extend_from_slice(&45_u16.to_le_bytes());
+        out.extend_from_slice(&45_u16.to_le_bytes());
+        out.extend_from_slice(&0_u32.to_le_bytes());
+        out.extend_from_slice(&0_u32.to_le_bytes());
+        out.extend_from_slice(&1_u64.to_le_bytes());
+        out.extend_from_slice(&1_u64.to_le_bytes());
+        out.extend_from_slice(&cd_size.to_le_bytes());
+        out.extend_from_slice(&cd_offset.to_le_bytes());
+        out.extend_from_slice(b"PK\x06\x07");
+        out.extend_from_slice(&0_u32.to_le_bytes());
+        out.extend_from_slice(&zip64_at.to_le_bytes());
+        out.extend_from_slice(&1_u32.to_le_bytes());
+        out.extend_from_slice(&end);
+        std::fs::write(file.path(), &out).unwrap();
+        let mut handle = File::open(file.path()).unwrap();
+        let len = handle.metadata().unwrap().len();
+        assert_eq!(declared_entries(&mut handle, len).unwrap(), 1);
     }
 
     #[test]

@@ -3185,3 +3185,24 @@ async fn a_client_saved_against_several_tenants_is_refused_without_listing_them(
         assert!(!shown.contains(TENANT_ID), "{shown}");
     }
 }
+
+#[tokio::test]
+async fn a_malformed_saved_client_id_is_refused_without_naming_its_key() {
+    let harness = Harness::new().await;
+    let canary = "canary-key-3c9a@contoso.example";
+    let config = serde_json::json!({
+        "default_account": canary,
+        "clients": {canary: {"client_id": "not-a-guid", "tenant_id": TENANT_ID}},
+    });
+    std::fs::create_dir_all(harness.config_dir()).unwrap();
+    std::fs::write(harness.config_dir().join("config.json"), config.to_string()).unwrap();
+    for json in [false, true] {
+        let mut args = if json { vec!["--json"] } else { vec![] };
+        args.extend(["auth", "login"]);
+        let run = harness.run(&args).await;
+        assert_eq!(run.outcome.exit_code, 1, "{args:?}");
+        let shown = format!("{}{}", run.stdout(), run.stderr());
+        assert!(shown.contains("invalid client id"), "{shown}");
+        assert!(!shown.contains("canary-key"), "{shown}");
+    }
+}

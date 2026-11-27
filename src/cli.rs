@@ -1838,7 +1838,7 @@ fn login_registration(
     };
     Ok(LoginRegistration {
         client_id: auth::validate_client_id(&client.client_id)
-            .map_err(|error| error.context(format!("the registration saved with {email}")))?,
+            .map_err(|error| error.context("the app registration saved in config.json"))?,
         tenant_id: tenant,
         saved_with: Some(email.to_owned()),
     })

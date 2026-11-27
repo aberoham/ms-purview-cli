@@ -1874,15 +1874,12 @@ fn saved_tenant_for(
     match tenants.as_slice() {
         [] => Ok(None),
         [only] => Ok(Some(only.clone())),
-        _ => Err(PurviewError::message(format!(
-            "that app registration is saved against several tenants ({}); pass --tenant-id \
-             or --account",
-            tenants
-                .iter()
-                .map(|tenant| sanitize(tenant))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ))),
+        // The saved values are not shown: config.json is free to hold
+        // anything, and the remedy needs none of them.
+        _ => Err(PurviewError::message(
+            "that app registration is saved against several tenants; pass --tenant-id or \
+             --account",
+        )),
     }
 }
 

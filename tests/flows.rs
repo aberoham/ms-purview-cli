@@ -3161,3 +3161,27 @@ async fn account_and_registration_errors_do_not_repeat_the_value() {
         }
     }
 }
+
+#[tokio::test]
+async fn a_client_saved_against_several_tenants_is_refused_without_listing_them() {
+    let harness = Harness::new().await;
+    let canary = "canary-tenant-5b1d";
+    let config = serde_json::json!({
+        "clients": {
+            "a@contoso.example": {"client_id": CLIENT_ID, "tenant_id": TENANT_ID},
+            "b@contoso.example": {"client_id": CLIENT_ID, "tenant_id": canary},
+        }
+    });
+    std::fs::create_dir_all(harness.config_dir()).unwrap();
+    std::fs::write(harness.config_dir().join("config.json"), config.to_string()).unwrap();
+    for json in [false, true] {
+        let mut args = if json { vec!["--json"] } else { vec![] };
+        args.extend(["auth", "login", "--client-id", CLIENT_ID]);
+        let run = harness.run(&args).await;
+        assert_eq!(run.outcome.exit_code, 1, "{args:?}");
+        let shown = format!("{}{}", run.stdout(), run.stderr());
+        assert!(shown.contains("saved against several tenants"), "{shown}");
+        assert!(!shown.contains(canary), "{shown}");
+        assert!(!shown.contains(TENANT_ID), "{shown}");
+    }
+}

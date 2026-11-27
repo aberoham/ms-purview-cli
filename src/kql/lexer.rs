@@ -462,7 +462,8 @@ impl Lexer {
             if !is_full_address(&address) {
                 return Err(KqlError::new(
                     value_column,
-                    "not a full address: an address needs a local part, @ and a domain, such \
+                    "not a full address: an address needs a local part that starts with a letter \
+                     or digit, @ and a domain, such \
                      as alex@contoso.example",
                 ));
             }

@@ -61,7 +61,8 @@ fn address(flag: &str, value: &str, index: usize, count: usize) -> Result<String
     }
     if !is_full_address(value) {
         return Err(PurviewError::message(format!(
-            "{flag}{} needs a full address, such as alex@contoso.example: a local part, @ and a \
+            "{flag}{} needs a full address, such as alex@contoso.example: a local part that starts \
+             with a letter or digit, @ and a \
              domain, with no * and no quotes",
             ordinal(index, count)
         )));

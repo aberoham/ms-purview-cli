@@ -15,7 +15,8 @@ use ms_purview_cli::secrets::{AccountLocks, MemoryStore};
 use serde_json::Value;
 use std::time::Duration;
 use url::form_urlencoded;
-use wiremock::{Match, MockServer, Request};
+use wiremock::matchers::{method, path};
+use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
 
 pub const CLIENT_ID: &str = "00000000-0000-4000-8000-000000000001";
 pub const TENANT_ID: &str = "00000000-0000-4000-8000-000000000002";
@@ -474,4 +475,78 @@ impl BrowserOpener for ScriptedBrowser {
         play();
         Ok(())
     }
+}
+
+pub fn json_response(status: u16, body: Value) -> ResponseTemplate {
+    ResponseTemplate::new(status).set_body_json(body)
+}
+
+/// Mounts a device-code sign-in: the device code, one pending poll, the
+/// Graph token with the given claims, then `download` for the download
+/// redemption.
+pub async fn mount_login(harness: &Harness, claims: &str, download: ResponseTemplate) {
+    Mock::given(method("POST"))
+        .and(path(token_path("devicecode")))
+        .respond_with(json_response(200, fixture("device-code.json")))
+        .expect(1)
+        .mount(&harness.identity)
+        .await;
+    let device_grant = Form::new(&[
+        ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+        ("device_code", "canary-device-code-0001"),
+        ("client_id", CLIENT_ID),
+    ]);
+    Mock::given(method("POST"))
+        .and(path(token_path("token")))
+        .and(device_grant)
+        .respond_with(json_response(400, fixture("authorization-pending.json")))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&harness.identity)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(token_path("token")))
+        .and(Form::new(&[(
+            "grant_type",
+            "urn:ietf:params:oauth:grant-type:device_code",
+        )]))
+        .respond_with(json_response(200, graph_token(claims)))
+        .with_priority(2)
+        .mount(&harness.identity)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(token_path("token")))
+        .and(Form::new(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", "canary-refresh-0001"),
+            (
+                "scope",
+                "b26e684c-5068-4120-a679-64a5d2c909d9/.default offline_access",
+            ),
+        ]))
+        .respond_with(download)
+        .expect(1)
+        .mount(&harness.identity)
+        .await;
+}
+
+pub async fn sign_in_alex(harness: &Harness) {
+    mount_login(
+        harness,
+        "id-claims-preferred.json",
+        json_response(200, fixture("token-download.json")),
+    )
+    .await;
+    let run = harness
+        .run(&[
+            "auth",
+            "login",
+            "--client-id",
+            CLIENT_ID,
+            "--tenant-id",
+            TENANT_ID,
+        ])
+        .await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
+    harness.identity.reset().await;
 }

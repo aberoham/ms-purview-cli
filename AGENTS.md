@@ -11,7 +11,9 @@ downloads, and offline parsing of the resulting zips.
 implements one item of its section 11 and nothing from later items. Today
 the binary has `purview version`, `purview auth login` (device code, or
 `--browser`), `auth refresh`, `auth status`, `auth list` and `auth logout`,
-and the global options `--verbose`, `--timeout` and `--trace`. Do not add stubs for commands
+`case list`, `case get`, `search list`, `search get`, `operation list` and
+`operation get` (with `--wait`), and the global options `--verbose`,
+`--timeout`, `--trace` and `--wrap-untrusted`. Do not add stubs for commands
 that a later pull request owns.
 
 The tool never places, changes or releases a hold, never deletes or reopens a
@@ -61,7 +63,28 @@ that the test files pass their own scan.
 - `src/main.rs` is the tokio entry point. It calls `cli::execute`.
 - `src/cli.rs` holds the Clap tree, dispatch and the top-level printer.
   `execute_with(Env, args) -> Outcome` runs a whole command in-process; it
-  is `#[doc(hidden)]` and exists for tests.
+  is `#[doc(hidden)]` and exists for tests. It checks a read command's
+  arguments (`ReadCommand`) before sign-in, then signs in and hands the
+  command a `commands::Session`.
+- `src/commands/` holds the bodies of the read commands: `case.rs`,
+  `search.rs` and `operation.rs`, with key resolution in `mod.rs`. A
+  `<case>` or `<search>` that is an id is used as given, with no read; a
+  name is matched exactly against the whole list, which must reach its
+  last page. A command returns `Produced { exit_code, document }`, and
+  `cli` prints the document.
+- `src/model/wire.rs` holds the wire records (`CaseRecord`,
+  `SearchRecord`, `OperationRecord` and its typed details), each read field
+  by field from the JSON so that no field is required and a field of the
+  wrong type is `None`; each keeps the JSON it came from in `raw`.
+  `src/model/valid.rs` holds the validated inputs (`CaseKey`, `SearchKey`,
+  `CaseRef`, `SearchRef`, `PollTarget`).
+- `src/poll.rs` is the operation wait of `docs/SPEC.md` section 4.6: one
+  deadline over reads, sleeps and retries (a read in flight is abandoned
+  with tokio's timer), the interval schedule, a 404 grace only for a
+  fresh submission, and Ctrl-C through `Env`'s `Interrupt`. A read that
+  fails with no response, 429 or 5xx, including a `Retry-After` longer than
+  `GraphClient` waits for, does not end the wait; the next read comes
+  after the interval or the `Retry-After`, whichever is longer.
 - `src/env.rs` defines `Env`: stdout and stderr (each through the
   Redactor), terminal detection, the configuration directory override
   (`PURVIEW_CONFIG_DIR`) and the `PURVIEW_*` variables that give flags their
@@ -77,7 +100,9 @@ that the test files pass their own scan.
   always `None` in production, that makes one of `auth login`'s writes
   fail, and the per-account locks (`AccountLocks`) that serialise login,
   logout and refresh commits across processes; `Env::in_memory()` has none
-  until a test sets them. It carries the `BrowserOpener` that
+  until a test sets them. It carries the `Interrupt` that ends an operation wait (tokio's Ctrl-C
+  handler in production, a `ManualInterrupt` that tests fire in
+  `Env::in_memory()`), and the `BrowserOpener` that
 `auth login --browser` uses (the system browser in production, `NoBrowser`
 in `Env::in_memory()`, and the harness's `ScriptedBrowser`, which plays the
 redirect against the loopback listener, in flows) and that sign-in's
@@ -145,8 +170,10 @@ timeout. It carries the Graph base URL (`origin::GRAPH_BASE` in production,
   `tests/flows.rs` runs whole commands in-process through `execute_with`
   against wiremock, with the harness and canary scanner in
   `tests/support/` and hand-written fixtures in `tests/fixtures/`;
-  `tests/graph.rs` drives `GraphClient` against wiremock with a fake token
-  provider; `tests/write_allow_list.rs` scans `src/` and `build.rs` for
+  `tests/reads.rs` runs the read commands the same way, with the
+  sign-in helpers it shares with `tests/flows.rs` in `tests/support/`;
+  `tests/graph.rs` drives `GraphClient`, and `Poller` over it, against
+  wiremock with a fake token provider; `tests/write_allow_list.rs` scans `src/` and `build.rs` for
   HTTP write methods; `tests/fixture_lint.rs` is the public-data lint.
 - `contrib/resign.sh` gives local macOS builds a stable signing identity.
   `contrib/install.sh` tests, builds, signs and installs the per-user
@@ -205,13 +232,28 @@ check whether the other repository needs the same fix.
 - If stdout cannot be written or flushed, the command exits 1 with
   `Error: could not write to standard output: …` on stderr, whatever it
   printed before. No second JSON document follows a partial one.
-- Exit codes 3, 4, 5 and 130, the write-plan shapes and the JSON Lines
-  (JSONL) commands arrive with the pull requests that need them. Their
-  shapes are fixed in `docs/SPEC.md` section 3.3; implement them as written
-  there.
+- `operation get` exits 4 when the operation finished without
+  succeeding, 5 at the `--wait` deadline and 130 on Ctrl-C, in the shapes
+  of `docs/SPEC.md` section 3.3; exit 4 prints the whole envelope even
+  under `--results-only`. Exit code 3, the write-plan shapes and the JSON
+  Lines (JSONL) commands arrive with the pull requests that need them, as
+  written in section 3.3.
 - Every string from the tenant or a file goes through `sanitize` or
   `sanitize_multiline` before it reaches a terminal. JSON keeps the original
-  value.
+  value, apart from two changes. Every URL is redacted as in the trace (a
+  string that is one URL keeps only its OData options; a URL in other text
+  keeps only scheme, host and path), and `--wrap-untrusted` wraps every
+  string under a key in `output::UNTRUSTED_KEYS`, at any depth. Human views
+  put tenant text through `redact::shown` once, before it is sanitised or
+  cut.
+- A read command's JSON `results` is Graph's record as it came, with those
+  changes. Keys the tool adds are ones Graph does not use on that record:
+  `actionSource` on `operation list` entries, `collection` on `operation
+  get`, and the three source lists that `search get` adds under Graph's
+  navigation property names, replacing any list Graph sent inline, when
+  the list reached its last page; otherwise the key is removed.
+- Diagnostics never repeat an argument value (`--select`, `<op>`, a case or
+  search name) or tenant text: a pasted value could be a secret.
 - Every sink writes through the Redactor: stdout and stderr through `Env`,
   and later trace files and the download manifest. Never write to
   `std::io::stdout()` or `std::io::stderr()`, or use `println!` and

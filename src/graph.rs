@@ -328,9 +328,10 @@ impl GraphClient {
                         attempt += 1;
                         continue;
                     }
-                    return Err(PurviewError::message(format!(
-                        "could not reach Microsoft Graph: {reason} ({attempt} attempts)"
-                    )));
+                    return Err(PurviewError::GraphUnreachable {
+                        reason,
+                        attempts: attempt,
+                    });
                 }
             };
             self.log(
@@ -528,6 +529,8 @@ impl GraphClient {
             message,
             request_id,
             date: clean(inner.date.as_ref()),
+            retry_after: header_text(headers, RETRY_AFTER.as_str())
+                .and_then(|value| retry_after(&value, self.clock.now())),
         }))
     }
 

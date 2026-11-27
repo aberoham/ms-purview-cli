@@ -1,0 +1,31 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#security/cases/ediscoveryCases('00000000-0000-4000-8000-000000000031')/operations/$entity",
+  "@odata.type": "#microsoft.graph.security.ediscoveryEstimateOperation",
+  "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaa0001",
+  "action": "estimateStatistics",
+  "status": "submissionFailed",
+  "percentProgress": 100,
+  "createdDateTime": "2026-01-02T10:21:00Z",
+  "completedDateTime": "2026-01-02T10:26:00Z",
+  "createdBy": {
+    "application": null,
+    "user": {
+      "displayName": "Alex Wilber",
+      "userPrincipalName": "alex.w@contoso.example",
+      "id": "00000000-0000-4000-8000-000000000011"
+    }
+  },
+  "resultInfo": {
+    "code": 3,
+    "subcode": 4,
+    "message": "The operation could not be submitted."
+  },
+  "indexedItemCount": 1234,
+  "indexedItemsSize": 5678901,
+  "unindexedItemCount": 0,
+  "unindexedItemsSize": 0,
+  "mailboxCount": 17,
+  "siteCount": 0,
+  "statisticsOptions": "includeQueryStats",
+  "reportFileMetadata": []
+}

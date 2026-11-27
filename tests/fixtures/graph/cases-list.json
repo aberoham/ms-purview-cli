@@ -1,0 +1,80 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#security/cases/ediscoveryCases",
+  "value": [
+    {
+      "id": "00000000-0000-4000-8000-000000000031",
+      "displayName": "Records research - Orders review",
+      "description": "Requested by alex.w@contoso.example. Tenant-wide mailbox search with no custodians or holds. [created-by:purview-cli]",
+      "externalId": "REQ-0001",
+      "status": "active",
+      "createdDateTime": "2026-01-02T10:15:00.1234567Z",
+      "lastModifiedDateTime": "2026-01-03T08:00:00Z",
+      "closedDateTime": null,
+      "createdBy": {
+        "application": null,
+        "user": {
+          "displayName": "Alex Wilber",
+          "userPrincipalName": "alex.w@contoso.example",
+          "id": "00000000-0000-4000-8000-000000000011"
+        }
+      },
+      "lastModifiedBy": {
+        "application": null,
+        "user": {
+          "displayName": "Alex Wilber",
+          "userPrincipalName": "alex.w@contoso.example",
+          "id": "00000000-0000-4000-8000-000000000011"
+        }
+      },
+      "closedBy": null
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000032",
+      "displayName": "Supplier contract",
+      "description": "",
+      "externalId": null,
+      "status": "closing",
+      "createdDateTime": "2025-12-01T09:00:00Z",
+      "createdBy": {
+        "application": null,
+        "user": {
+          "displayName": "Sam Taylor",
+          "userPrincipalName": "sam.taylor@contoso.example",
+          "id": "00000000-0000-4000-8000-000000000012"
+        }
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000033",
+      "displayName": "Supplier contract",
+      "status": "closed",
+      "createdDateTime": "2025-06-15T09:00:00Z",
+      "closedDateTime": "2025-07-01T09:00:00Z",
+      "createdBy": {
+        "application": null,
+        "user": {
+          "displayName": "Alex Wilber",
+          "userPrincipalName": "alex.w@contoso.example"
+        }
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000034",
+      "displayName": null,
+      "status": "active",
+      "createdDateTime": "2026-01-04T23:59:59Z",
+      "createdBy": {
+        "application": null,
+        "user": {
+          "displayName": "Sam Taylor",
+          "userPrincipalName": "sam.taylor@contoso.example",
+          "id": "00000000-0000-4000-8000-000000000012"
+        }
+      }
+    },
+    {
+      "displayName": "Legacy hold review",
+      "status": "closed"
+    }
+  ]
+}

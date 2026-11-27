@@ -138,9 +138,8 @@ From the queries sampled in one tenant (Observed):
 
 ## Not yet observed
 
-1. Search `GET` fields and source reads (PR 1.4).
-2. `$expand=search` on operations (PR 1.4).
-3. What an `eDiscovery.Read.All` session can reach (PR 1.4 checks list and get).
+1. Whether a missing eDiscovery role gives 403 (not checked in PR 1.4; Assumption).
+2. Non-empty custodian, non-custodial and additional source lists.
 4. Redirects on download (PR 1.5).
 5. Reports and exports without Teams context (PR 2.5, PR 4.1).
 6. Case close on a case with holds, and hold reads on an empty case (PR 2.6).
@@ -243,3 +242,51 @@ and account. The stored Graph token had expired, so the read began with a refres
   trace nor stderr held a JSON Web Token or any request header. (Observed)
 - **Keychain:** no prompt; the branch build read and updated the item the earlier builds
   wrote. (Observed)
+
+### PR 1.4: read commands
+
+Status: **run on 26 November 2026** from a local build of the PR 1.4 branch, signed with the
+same local code-signing identity as the earlier checks, against the same tenant,
+registration and account. Every command was a read; the traces stayed outside the
+repository.
+
+- **Case records:** the case list returned every case (a few hundred) on one page, with no
+  `@odata.nextLink`. List entries and a single case `GET` had the same fields, `closedBy`,
+  `closedDateTime`, `createdDateTime`, `description`, `displayName`, `externalId`, `id`,
+  `lastModifiedBy`, `lastModifiedDateTime` and `status`, and neither had `createdBy`.
+  (Observed) `case list --mine` therefore matches nothing in this tenant and says so, and
+  the `CREATED BY` column is empty.
+- **Search records:** the search list and a single search `GET` both returned
+  `dataSourceScopes` (`allTenantMailboxes` on every search of the case read), with
+  `contentQuery`, `createdBy`, `createdDateTime`, `description`, `displayName`, `id`,
+  `lastModifiedBy` and `lastModifiedDateTime`. Both also carried `additionalSources` inline,
+  with an `@odata.context` annotation of its own, without an `$expand`. (Observed)
+- **Source reads:** `GET` on a search's `custodianSources`, `noncustodialSources` and
+  `additionalSources` each returned 200 with an empty `value` for a tenant-wide search.
+  (Observed) Non-empty lists were not seen.
+- **Operations:** the list had base fields only (`action`, `completedDateTime`,
+  `createdBy`, `createdDateTime`, `id`, `percentProgress`, `status`) and showed item
+  reports and exports alike as `exportResult`; single `GET`s told them apart as
+  `exportReport` and `exportResult`, both typed
+  `#microsoft.graph.security.ediscoverySearchExportOperation`, and estimates as
+  `#microsoft.graph.security.ediscoveryEstimateOperation`. (Observed) An export `GET` also
+  carried `cloudAttachmentVersion`, `documentVersion` and `exportSingleItems`, which the
+  tool keeps in JSON without reading. (Observed)
+- **Download URLs:** the `downloadUrl` of each export file had no query string. (Observed)
+  The tool still redacts query values in its output, apart from `downloadType` and the
+  OData options `$top`, `$select`, `$filter`, `$expand` and `$skiptoken`.
+- **`$expand=search` on operations:** refused on both the list and a single `GET` with HTTP
+  400 `BadRequest` ("Could not find a property named 'search'"). (Observed) The tool does
+  not send it; an operation's search cannot be read from the operation.
+- **Read-only session:** `auth login --read-only` (device code) asked for
+  `eDiscovery.Read.All`, and the identity platform returned
+  `openid profile email https://graph.microsoft.com/eDiscovery.ReadWrite.All
+  https://graph.microsoft.com/eDiscovery.Read.All`: it grants every scope consented for the
+  app, so the token is not narrowed. (Observed) `auth status`, `case list`, `case get`,
+  `search list`, `search get`, `operation list` and `operation get` all succeeded in that
+  session. (Observed) `--read-only` therefore limits what the tool sends, not what the token
+  allows; a registration made with `READ_ONLY=1` is the way to narrow the token (Derived). A later
+  sign-in without `--read-only` returned both Graph eDiscovery scopes, so the read-only
+  sign-in had added a consent for `eDiscovery.Read.All` that persists. (Observed)
+- **Missing role:** not checked; whether an account without an eDiscovery role gets 403
+  stays an Assumption.

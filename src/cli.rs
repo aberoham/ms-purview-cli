@@ -12,13 +12,17 @@ use clap::{error::ErrorKind, Args, CommandFactory, Parser, Subcommand};
 use serde_json::{json, Value};
 
 use crate::auth::{self, IdentityClient};
+use crate::commands::{self, Session};
 use crate::config::{self, AccountRecord, ClientConfig, Config};
 use crate::env::{Env, LoginWrite};
 use crate::error::{PurviewError, Result};
 use crate::graph::{GraphClient, GraphSettings, DEFAULT_TIMEOUT, MAX_TIMEOUT_SECONDS};
+use crate::model::valid::{self, CaseKey, SearchKey};
 use crate::output::{
     error_value, sanitize, sanitize_multiline, write_rows, OutputFormat, OutputOptions,
 };
+use crate::poll;
+use crate::routes::OperationId;
 use crate::routes::{Query, ReadRoute};
 use crate::secrets::{delete_value, entry_exists, token_key, CredentialLock};
 use crate::token::{Credential, IdentityEndpoint, StoredPrincipal, StoredTokenProvider};
@@ -36,7 +40,9 @@ use crate::trace::TraceSink;
 Examples:
   purview auth login --client-id <application-client-id> --tenant-id <tenant-id>
   purview auth status
-  purview auth list
+  purview case list --status active
+  purview search list <case>
+  purview operation get <case> <op> --wait
   purview version --json",
     next_help_heading = "Global Options"
 )]
@@ -106,6 +112,13 @@ refresh', on stderr through the redactor [env: PURVIEW_VERBOSE=true]"
 request headers; the files hold tenant data [env: PURVIEW_TRACE_DIR]"
     )]
     trace: Option<PathBuf>,
+    #[arg(
+        long,
+        global = true,
+        help = "In JSON, wrap text that tenant users wrote (names, descriptions, queries, file \
+names) in [UNTRUSTED:<id>] markers [env: PURVIEW_WRAP_UNTRUSTED=true]"
+    )]
+    wrap_untrusted: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -126,6 +139,34 @@ Examples:
   purview auth logout --account alex@contoso.example"
     )]
     Auth(AuthArgs),
+    #[command(
+        about = "List and show eDiscovery cases",
+        after_help = "\
+Examples:
+  purview case list
+  purview case list --status active --mine
+  purview case list --name orders --created-after 2026-01-01
+  purview case get <case>"
+    )]
+    Case(CaseArgs),
+    #[command(
+        about = "List and show the searches in a case",
+        after_help = "\
+Examples:
+  purview search list <case>
+  purview search get <case> <search> --json"
+    )]
+    Search(SearchArgs),
+    #[command(
+        about = "List and show a case's operations: estimates, item reports and exports",
+        after_help = "\
+Examples:
+  purview operation list <case>
+  purview operation list <case> --resolve --action report
+  purview operation get <case> <op>
+  purview operation get <case> <op> --wait --wait-timeout 30m"
+    )]
+    Operation(OperationArgs),
     #[command(
         about = "Show the version, commit and build target",
         after_help = "\
@@ -222,6 +263,231 @@ Examples:
 }
 
 #[derive(Debug, Clone, Args)]
+struct CaseArgs {
+    #[command(subcommand)]
+    command: CaseCommand,
+}
+
+const CASE_HELP: &str = "A case id, or the case's exact display name";
+const SEARCH_HELP: &str = "A search id, or the search's exact display name within the case";
+
+#[derive(Debug, Clone, Subcommand)]
+enum CaseCommand {
+    #[command(
+        about = "List cases, filtered on this computer",
+        long_about = "\
+List every case the account can see, whatever its status, then filter on this \
+computer. Dates are inclusive and compare UTC dates. --mine keeps the cases \
+the signed-in account created.",
+        after_help = "\
+Examples:
+  purview case list --status active
+  purview case list --name orders --plain --select ID,NAME"
+    )]
+    List(CaseList),
+    #[command(
+        about = "Show one case",
+        long_about = "\
+Show one case. A name must match a case's display name exactly; names are not \
+unique, and several matches fail with AmbiguousCase. --json prints Graph's \
+record as it came.",
+        after_help = "\
+Examples:
+  purview case get <case>
+  purview case get \"Records research - Orders review\" --json"
+    )]
+    Get {
+        #[arg(value_name = "CASE", help = CASE_HELP)]
+        case: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum CaseStatusArg {
+    Active,
+    Closing,
+    Closed,
+    All,
+}
+
+#[derive(Debug, Clone, Args)]
+struct CaseList {
+    #[arg(
+        long,
+        value_enum,
+        default_value = "all",
+        help = "Keep cases in this status"
+    )]
+    status: CaseStatusArg,
+    #[arg(
+        long,
+        value_name = "SUBSTR",
+        help = "Keep cases whose display name contains SUBSTR, ignoring case"
+    )]
+    name: Option<String>,
+    #[arg(
+        long,
+        value_name = "DATE",
+        value_parser = parse_date,
+        help = "Keep cases created on or before DATE (YYYY-MM-DD, UTC)"
+    )]
+    created_before: Option<chrono::NaiveDate>,
+    #[arg(
+        long,
+        value_name = "DATE",
+        value_parser = parse_date,
+        help = "Keep cases created on or after DATE (YYYY-MM-DD, UTC)"
+    )]
+    created_after: Option<chrono::NaiveDate>,
+    #[arg(long, help = "Keep cases the signed-in account created")]
+    mine: bool,
+}
+
+fn parse_date(text: &str) -> std::result::Result<chrono::NaiveDate, String> {
+    chrono::NaiveDate::parse_from_str(text.trim(), "%Y-%m-%d")
+        // The value is not repeated, as in every argument error.
+        .map_err(|_| "expected a date in the form YYYY-MM-DD".to_owned())
+}
+
+#[derive(Debug, Clone, Args)]
+struct SearchArgs {
+    #[command(subcommand)]
+    command: SearchCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum SearchCommand {
+    #[command(
+        about = "List the searches in a case",
+        after_help = "\
+Examples:
+  purview search list <case>
+  purview search list <case> --json"
+    )]
+    List {
+        #[arg(value_name = "CASE", help = CASE_HELP)]
+        case: String,
+    },
+    #[command(
+        about = "Show one search, with its query, scope and sources",
+        long_about = "\
+Show one search: its query, its data source scope, and its custodian, \
+non-custodial and additional sources, which an action on the search would \
+also collect from. --json prints Graph's record, with the three source lists \
+added under Graph's names for them.",
+        after_help = "\
+Examples:
+  purview search get <case> <search>
+  purview search get <case> <search> --json"
+    )]
+    Get {
+        #[arg(value_name = "CASE", help = CASE_HELP)]
+        case: String,
+        #[arg(value_name = "SEARCH", help = SEARCH_HELP)]
+        search: String,
+    },
+}
+
+#[derive(Debug, Clone, Args)]
+struct OperationArgs {
+    #[command(subcommand)]
+    command: OperationCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum OperationCommand {
+    #[command(
+        about = "List a case's operations",
+        long_about = "\
+List a case's operations. The list shows both item reports and exports as \
+exportResult, so their ACTION reads exportResult?, and --action report or \
+--action export needs --resolve, which reads each operation on its own (four \
+at a time) for its true action, counts and files.",
+        after_help = "\
+Examples:
+  purview operation list <case>
+  purview operation list <case> --status running
+  purview operation list <case> --resolve --action export --json"
+    )]
+    List(OperationList),
+    #[command(
+        about = "Show one operation, or wait for it to finish",
+        long_about = "\
+Show one operation: its status, counts, result and files. --json includes \
+each file's downloadUrl. An operation that finished without succeeding \
+exits 4.
+
+--wait reads the operation until it finishes: every 10 seconds for the first \
+2 minutes, then every 30 seconds up to 10 minutes, then every minute. \
+--wait-timeout (default 2h) ends the wait with exit 5, and Ctrl-C ends it \
+with exit 130; either way the service carries on running the operation.",
+        after_help = "\
+Examples:
+  purview operation get <case> <op>
+  purview operation get <case> <op> --wait --wait-timeout 30m --json"
+    )]
+    Get(OperationGet),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum ActionArg {
+    Any,
+    Estimate,
+    Report,
+    Export,
+}
+
+#[derive(Debug, Clone, Args)]
+struct OperationList {
+    #[arg(value_name = "CASE", help = CASE_HELP)]
+    case: String,
+    #[arg(
+        long,
+        value_enum,
+        default_value = "any",
+        help = "Keep operations of this action; report and export need --resolve"
+    )]
+    action: ActionArg,
+    #[arg(
+        long,
+        value_name = "S",
+        help = "Keep operations in this status: notStarted, running, succeeded, \
+partiallySucceeded, failed or submissionFailed"
+    )]
+    status: Option<String>,
+    #[arg(
+        long,
+        help = "Read each operation on its own for its true action, counts and files"
+    )]
+    resolve: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+struct OperationGet {
+    #[arg(value_name = "CASE", help = CASE_HELP)]
+    case: String,
+    #[arg(value_name = "OP", help = "An operation id: 32 hexadecimal characters")]
+    operation: String,
+    #[arg(long, help = "Read the operation until it finishes")]
+    wait: bool,
+    #[arg(
+        long,
+        value_name = "DUR",
+        requires = "wait",
+        help = "How long --wait waits, such as 30m or 2h (default 2h, at most 24h)"
+    )]
+    wait_timeout: Option<String>,
+    #[arg(
+        long,
+        value_name = "DUR",
+        requires = "wait",
+        help = "A fixed interval between reads, at least 5s (default: 10s, then 30s after 2 \
+minutes, then 60s after 10)"
+    )]
+    poll_interval: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
 struct AuthLogin {
     #[arg(
         long,
@@ -258,6 +524,7 @@ struct FlagDefaults {
     plain: bool,
     no_input: bool,
     verbose: bool,
+    wrap_untrusted: bool,
     select: Option<String>,
     account: Option<String>,
     timeout: Option<String>,
@@ -288,6 +555,7 @@ impl FlagDefaults {
             plain: flag("PURVIEW_PLAIN")?,
             no_input: flag("PURVIEW_NO_INPUT")?,
             verbose: flag("PURVIEW_VERBOSE")?,
+            wrap_untrusted: flag("PURVIEW_WRAP_UNTRUSTED")?,
             select: text("PURVIEW_SELECT")?,
             account: text("PURVIEW_ACCOUNT")?,
             timeout: text("PURVIEW_TIMEOUT")?,
@@ -484,6 +752,7 @@ fn output_options(cli: &Cli, defaults: &FlagDefaults) -> Result<OutputOptions> {
         },
         select,
         results_only: cli.results_only || defaults.results_only,
+        wrap_untrusted: cli.wrap_untrusted || defaults.wrap_untrusted,
     })
 }
 
@@ -578,6 +847,16 @@ impl Printer {
             let text = rendered.trim();
             text.strip_prefix("error: ").unwrap_or(text).to_owned()
         };
+        // Clap quotes the value it refused, which could be a secret pasted
+        // into the wrong place. That value is left out, and any other URL in
+        // the message is redacted as in free text.
+        let message = match error.get(clap::error::ContextKind::InvalidValue) {
+            Some(clap::error::ContextValue::String(value)) if !value.is_empty() => {
+                message.replace(&format!(" '{value}'"), "")
+            }
+            _ => message,
+        };
+        let message = crate::redact::urls_in_text(&message, &env.redactor);
         let json_mode = json_requested(args, json_default);
         self.fail(env, json_mode, &PurviewError::message(message))
     }
@@ -620,8 +899,181 @@ async fn run(
             AuthCommand::List => auth_list(env, output),
             AuthCommand::Logout => auth_logout(env, output, globals).await,
         },
+        Command::Case(case) => {
+            read_command(env, output, globals, ReadCommand::case(case.command)?).await
+        }
+        Command::Search(search) => {
+            read_command(env, output, globals, ReadCommand::search(search.command)?).await
+        }
+        Command::Operation(operation) => {
+            read_command(
+                env,
+                output,
+                globals,
+                ReadCommand::operation(operation.command)?,
+            )
+            .await
+        }
         Command::Version => version(env, output),
     }
+}
+
+/// A read command with its arguments checked, before any sign-in or
+/// network call.
+enum ReadCommand {
+    CaseList(commands::case::ListFilters),
+    CaseGet(CaseKey),
+    SearchList(CaseKey),
+    SearchGet(CaseKey, SearchKey),
+    OperationList(CaseKey, commands::operation::ListFilters),
+    OperationGet(CaseKey, OperationId, Option<commands::operation::Wait>),
+}
+
+impl ReadCommand {
+    /// The table columns of a list command, which `--select` must name.
+    fn columns(&self) -> Option<&'static [&'static str]> {
+        match self {
+            Self::CaseList(_) => Some(commands::case::LIST_COLUMNS),
+            Self::SearchList(_) => Some(commands::search::LIST_COLUMNS),
+            Self::OperationList(..) => Some(commands::operation::LIST_COLUMNS),
+            Self::CaseGet(_) | Self::SearchGet(..) | Self::OperationGet(..) => None,
+        }
+    }
+
+    fn case(command: CaseCommand) -> Result<Self> {
+        Ok(match command {
+            CaseCommand::List(list) => Self::CaseList(commands::case::ListFilters {
+                status: match list.status {
+                    CaseStatusArg::Active => commands::case::StatusFilter::Active,
+                    CaseStatusArg::Closing => commands::case::StatusFilter::Closing,
+                    CaseStatusArg::Closed => commands::case::StatusFilter::Closed,
+                    CaseStatusArg::All => commands::case::StatusFilter::All,
+                },
+                name: list
+                    .name
+                    .as_deref()
+                    .map(|name| explicit("--name", name))
+                    .transpose()?,
+                created_before: list.created_before,
+                created_after: list.created_after,
+                mine: list.mine,
+            }),
+            CaseCommand::Get { case } => Self::CaseGet(CaseKey::parse(&case)?),
+        })
+    }
+
+    fn search(command: SearchCommand) -> Result<Self> {
+        Ok(match command {
+            SearchCommand::List { case } => Self::SearchList(CaseKey::parse(&case)?),
+            SearchCommand::Get { case, search } => {
+                Self::SearchGet(CaseKey::parse(&case)?, SearchKey::parse(&search)?)
+            }
+        })
+    }
+
+    fn operation(command: OperationCommand) -> Result<Self> {
+        Ok(match command {
+            OperationCommand::List(list) => {
+                let action = match list.action {
+                    ActionArg::Any => commands::operation::ActionFilter::Any,
+                    ActionArg::Estimate => commands::operation::ActionFilter::Estimate,
+                    ActionArg::Report => commands::operation::ActionFilter::Report,
+                    ActionArg::Export => commands::operation::ActionFilter::Export,
+                };
+                if action.needs_resolve() && !list.resolve {
+                    return Err(PurviewError::ResolveRequired(
+                        "--action report and --action export need --resolve: the operation list \
+                         shows both item reports and exports as exportResult, so only a read of \
+                         each operation tells them apart"
+                            .to_owned(),
+                    ));
+                }
+                Self::OperationList(
+                    CaseKey::parse(&list.case)?,
+                    commands::operation::ListFilters {
+                        action,
+                        status: list
+                            .status
+                            .as_deref()
+                            .map(commands::operation::status_filter)
+                            .transpose()?,
+                        resolve: list.resolve,
+                    },
+                )
+            }
+            OperationCommand::Get(get) => {
+                let case = CaseKey::parse(&get.case)?;
+                let operation = valid::operation_id(&get.operation)?;
+                let wait = if get.wait {
+                    Some(commands::operation::Wait {
+                        timing: poll::timing(
+                            get.wait_timeout.as_deref(),
+                            get.poll_interval.as_deref(),
+                            poll::DEFAULT_WAIT_TIMEOUT,
+                        )?,
+                    })
+                } else {
+                    None
+                };
+                Self::OperationGet(case, operation, wait)
+            }
+        })
+    }
+}
+
+/// Signs in, then runs a read command. A token that cannot be had is
+/// reported as a broken sign-in, as in `auth status`.
+async fn read_command(
+    env: &mut Env,
+    output: &OutputOptions,
+    globals: &Globals,
+    command: ReadCommand,
+) -> Result<Outcome> {
+    // Checked in every format, so that a typo fails the same way with or
+    // without --json, before sign-in.
+    if let Some(columns) = command.columns() {
+        crate::output::selected_indices(&output.select, columns)?;
+    }
+    let (account, credential) = signed_in(env, globals)?;
+    let email = account.email.clone();
+    let provider = Arc::new(token_provider(env, credential)?);
+    let graph = Arc::new(graph_client(env, globals, provider)?);
+    let mut session = Session {
+        env,
+        output,
+        graph,
+        account,
+        verbose: globals.verbose,
+    };
+    let produced = match &command {
+        ReadCommand::CaseList(filters) => commands::case::list(&mut session, filters).await,
+        ReadCommand::CaseGet(key) => commands::case::get(&mut session, key).await,
+        ReadCommand::SearchList(case) => commands::search::list(&mut session, case).await,
+        ReadCommand::SearchGet(case, search) => {
+            commands::search::get(&mut session, case, search).await
+        }
+        ReadCommand::OperationList(case, filters) => {
+            commands::operation::list(&mut session, case, filters).await
+        }
+        ReadCommand::OperationGet(case, operation, wait) => {
+            commands::operation::get(&mut session, case, operation, *wait).await
+        }
+    }
+    .map_err(|error| {
+        if error.is_token_unavailable() {
+            error.context(format!(
+                "getting a Graph token for {} (if the identity platform refused the refresh, \
+                 sign in again with 'purview auth login')",
+                sanitize(&email)
+            ))
+        } else {
+            error
+        }
+    })?;
+    Ok(Outcome {
+        exit_code: produced.exit_code,
+        stdout_value: produced.document,
+    })
 }
 
 fn non_empty(value: Option<&str>) -> Option<&str> {

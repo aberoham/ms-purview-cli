@@ -76,6 +76,35 @@ pub enum PurviewError {
     #[error("credential store operation failed: {0}")]
     Keyring(String),
 
+    /// A Graph GET that got no complete response in any of its attempts:
+    /// the connection failed, the request timed out or the body was cut
+    /// off. Kept apart from Graph's own answers, so that polling can wait
+    /// and try again.
+    #[error("could not reach Microsoft Graph: {reason} ({attempts} attempts)")]
+    GraphUnreachable { reason: String, attempts: u32 },
+
+    /// A case name that matches more than one case. The message lists
+    /// each match's id, status and creation date, never its name.
+    #[error("{0}")]
+    AmbiguousCase(String),
+
+    /// A search name that matches more than one search in the case.
+    #[error("{0}")]
+    AmbiguousSearch(String),
+
+    /// No case has the id or exact display name given.
+    #[error("{0}")]
+    CaseNotFound(String),
+
+    /// No search in the case has the id or exact display name given.
+    #[error("{0}")]
+    SearchNotFound(String),
+
+    /// A filter that needs each operation read on its own (`--resolve`),
+    /// because the operation list cannot tell the actions apart.
+    #[error("{0}")]
+    ResolveRequired(String),
+
     /// A stored password entry that its backend cannot decode (on Windows,
     /// a blob that is not UTF-16LE). Kept apart from access failures, so
     /// that a repair the ownership check authorised can replace it.
@@ -120,6 +149,9 @@ pub struct GraphErrorDetails {
     pub message: String,
     pub request_id: String,
     pub date: String,
+    /// The wait Graph's `Retry-After` header asked for, if any. Not
+    /// printed; polling uses it to space its next read.
+    pub retry_after: Option<std::time::Duration>,
 }
 
 /// The status and Graph's code and message, then the identifiers a support
@@ -209,7 +241,13 @@ impl PurviewError {
             Self::DownloadNotConsented { .. } => ("DownloadNotConsented", 0),
             Self::CredentialLockBusy { .. } => ("CredentialLockBusy", 0),
             Self::CredentialLockFailed { .. } => ("CredentialLockFailed", 0),
+            Self::AmbiguousCase(_) => ("AmbiguousCase", 0),
+            Self::AmbiguousSearch(_) => ("AmbiguousSearch", 0),
+            Self::CaseNotFound(_) => ("CaseNotFound", 0),
+            Self::SearchNotFound(_) => ("SearchNotFound", 0),
+            Self::ResolveRequired(_) => ("ResolveRequired", 0),
             Self::Message(_)
+            | Self::GraphUnreachable { .. }
             | Self::Io(_)
             | Self::Json(_)
             | Self::Http(_)
@@ -260,6 +298,27 @@ impl PurviewError {
         match self {
             Self::Graph(details) => Some(details.status),
             Self::Context { source, .. } => source.graph_status(),
+            _ => None,
+        }
+    }
+
+    /// Whether a Graph read failed in a way that a later read may not:
+    /// no complete response, HTTP 429, or any 5xx. Polling keeps waiting
+    /// after such a failure.
+    pub fn is_transient_graph_failure(&self) -> bool {
+        match self {
+            Self::GraphUnreachable { .. } => true,
+            Self::Graph(details) => details.status == 429 || (500..=599).contains(&details.status),
+            Self::Context { source, .. } => source.is_transient_graph_failure(),
+            _ => false,
+        }
+    }
+
+    /// The wait Graph asked for in `Retry-After`, through any context.
+    pub fn retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::Graph(details) => details.retry_after,
+            Self::Context { source, .. } => source.retry_after(),
             _ => None,
         }
     }
@@ -366,6 +425,7 @@ mod tests {
             message: "no role".into(),
             request_id: "request-0001".into(),
             date: "2026-01-05T09:00:00".into(),
+            retry_after: None,
         }))
         .context("checking the Purview role");
         assert_eq!(error.metadata(), ("Forbidden", 403));

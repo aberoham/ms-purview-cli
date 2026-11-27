@@ -1,0 +1,26 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#security/cases/ediscoveryCases('00000000-0000-4000-8000-000000000031')/searches/$entity",
+  "id": "00000000-0000-4000-8000-000000000051",
+  "displayName": "Orders API mentions",
+  "description": "participants:alex@contoso.example orders-api [created-by:purview-cli]",
+  "contentQuery": "participants:alex@contoso.example AND \"orders-api\"",
+  "dataSourceScopes": "allTenantMailboxes",
+  "createdDateTime": "2026-01-02T10:20:00Z",
+  "lastModifiedDateTime": "2026-01-02T10:20:00Z",
+  "createdBy": {
+    "application": null,
+    "user": {
+      "displayName": "Alex Wilber",
+      "userPrincipalName": "alex.w@contoso.example",
+      "id": "00000000-0000-4000-8000-000000000011"
+    }
+  },
+  "lastModifiedBy": {
+    "application": null,
+    "user": {
+      "displayName": "Alex Wilber",
+      "userPrincipalName": "alex.w@contoso.example",
+      "id": "00000000-0000-4000-8000-000000000011"
+    }
+  }
+}

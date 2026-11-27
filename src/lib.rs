@@ -4,12 +4,15 @@
 
 pub mod auth;
 pub mod cli;
+pub mod commands;
 pub mod config;
 pub mod env;
 pub mod error;
 pub mod graph;
+pub mod model;
 pub mod origin;
 pub mod output;
+pub mod poll;
 pub mod redact;
 pub mod routes;
 pub mod secrets;

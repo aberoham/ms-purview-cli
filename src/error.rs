@@ -225,6 +225,21 @@ pub enum PurviewError {
     #[error("{0}")]
     CaseNotActive(String),
 
+    /// A zip that is refused before or while it is read: not a zip, too
+    /// many entries, a name that would leave its folder, or more bytes, or
+    /// a higher ratio, than the limits allow. Never names an entry.
+    #[error("refusing the zip: {0}")]
+    HostileZip(String),
+
+    /// A CSV record larger than `limits.csv_max_record_bytes`.
+    #[error("a CSV record in {file} is larger than {limit} bytes (limits.csv_max_record_bytes)")]
+    RecordTooLarge { file: String, limit: u64 },
+
+    /// A zip that is not the kind the command reads, such as a zip with
+    /// no `Locations-*.csv` for `parse locations`.
+    #[error("{0}")]
+    NotAReportZip(String),
+
     #[error("could not {action} the credential lock file {path}: {source}")]
     CredentialLockFailed {
         action: &'static str,
@@ -366,6 +381,9 @@ impl PurviewError {
             Self::CaseNameInUse(_) => ("CaseNameInUse", 0),
             Self::SearchNameInUse(_) => ("SearchNameInUse", 0),
             Self::CaseNotActive(_) => ("CaseNotActive", 0),
+            Self::HostileZip(_) => ("HostileZip", 0),
+            Self::RecordTooLarge { .. } => ("RecordTooLarge", 0),
+            Self::NotAReportZip(_) => ("NotAReportZip", 0),
             Self::WriteRefused => ("WriteRefused", 0),
             Self::ReadOnlySession(_) => ("ReadOnlySession", 0),
             Self::WriteOutcomeUnknown { .. } => ("WriteOutcomeUnknown", 0),

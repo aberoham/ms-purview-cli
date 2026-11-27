@@ -191,7 +191,7 @@ fn enclosing_function(code: &str, at: usize) -> Option<String> {
 fn allowed_posts() -> Vec<(&'static str, String)> {
     vec![
         ("auth.rs", ["async fn po", "st("].concat()),
-        ("graph.rs", ["pub async fn send_wr", "ite("].concat()),
+        ("graph.rs", ["pub(crate) async fn send_wr", "ite("].concat()),
     ]
 }
 
@@ -263,7 +263,7 @@ fn a_post_is_built_only_in_send_write_and_the_token_client() {
 #[test]
 fn the_post_check_finds_a_post_in_the_wrong_place() {
     let post = [".po", "st("].concat();
-    let send = ["pub async fn send_wr", "ite("].concat();
+    let send = ["pub(crate) async fn send_wr", "ite("].concat();
     let wrapper = ["self.po", "st("].concat();
     let good = format!("impl X {{\n    {send}) {{\n        c{post}u);\n    }}\n}}\n");
     assert!(misplaced_posts("src/graph.rs", &good).is_empty());
@@ -299,8 +299,10 @@ fn the_post_check_finds_a_post_in_the_wrong_place() {
     }
 }
 
-/// Every call of `name(` outside unit-test modules, as (file, enclosing
-/// function), one entry per call.
+/// Every call of the function `name` outside unit-test modules, as (file,
+/// enclosing function), one entry per call. `name(` must not follow a
+/// letter, digit or `_`, so a method call, an imported name and a path such
+/// as `GraphClient::name(` all count; its own `fn name(` does not.
 fn callers(root: &Path, name: &str) -> Vec<(String, String)> {
     let mut files = Vec::new();
     rust_files(&root.join("src"), &mut files);
@@ -317,7 +319,8 @@ fn callers(root: &Path, name: &str) -> Vec<(String, String)> {
                 continue;
             }
             for (column, _) in line.match_indices(&format!("{name}(")) {
-                if line[..column].ends_with("fn ") {
+                let after_word = column > 0 && is_word_byte(line.as_bytes()[column - 1]);
+                if after_word || line[..column].ends_with("fn ") {
                     continue;
                 }
                 let function = enclosing_function(code, start + column).unwrap_or_default();
@@ -337,11 +340,11 @@ fn only_the_write_runner_decides_and_sends() {
         "run_write".to_owned(),
     );
     assert_eq!(
-        callers(root, &["safety::dec", "ide"].concat()),
+        callers(root, &["dec", "ide"].concat()),
         std::slice::from_ref(&runner)
     );
     assert_eq!(
-        callers(root, &[".send_wr", "ite"].concat()),
+        callers(root, &["send_wr", "ite"].concat()),
         std::slice::from_ref(&runner)
     );
     let safety = ["src", "safety.rs"].join(std::path::MAIN_SEPARATOR_STR);

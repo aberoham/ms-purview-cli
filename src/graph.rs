@@ -410,7 +410,7 @@ impl GraphClient {
     /// the request is never sent again, whatever `Retry-After` says. A
     /// connection that could not be opened sent nothing and is
     /// `GraphUnreachable`.
-    pub async fn send_write(
+    pub(crate) async fn send_write(
         &self,
         write: ApprovedWrite,
         log: &mut (dyn Write + Send),

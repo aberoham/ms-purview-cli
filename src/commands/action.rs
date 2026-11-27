@@ -72,7 +72,7 @@ pub async fn check_search(
     }
     for (sources, name) in SOURCES {
         let items = graph
-            .list(
+            .list_bound(
                 &ReadRoute::SearchSources(case, search.id, sources),
                 &Query::new(),
                 log,
@@ -152,7 +152,8 @@ impl Active {
 
 /// The case's operations with `action` (`estimateStatistics`, or
 /// `exportResult`, which the list shows for both reports and exports) that
-/// are `notStarted` or `running`, read to the last page. `$expand=search`
+/// are not known to be finished, read to the last page; an entry whose
+/// action or status cannot be read is kept, since it cannot be ruled out. `$expand=search`
 /// is refused (Observed), so they cannot be narrowed to the search.
 pub async fn active_operations(
     graph: &GraphClient,
@@ -161,21 +162,36 @@ pub async fn active_operations(
     log: &mut (dyn Write + Send),
 ) -> Result<Vec<Active>> {
     let items = graph
-        .list(&ReadRoute::Operations(case), &Query::new(), log)
+        .list_bound(&ReadRoute::Operations(case), &Query::new(), log)
         .await?
         .complete()
         .map_err(|error| error.context("listing the case's operations"))?;
     let mut active = Vec::new();
     for item in items {
+        // An entry that cannot be read could be an unfinished estimate,
+        // so it counts as one that may be a duplicate.
         let Some(record) = OperationRecord::from_value(item) else {
+            active.push(Active {
+                id: "?".into(),
+                status: "unreadable".into(),
+                created: None,
+            });
             continue;
         };
-        if record.action.as_deref() != Some(action)
-            || !matches!(
-                record.status,
-                OperationStatus::NotStarted | OperationStatus::Running
-            )
-        {
+        // Only an entry known to be of another action, or known to be
+        // finished, is ruled out.
+        let other_action = record
+            .action
+            .as_deref()
+            .is_some_and(|found| found != action);
+        let finished = matches!(
+            record.status,
+            OperationStatus::Succeeded
+                | OperationStatus::PartiallySucceeded
+                | OperationStatus::Failed
+                | OperationStatus::SubmissionFailed
+        );
+        if other_action || finished {
             continue;
         }
         // Ids are checked: anything else is Graph's text.
@@ -185,9 +201,15 @@ pub async fn active_operations(
             .and_then(OperationId::parse)
             .map(|id| id.to_string())
             .unwrap_or_else(|| "?".into());
+        let status = match &record.status {
+            OperationStatus::NotStarted | OperationStatus::Running => {
+                record.status.as_str().to_owned()
+            }
+            _ => "unknown status".to_owned(),
+        };
         active.push(Active {
             id,
-            status: record.status.as_str().to_owned(),
+            status,
             created: record.created_date_time,
         });
     }

@@ -241,6 +241,11 @@ pub enum PurviewError {
     #[error("{0}")]
     SearchHasSources(String),
 
+    /// An action's search that changed between the plan and the send: its
+    /// query, scope or sources differ from what was approved.
+    #[error("{0}")]
+    SearchChanged(String),
+
     /// A 202 whose `Location` header does not name an operation of the
     /// case in a known form. The operation may still be running.
     #[error("{0}")]
@@ -412,6 +417,7 @@ impl PurviewError {
             Self::ScopeNotAllowed(_) => ("ScopeNotAllowed", 0),
             Self::SearchHasSources(_) => ("SearchHasSources", 0),
             Self::UnexpectedLocation(_) => ("UnexpectedLocation", 0),
+            Self::SearchChanged(_) => ("SearchChanged", 0),
             Self::HostileZip(_) => ("HostileZip", 0),
             Self::RecordTooLarge { .. } => ("RecordTooLarge", 0),
             Self::NotAReportZip(_) => ("NotAReportZip", 0),

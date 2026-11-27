@@ -473,6 +473,19 @@ Settled in PR 2.3:
   wait or the download, give the operation-wait shapes of section 3.3.
 - The reason of `--allow-generic` is in the plan's warnings only; the download manifest
   does not record it yet.
+- After approval and before the send, `WriteCommand::recheck` reads the search again
+  through the same checks; a different query, verdict, scope or sources refuse with
+  `SearchChanged`. A change after that read is not caught: Graph offers no conditional
+  action (Assumption).
+- The answer must be 202, and the operation the `Location` header names must be an
+  `estimateStatistics` operation with estimate detail before any file is fetched; anything
+  else is `UnexpectedLocation`.
+- The concurrency check and the source lists use `GraphClient::list_bound`, which refuses a
+  paging link to another path. An operation entry whose action or status cannot be read
+  counts as a possible duplicate.
+- `--wait-timeout` covers the wait. The download has its own timeouts (section 4.7); Ctrl-C
+  during it gives exit 130 with the time since the POST, as `operation get --check` does.
+- Exit-4 reasons are redacted as the rest of the document, after they are added.
 
 #### `purview report <case> <search>` (write: action)
 
@@ -1087,7 +1100,13 @@ name, are those of the notes: `Locations-*.csv` `DataSourceName`, `DataSourceTyp
 `ErrorWarning`, `Query`; `Statistics-*.csv` `DataSourceName`, `DataSourceType`, `Location`,
 `LocationType`, `LocationSubType`, `StatType`, `StatName`, `OriginalStatName`, `Value`
 (Observed). The collection check is `unchecked` when the file it reads, or its `Location`,
-`Status` or `StatType` column, is missing.
+`Status` or `StatType` column, is missing, when a row lacks the location, status or
+`StatType` it needs, or when the zip holds more than one Locations or Statistics file. The
+entry count declared by the end of central directory record (or its ZIP64 form) is read
+before the zip is indexed, and an index with fewer entries than declared (a name listed
+twice) is `HostileZip`. The ratio's compressed size is at most the file's size. The record
+budget is checked on each record's own bytes; the reader below allows two 64 KiB buffers
+more as a backstop.
 
 **Summary and Settings.** These are parsed as before:
 

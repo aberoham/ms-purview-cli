@@ -336,6 +336,7 @@ pub async fn get(
     wait: Option<Wait>,
     check: Option<Check<'_>>,
 ) -> Result<Produced> {
+    let command_started = session.env.clock.elapsed();
     let case = case_id(&session.graph, case, &mut session.env.stderr).await?;
     let route = ReadRoute::Operation(case, operation.clone());
     let record = match wait {
@@ -396,7 +397,13 @@ pub async fn get(
         std::iter::once(&record),
     );
     let collection = match check {
-        Some(check) => Some(check_collection(session, case, operation, &record, check).await?),
+        Some(check) => match check_collection(session, case, operation, &record, check).await? {
+            Some(collection) => Some(collection),
+            None => {
+                let waited = session.env.clock.elapsed().saturating_sub(command_started);
+                return stopped(session, case, operation, Some(record), waited, true);
+            }
+        },
         None => None,
     };
     show(session, &record, collection)
@@ -405,26 +412,27 @@ pub async fn get(
 /// `--check`: the evidence file of a finished estimate, item report or
 /// export downloaded into the data directory (a verified copy there is
 /// reused), and the collection check for its action. An operation that is
-/// not finished, or of another action, stays unchecked.
+/// not finished, or of another action, stays unchecked. `None` when
+/// Ctrl-C stopped the download.
 async fn check_collection(
     session: &mut Session<'_>,
     case: CaseId,
     operation: &OperationId,
     record: &OperationRecord,
     check: Check<'_>,
-) -> Result<Collection> {
+) -> Result<Option<Collection>> {
     let action = record.action(Source::Single);
     let evidence_of = match action {
         Action::Estimate => EvidenceOf::Estimate,
         Action::ExportReport | Action::ExportResult => EvidenceOf::Report,
-        _ => return Ok(Collection::Unchecked),
+        _ => return Ok(Some(Collection::Unchecked)),
     };
     if !record.status.is_terminal() {
         let _ = writeln!(
             session.env.stderr,
             "notice: the operation is not finished, so --check has nothing to read yet"
         );
-        return Ok(Collection::Unchecked);
+        return Ok(Some(Collection::Unchecked));
     }
     // An export's evidence is its report part (Assumption: named
     // Reports-…); the other actions have only the report.
@@ -443,7 +451,7 @@ async fn check_collection(
             session.env.stderr,
             "warning: collection unchecked: the export lists no Reports- file"
         );
-        return Ok(Collection::Unchecked);
+        return Ok(Some(Collection::Unchecked));
     }
     let request = super::download::Request {
         case: CaseKey::Id(case),
@@ -463,9 +471,7 @@ async fn check_collection(
         }
     }
     if fetched.interrupted {
-        return Err(PurviewError::message(
-            "interrupted while downloading the evidence file; the collection was not checked",
-        ));
+        return Ok(None);
     }
     for done in &fetched.done {
         match crate::report::ReportFiles::read(&done.path, check.limits) {
@@ -476,7 +482,7 @@ async fn check_collection(
                     "notice: checked {}",
                     sanitize(&done.path.display().to_string())
                 );
-                return Ok(files.collection(evidence_of));
+                return Ok(Some(files.collection(evidence_of)));
             }
             Ok(_) => {}
             Err(error) => {
@@ -492,7 +498,7 @@ async fn check_collection(
         session.env.stderr,
         "warning: collection unchecked: no downloaded file is a report zip"
     );
-    Ok(Collection::Unchecked)
+    Ok(Some(Collection::Unchecked))
 }
 
 /// `3f2a…` for progress lines.

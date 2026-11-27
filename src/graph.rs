@@ -251,6 +251,32 @@ impl GraphClient {
         query: &Query,
         log: &mut (dyn Write + Send),
     ) -> (Listing, Option<PurviewError>) {
+        self.list_pages(route, query, log, false).await
+    }
+
+    /// `list`, refusing a paging link to any path other than the
+    /// collection's own, ignoring case: for a check whose answer depends
+    /// on that collection being read to its end, such as a search's
+    /// sources.
+    pub async fn list_bound(
+        &self,
+        route: &ReadRoute,
+        query: &Query,
+        log: &mut (dyn Write + Send),
+    ) -> Result<Listing> {
+        match self.list_pages(route, query, log, true).await {
+            (listing, None) => Ok(listing),
+            (_, Some(error)) => Err(error),
+        }
+    }
+
+    async fn list_pages(
+        &self,
+        route: &ReadRoute,
+        query: &Query,
+        log: &mut (dyn Write + Send),
+        bound: bool,
+    ) -> (Listing, Option<PurviewError>) {
         let mut items = Vec::new();
         let mut url = match self.url(route, query) {
             Ok(url) => url,
@@ -265,6 +291,7 @@ impl GraphClient {
             }
         };
         let mut seen = std::collections::HashSet::new();
+        let own_path = url.path().to_ascii_lowercase();
         for _ in 0..MAX_PAGES {
             seen.insert(url.as_str().to_owned());
             let page = match self
@@ -292,6 +319,17 @@ impl GraphClient {
                             stopped: None,
                         },
                         None,
+                    )
+                }
+                Some(next) if bound && next.path().to_ascii_lowercase() != own_path => {
+                    return (
+                        Listing {
+                            items,
+                            stopped: None,
+                        },
+                        Some(PurviewError::message(
+                            "Graph's paging link leads to another collection than the one listed",
+                        )),
                     )
                 }
                 Some(next) if seen.contains(next.as_str()) => {

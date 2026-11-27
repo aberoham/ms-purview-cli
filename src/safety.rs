@@ -445,6 +445,14 @@ pub trait WriteCommand: Send {
     /// sent here.
     async fn plan(&mut self, preflight: &mut Preflight<'_>) -> Result<Planned>;
 
+    /// Runs after approval and before the send: a command whose plan
+    /// rests on state another person can change (an action's search)
+    /// reads it again and refuses when it differs from what the plan
+    /// showed. Reads only. A change after this read is still possible.
+    async fn recheck(&mut self, _preflight: &mut Preflight<'_>) -> Result<()> {
+        Ok(())
+    }
+
     /// Whether the command downloads files after its write, so that the
     /// runner sets up the download client.
     fn downloads(&self) -> bool {

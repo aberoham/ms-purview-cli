@@ -87,6 +87,13 @@ pub const UNTRUSTED_KEYS: &[&str] = &[
     "externalId",
     "contentQuery",
     "fileName",
+    // Report files: location names, the messages beside them, and the
+    // summary and settings, which repeat case, search and query text.
+    "location",
+    "errorWarning",
+    "failureMessage",
+    "summary",
+    "settings",
 ];
 
 /// Wraps every non-empty string under a key in `UNTRUSTED_KEYS`, at any

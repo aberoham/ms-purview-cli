@@ -95,6 +95,22 @@ pub fn warn_missing_columns(log: &mut dyn Write, files: &ReportFiles) {
             files.missing_columns.join(", ")
         );
     }
+    if !files.duplicates.is_empty() {
+        let _ = writeln!(
+            log,
+            "warning: the zip holds more than one file of these kinds, and only the first of \
+             each was read: {}",
+            files.duplicates.join(", ")
+        );
+    }
+    if files.unusable_rows() > 0 {
+        let _ = writeln!(
+            log,
+            "warning: {} Locations or Statistics rows have no location, status or StatType, so \
+             the collection cannot be checked",
+            files.unusable_rows()
+        );
+    }
     if let Some(count) = files
         .locations
         .as_ref()

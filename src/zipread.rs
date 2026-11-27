@@ -85,22 +85,37 @@ pub struct ZipReader {
     names: Vec<String>,
     limits: ZipLimits,
     total: Rc<Cell<u64>>,
+    /// The zip's size on disk: no entry's compressed bytes can exceed it,
+    /// whatever its header says.
+    file_len: u64,
 }
 
 impl ZipReader {
     /// Opens `path`. A zip with more entries than allowed, or with an
     /// entry name that would leave its folder, is `HostileZip`.
     pub fn open(path: &Path, limits: ZipLimits) -> Result<Self> {
-        let file = File::open(path)?;
+        let mut file = File::open(path)?;
+        let file_len = file.metadata()?.len();
+        // The count the central directory declares, read before the zip
+        // crate indexes it, so that a huge directory is refused unread.
+        let declared = declared_entries(&mut file, file_len)?;
+        if declared > limits.entries as u64 {
+            return Err(PurviewError::HostileZip(format!(
+                "the zip has {declared} entries, more than the {} allowed",
+                limits.entries
+            )));
+        }
         let mut archive = zip::ZipArchive::new(file).map_err(|_| {
             PurviewError::HostileZip("the file is not a zip archive that can be read".into())
         })?;
-        if archive.len() > limits.entries {
-            return Err(PurviewError::HostileZip(format!(
-                "the zip has {} entries, more than the {} allowed",
-                archive.len(),
-                limits.entries
-            )));
+        // The index keeps one entry per name, so fewer entries than
+        // declared means a name is listed twice.
+        if archive.len() as u64 != declared || archive.len() > limits.entries {
+            return Err(PurviewError::HostileZip(
+                "the zip's central directory does not match its entries: a name may be listed \
+                 twice"
+                    .into(),
+            ));
         }
         let mut names = Vec::with_capacity(archive.len());
         for index in 0..archive.len() {
@@ -127,6 +142,7 @@ impl ZipReader {
             names,
             limits,
             total: Rc::new(Cell::new(0)),
+            file_len,
         })
     }
 
@@ -138,12 +154,21 @@ impl ZipReader {
     /// The first entry whose file name (after the last `/`) starts with
     /// `prefix` and ends with `.csv`, ignoring the case of `.csv`.
     pub fn find(&self, prefix: &str) -> Option<usize> {
-        self.names.iter().position(|name| {
-            let base = name.rsplit('/').next().unwrap_or(name);
-            base.starts_with(prefix)
-                && base.len() >= prefix.len() + 4
-                && base[base.len() - 4..].eq_ignore_ascii_case(".csv")
-        })
+        self.find_all(prefix).first().copied()
+    }
+
+    /// Every entry `find` would match, in the zip's order.
+    pub fn find_all(&self, prefix: &str) -> Vec<usize> {
+        (0..self.names.len())
+            .filter(|index| {
+                let name = &self.names[*index];
+                let base = name.rsplit('/').next().unwrap_or(name);
+                let bytes = base.as_bytes();
+                base.starts_with(prefix)
+                    && bytes.len() >= prefix.len() + 4
+                    && bytes[bytes.len() - 4..].eq_ignore_ascii_case(b".csv")
+            })
+            .collect()
     }
 
     /// Reads entry `index` to its end through the limits, giving the
@@ -158,7 +183,7 @@ impl ZipReader {
         let entry = self.archive.by_index(index).map_err(|_| {
             PurviewError::HostileZip(format!("entry {} of the zip cannot be read", index + 1))
         })?;
-        let compressed = entry.compressed_size();
+        let compressed = entry.compressed_size().min(self.file_len);
         let mut counted = Counted {
             inner: entry,
             read: 0,
@@ -168,6 +193,51 @@ impl ZipReader {
         };
         read(&mut counted)
     }
+}
+
+/// The number of entries the end of central directory record declares,
+/// with its ZIP64 form when the classic field is full. A file with no such
+/// record is not a zip.
+fn declared_entries(file: &mut File, len: u64) -> Result<u64> {
+    use std::io::{Seek, SeekFrom};
+    let not_zip =
+        || PurviewError::HostileZip("the file is not a zip archive that can be read".into());
+    // The record is 22 bytes, followed by a comment of at most 65,535.
+    let tail_len = len.min(22 + 65_535);
+    let mut tail = vec![0_u8; tail_len as usize];
+    file.seek(SeekFrom::Start(len - tail_len))?;
+    file.read_exact(&mut tail)?;
+    let at = (0..tail.len().saturating_sub(21))
+        .rev()
+        .find(|at| tail[*at..].starts_with(b"PK\x05\x06"))
+        .ok_or_else(not_zip)?;
+    let u16_at = |offset: usize| u16::from_le_bytes([tail[at + offset], tail[at + offset + 1]]);
+    let classic = u64::from(u16_at(10));
+    if classic != 0xFFFF {
+        file.seek(SeekFrom::Start(0))?;
+        return Ok(classic);
+    }
+    // ZIP64: the locator is the 20 bytes before the record, and names the
+    // ZIP64 end of central directory record.
+    let locator_at = (len - tail_len + at as u64)
+        .checked_sub(20)
+        .ok_or_else(not_zip)?;
+    let mut locator = [0_u8; 20];
+    file.seek(SeekFrom::Start(locator_at))?;
+    file.read_exact(&mut locator)?;
+    if !locator.starts_with(b"PK\x06\x07") {
+        return Err(not_zip());
+    }
+    let record_at = u64::from_le_bytes(locator[8..16].try_into().map_err(|_| not_zip())?);
+    let mut record = [0_u8; 40];
+    file.seek(SeekFrom::Start(record_at))?;
+    file.read_exact(&mut record).map_err(|_| not_zip())?;
+    if !record.starts_with(b"PK\x06\x06") {
+        return Err(not_zip());
+    }
+    let total = u64::from_le_bytes(record[32..40].try_into().map_err(|_| not_zip())?);
+    file.seek(SeekFrom::Start(0))?;
+    Ok(total)
 }
 
 /// A reader that counts the bytes it gives and fails past the limits.
@@ -347,6 +417,51 @@ mod tests {
                 .unwrap();
             assert_eq!(error.metadata().0, "HostileZip", "{error}");
         }
+    }
+
+    #[test]
+    fn a_name_ending_inside_a_multibyte_character_is_not_a_match() {
+        // The last four bytes start inside the euro sign.
+        let file = zip_with(&[("Locations-€é", b"a")], zip::CompressionMethod::Stored);
+        let zip = ZipReader::open(file.path(), limits()).unwrap();
+        assert_eq!(zip.find("Locations-"), None);
+    }
+
+    #[test]
+    fn a_name_listed_twice_is_hostile() {
+        let file = zip_with(
+            &[("Locations-a.csv", b"1"), ("Locations-b.csv", b"2")],
+            zip::CompressionMethod::Stored,
+        );
+        // Rename the second entry to the first's name, in both its local
+        // header and the central directory: same length, so offsets hold.
+        let mut bytes = std::fs::read(file.path()).unwrap();
+        let from = b"Locations-b.csv";
+        let mut at = 0;
+        while let Some(found) = bytes[at..]
+            .windows(from.len())
+            .position(|window| window == from)
+        {
+            bytes[at + found..at + found + from.len()].copy_from_slice(b"Locations-a.csv");
+            at += found + from.len();
+        }
+        std::fs::write(file.path(), &bytes).unwrap();
+        let error = ZipReader::open(file.path(), limits()).err().unwrap();
+        assert_eq!(error.metadata().0, "HostileZip", "{error}");
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_zip_is_hostile() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"not a zip at all").unwrap();
+        assert_eq!(
+            ZipReader::open(file.path(), limits())
+                .err()
+                .unwrap()
+                .metadata()
+                .0,
+            "HostileZip"
+        );
     }
 
     #[test]

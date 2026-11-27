@@ -10,6 +10,7 @@ mod support;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ms_purview_cli::download::DownloadRule;
@@ -17,7 +18,7 @@ use ms_purview_cli::env::Env;
 use serde_json::{json, Value};
 use support::*;
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 const CASES: &str = "/v1.0/security/cases/ediscoveryCases";
 const CASE: &str = "00000000-0000-4000-8000-000000000031";
@@ -55,7 +56,11 @@ fn estimate_zip(failed: bool) -> Vec<u8> {
         locations.push_str("Exchange,Mailbox,kim@contoso.example,id-4,Mailbox,PrimaryMailBox,,,Failed,Timed out,q\r\n");
         statistics.push_str("Exchange,Mailbox,pat@fabrikam.example,Mailbox,SystemMailbox,Error,OperationCanceledException,x,0\r\n");
     }
-    let summary = "\u{feff}Job ID,j,x\r\nLocationCount,4,Locations\r\n\r\nStartTime (UTC),01/05/2026 9:00:00 AM,x\r\n";
+    let rows = if failed { 4 } else { 3 };
+    let summary = format!(
+        "\u{feff}Job ID,j,x\r\nLocationCount,{rows},Locations\r\n\r\nStartTime (UTC),01/05/2026 9:00:00 AM,x\r\n"
+    );
+    let summary = summary.as_str();
     let mut buffer = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buffer);
@@ -374,7 +379,7 @@ async fn a_portal_search_with_a_generic_query_is_refused_then_accepted_with_a_re
         .as_str()
         .unwrap()
         .contains("Legal asked for every mention"));
-    assert_eq!(plan["preflight"][2], "query: retention");
+    assert_eq!(plan["preflight"][2]["contentQuery"], "retention");
     assert!(setup.posts().await.is_empty());
 
     // A query outside the grammar is refused even with the override.
@@ -459,7 +464,7 @@ async fn an_estimate_posts_once_polls_downloads_and_checks_the_collection() {
     assert_eq!(result["collection"], "complete");
     assert_eq!(result["indexedItemCount"], 15);
     assert_eq!(result["mailboxCount"], 2);
-    assert_eq!(result["locationsSearched"], 4);
+    assert_eq!(result["locationsSearched"], 3);
     assert_eq!(result["topLocations"].as_array().unwrap().len(), 2);
     assert_eq!(
         result["topLocations"][0]["location"],
@@ -753,7 +758,7 @@ async fn a_human_run_shows_the_plan_and_the_result() {
     let stderr = run.stderr();
     assert!(stderr.contains("Plan: purview estimate"), "{stderr}");
     assert!(
-        stderr.contains("query: participants:alex@contoso.example"),
+        stderr.contains("{\"contentQuery\":\"participants:alex@contoso.example"),
         "{stderr}"
     );
     let stdout = run.stdout();
@@ -769,25 +774,86 @@ async fn a_human_run_shows_the_plan_and_the_result() {
 
 // Flow 5: the Graph token expires while the estimate is polled.
 
+/// Answers with `response` and appends `label` to a log shared by every
+/// mock, so that a test can see the order across origins.
+#[derive(Clone)]
+struct Logged {
+    log: Arc<Mutex<Vec<&'static str>>>,
+    label: &'static str,
+    response: ResponseTemplate,
+}
+
+impl Respond for Logged {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        self.log.lock().unwrap().push(self.label);
+        self.response.clone()
+    }
+}
+
 #[tokio::test]
 async fn a_token_that_expires_while_polling_is_refreshed_before_the_next_read() {
     let setup = Setup::new().await;
-    setup.ready(40, false).await;
-    // The Graph refresh, and the download redemption, which names its
-    // own resource.
+    let log: Arc<Mutex<Vec<&'static str>>> = Arc::default();
+    let logged = |label: &'static str, response: ResponseTemplate| Logged {
+        log: log.clone(),
+        label,
+        response,
+    };
+    setup
+        .preflight(
+            fixture_value(&setup.harness, "search-get-mailboxes.json"),
+            json!({"value": []}),
+        )
+        .await;
+    setup.accept(&setup.key_form_location()).await;
+    Mock::given(method("GET"))
+        .and(path(operation_path()))
+        .respond_with(logged(
+            "poll running",
+            json_response(200, operation("running", json!([]))),
+        ))
+        .up_to_n_times(40)
+        .with_priority(1)
+        .mount(&setup.harness.graph)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(operation_path()))
+        .respond_with(logged(
+            "poll succeeded",
+            json_response(200, setup.succeeded()),
+        ))
+        .with_priority(2)
+        .mount(&setup.harness.graph)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(FILE_PATH))
+        .respond_with(logged(
+            "file",
+            ResponseTemplate::new(200).set_body_bytes(estimate_zip(false)),
+        ))
+        .mount(&setup.alpha)
+        .await;
+    // The download redemption names its own resource; any other token
+    // request is the Graph refresh.
     Mock::given(method("POST"))
         .and(path(token_path("token")))
         .and(Form::new(&[(
             "scope",
             "b26e684c-5068-4120-a679-64a5d2c909d9/.default offline_access",
         )]))
-        .respond_with(json_response(200, fixture("token-download.json")))
+        .respond_with(logged(
+            "download token",
+            json_response(200, fixture("token-download.json")),
+        ))
         .with_priority(1)
         .mount(&setup.harness.identity)
         .await;
     Mock::given(method("POST"))
         .and(path(token_path("token")))
-        .respond_with(json_response(200, fixture("token-poll-window.json")))
+        .respond_with(logged(
+            "graph refresh",
+            json_response(200, fixture("token-poll-window.json")),
+        ))
         .with_priority(2)
         .mount(&setup.harness.identity)
         .await;
@@ -812,20 +878,22 @@ async fn a_token_that_expires_while_polling_is_refreshed_before_the_next_read() 
         Some(format!("Bearer {GRAPH_TOKEN}").as_str()),
         "the POST went out with no refresh"
     );
-    let identity = setup
-        .harness
-        .identity
-        .received_requests()
-        .await
-        .expect("the mock identity platform records requests");
-    let refreshes: Vec<&Request> = identity
-        .iter()
-        .filter(|request| {
-            !String::from_utf8_lossy(&request.body).contains("b26e684c-5068-4120-a679-64a5d2c909d9")
-        })
-        .collect();
-    assert_eq!(refreshes.len(), 1, "one Graph refresh");
-    // Reads before the refresh use the old token, those after it the new.
+    let events = log.lock().unwrap().clone();
+    let at = |label: &str| events.iter().position(|event| *event == label);
+    let count = |label: &str| events.iter().filter(|event| **event == label).count();
+    assert_eq!(count("graph refresh"), 1, "{events:?}");
+    assert_eq!(count("poll running"), 40, "{events:?}");
+    assert_eq!(count("poll succeeded"), 1, "{events:?}");
+    let refresh = at("graph refresh").unwrap();
+    let last_poll = at("poll succeeded").unwrap();
+    let redemption = at("download token").expect("the download token was redeemed");
+    let file = at("file").expect("the file was downloaded");
+    // A refresh during polling, with reads on both sides of it; then,
+    // only after the last read, the download token and the file.
+    assert!(refresh > 0 && refresh < last_poll, "{events:?}");
+    assert!(last_poll < redemption, "{events:?}");
+    assert!(redemption < file, "{events:?}");
+    // Reads before the refresh used the old token, those after it the new.
     let polls: Vec<String> = setup
         .graph_requests()
         .await
@@ -833,7 +901,6 @@ async fn a_token_that_expires_while_polling_is_refreshed_before_the_next_read() 
         .filter(|request| request.url.path() == operation_path())
         .map(|request| header(request, "authorization").unwrap_or_default())
         .collect();
-    assert_eq!(polls.len(), 41);
     let first_new = polls
         .iter()
         .position(|token| token.ends_with("canary-graph-access-0002"))
@@ -842,23 +909,6 @@ async fn a_token_that_expires_while_polling_is_refreshed_before_the_next_read() 
     assert!(polls[first_new..]
         .iter()
         .all(|token| token.ends_with("canary-graph-access-0002")));
-    // Nothing reached the download origin until the estimate finished,
-    // and the download token was redeemed after the last read.
-    let downloads = setup.downloads().await;
-    assert_eq!(downloads.len(), 1);
-    let download_redemption = identity
-        .iter()
-        .position(|request| {
-            String::from_utf8_lossy(&request.body).contains("b26e684c-5068-4120-a679-64a5d2c909d9")
-        })
-        .expect("the download token was redeemed");
-    let graph_refresh = identity
-        .iter()
-        .position(|request| {
-            !String::from_utf8_lossy(&request.body).contains("b26e684c-5068-4120-a679-64a5d2c909d9")
-        })
-        .unwrap();
-    assert!(graph_refresh < download_redemption);
 }
 
 // operation get --check.
@@ -948,4 +998,262 @@ async fn a_new_operation_not_yet_visible_is_read_again() {
         run.stderr()
     );
     assert!(run.stderr().contains("not visible yet"), "{}", run.stderr());
+}
+
+// Round-1 review fixes.
+
+#[tokio::test]
+async fn a_search_that_changes_after_the_plan_is_not_estimated() {
+    let setup = Setup::new().await;
+    // The plan reads the query; the read after approval sees another.
+    Mock::given(method("GET"))
+        .and(path(search_path("")))
+        .respond_with(json_response(
+            200,
+            fixture_value(&setup.harness, "search-get-mailboxes.json"),
+        ))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&setup.harness.graph)
+        .await;
+    let changed = search_with(
+        |search| {
+            search["contentQuery"] = json!("participants:sam@contoso.example AND \"orders-api\"")
+        },
+        &setup.harness,
+    );
+    setup.preflight(changed, json!({"value": []})).await;
+    setup.accept(&setup.key_form_location()).await;
+    let run = setup.run(&["--json", "--yes"]).await;
+    assert_eq!(run.outcome.exit_code, 1, "{}", run.stdout());
+    assert_eq!(run.json()["error"]["code"], "SearchChanged");
+    assert!(setup.posts().await.is_empty());
+}
+
+#[tokio::test]
+async fn an_operation_that_is_not_an_estimate_is_not_downloaded() {
+    let setup = Setup::new().await;
+    setup
+        .preflight(
+            fixture_value(&setup.harness, "search-get-mailboxes.json"),
+            json!({"value": []}),
+        )
+        .await;
+    setup.accept(&setup.key_form_location()).await;
+    let export = json!({
+        "@odata.type": "#microsoft.graph.security.ediscoverySearchExportOperation",
+        "id": OP,
+        "action": "exportResult",
+        "status": "succeeded",
+        "exportFileMetadata": [{"fileName": "Items.1.001.zip", "size": 10, "downloadUrl": setup.file_url()}],
+    });
+    setup.operation(0, export).await;
+    setup.serve(estimate_zip(false)).await;
+    let run = setup.run(&["--json", "--yes"]).await;
+    assert_eq!(run.outcome.exit_code, 1, "{}", run.stdout());
+    assert_eq!(run.json()["error"]["code"], "UnexpectedLocation");
+    assert!(setup.downloads().await.is_empty());
+    assert!(setup
+        .harness
+        .identity
+        .received_requests()
+        .await
+        .expect("recorded")
+        .is_empty());
+}
+
+#[tokio::test]
+async fn an_answer_other_than_202_stops_before_polling() {
+    let setup = Setup::new().await;
+    setup
+        .preflight(
+            fixture_value(&setup.harness, "search-get-mailboxes.json"),
+            json!({"value": []}),
+        )
+        .await;
+    Mock::given(method("POST"))
+        .and(path(search_path("/estimateStatistics")))
+        .respond_with(
+            json_response(200, json!({"id": OP}))
+                .insert_header("Location", setup.key_form_location().as_str()),
+        )
+        .mount(&setup.harness.graph)
+        .await;
+    let run = setup.run(&["--json", "--yes"]).await;
+    assert_eq!(run.json()["error"]["code"], "UnexpectedLocation");
+    assert!(setup
+        .graph_requests()
+        .await
+        .iter()
+        .all(|request| request.url.path() != operation_path()));
+}
+
+#[tokio::test]
+async fn a_signed_url_in_a_failure_reason_is_redacted() {
+    let setup = Setup::new().await;
+    setup
+        .preflight(
+            fixture_value(&setup.harness, "search-get-mailboxes.json"),
+            json!({"value": []}),
+        )
+        .await;
+    setup.accept(&setup.key_form_location()).await;
+    let signed = ["https://", "files.contoso.example/r?sig=canary-sig-0077"].concat();
+    let mut failed = operation("failed", json!([]));
+    failed["resultInfo"] = json!({"code": 1, "message": format!("see {signed}")});
+    setup.operation(0, failed).await;
+    for args in [
+        &["--json", "--yes", "--no-download"][..],
+        &["--yes", "--no-download"],
+    ] {
+        let run = setup.run(args).await;
+        assert_eq!(run.outcome.exit_code, 4, "{args:?}: {}", run.stdout());
+        assert!(
+            !run.stdout().contains("canary-sig-0077"),
+            "{}",
+            run.stdout()
+        );
+        assert!(
+            !run.stderr().contains("canary-sig-0077"),
+            "{}",
+            run.stderr()
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_operation_entry_that_cannot_be_read_may_be_a_duplicate() {
+    for entry in [
+        json!({"id": OTHER_OP, "status": "running"}),
+        json!({"id": OTHER_OP, "action": "estimateStatistics"}),
+        json!("not an object"),
+    ] {
+        let setup = Setup::new().await;
+        setup
+            .preflight(
+                fixture_value(&setup.harness, "search-get-mailboxes.json"),
+                json!({"value": [entry.clone()]}),
+            )
+            .await;
+        setup.accept(&setup.key_form_location()).await;
+        let run = setup.run(&["--json", "--yes"]).await;
+        assert_eq!(
+            run.json()["error"]["code"],
+            "ConcurrentOperation",
+            "{entry}"
+        );
+        assert!(setup.posts().await.is_empty(), "{entry}");
+    }
+}
+
+#[tokio::test]
+async fn a_source_list_whose_paging_leaves_it_is_unverified() {
+    let setup = Setup::new().await;
+    let elsewhere = format!(
+        "{}{CASES}/{CASE}/searches/00000000-0000-4000-8000-000000000052/custodianSources",
+        setup.harness.graph.uri()
+    );
+    Mock::given(method("GET"))
+        .and(path(search_path("/custodianSources")))
+        .respond_with(json_response(
+            200,
+            json!({"value": [], "@odata.nextLink": elsewhere}),
+        ))
+        .with_priority(1)
+        .mount(&setup.harness.graph)
+        .await;
+    setup
+        .preflight(
+            fixture_value(&setup.harness, "search-get-mailboxes.json"),
+            json!({"value": []}),
+        )
+        .await;
+    let run = setup.run(&["--json", "--yes"]).await;
+    assert_eq!(run.json()["error"]["code"], "ScopeUnverified");
+    assert!(setup.posts().await.is_empty());
+}
+
+/// An estimate zip whose Locations file has a row with no status, or two
+/// Locations files, cannot be checked; known failures are still listed.
+#[tokio::test]
+async fn partial_evidence_is_unchecked_and_strict_exits_4() {
+    let build = |extra_row: &str, second_locations: bool| -> Vec<u8> {
+        let mut buffer = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut buffer);
+            let options = zip::write::SimpleFileOptions::default();
+            let locations = format!(
+                "{LOCATIONS_HEADER}Exchange,Mailbox,alex@contoso.example,id-1,Mailbox,PrimaryMailBox,12,2048,Succeeded,,q\r\n{extra_row}"
+            );
+            writer.start_file("Locations-1.csv", options).unwrap();
+            writer.write_all(locations.as_bytes()).unwrap();
+            if second_locations {
+                writer.start_file("Locations-2.csv", options).unwrap();
+                writer.write_all(LOCATIONS_HEADER.as_bytes()).unwrap();
+            }
+            writer.start_file("Statistics-1.csv", options).unwrap();
+            writer.write_all(STATISTICS_HEADER.as_bytes()).unwrap();
+            writer.finish().unwrap();
+        }
+        buffer.into_inner()
+    };
+    for (zip, label) in [
+        (
+            build(
+                "Exchange,Mailbox,sam@contoso.example,id-2,Mailbox,PrimaryMailBox,3\r\n",
+                false,
+            ),
+            "a row with no status",
+        ),
+        (build("", true), "two Locations files"),
+    ] {
+        let setup = Setup::new().await;
+        setup
+            .preflight(
+                fixture_value(&setup.harness, "search-get-mailboxes.json"),
+                json!({"value": []}),
+            )
+            .await;
+        setup.accept(&setup.key_form_location()).await;
+        setup.operation(0, setup.succeeded()).await;
+        setup.serve(zip).await;
+        let run = setup.run(&["--json", "--yes", "--strict"]).await;
+        assert_eq!(run.outcome.exit_code, 4, "{label}: {}", run.stdout());
+        let document = run.json();
+        assert_eq!(
+            document["results"]["result"]["collection"], "unchecked",
+            "{label}"
+        );
+        assert_eq!(
+            document["outcome"]["reasons"][0]["code"], "EvidenceMissing",
+            "{label}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn wrap_untrusted_marks_the_plan_query_and_report_text() {
+    let setup = Setup::new().await;
+    setup.ready(0, true).await;
+    let run = setup
+        .run(&["--json", "--dry-run", "--wrap-untrusted"])
+        .await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stdout());
+    let query = run.json()["results"]["plan"]["preflight"][2]["contentQuery"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(query.starts_with("[UNTRUSTED:"), "{query}");
+
+    let run = setup.run(&["--json", "--yes", "--wrap-untrusted"]).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stdout());
+    let failed = &run.json()["results"]["result"]["failedLocations"][0];
+    assert!(failed["location"]
+        .as_str()
+        .unwrap()
+        .starts_with("[UNTRUSTED:"));
+    assert!(failed["failureMessage"]
+        .as_str()
+        .unwrap()
+        .starts_with("[UNTRUSTED:"));
 }

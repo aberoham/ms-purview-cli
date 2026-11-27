@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::error::{PurviewError, Result};
 use crate::zipread::{config_limit, ZipLimits, ZipReader};
-use estimate::{Collection, FailedLocation, Locations};
+use estimate::{Collection, FailedLocation, Locations, StatisticsErrors};
 use summary::{Setting, SummaryFile};
 
 /// The kind of report zip, from its entry names.
@@ -85,11 +85,14 @@ pub struct ReportFiles {
     pub kind: Kind,
     pub locations: Option<Locations>,
     /// The `StatType: Error` rows of `Statistics-*.csv`.
-    pub statistics_errors: Option<Vec<FailedLocation>>,
+    pub statistics_errors: Option<StatisticsErrors>,
     pub summary: Option<SummaryFile>,
     pub settings: Option<Vec<Setting>>,
     /// Missing columns, as `File: Column`.
     pub missing_columns: Vec<String>,
+    /// The kinds of file the zip holds more than one of, such as
+    /// `Locations`; only the first is read.
+    pub duplicates: Vec<&'static str>,
 }
 
 impl ReportFiles {
@@ -99,6 +102,10 @@ impl ReportFiles {
         let kind = Kind::of(zip.names());
         let record = limits.record_bytes;
         let mut missing_columns = Vec::new();
+        let duplicates = ["Locations", "Statistics", "Summary", "Settings"]
+            .into_iter()
+            .filter(|kind| zip.find_all(&format!("{kind}-")).len() > 1)
+            .collect();
         let locations = match zip.find("Locations-") {
             None => None,
             Some(index) => {
@@ -116,11 +123,15 @@ impl ReportFiles {
         let statistics_errors = match zip.find("Statistics-") {
             None => None,
             Some(index) => {
-                let (errors, missing) = zip.read_entry(index, |reader| {
+                let read = zip.read_entry(index, |reader| {
                     estimate::read_statistics_errors(reader, record)
                 })?;
-                missing_columns.extend(missing.iter().map(|c| format!("Statistics: {c}")));
-                Some(errors)
+                missing_columns.extend(
+                    read.missing_columns
+                        .iter()
+                        .map(|c| format!("Statistics: {c}")),
+                );
+                Some(read)
             }
         };
         let summary = match zip.find("Summary-") {
@@ -143,18 +154,35 @@ impl ReportFiles {
             summary,
             settings,
             missing_columns,
+            duplicates,
         })
+    }
+
+    /// Rows of Locations and Statistics that cannot be shown to be
+    /// searched in full.
+    pub fn unusable_rows(&self) -> usize {
+        self.locations.as_ref().map_or(0, |l| l.unusable_rows)
+            + self
+                .statistics_errors
+                .as_ref()
+                .map_or(0, |s| s.unusable_rows)
     }
 
     /// The failed locations of both files.
     pub fn failed_locations(&self) -> Vec<FailedLocation> {
-        estimate::failed_locations(self.locations.as_ref(), self.statistics_errors.as_deref())
+        estimate::failed_locations(
+            self.locations.as_ref(),
+            self.statistics_errors
+                .as_ref()
+                .map(|read| read.errors.as_slice()),
+        )
     }
 
     /// The collection check for an action whose evidence this is
     /// (`docs/SPEC.md` section 3.5): an estimate needs both Locations and
-    /// Statistics, a report Locations; without them, or with a column the
-    /// check reads missing, it is `Unchecked`.
+    /// Statistics, a report Locations; without them, with a column the
+    /// check reads missing, with a row it cannot read, or with more than
+    /// one such file, it is `Unchecked`, whatever failures it found.
     pub fn collection(&self, action: EvidenceOf) -> Collection {
         let locations_usable = self.locations.as_ref().is_some_and(|locations| {
             !locations
@@ -173,7 +201,11 @@ impl ReportFiles {
             EvidenceOf::Estimate => locations_usable && statistics_usable,
             EvidenceOf::Report => locations_usable,
         };
-        if !usable {
+        let ambiguous = self
+            .duplicates
+            .iter()
+            .any(|kind| matches!(*kind, "Locations" | "Statistics"));
+        if !usable || ambiguous || self.unusable_rows() > 0 {
             return Collection::Unchecked;
         }
         match self.failed_locations().len() {

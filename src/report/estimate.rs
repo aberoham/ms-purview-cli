@@ -65,6 +65,9 @@ pub struct Locations {
     pub missing_columns: Vec<&'static str>,
     /// Rows whose `Count` or `Size` was not a whole number.
     pub unreadable_counts: usize,
+    /// Rows with no `Location` or no `Status`, which cannot be shown to
+    /// be searched in full.
+    pub unusable_rows: usize,
 }
 
 /// A whole number such as `1024` or `1,024`.
@@ -87,9 +90,16 @@ pub fn read_locations(input: impl Read, limit: u64) -> Result<Locations> {
         ..Locations::default()
     };
     while let Some(row) = table.next_row()? {
+        if row.iter().all(|field| field.trim().is_empty()) {
+            continue;
+        }
         let Some(location) = field(&row, index[0]) else {
+            locations.unusable_rows += 1;
             continue;
         };
+        if field(&row, index[6]).is_none() {
+            locations.unusable_rows += 1;
+        }
         if locations.query.is_none() {
             locations.query = field(&row, index[8]);
         }
@@ -121,33 +131,51 @@ pub struct FailedLocation {
     pub sub_type: Option<String>,
     /// `StatName` of a Statistics error, else `ErrorWarning` of the
     /// Locations row; `None` when neither has text.
+    #[serde(rename = "failureMessage")]
     pub message: Option<String>,
     /// Where the failure was read: `locations`, `statistics` or both.
     pub sources: Vec<&'static str>,
 }
 
-/// The `StatType: Error` rows of `Statistics-*.csv`, and the names of
-/// missing columns.
-pub fn read_statistics_errors(
-    input: impl Read,
-    limit: u64,
-) -> Result<(Vec<FailedLocation>, Vec<&'static str>)> {
+/// The `StatType: Error` rows of `Statistics-*.csv`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StatisticsErrors {
+    pub errors: Vec<FailedLocation>,
+    pub missing_columns: Vec<&'static str>,
+    /// Rows with no `StatType`, or an error with no `Location`.
+    pub unusable_rows: usize,
+}
+
+pub fn read_statistics_errors(input: impl Read, limit: u64) -> Result<StatisticsErrors> {
     let mut table = Table::new(input, "Statistics", limit)?;
-    let (index, missing) = table.index(STATISTICS_COLUMNS);
-    let mut errors = Vec::new();
+    let (index, missing_columns) = table.index(STATISTICS_COLUMNS);
+    let mut read = StatisticsErrors {
+        missing_columns,
+        ..StatisticsErrors::default()
+    };
     while let Some(row) = table.next_row()? {
-        let is_error = field(&row, index[2]).is_some_and(|kind| kind.eq_ignore_ascii_case("Error"));
-        let Some(location) = field(&row, index[0]).filter(|_| is_error) else {
+        if row.iter().all(|field| field.trim().is_empty()) {
+            continue;
+        }
+        let Some(kind) = field(&row, index[2]) else {
+            read.unusable_rows += 1;
             continue;
         };
-        errors.push(FailedLocation {
+        if !kind.eq_ignore_ascii_case("Error") {
+            continue;
+        }
+        let Some(location) = field(&row, index[0]) else {
+            read.unusable_rows += 1;
+            continue;
+        };
+        read.errors.push(FailedLocation {
             location,
             sub_type: field(&row, index[1]),
             message: field(&row, index[3]),
             sources: vec!["statistics"],
         });
     }
-    Ok((errors, missing))
+    Ok(read)
 }
 
 /// The union of `Status: Failed` locations and Statistics errors, keyed by
@@ -267,8 +295,9 @@ mod tests {
     #[test]
     fn failures_are_the_union_of_both_files() {
         let locations = read_locations(LOCATIONS.as_bytes(), 1 << 20).unwrap();
-        let (errors, missing) = read_statistics_errors(STATISTICS.as_bytes(), 1 << 20).unwrap();
-        assert!(missing.is_empty());
+        let read = read_statistics_errors(STATISTICS.as_bytes(), 1 << 20).unwrap();
+        assert!(read.missing_columns.is_empty());
+        let errors = read.errors;
         assert_eq!(errors.len(), 2);
         let failed = failed_locations(Some(&locations), Some(&errors));
         assert_eq!(failed.len(), 2, "{failed:?}");

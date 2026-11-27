@@ -64,6 +64,8 @@ pub struct Estimate {
     /// What the plan sends to, and when preflight ended, for
     /// reconciliation.
     planned: Option<(CaseId, SearchId, DateTime<Utc>)>,
+    /// The query and verdict the plan showed.
+    shown: Option<(String, bool)>,
 }
 
 impl Estimate {
@@ -73,6 +75,7 @@ impl Estimate {
             guard: None,
             limits: None,
             planned: None,
+            shown: None,
         }
     }
 }
@@ -144,6 +147,7 @@ impl WriteCommand for Estimate {
             statistics_options: IncludeQueryStats,
         })?;
         self.planned = Some((case, search.id, preflight.clock.now() - CLOCK_SKEW));
+        self.shown = Some((query.clone(), narrowed));
         Ok(Planned::Write(WritePlan::new(PlanInput {
             command: "estimate",
             account: preflight.account.email.clone(),
@@ -169,7 +173,8 @@ impl WriteCommand for Estimate {
                     "sources: the custodian, non-custodial and additional source lists are empty"
                         .into(),
                 ),
-                Value::String(format!("query: {query}")),
+                // An object, so that --wrap-untrusted marks the query.
+                json!({ "contentQuery": query }),
                 Value::String(if narrowed {
                     "guard: the query is narrowed".into()
                 } else {
@@ -185,6 +190,45 @@ impl WriteCommand for Estimate {
         })?))
     }
 
+    /// The search again, by its id: its scope and sources are checked as
+    /// in preflight, and its query and the guard's verdict must be the
+    /// ones the plan showed.
+    async fn recheck(&mut self, preflight: &mut Preflight<'_>) -> Result<()> {
+        let (Some((case, search, _)), Some((query, narrowed)), Some(guard)) =
+            (self.planned, self.shown.clone(), self.guard.clone())
+        else {
+            return Err(PurviewError::message(
+                "estimate was approved without a plan",
+            ));
+        };
+        let changed = |what: &str| {
+            PurviewError::SearchChanged(format!(
+                "search {search} changed after the plan was shown ({what}); nothing was sent. Run \
+                 the command again to see a new plan"
+            ))
+        };
+        let again = check_search(
+            preflight.graph,
+            &CaseKey::Id(case),
+            &SearchKey::Id(search),
+            &guard,
+            self.flags.override_reason.as_deref(),
+            preflight.log,
+        )
+        .await
+        .map_err(|error| {
+            let (code, _) = error.metadata();
+            changed(&format!("it no longer passes the preflight: {code}"))
+        })?;
+        if again.search.id != search || again.query != query {
+            return Err(changed("its query is not the one shown"));
+        }
+        if again.narrowed != narrowed {
+            return Err(changed("the guard's verdict is not the one shown"));
+        }
+        Ok(())
+    }
+
     async fn applied(&mut self, after: &mut After<'_>, response: WriteResponse) -> Result<Applied> {
         let Some((case, _, _)) = self.planned else {
             return Err(PurviewError::message("estimate was applied without a plan"));
@@ -193,6 +237,13 @@ impl WriteCommand for Estimate {
             "the estimate may be running; 'purview operation list {case} --action estimate' \
              lists it"
         );
+        if response.status != 202 {
+            return Err(PurviewError::UnexpectedLocation(format!(
+                "Graph answered the estimate with HTTP {}, where 202 and a Location header were \
+                 observed; {reconcile_hint}",
+                response.status
+            )));
+        }
         let operation = response
             .location
             .as_deref()
@@ -256,6 +307,16 @@ impl WriteCommand for Estimate {
                 )?))
             }
         };
+        // The operation the header named must be an estimate: its files are
+        // a report, never item content.
+        if record.action.as_deref() != Some("estimateStatistics")
+            || !matches!(record.detail(), Some(OperationDetail::Estimate(_)))
+        {
+            return Err(PurviewError::UnexpectedLocation(format!(
+                "operation {operation} of case {case}, which the estimate's Location header \
+                 named, is not an estimate; nothing was downloaded. {reconcile_hint}"
+            )));
+        }
         let mut reasons: Vec<Value> = Vec::new();
         let mut files: Vec<Value> = Vec::new();
         let mut evidence: Option<ReportFiles> = None;
@@ -275,7 +336,11 @@ impl WriteCommand for Estimate {
                 overwrite: false,
             };
             let fetched = fetch(&mut after.session, case, &record, &request, context).await?;
+            // The deadline covers the wait; the download has its own
+            // timeouts (`docs/SPEC.md` section 4.7). Ctrl-C during it
+            // reports the time since the estimate was sent.
             if fetched.interrupted {
+                let waited = clock.elapsed().saturating_sub(started);
                 return Ok(Applied::Produced(stopped(
                     &mut after.session,
                     case,

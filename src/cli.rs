@@ -2046,6 +2046,15 @@ async fn run_write(
             if write.by_flag() && !json {
                 write.plan().write_text(&mut env.stderr, &redactor)?;
             }
+            command
+                .recheck(&mut Preflight {
+                    graph,
+                    account,
+                    log: &mut env.stderr,
+                    verbose: globals.verbose,
+                    clock: clock.as_ref(),
+                })
+                .await?;
             let (plan, response) = match graph.send_write(write, &mut env.stderr).await {
                 Ok(sent) => sent,
                 Err(PurviewError::WriteOutcomeUnknown { reason, .. }) => {
@@ -2123,9 +2132,12 @@ async fn run_write(
                     &redactor,
                 )?;
                 if let (false, Value::Object(object)) = (reasons.is_empty(), &mut value) {
+                    // A reason can quote Graph's message, which can hold a
+                    // signed URL: redacted as the rest of the document is.
+                    let outcome = serde_json::json!({"code": "Incomplete", "reasons": reasons});
                     object.insert(
                         "outcome".into(),
-                        serde_json::json!({"code": "Incomplete", "reasons": reasons}),
+                        redactor.redact_value(&crate::trace::redact_urls(&outcome, &redactor)),
                     );
                 }
                 return Ok(Outcome {
@@ -2141,7 +2153,10 @@ async fn run_write(
                 writeln!(
                     env.stderr,
                     "incomplete: {}",
-                    sanitize(reason["message"].as_str().unwrap_or_default())
+                    sanitize(&crate::redact::shown(
+                        reason["message"].as_str().unwrap_or_default(),
+                        &redactor
+                    ))
                 )?;
             }
             Ok(Outcome {

@@ -117,28 +117,37 @@ given, whoever created it:
   grammar is always refused; one that is not narrowed is refused unless
   `--allow-generic` gives a `--reason`, which the plan shows. An estimate
   has no description to record it in.
-- An estimate of the case that is `notStarted` or `running` may be a
+- An estimate of the case that is not known to be finished may be a
   duplicate: the operation list does not say which search an operation
-  runs. The plan names each one, and the estimate is refused with
+  runs, and an entry whose action or status cannot be read counts too. The plan names each one, and the estimate is refused with
   `ConcurrentOperation` unless `--allow-concurrent` is given; `--yes` alone
   is not enough. A dry run shows the plan either way.
 
-After approval the estimate is sent once. Its 202 answer must name the new
-operation in the `Location` header, on the Graph origin and for the case
-posted to; anything else stops the command with `UnexpectedLocation`,
-and the estimate may still be running (`purview operation list <case>
+After approval, and before anything is sent, the search is read again
+with the same checks; if its query, the guard's verdict, its scope or its
+sources differ from the plan, nothing is sent (`SearchChanged`). A change
+made after that read is still possible. The estimate is then sent once.
+Its answer must be a 202 naming the new operation in the `Location`
+header, on the Graph origin and for the case posted to, and the operation
+must be an estimate; anything else stops the command with
+`UnexpectedLocation` before any download, and the estimate may still be
+running (`purview operation list <case>
 --action estimate` shows it). The command then waits for the operation,
 downloads its report zip and reads it:
 
 - `collection` is `complete` when no location failed, `incomplete` when
   `Locations-*.csv` has a `Status=Failed` row or `Statistics-*.csv` a
   `StatType=Error` row, and `unchecked` when the zip was not read
-  (`--no-download`, or a file missing).
+  (`--no-download`), a file or a column it needs is missing, a row has no
+  location, status or `StatType`, or the zip holds two Locations or
+  Statistics files. Failures found are listed either way.
 - An estimate can succeed while locations failed (Observed); the command
   warns, and `--strict` makes it exit 4 (`FailedLocations`, or
   `EvidenceMissing` when the collection is unchecked).
-- At the wait deadline it exits 5, and on Ctrl-C 130, with the commands
-  that resume: `operation get --wait`, then `download`.
+- At the wait deadline it exits 5, and on Ctrl-C (during the wait or the
+  download) 130, with the commands that resume: `operation get --wait`,
+  then `download`. `--wait-timeout` covers the wait; the download has its
+  own timeouts.
 
 `purview operation get <case> <op> --check` runs the same collection
 check on an existing operation, downloading its evidence file into the

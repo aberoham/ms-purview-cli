@@ -13,9 +13,14 @@ use crate::error::{PurviewError, Result};
 /// The default of `limits.csv_max_record_bytes`: 64 MiB.
 pub const DEFAULT_RECORD_BYTES: u64 = 64 << 20;
 
+/// The CSV reader's buffer. The reader below may run ahead of a record by
+/// this much, so it allows that on top of the budget.
+const BUFFER: usize = 64 * 1024;
+
 /// Fails a read once more than `limit` bytes have passed since the last
-/// `reset`. The CSV reader buffers its input, so the count runs ahead of
-/// the record by at most that buffer.
+/// reset: a backstop that keeps one record from growing without bound
+/// while it is read. The budget itself is checked on each record's own
+/// bytes, in `CsvFile::next_row`.
 struct RecordBudget<R> {
     inner: R,
     since_reset: Rc<Cell<u64>>,
@@ -65,10 +70,13 @@ impl<R: Read> CsvFile<R> {
         let reader = csv::ReaderBuilder::new()
             .has_headers(false)
             .flexible(true)
+            .buffer_capacity(BUFFER)
             .from_reader(RecordBudget {
                 inner: input,
                 since_reset: since_reset.clone(),
-                limit,
+                // Two buffers: the one that held the end of the last
+                // record may also hold the start of this one.
+                limit: limit.saturating_add(2 * BUFFER as u64),
             });
         Self {
             reader,
@@ -90,6 +98,15 @@ impl<R: Read> CsvFile<R> {
         self.since_reset.set(0);
         if !more {
             return Ok(None);
+        }
+        // The record's own bytes: its fields and the separators between
+        // them.
+        let size = record.as_slice().len() as u64 + record.len().saturating_sub(1) as u64;
+        if size > self.limit {
+            return Err(PurviewError::RecordTooLarge {
+                file: self.what.to_owned(),
+                limit: self.limit,
+            });
         }
         let mut row: Row = record
             .iter()
@@ -227,6 +244,32 @@ mod tests {
         let error = table.next_row().err().unwrap();
         assert_eq!(error.metadata().0, "RecordTooLarge");
         assert!(!error.to_string().contains("xxx"));
+    }
+
+    #[test]
+    fn short_records_next_to_each_other_are_measured_one_by_one() {
+        // Each record is 40 bytes, under a 64-byte budget; together they
+        // are far over it.
+        let row = format!("{}\n", "x".repeat(40));
+        let text = format!("Location\n{}", row.repeat(5000));
+        let mut table = Table::new(text.as_bytes(), "Locations", 64).unwrap();
+        let mut count = 0;
+        while table.next_row().unwrap().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 5000);
+        // One record just over the budget, between short ones.
+        let text = format!("Location\n{row}{}\n{row}", "y".repeat(65));
+        let mut table = Table::new(text.as_bytes(), "Locations", 64).unwrap();
+        assert!(table.next_row().unwrap().is_some());
+        assert_eq!(
+            table.next_row().err().unwrap().metadata().0,
+            "RecordTooLarge"
+        );
+        // Exactly at the budget is accepted.
+        let text = format!("Location\n{}\n", "z".repeat(64));
+        let mut table = Table::new(text.as_bytes(), "Locations", 64).unwrap();
+        assert!(table.next_row().unwrap().is_some());
     }
 
     #[test]

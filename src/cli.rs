@@ -1599,7 +1599,7 @@ async fn write_command(
         guard: crate::kql::GuardConfig::from_config(&stored.extra)?,
     };
     command.check(&settings)?;
-    let (account, credential) = signed_in(env, globals)?;
+    let (account, credential) = signed_in_with(env, globals, &dir, &stored)?;
     let email = account.email.clone();
     let may_write = crate::auth::graph_permissions(&credential.graph.scope)
         .contains(&crate::auth::SCOPE_READ_WRITE.to_ascii_lowercase());
@@ -1765,13 +1765,27 @@ async fn run_write(
                             verbose: globals.verbose,
                         })
                         .await;
-                    let candidates = match found {
-                        Ok(candidates) => candidates,
-                        Err(error) => vec![format!(
-                            "nothing could be listed, because the check failed: {error}"
-                        )],
-                    };
-                    return Err(PurviewError::WriteOutcomeUnknown { reason, candidates });
+                    // The error's code and status only: its message can
+                    // hold text Graph quoted back.
+                    let found = found.unwrap_or_else(|error| {
+                        let (code, status) = error.metadata();
+                        safety::Reconciled {
+                            candidates: Vec::new(),
+                            notes: vec![format!(
+                                "The check for what it may have created failed ({code}{})",
+                                if status == 0 {
+                                    String::new()
+                                } else {
+                                    format!(", HTTP {status}")
+                                }
+                            )],
+                        }
+                    });
+                    return Err(PurviewError::WriteOutcomeUnknown {
+                        reason,
+                        candidates: found.candidates,
+                        notes: found.notes,
+                    });
                 }
                 Err(error) => return Err(error),
             };
@@ -2474,8 +2488,20 @@ fn select_account(
 fn signed_in(env: &mut Env, globals: &Globals) -> Result<(AccountRecord, Credential)> {
     let dir = configuration_dir(env)?;
     let stored = load_config(env, &dir)?;
+    signed_in_with(env, globals, &dir, &stored)
+}
+
+/// `signed_in` with `config.json` already read, so that a write uses one
+/// reading for its settings and its account.
+fn signed_in_with(
+    env: &mut Env,
+    globals: &Globals,
+    dir: &Path,
+    stored: &Config,
+) -> Result<(AccountRecord, Credential)> {
+    let dir = dir.to_path_buf();
     let accounts = config::list_accounts(&dir, &mut env.stderr)?;
-    let account = select_account(&stored, &accounts, globals.account.as_deref())?;
+    let account = select_account(stored, &accounts, globals.account.as_deref())?;
     let credential = Credential::load(env.credentials.as_ref(), &account.email, &env.redactor)?
         .ok_or_else(|| {
             PurviewError::message(format!(

@@ -60,6 +60,7 @@ error.
 
 ### `case create`
 
+- `naming.marker` must not be blank.
 - The name is `naming.case_name` rendered with `--topic` (by default
   `Records research - {topic} {yyyy_mm}`), or `--name`. The description is
   `naming.case_description`, or `--description`; `naming.marker` is added
@@ -69,7 +70,8 @@ error.
   whatever its status, nothing is sent and the command fails with
   `CaseNameInUse`, listing each match's id and status but not the name.
   Two cases with one name would make every later lookup by that name
-  ambiguous. A list that stops before its last page refuses too.
+  ambiguous. A list that stops before its last page refuses too, and so
+  does an entry whose name cannot be read.
 - `--reuse-existing`: if exactly one case has the name and it is active,
   the command shows it and exits 0 without sending anything
   (`"reused": true`, `"applied": false`). A closed or closing match, or
@@ -83,9 +85,10 @@ error.
   the reason is then recorded in the search's description, and the plan
   carries a warning. A query outside the grammar (`KqlNotUnderstood`) is
   refused with or without the override.
-- Preflight reads the case, which must be active (`CaseNotActive`
-  otherwise), and lists its searches to the last page. A search with the
-  same name refuses with `SearchNameInUse`.
+- Preflight reads the case, which must be the case asked for and active
+  (`CaseNotActive` otherwise), and lists its searches to the last page. A
+  search with the same name, or one whose name cannot be read, refuses
+  (`SearchNameInUse` for the first).
 - The body's `dataSourceScopes` is always `allTenantMailboxes`: the request
   type has no other value and no field for custodians or other sources.
 - The description is `naming.search_description` (by default the first 200
@@ -101,7 +104,9 @@ error.
 If the POST gets no answer, times out, or gets HTTP 429 or a 5xx, it is not
 sent again. `case create` lists the cases with the planned name, and
 `search create` the case's searches with the planned name, and the command
-fails with `WriteOutcomeUnknown`, naming each by id. Names are not unique,
+fails with `WriteOutcomeUnknown`, naming each by id. Entries on pages read
+before a page failed are still shown, with a note that the list stopped
+early. Names are not unique,
 so a match is only a candidate: check it with `purview case get` or
 `purview search get` before running the command again. Purview may not list
 a new case or search at once.

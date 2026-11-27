@@ -111,7 +111,11 @@ fn created_search(query: &str) -> ResponseTemplate {
 }
 
 async fn graph_requests(harness: &Harness) -> Vec<Request> {
-    harness.graph.received_requests().await.unwrap_or_default()
+    harness
+        .graph
+        .received_requests()
+        .await
+        .expect("the mock Graph records requests")
 }
 
 /// The Graph requests that were not GETs.
@@ -290,12 +294,10 @@ async fn one_active_case_with_the_name_is_reused_only_when_asked() {
 
     let run = harness.run(&case_create(&["--reuse-existing"])).await;
     assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
-    assert!(
-        run.stdout().starts_with(&format!(
-            "Reused: case {CASE} is active and has the name; nothing was sent.\n"
-        )),
-        "{}",
-        run.stdout()
+    let record = serde_json::to_string_pretty(&case(CASE, CASE_NAME, "active")).unwrap();
+    assert_eq!(
+        run.stdout(),
+        format!("Reused: case {CASE} is active and has the name; nothing was sent.\n{record}\n")
     );
     assert!(writes(&harness).await.is_empty());
 }
@@ -440,7 +442,7 @@ async fn a_guard_refusal_sends_no_request() {
         .identity
         .received_requests()
         .await
-        .unwrap_or_default()
+        .expect("the mock identity platform records requests")
         .is_empty());
 }
 
@@ -743,9 +745,14 @@ async fn an_unclear_outcome_with_nothing_listed_says_so() {
     assert_eq!(run.outcome.exit_code, 1);
     let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
     assert!(
-        message.contains("no case with the name was listed"),
+        message.contains("No case with the name was listed"),
         "{message}"
     );
+    assert!(
+        message.contains("Check in the Purview portal whether it took effect"),
+        "{message}"
+    );
+    assert!(!message.contains("It may have created"), "{message}");
     assert_eq!(writes(&harness).await.len(), 1);
 }
 
@@ -825,4 +832,208 @@ async fn a_list_whose_paging_repeats_refuses_both_creates() {
     let run = harness.run(&search_create(&["--json", "--yes"])).await;
     assert_eq!(run.outcome.exit_code, 1, "{}", run.stdout());
     assert!(writes(&harness).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_case_read_that_answers_with_another_case_is_refused() {
+    let harness = signed_in().await;
+    mount_get(
+        &harness,
+        &format!("{CASES}/{CASE}"),
+        case(NEW_CASE, "Other case", "active"),
+    )
+    .await;
+    mount_get(
+        &harness,
+        &format!("{CASES}/{NEW_CASE}/searches"),
+        page(vec![]),
+    )
+    .await;
+    mount_post(
+        &harness,
+        &format!("{CASES}/{NEW_CASE}/searches"),
+        created_search(QUERY),
+    )
+    .await;
+    let run = harness.run(&search_create(&["--json", "--yes"])).await;
+    assert_eq!(run.outcome.exit_code, 1, "{}", run.stdout());
+    assert!(writes(&harness).await.is_empty());
+    // Only the read of the case was sent.
+    assert_eq!(graph_requests(&harness).await.len(), 1);
+}
+
+#[tokio::test]
+async fn an_entry_whose_name_cannot_be_read_refuses_the_name_check() {
+    for entry in [
+        json!({"id": CASE, "status": "active"}),
+        json!({"id": CASE, "displayName": 7, "status": "active"}),
+        json!("not an object"),
+    ] {
+        let harness = signed_in().await;
+        mount_get(
+            &harness,
+            CASES,
+            page(vec![case(NEW_CASE, CASE_NAME, "active"), entry.clone()]),
+        )
+        .await;
+        mount_post(&harness, CASES, created_case()).await;
+        let run = harness
+            .run(&case_create(&["--json", "--yes", "--reuse-existing"]))
+            .await;
+        assert_eq!(run.outcome.exit_code, 1, "{entry}");
+        let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
+        assert!(message.contains("cannot be read"), "{entry}: {message}");
+        assert!(writes(&harness).await.is_empty(), "{entry}");
+    }
+    // A null name is no name, and is not in the way.
+    let harness = signed_in().await;
+    mount_get(
+        &harness,
+        CASES,
+        page(vec![
+            json!({"id": CASE, "displayName": null, "status": "active"}),
+        ]),
+    )
+    .await;
+    let run = harness.run(&case_create(&["--json"])).await;
+    assert_eq!(run.outcome.exit_code, 3, "{}", run.stdout());
+
+    let harness = signed_in().await;
+    mount_get(
+        &harness,
+        &format!("{CASES}/{CASE}"),
+        graph_fixture("case-get.json", &harness.graph.uri()),
+    )
+    .await;
+    mount_get(
+        &harness,
+        &searches_path(),
+        page(vec![json!({"id": NEW_SEARCH})]),
+    )
+    .await;
+    mount_post(&harness, &searches_path(), created_search(QUERY)).await;
+    let run = harness.run(&search_create(&["--json", "--yes"])).await;
+    assert_eq!(run.outcome.exit_code, 1);
+    assert!(writes(&harness).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_multiline_query_is_sent_as_given_and_summarised_on_one_line() {
+    let harness = ready_for_search(created_search(QUERY)).await;
+    let query = "\"orders-api\" AND\n\tparticipants:alex@contoso.example";
+    let run = harness
+        .run(&[
+            "--json",
+            "search",
+            "create",
+            CASE,
+            "--name",
+            "orders-api-mail",
+            "--kql",
+            query,
+        ])
+        .await;
+    assert_eq!(run.outcome.exit_code, 3, "{}", run.stdout());
+    let body = &run.json()["plan"]["body"];
+    assert_eq!(body["contentQuery"], query);
+    assert_eq!(
+        body["description"],
+        "\"orders-api\" AND  participants:alex@contoso.example [created-by:purview-cli]"
+    );
+}
+
+#[tokio::test]
+async fn a_blank_marker_is_refused_before_any_request() {
+    let harness = signed_in().await;
+    set_naming(&harness, json!({"marker": " "}));
+    let run = harness.run(&case_create(&["--json", "--yes"])).await;
+    assert_eq!(run.outcome.exit_code, 1);
+    let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
+    assert!(
+        message.contains("naming.marker must not be blank"),
+        "{message}"
+    );
+    assert!(graph_requests(&harness).await.is_empty());
+}
+
+/// Reconciliation keeps what earlier pages showed when a later page fails,
+/// and does not repeat the failure's message.
+#[tokio::test]
+async fn reconciliation_keeps_candidates_from_pages_before_a_failure() {
+    let harness = signed_in().await;
+    let next = format!("{}{CASES}?$skiptoken=2", harness.graph.uri());
+    Mock::given(method("GET"))
+        .and(path(CASES))
+        .and(wiremock::matchers::query_param("$skiptoken", "2"))
+        .respond_with(json_response(
+            400,
+            json!({"error": {"code": "BadRequest", "message": "reflected canary-name-0091"}}),
+        ))
+        .with_priority(1)
+        .mount(&harness.graph)
+        .await;
+    mount_get_then(
+        &harness,
+        CASES,
+        page(vec![]),
+        json!({"value": [case(NEW_CASE, CASE_NAME, "active")], "@odata.nextLink": next}),
+    )
+    .await;
+    mount_post(
+        &harness,
+        CASES,
+        json_response(503, json!({"error": {"code": "ServiceUnavailable"}})),
+    )
+    .await;
+    let run = harness.run(&case_create(&["--json", "--yes"])).await;
+    assert_eq!(run.outcome.exit_code, 1);
+    let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
+    assert!(
+        message.contains(&format!("It may have created: case {NEW_CASE} (active")),
+        "{message}"
+    );
+    assert!(
+        message.contains("stopped before its last page"),
+        "{message}"
+    );
+    assert!(!message.contains("canary-name-0091"), "{message}");
+    assert_eq!(writes(&harness).await.len(), 1);
+}
+
+/// SPEC 6.2: a dry run that starts with an expired token refreshes once
+/// and sends no Graph write, for each create command.
+#[tokio::test]
+async fn a_dry_run_with_an_expired_token_refreshes_once_for_each_create() {
+    for search in [false, true] {
+        let harness = ready_for_search(created_search(QUERY)).await;
+        mount_get(&harness, CASES, page(vec![])).await;
+        mount_post(&harness, CASES, created_case()).await;
+        let scope = harness.stored(ALEX).unwrap()["graph"]["scope"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        Mock::given(method("POST"))
+            .and(path(token_path("token")))
+            .respond_with(json_response(
+                200,
+                token("canary-graph-access-0002", "canary-refresh-0002", &scope),
+            ))
+            .mount(&harness.identity)
+            .await;
+        harness.clock.advance(Duration::from_secs(5 * 3600));
+        let args = if search {
+            search_create(&["--json", "--dry-run"])
+        } else {
+            case_create(&["--json", "--dry-run"])
+        };
+        let run = harness.run(&args).await;
+        assert_eq!(run.outcome.exit_code, 0, "{search}: {}", run.stdout());
+        let refreshes = harness
+            .identity
+            .received_requests()
+            .await
+            .expect("the mock identity platform records requests");
+        assert_eq!(refreshes.len(), 1, "{search}");
+        assert!(writes(&harness).await.is_empty(), "{search}");
+    }
 }

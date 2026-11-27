@@ -235,33 +235,84 @@ impl GraphClient {
         query: &Query,
         log: &mut (dyn Write + Send),
     ) -> Result<Listing> {
-        let mut url = self.url(route, query)?;
-        let mut seen = std::collections::HashSet::new();
+        match self.list_partial(route, query, log).await {
+            (listing, None) => Ok(listing),
+            (_, Some(error)) => Err(error),
+        }
+    }
+
+    /// `list`, keeping the items of the pages read before a page failed,
+    /// with that failure. For reconciliation after an unclear write, where
+    /// a candidate on an earlier page is worth showing; a decision that
+    /// needs the whole list uses `list`.
+    pub async fn list_partial(
+        &self,
+        route: &ReadRoute,
+        query: &Query,
+        log: &mut (dyn Write + Send),
+    ) -> (Listing, Option<PurviewError>) {
         let mut items = Vec::new();
+        let mut url = match self.url(route, query) {
+            Ok(url) => url,
+            Err(error) => {
+                return (
+                    Listing {
+                        items,
+                        stopped: None,
+                    },
+                    Some(error),
+                )
+            }
+        };
+        let mut seen = std::collections::HashSet::new();
         for _ in 0..MAX_PAGES {
             seen.insert(url.as_str().to_owned());
-            let page = self.page(self.get_url(&url, log).await?)?;
+            let page = match self
+                .get_url(&url, log)
+                .await
+                .and_then(|body| self.page(body))
+            {
+                Ok(page) => page,
+                Err(error) => {
+                    return (
+                        Listing {
+                            items,
+                            stopped: None,
+                        },
+                        Some(error),
+                    )
+                }
+            };
             items.extend(page.value);
             match page.next_link {
                 None => {
-                    return Ok(Listing {
-                        items,
-                        stopped: None,
-                    })
+                    return (
+                        Listing {
+                            items,
+                            stopped: None,
+                        },
+                        None,
+                    )
                 }
                 Some(next) if seen.contains(next.as_str()) => {
-                    return Ok(Listing {
-                        items,
-                        stopped: Some(ListStop::RepeatedLink),
-                    })
+                    return (
+                        Listing {
+                            items,
+                            stopped: Some(ListStop::RepeatedLink),
+                        },
+                        None,
+                    )
                 }
                 Some(next) => url = next,
             }
         }
-        Ok(Listing {
-            items,
-            stopped: Some(ListStop::PageLimit),
-        })
+        (
+            Listing {
+                items,
+                stopped: Some(ListStop::PageLimit),
+            },
+            None,
+        )
     }
 
     /// A collection page from a response body.
@@ -830,6 +881,7 @@ fn header_text(headers: &HeaderMap, name: &str) -> Option<String> {
 /// A write whose outcome is not known; the command adds what it finds.
 fn unknown(reason: String) -> PurviewError {
     PurviewError::WriteOutcomeUnknown {
+        notes: Vec::new(),
         reason,
         candidates: Vec::new(),
     }

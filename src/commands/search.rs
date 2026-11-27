@@ -8,9 +8,9 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use super::{
-    candidates, case_id, case_status, check_sent_text, cut, date_text, resolve_case,
-    resolve_search, sent_text, shown, shown_fields, time_text, warn_incomplete, warn_unreadable,
-    with_marker, Produced, Session,
+    candidates, case_id, case_status, check_sent_text, cut, date_text, reconcile_notes,
+    resolve_case, resolve_search, sent_text, shown, shown_fields, split_by_name, time_text,
+    unreadable_names, warn_incomplete, warn_unreadable, with_marker, Produced, Session,
 };
 use crate::error::{PurviewError, Result};
 use crate::graph::WriteResponse;
@@ -21,7 +21,9 @@ use crate::model::wire::{identity, CaseStatus, SearchRecord};
 use crate::naming::{Naming, Values};
 use crate::output::{sanitize, write_fields, write_rows, OutputFormat};
 use crate::routes::{CaseId, Query, ReadRoute, SearchId, SearchSources, WriteRoute};
-use crate::safety::{PlanInput, Planned, Preflight, WriteCommand, WritePlan, WriteSettings};
+use crate::safety::{
+    PlanInput, Planned, Preflight, Reconciled, WriteCommand, WritePlan, WriteSettings,
+};
 
 pub const LIST_COLUMNS: &[&str] = &["ID", "NAME", "SCOPE", "CREATED", "QUERY"];
 /// The `QUERY` column's width; JSON keeps the whole query.
@@ -322,13 +324,17 @@ impl SearchCreate {
     }
 }
 
-/// The searches whose display name is exactly `name`.
-fn same_name(items: Vec<Value>, name: &str) -> Vec<SearchRecord> {
-    items
-        .into_iter()
-        .filter_map(SearchRecord::from_value)
-        .filter(|search| search.display_name.as_deref() == Some(name))
-        .collect()
+/// The searches whose display name is exactly `name`, and how many
+/// entries have a name that cannot be read.
+fn same_name(items: Vec<Value>, name: &str) -> (Vec<SearchRecord>, usize) {
+    let (matches, unreadable) = split_by_name(items, name);
+    (
+        matches
+            .into_iter()
+            .filter_map(SearchRecord::from_value)
+            .collect(),
+        unreadable,
+    )
 }
 
 /// `id (created date)` for each search, never its name.
@@ -385,7 +391,10 @@ impl WriteCommand for SearchCreate {
             .complete()
             .map_err(|error| error.context("checking whether a search has the name already"))?;
         let listed = items.len();
-        let matches = same_name(items, &self.name);
+        let (matches, unreadable) = same_name(items, &self.name);
+        if unreadable > 0 {
+            return Err(unreadable_names("searches", unreadable));
+        }
         if !matches.is_empty() {
             return Err(PurviewError::SearchNameInUse(format!(
                 "{} in case {} already {} the name given with --name; nothing was sent: {}. \
@@ -504,17 +513,17 @@ impl WriteCommand for SearchCreate {
         Ok(body)
     }
 
-    async fn reconcile(&mut self, preflight: &mut Preflight<'_>) -> Result<Vec<String>> {
+    async fn reconcile(&mut self, preflight: &mut Preflight<'_>) -> Result<Reconciled> {
         let Some(case) = self.planned_case else {
-            return Ok(Vec::new());
+            return Ok(Reconciled::default());
         };
-        let listing = preflight
+        let (listing, failure) = preflight
             .graph
-            .list(&ReadRoute::Searches(case), &Query::new(), preflight.log)
-            .await?;
-        let incomplete = listing.stopped.is_some();
-        let matches = same_name(listing.items, &self.name);
-        let mut found: Vec<String> = matches
+            .list_partial(&ReadRoute::Searches(case), &Query::new(), preflight.log)
+            .await;
+        let incomplete = failure.is_some() || listing.stopped.is_some();
+        let (matches, unreadable) = same_name(listing.items, &self.name);
+        let candidates: Vec<String> = matches
             .iter()
             .map(|search| {
                 format!(
@@ -523,18 +532,15 @@ impl WriteCommand for SearchCreate {
                 )
             })
             .collect();
-        if found.is_empty() {
-            found.push(format!(
-                "no search with the name was listed in case {case}; Purview may not list a new \
-                 search at once, so check 'purview search list {case}' again before running the \
-                 command again"
-            ));
-        }
-        if incomplete {
-            found.push(
-                "the search list stopped before its last page, so others may exist".to_owned(),
-            );
-        }
-        Ok(found)
+        Ok(Reconciled {
+            notes: reconcile_notes(
+                "search",
+                candidates.is_empty(),
+                incomplete,
+                unreadable,
+                format!("purview search list {case}"),
+            ),
+            candidates,
+        })
     }
 }

@@ -19,7 +19,7 @@ use ms_purview_cli::error::{PurviewError, Result};
 use ms_purview_cli::graph::WriteResponse;
 use ms_purview_cli::routes::{CaseId, Query, ReadRoute, WriteRoute};
 use ms_purview_cli::safety::{
-    self, PlanInput, Planned, Preflight, WriteCommand, WritePlan, WriteSettings,
+    self, PlanInput, Planned, Preflight, Reconciled, WriteCommand, WritePlan, WriteSettings,
 };
 use ms_purview_cli::secrets::store_value;
 use serde_json::{json, Value};
@@ -86,8 +86,11 @@ impl WriteCommand for StubWrite {
         }))
     }
 
-    async fn reconcile(&mut self, _preflight: &mut Preflight<'_>) -> Result<Vec<String>> {
-        Ok(vec!["a search named Stub search".into()])
+    async fn reconcile(&mut self, _preflight: &mut Preflight<'_>) -> Result<Reconciled> {
+        Ok(Reconciled {
+            candidates: vec!["a search named Stub search".into()],
+            notes: Vec::new(),
+        })
     }
 }
 

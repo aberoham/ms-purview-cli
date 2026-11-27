@@ -361,6 +361,14 @@ pub enum Planned {
     Existing { result: Value, notice: String },
 }
 
+/// What reconciliation found: candidates the write may have created, each
+/// named by id, and notes on how far the check got.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Reconciled {
+    pub candidates: Vec<String>,
+    pub notes: Vec<String>,
+}
+
 /// What a write command gets while it plans, reconciles or reads its
 /// result: the Graph client, the signed-in account and a log for notices.
 /// Not `Env`: the terminal, the approval input and the prompt belong to the
@@ -400,8 +408,8 @@ pub trait WriteCommand: Send {
 
     /// After an unclear outcome: what the write may have created, for the
     /// person to check. Reads only.
-    async fn reconcile(&mut self, _preflight: &mut Preflight<'_>) -> Result<Vec<String>> {
-        Ok(Vec::new())
+    async fn reconcile(&mut self, _preflight: &mut Preflight<'_>) -> Result<Reconciled> {
+        Ok(Reconciled::default())
     }
 }
 

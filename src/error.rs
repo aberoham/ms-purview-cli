@@ -144,11 +144,14 @@ pub enum PurviewError {
     /// command found that the request may have created.
     #[error(
         "the write may or may not have been applied: {reason}. It was not sent again{}",
-        candidates_text(.candidates)
+        candidates_text(.candidates, .notes)
     )]
     WriteOutcomeUnknown {
         reason: String,
         candidates: Vec<String>,
+        /// What the check found besides candidates, such as a list that
+        /// stopped early.
+        notes: Vec<String>,
     },
 
     /// The target exists and is not a verified download of the file.
@@ -472,16 +475,22 @@ impl From<String> for PurviewError {
 
 pub type Result<T> = std::result::Result<T, PurviewError>;
 
-/// The candidates of a `WriteOutcomeUnknown`, as the end of its message.
-fn candidates_text(candidates: &[String]) -> String {
-    if candidates.is_empty() {
-        return ". Check in the Purview portal whether it took effect before running it again"
-            .to_owned();
+/// The candidates and notes of a `WriteOutcomeUnknown`, as the end of its
+/// message.
+fn candidates_text(candidates: &[String], notes: &[String]) -> String {
+    let mut text = if candidates.is_empty() {
+        ". Check in the Purview portal whether it took effect before running it again".to_owned()
+    } else {
+        format!(
+            ". It may have created: {}. Check them before running the command again",
+            candidates.join("; ")
+        )
+    };
+    for note in notes {
+        text.push_str(". ");
+        text.push_str(note);
     }
-    format!(
-        ". It may have created: {}. Check them before running the command again",
-        candidates.join("; ")
-    )
+    text
 }
 
 #[cfg(test)]

@@ -141,7 +141,14 @@ pub async fn resolve_case(
     let body = graph.get(&ReadRoute::Case(id), &Query::new(), log).await?;
     let record = CaseRecord::from_value(body)
         .ok_or_else(|| PurviewError::message("Graph returned a case that is not an object"))?;
-    CaseRef::new(record)
+    let case = CaseRef::new(record)?;
+    if case.id != id {
+        return Err(PurviewError::message(format!(
+            "Graph answered the read of case {id} with case {}; nothing more was read",
+            case.id
+        )));
+    }
+    Ok(case)
 }
 
 async fn match_case_name(
@@ -213,7 +220,14 @@ pub async fn resolve_search(
         .await?;
     let record = SearchRecord::from_value(body)
         .ok_or_else(|| PurviewError::message("Graph returned a search that is not an object"))?;
-    SearchRef::new(record)
+    let search = SearchRef::new(record)?;
+    if search.id != id {
+        return Err(PurviewError::message(format!(
+            "Graph answered the read of search {id} with search {}; nothing more was read",
+            search.id
+        )));
+    }
+    Ok(search)
 }
 
 async fn match_search_name(
@@ -292,14 +306,71 @@ pub(crate) fn candidates(
 /// refused when blank or when it holds a control or invisible character.
 /// Errors name the flag, never the value.
 pub fn sent_text(flag: &str, value: &str) -> Result<String> {
+    // Checked before trimming, so that a line break at either end is
+    // refused too.
+    check_sent_text(flag, value)?;
     let value = value.trim();
     if value.is_empty() {
         return Err(PurviewError::message(format!(
             "{flag} was given an empty value"
         )));
     }
-    check_sent_text(flag, value)?;
     Ok(value.to_owned())
+}
+
+/// The entries of a list whose `displayName` is exactly `name`, and how
+/// many entries have a name that cannot be read: not a JSON object, or a
+/// `displayName` that is missing or not a string. A `null` `displayName`
+/// is no name, and matches nothing.
+pub fn split_by_name(items: Vec<Value>, name: &str) -> (Vec<Value>, usize) {
+    let mut matches = Vec::new();
+    let mut unreadable = 0;
+    for item in items {
+        match item.get("displayName") {
+            Some(Value::String(found)) if found == name => matches.push(item),
+            Some(Value::String(_) | Value::Null) => {}
+            _ => unreadable += 1,
+        }
+    }
+    (matches, unreadable)
+}
+
+/// The notes of a reconciliation: that nothing was listed, that the list
+/// stopped early, and entries whose name could not be read. `what` is
+/// `case` or `search`; `again` is the command that lists them.
+pub fn reconcile_notes(
+    what: &str,
+    none_found: bool,
+    incomplete: bool,
+    unreadable: usize,
+    again: String,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    if none_found {
+        notes.push(format!(
+            "No {what} with the name was listed; Purview may not list a new {what} at once, so \
+             run '{again}' again before running the command again"
+        ));
+    }
+    if incomplete {
+        notes.push(format!(
+            "The {what} list stopped before its last page, so others may exist"
+        ));
+    }
+    if unreadable > 0 {
+        notes.push(format!(
+            "{unreadable} entries of the {what} list have a name that cannot be read"
+        ));
+    }
+    notes
+}
+
+/// The refusal when a name check met entries whose name cannot be read.
+pub fn unreadable_names(what: &str, count: usize) -> PurviewError {
+    PurviewError::message(format!(
+        "{count} {what} in Graph's list have a display name that cannot be read, so it cannot be \
+         shown that none of them has the name; nothing was sent"
+    ))
 }
 
 /// Refuses text for the tenant that holds a control or invisible

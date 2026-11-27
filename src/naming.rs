@@ -106,6 +106,13 @@ impl Naming {
                 "config.json: naming.marker must not hold control characters",
             ));
         }
+        // The marker tells a case or search this tool made, so it cannot
+        // be blank.
+        if marker.trim().is_empty() {
+            return Err(PurviewError::message(
+                "config.json: naming.marker must not be blank",
+            ));
+        }
         Ok(Self {
             case_name: template("case_name", DEFAULT_CASE_NAME)?,
             case_description: template("case_description", DEFAULT_CASE_DESCRIPTION)?,
@@ -207,7 +214,21 @@ fn value_of(name: &str, values: &Values<'_>, marker: &str) -> Option<String> {
         "user" => Some(values.user.to_owned()),
         "query_summary" => values
             .query
-            .map(|query| query.chars().take(QUERY_SUMMARY_CHARS).collect()),
+            // A line break or tab between the query's tokens becomes a
+            // space: a description holds one line.
+            .map(|query| {
+                query
+                    .chars()
+                    .take(QUERY_SUMMARY_CHARS)
+                    .map(|character| {
+                        if character.is_control() {
+                            ' '
+                        } else {
+                            character
+                        }
+                    })
+                    .collect()
+            }),
         "yyyy_mm" => date("%Y-%m"),
         "utc_date" => date("%Y-%m-%d"),
         "utc_hhmm" => date("%H%M"),
@@ -349,6 +370,8 @@ mod tests {
         assert!(naming(json!({"naming": {"case_name": 3}})).is_err());
         assert!(naming(json!({"naming": {"marker": false}})).is_err());
         assert!(naming(json!({"naming": {"marker": "a\u{7}"}})).is_err());
+        assert!(naming(json!({"naming": {"marker": ""}})).is_err());
+        assert!(naming(json!({"naming": {"marker": "  "}})).is_err());
         let defaults = naming(json!({})).unwrap();
         assert_eq!(naming(json!({"naming": null})).unwrap(), defaults);
         assert_eq!(

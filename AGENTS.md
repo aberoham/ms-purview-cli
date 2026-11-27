@@ -198,7 +198,8 @@ timeout. It carries the Graph base URL (`origin::GRAPH_BASE` in production,
   `build_url`, which encodes each path segment on its own and refuses
   `.`, `..` and empty segments.
 - `src/graph.rs` is `GraphClient`, the only Graph transport: `get`,
-  `get_page` and `list` (paging), the origin and base-path check on every
+  `get_page`, `list` (paging) and `list_partial` (the pages read before
+  one failed, with the failure, for reconciliation), the origin and base-path check on every
   request and paging link, the retry loop of `docs/SPEC.md` section 4.3
   (with `Retry-After` honoured up to 60 seconds; a longer one ends the read
   with Graph's error), the 8 MiB body limit and the Graph error allow-list.
@@ -215,7 +216,8 @@ timeout. It carries the Graph base URL (`origin::GRAPH_BASE` in production,
   `--yes`, the `Apply? [y/N]` prompt through `Env`'s `Input`, exit 3 as
   `ConfirmationRequired` or `Declined`), `ApprovedWrite`, which only
   `approve` builds from an `Approval` only this module makes, and the
-  `WriteCommand` trait (`check`, `plan`, `applied`, `reconcile`). `check`
+  `WriteCommand` trait (`check`, `plan`, `applied`, `reconcile`, which
+  returns `Reconciled`: candidates by id, and notes). `check`
   gets the `WriteSettings` (`naming` and `guard` from `config.json`);
   `plan` returns `Planned::Write(WritePlan)` or, when nothing needs to be
   sent, `Planned::Existing` (printed as `{"applied": false, "plan": null,

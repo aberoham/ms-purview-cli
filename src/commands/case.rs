@@ -5,8 +5,9 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::Value;
 
 use super::{
-    candidates, case_status, check_sent_text, date_text, resolve_case, sent_text, shown_fields,
-    shown_rows, time_text, warn_incomplete, warn_unreadable, with_marker, Produced, Session,
+    candidates, case_status, check_sent_text, date_text, reconcile_notes, resolve_case, sent_text,
+    shown_fields, shown_rows, split_by_name, time_text, unreadable_names, warn_incomplete,
+    warn_unreadable, with_marker, Produced, Session,
 };
 use crate::error::{PurviewError, Result};
 use crate::graph::WriteResponse;
@@ -16,7 +17,9 @@ use crate::model::wire::{identity, CaseRecord, CaseStatus};
 use crate::naming::{Naming, Values};
 use crate::output::{write_fields, write_rows, OutputFormat};
 use crate::routes::{CaseId, Query, ReadRoute, WriteRoute};
-use crate::safety::{PlanInput, Planned, Preflight, WriteCommand, WritePlan, WriteSettings};
+use crate::safety::{
+    PlanInput, Planned, Preflight, Reconciled, WriteCommand, WritePlan, WriteSettings,
+};
 use std::io::Write;
 
 /// `--status` of `case list`.
@@ -315,13 +318,17 @@ impl CaseCreate {
     }
 }
 
-/// The cases whose display name is exactly `name`.
-fn same_name(items: Vec<Value>, name: &str) -> Vec<CaseRecord> {
-    items
-        .into_iter()
-        .filter_map(CaseRecord::from_value)
-        .filter(|case| case.display_name.as_deref() == Some(name))
-        .collect()
+/// The cases whose display name is exactly `name`, and how many entries
+/// have a name that cannot be read.
+fn same_name(items: Vec<Value>, name: &str) -> (Vec<CaseRecord>, usize) {
+    let (matches, unreadable) = split_by_name(items, name);
+    (
+        matches
+            .into_iter()
+            .filter_map(CaseRecord::from_value)
+            .collect(),
+        unreadable,
+    )
 }
 
 /// `id (status, created date)` for each case, never its name.
@@ -358,7 +365,10 @@ impl WriteCommand for CaseCreate {
             .complete()
             .map_err(|error| error.context("checking whether a case has the name already"))?;
         let listed = items.len();
-        let matches = same_name(items, &name);
+        let (matches, unreadable) = same_name(items, &name);
+        if unreadable > 0 {
+            return Err(unreadable_names("cases", unreadable));
+        }
         match matches.as_slice() {
             [] => {}
             [only] if self.reuse_existing && only.status == CaseStatus::Active => {
@@ -463,30 +473,29 @@ impl WriteCommand for CaseCreate {
         Ok(body)
     }
 
-    async fn reconcile(&mut self, preflight: &mut Preflight<'_>) -> Result<Vec<String>> {
+    async fn reconcile(&mut self, preflight: &mut Preflight<'_>) -> Result<Reconciled> {
         let Some(name) = self.planned_name.clone() else {
-            return Ok(Vec::new());
+            return Ok(Reconciled::default());
         };
-        let listing = preflight
+        let (listing, failure) = preflight
             .graph
-            .list(&ReadRoute::Cases, &Query::new(), preflight.log)
-            .await?;
-        let incomplete = listing.stopped.is_some();
-        let matches = same_name(listing.items, &name);
-        let mut found: Vec<String> = matches
+            .list_partial(&ReadRoute::Cases, &Query::new(), preflight.log)
+            .await;
+        let incomplete = failure.is_some() || listing.stopped.is_some();
+        let (matches, unreadable) = same_name(listing.items, &name);
+        let candidates: Vec<String> = matches
             .iter()
             .map(|case| format!("case {}", case_candidates(std::slice::from_ref(case))))
             .collect();
-        if found.is_empty() {
-            found.push(
-                "no case with the name was listed; Purview may not list a new case at once, so \
-                 check 'purview case list' again before running the command again"
-                    .to_owned(),
-            );
-        }
-        if incomplete {
-            found.push("the case list stopped before its last page, so others may exist".into());
-        }
-        Ok(found)
+        Ok(Reconciled {
+            notes: reconcile_notes(
+                "case",
+                candidates.is_empty(),
+                incomplete,
+                unreadable,
+                "purview case list".to_owned(),
+            ),
+            candidates,
+        })
     }
 }

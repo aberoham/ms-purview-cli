@@ -591,6 +591,13 @@ async fn a_body_that_is_not_a_zip_is_not_published() {
     let run = setup.run(&["download", CASE, OP]).await;
     assert_eq!(run.outcome.exit_code, 1);
     assert!(run.stderr().contains("not a zip"), "{}", run.stderr());
+    // Files are named by position, never by their tenant-written names.
+    assert!(
+        run.stderr().contains("downloading file 1 of 1"),
+        "{}",
+        run.stderr()
+    );
+    assert!(!run.stderr().contains("Orders API"), "{}", run.stderr());
     assert_eq!(entries(&setup.target_dir()), Vec::<String>::new());
 }
 
@@ -1203,4 +1210,219 @@ async fn a_link_inside_the_managed_data_path_is_refused() {
     assert!(run.stderr().contains("is a link"), "{}", run.stderr());
     assert!(entries(&elsewhere).is_empty());
     assert!(Setup::requests(&setup.alpha).await.is_empty());
+}
+
+/// A server that sends a `Content-Length` of 100 and ten bytes, then holds
+/// the connection open without sending more.
+async fn stalling_server() -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buffer = [0u8; 4096];
+                let _ = stream.read(&mut buffer).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n0123456789")
+                    .await;
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            });
+        }
+    });
+    address
+}
+
+#[tokio::test]
+async fn a_stalled_download_ends_at_the_idle_timeout_and_leaves_nothing() {
+    let setup = Setup::new().await;
+    let address = stalling_server().await;
+    let url = format!("http://{ALPHA}:{}/x", address.port());
+    setup
+        .operation("succeeded", json!([file(NAME, 0, &url)]))
+        .await;
+    let run = setup
+        .run_with(&["download", CASE, OP], |env| {
+            env.download_resolve = vec![(ALPHA.to_owned(), address)];
+            env.download_idle_timeout = std::time::Duration::from_secs(1);
+        })
+        .await;
+    assert_eq!(run.outcome.exit_code, 1);
+    assert!(
+        run.stderr().contains("no data arrived for 1 seconds"),
+        "{}",
+        run.stderr()
+    );
+    assert_eq!(entries(&setup.target_dir()), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn ctrl_c_while_a_file_streams_removes_its_temporary_file() {
+    let setup = Setup::new().await;
+    let address = stalling_server().await;
+    let url = format!("http://{ALPHA}:{}/x", address.port());
+    setup
+        .operation("succeeded", json!([file(NAME, 0, &url)]))
+        .await;
+    let interrupt = Arc::new(ms_purview_cli::env::ManualInterrupt::default());
+    let fired = interrupt.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        fired.fire();
+    });
+    let run = setup
+        .run_with(&["--json", "download", CASE, OP], |env| {
+            env.download_resolve = vec![(ALPHA.to_owned(), address)];
+            env.interrupt = interrupt.clone();
+        })
+        .await;
+    assert_eq!(run.outcome.exit_code, 130, "{}", run.stdout());
+    assert_eq!(run.json()["error"]["code"], "Interrupted");
+    assert_eq!(run.json()["count"], 0);
+    assert_eq!(entries(&setup.target_dir()), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn a_recorded_file_that_changed_is_refused_before_any_request() {
+    let setup = Setup::new().await;
+    setup.serve(zip_bytes("recorded\n")).await;
+    setup
+        .operation("succeeded", json!([file(NAME, 0, &setup.file_url())]))
+        .await;
+    assert_eq!(
+        setup.run(&["download", CASE, OP]).await.outcome.exit_code,
+        0
+    );
+    let target = setup.target_dir().join(NAME);
+    std::fs::write(&target, zip_bytes("tampered\n")).unwrap();
+    let run = setup.run(&["--json", "download", CASE, OP]).await;
+    assert_eq!(run.outcome.exit_code, 1);
+    assert_eq!(run.json()["error"]["code"], "TargetExists");
+    assert_eq!(Setup::requests(&setup.alpha).await.len(), 1);
+}
+
+#[tokio::test]
+async fn an_unrecorded_file_that_is_not_a_zip_is_not_recovered() {
+    let setup = Setup::new().await;
+    setup.serve(zip_bytes("x\n")).await;
+    setup
+        .operation("succeeded", json!([file(NAME, 0, &setup.file_url())]))
+        .await;
+    std::fs::create_dir_all(setup.target_dir()).unwrap();
+    std::fs::write(setup.target_dir().join(NAME), b"not a zip").unwrap();
+    let run = setup.run(&["--json", "download", CASE, OP]).await;
+    assert_eq!(run.outcome.exit_code, 1);
+    assert_eq!(run.json()["error"]["code"], "TargetExists");
+    assert!(Setup::requests(&setup.alpha).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_403_is_download_refused_with_its_status() {
+    let setup = Setup::new().await;
+    setup
+        .operation("succeeded", json!([file(NAME, 0, &setup.file_url())]))
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&setup.alpha)
+        .await;
+    let run = setup.run(&["--json", "download", CASE, OP]).await;
+    assert_eq!(run.outcome.exit_code, 1);
+    assert_eq!(run.json()["error"]["code"], "DownloadRefused");
+    assert_eq!(run.json()["error"]["status"], 403);
+}
+
+#[tokio::test]
+async fn defaults_data_dir_replaces_the_data_root() {
+    let setup = Setup::new().await;
+    setup.serve(zip_bytes("x\n")).await;
+    setup
+        .operation("succeeded", json!([file(NAME, 0, &setup.file_url())]))
+        .await;
+    let configured = setup.harness.root.path().join("configured");
+    let mut config = setup.harness.config();
+    config["defaults"] = json!({"data_dir": configured.to_str().unwrap()});
+    std::fs::write(
+        setup.harness.config_dir().join("config.json"),
+        serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
+    let run = setup.run(&["download", CASE, OP]).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
+    assert!(configured
+        .join("cases")
+        .join(CASE)
+        .join(OP)
+        .join(NAME)
+        .is_file());
+    assert!(!setup.target_dir().exists());
+}
+
+#[tokio::test]
+async fn wrap_untrusted_wraps_the_server_file_name() {
+    let setup = Setup::new().await;
+    setup.serve(zip_bytes("x\n")).await;
+    setup
+        .operation("succeeded", json!([file(NAME, 0, &setup.file_url())]))
+        .await;
+    let run = setup
+        .run(&["--json", "--wrap-untrusted", "download", CASE, OP])
+        .await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stdout());
+    let name = run.json()["results"][0]["fileName"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(name.starts_with("[UNTRUSTED:"), "{name}");
+    assert!(name.contains(NAME), "{name}");
+}
+
+#[tokio::test]
+async fn an_expired_download_token_is_refreshed_and_no_token_leaks_into_trace_or_output() {
+    let setup = Setup::new().await;
+    setup.serve(zip_bytes("x\n")).await;
+    setup
+        .operation("succeeded", json!([file(NAME, 0, &setup.file_url())]))
+        .await;
+    // The download token (valid for 3599 seconds) is past its 5-minute
+    // margin; the Graph token (4271 seconds) is not.
+    setup
+        .harness
+        .clock
+        .advance(std::time::Duration::from_secs(3600));
+    Mock::given(method("POST"))
+        .and(path(token_path("token")))
+        .and(Form::new(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", "canary-refresh-0002"),
+        ]))
+        .respond_with(json_response(
+            200,
+            token(
+                "canary-download-access-0002",
+                "canary-refresh-0004",
+                "b26e684c-5068-4120-a679-64a5d2c909d9/eDiscovery.Download.Read",
+            ),
+        ))
+        .expect(1)
+        .mount(&setup.harness.identity)
+        .await;
+    let trace = setup.harness.root.path().join("trace");
+    let run = setup
+        .run(&[
+            "--verbose",
+            "--trace",
+            trace.to_str().unwrap(),
+            "download",
+            CASE,
+            OP,
+        ])
+        .await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
+    let downloads = Setup::requests(&setup.alpha).await;
+    assert_eq!(
+        header(&downloads[0], "authorization").as_deref(),
+        Some("Bearer canary-download-access-0002")
+    );
+    setup.harness.assert_no_canaries(&run);
 }

@@ -222,6 +222,7 @@ pub struct DownloadClient {
     redactor: Arc<Redactor>,
     clock: Arc<dyn Clock>,
     verbose: bool,
+    idle_timeout: Duration,
     trace: Option<Arc<TraceSink>>,
     trace_failed: AtomicBool,
 }
@@ -259,6 +260,7 @@ impl DownloadClient {
             redactor,
             clock,
             verbose: settings.verbose,
+            idle_timeout: settings.idle_timeout,
             trace: settings.trace,
             trace_failed: AtomicBool::new(false),
         })
@@ -398,7 +400,7 @@ impl DownloadClient {
                 Err(error) if error.is_timeout() => {
                     break Err(PurviewError::message(format!(
                         "the download stalled: no data arrived for {} seconds",
-                        IDLE_TIMEOUT.as_secs()
+                        self.idle_timeout.as_secs()
                     )))
                 }
                 Err(_) => {
@@ -569,40 +571,72 @@ impl std::fmt::Debug for PartFile {
     }
 }
 
+/// Ctrl-C, as one listener the caller keeps for the whole run.
+pub type Interrupted<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+
 /// Fetches `file` for `placement` into a temporary file in its directory,
 /// then checks its length and zip central directory. The caller has
 /// checked the target: absent, or replaceable under `overwrite`.
+///
+/// `Ok(None)` when Ctrl-C came first: before the file started, or while
+/// it streamed. Ctrl-C is handled here rather than by cancelling this
+/// future, so the temporary file is always closed before it is removed:
+/// Windows cannot remove a file that is open.
 pub async fn stage(
     client: &DownloadClient,
     file: &DownloadableFile,
     placement: &Placement<'_>,
     limits: Limits,
+    interrupted: &mut Interrupted<'_>,
     log: &mut (dyn Write + Send),
-) -> Result<Staged> {
+) -> Result<Option<Staged>> {
     let target = placement.dir.join(placement.name);
     let (part, guard) = create_part(placement.dir, placement.name)?;
     let mut sink = tokio::fs::File::from_std(part);
-    let fetched = client.fetch(file, limits, &mut sink, log).await;
-    // Waits for any write in flight, so the file is closed here, before
-    // the guard removes it on failure: Windows cannot remove, link or
-    // rename a file that is open.
+    // Biased, so a Ctrl-C that came while the previous file was published
+    // ends the run before this one's request is sent.
+    let fetched = tokio::select! {
+        biased;
+        () = interrupted.as_mut() => None,
+        fetched = client.fetch(file, limits, &mut sink, log) => Some(fetched),
+    };
+    // Waits for any write in flight, so the file is closed before the
+    // guard removes it.
     let part = sink.into_std().await;
-    let fetched = fetched?;
+    let Some(fetched) = fetched else {
+        drop(part);
+        drop(guard);
+        return Ok(None);
+    };
+    let fetched = match fetched {
+        Ok(fetched) => fetched,
+        Err(error) => {
+            drop(part);
+            drop(guard);
+            return Err(error);
+        }
+    };
     // The zip check reads the file just written, through the handle that
-    // wrote it, not a fresh open of its name.
-    let checked = tokio::task::spawn_blocking(move || -> Result<()> {
-        part.sync_all()?;
-        check_zip_file(&part)
+    // wrote it, not a fresh open of its name. The guard goes with it, and
+    // the handle is closed before the guard can remove the file.
+    let checked = tokio::task::spawn_blocking(move || -> (PartFile, Result<()>) {
+        let checked = part
+            .sync_all()
+            .map_err(PurviewError::from)
+            .and_then(|()| check_zip_file(&part));
+        drop(part);
+        (guard, checked)
     })
     .await
     .map_err(|_| PurviewError::message("the zip check stopped unexpectedly"))?;
+    let (guard, checked) = checked;
     checked?;
-    Ok(Staged {
+    Ok(Some(Staged {
         part: guard,
         target,
         bytes: fetched.bytes,
         sha256: fetched.sha256,
-    })
+    }))
 }
 
 impl Staged {

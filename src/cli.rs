@@ -1894,7 +1894,7 @@ fn open_trace(env: &mut Env, globals: &Globals) -> Result<Option<Arc<TraceSink>>
 /// The download limits and the data root from `config.json`
 /// (`download.max_size`, `download.max_unknown_size`,
 /// `defaults.data_dir`), else the defaults.
-fn download_setup(env: &mut Env) -> Result<(crate::download::Limits, PathBuf)> {
+fn download_setup(env: &mut Env) -> Result<(crate::download::Limits, Option<PathBuf>)> {
     let dir = configuration_dir(env)?;
     let stored = load_config(env, &dir)?;
     let limits = crate::download::Limits::from_config(&stored.extra)?;
@@ -1913,14 +1913,9 @@ fn download_setup(env: &mut Env) -> Result<(crate::download::Limits, PathBuf)> {
             ))
         }
     };
-    let root = match configured {
-        Some(root) => root,
-        None => match &env.data_dir {
-            Some(root) => root.clone(),
-            None => config::data_dir()?,
-        },
-    };
-    Ok((limits, root))
+    // The platform directory is looked up only when it is used, so --out
+    // works where there is none.
+    Ok((limits, configured.or_else(|| env.data_dir.clone())))
 }
 
 /// The Graph client for a command.

@@ -51,8 +51,9 @@ pub struct Context {
     pub client: DownloadClient,
     pub limits: Limits,
     /// The root below which `cases/<case>/<op>/` is made when `--out` is
-    /// not given.
-    pub data_root: PathBuf,
+    /// not given; `None` for the platform's local data directory, which is
+    /// looked up only then.
+    pub data_root: Option<PathBuf>,
     pub faults: DownloadFaults,
 }
 
@@ -177,7 +178,11 @@ pub async fn run(
             dir
         }
         None => {
-            let root = std::path::absolute(&context.data_root)?;
+            let root = match &context.data_root {
+                Some(root) => root.clone(),
+                None => crate::config::data_dir()?,
+            };
+            let root = std::path::absolute(root)?;
             prepare_dir(&root)?;
             let mut dir = root;
             for part in [
@@ -213,15 +218,19 @@ pub async fn run(
         plans.push(plan);
     }
     if recovered {
-        save_manifest(&manifest, &dir, session, context, None)?;
+        save_manifest(&manifest, &dir, session, context, Saving::Recovered)?;
     }
     // One listener for the whole run; Ctrl-C abandons the file in flight,
     // whose temporary file is removed, and keeps the files already
     // published.
     let interrupt = session.env.interrupt.clone();
-    let interrupted = interrupt.wait();
-    tokio::pin!(interrupted);
+    let mut interrupted: download::Interrupted<'_> = interrupt.wait();
     let mut done = Vec::new();
+    let fetches = plans
+        .iter()
+        .filter(|plan| matches!(plan, Plan::Fetch { .. }))
+        .count();
+    let mut fetch = 0;
     for plan in plans {
         let (file, name, replace) = match plan {
             Plan::Done(finished) => {
@@ -239,22 +248,23 @@ pub async fn run(
             name: &name,
             overwrite: replace,
         };
-        let staged = tokio::select! {
-            staged = download::stage(
-                &context.client,
-                &file,
-                &placement,
-                context.limits,
-                &mut session.env.stderr,
-            ) => staged,
-            () = &mut interrupted => return finish(session, done, reasons, true),
-        };
-        let what = format!(
-            "downloading {}",
-            sanitize(&shown(session, &file.server_name))
-        );
+        fetch += 1;
+        // Files are named by position: a server name is tenant text.
+        let what = format!("downloading file {fetch} of {fetches}");
         let context_for = |error: PurviewError| error.context(what.clone());
-        let staged = staged.map_err(context_for)?;
+        let staged = download::stage(
+            &context.client,
+            &file,
+            &placement,
+            context.limits,
+            &mut interrupted,
+            &mut session.env.stderr,
+        )
+        .await
+        .map_err(context_for)?;
+        let Some(staged) = staged else {
+            return finish(session, done, reasons, true);
+        };
         let finished = Done {
             server_name: file.server_name.clone(),
             path: staged.target().to_path_buf(),
@@ -275,8 +285,7 @@ pub async fn run(
                 .files
                 .retain(|entry| !replaced.contains(&entry.file_name));
             manifest.record(recorded);
-            save_manifest(&manifest, &dir, session, context, None)
-                .map_err(|error| error.context("nothing was replaced"))?;
+            save_manifest(&manifest, &dir, session, context, Saving::BeforeReplacing)?;
             staged
                 .publish(true, &context.faults, &mut session.env.stderr)
                 .map_err(context_for)?;
@@ -285,7 +294,13 @@ pub async fn run(
                 .publish(false, &context.faults, &mut session.env.stderr)
                 .map_err(context_for)?;
             manifest.record(recorded);
-            save_manifest(&manifest, &dir, session, context, Some(&finished.path))?;
+            save_manifest(
+                &manifest,
+                &dir,
+                session,
+                context,
+                Saving::AfterPublishing(&finished.path),
+            )?;
         }
         done.push(finished);
     }
@@ -394,11 +409,12 @@ fn entry_for<'m>(
     name: &str,
     metadata: &fs::Metadata,
 ) -> Option<&'m Entry> {
+    let path = dir.join(name);
     manifest.entry(name).or_else(|| {
-        manifest.files.iter().find(|entry| {
-            fs::symlink_metadata(dir.join(&entry.file_name))
-                .is_ok_and(|other| same_file(metadata, &other))
-        })
+        manifest
+            .files
+            .iter()
+            .find(|entry| same_file(&path, metadata, &dir.join(&entry.file_name)))
     })
 }
 
@@ -406,33 +422,50 @@ fn entry_for<'m>(
 /// `dir/name`: the entry under that name, and any under another name for
 /// the same file.
 fn owners(dir: &Path, manifest: &Manifest, name: &str) -> Vec<String> {
-    let target = fs::symlink_metadata(dir.join(name)).ok();
+    let path = dir.join(name);
+    let target = fs::symlink_metadata(&path).ok();
     manifest
         .files
         .iter()
         .filter(|entry| {
             entry.file_name == name
-                || target.as_ref().is_some_and(|target| {
-                    fs::symlink_metadata(dir.join(&entry.file_name))
-                        .is_ok_and(|other| same_file(target, &other))
-                })
+                || target
+                    .as_ref()
+                    .is_some_and(|target| same_file(&path, target, &dir.join(&entry.file_name)))
         })
         .map(|entry| entry.file_name.clone())
         .collect()
 }
 
-/// Whether two metadata describe one file: the same device and inode on
-/// Unix; elsewhere, where the standard library gives no file identity, the
-/// same length and modification time.
-fn same_file(first: &fs::Metadata, second: &fs::Metadata) -> bool {
+/// Whether `other` is the same regular file as `path` (whose metadata,
+/// read without following links, is `metadata`): the same device and
+/// inode on Unix. Elsewhere, where the standard library gives no file
+/// identity, the same canonical path, which Windows gives with the name's
+/// stored case, so `Report.zip` and `report.zip` agree. A link is never the
+/// same file.
+fn same_file(path: &Path, metadata: &fs::Metadata, other: &Path) -> bool {
+    let Ok(other_metadata) = fs::symlink_metadata(other) else {
+        return false;
+    };
+    if !metadata.is_file()
+        || !other_metadata.is_file()
+        || crate::config::is_link_like(metadata)
+        || crate::config::is_link_like(&other_metadata)
+    {
+        return false;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        first.dev() == second.dev() && first.ino() == second.ino()
+        let _ = (path, other);
+        metadata.dev() == other_metadata.dev() && metadata.ino() == other_metadata.ino()
     }
     #[cfg(not(unix))]
     {
-        first.len() == second.len() && first.modified().ok() == second.modified().ok()
+        match (fs::canonicalize(path), fs::canonicalize(other)) {
+            (Ok(first), Ok(second)) => first == second,
+            _ => false,
+        }
     }
 }
 
@@ -538,6 +571,14 @@ fn entry(ids: &Ids, done: &Done, now: &chrono::DateTime<chrono::Utc>, recovered:
     }
 }
 
+/// Why the manifest is being saved, for the error if it cannot be.
+#[derive(Debug, Clone, Copy)]
+enum Saving<'a> {
+    Recovered,
+    BeforeReplacing,
+    AfterPublishing(&'a Path),
+}
+
 /// Saves the manifest. After a publication, a failure is
 /// `ManifestWriteFailed`, naming the file that stays.
 fn save_manifest(
@@ -545,21 +586,25 @@ fn save_manifest(
     dir: &Path,
     session: &Session<'_>,
     context: &Context,
-    published: Option<&Path>,
+    saving: Saving<'_>,
 ) -> Result<()> {
     let saved = if context.faults.manifest_write {
         Err(PurviewError::message("the manifest write was made to fail"))
     } else {
         manifest.save(dir, &session.env.redactor)
     };
-    match (saved, published) {
-        (Ok(()), _) => Ok(()),
-        (Err(error), Some(path)) => Err(PurviewError::ManifestWriteFailed {
+    let Err(error) = saved else {
+        return Ok(());
+    };
+    Err(match saving {
+        Saving::AfterPublishing(path) => PurviewError::ManifestWriteFailed {
             path: sanitize(&path.display().to_string()),
             reason: sanitize(&error.to_string()),
-        }),
-        (Err(error), None) => Err(error.context("recording recovered files in manifest.json")),
-    }
+        },
+        Saving::Recovered => error.context("recording recovered files in manifest.json"),
+        Saving::BeforeReplacing => error
+            .context("updating manifest.json before replacing the file, so nothing was replaced"),
+    })
 }
 
 /// What an interrupted run says. The temporary file of the file in flight

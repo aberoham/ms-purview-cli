@@ -6,7 +6,7 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/aberoham/ms-purview-cli/ci.yml?branch=main&label=CI)](https://github.com/aberoham/ms-purview-cli/actions/workflows/ci.yml)
 [![Licence](https://img.shields.io/github/license/aberoham/ms-purview-cli)](LICENSE)
 
-Status: release candidate (`v0.1.0-rc.1`, published 2026-11-26). Today the binary implements `purview version` and authentication (`purview auth login`, `auth refresh`, `auth list` and `auth logout`), with global options `--json`, `--results-only`, `--plain`, `--select`, `--account` and `--no-input`. Browser sign-in (`auth login --browser`), `auth status`, the read commands for cases, searches and operations (`case list`, `case get`, `search list`, `search get`, `operation list`, `operation get`), `download`, `kql`, the Microsoft Graph transport, the global options `--verbose`, `--timeout`, `--trace` and `--wrap-untrusted`, the app registration script and authentication documentation are on `main` since the release candidate. Write, export and parsing commands are planned in [docs/SPEC.md](docs/SPEC.md).
+Status: `v0.1.0`, published 2026-11-27, read-only. The binary implements authentication (`purview auth login`, with a device code or `--browser`, `auth refresh`, `auth status`, `auth list` and `auth logout`), the read commands for cases, searches and operations (`case list`, `case get`, `search list`, `search get`, `operation list`, `operation get`), `download`, `kql` and `version`, with global options `--json`, `--results-only`, `--plain`, `--select`, `--account`, `--no-input`, `--verbose`, `--timeout`, `--trace` and `--wrap-untrusted`. Write, export and parsing commands are planned in [docs/SPEC.md](docs/SPEC.md).
 
 Sibling project of [ms-entra-cli](https://github.com/aberoham/ms-entra-cli), sharing output, configuration and credential-storage conventions.
 
@@ -60,7 +60,7 @@ Existing tools leave gaps across the eDiscovery workflow (recorded in [docs/SPEC
 
 ## Status and roadmap
 
-**Available in `v0.1.0-rc.1` (2026-11-26, pre-release):**
+**Available in `v0.1.0` (2026-11-27):**
 
 - `purview version`: show the version, commit and build target.
 - `purview auth login`: sign in with a device code (pass `--client-id` and `--tenant-id` on first sign-in, saved for later; pass `--read-only` to request `eDiscovery.Read.All` instead of `eDiscovery.ReadWrite.All`).
@@ -68,9 +68,6 @@ Existing tools leave gaps across the eDiscovery workflow (recorded in [docs/SPEC
 - `purview auth list`: list stored accounts.
 - `purview auth logout`: remove an account's stored tokens and account file.
 - Global options: `--json`, `--results-only`, `--plain`, `--select`, `--account`, `--no-input`.
-
-**On `main` since `v0.1.0-rc.1` (unreleased):**
-
 - `purview auth login --browser`: sign in in the system browser on the same computer using the authorisation code flow with Proof Key for Code Exchange (PKCE) on `http://localhost:<port>/callback`.
 - `contrib/create-purview-app.sh`: Azure CLI setup script for the app registration.
 - `docs/auth.md`: authentication, permissions and setup guide.
@@ -86,7 +83,6 @@ Existing tools leave gaps across the eDiscovery workflow (recorded in [docs/SPEC
 
 **Planned roadmap (not yet built, no dates):**
 
-- **v0.1 (remaining items):** troubleshooting documentation and the release.
 - **v0.2:** write commands (`case create`, `search create`, `estimate`, `report`, and `case close` if its live checks complete) with preflight checks and explicit approval, plus estimate report parsing (`parse locations`, `parse failures`, `parse summary`).
 - **v0.3:** item report parsing (`parse items`, `parse profile`).
 - **v0.4:** `export create` and `export index`.

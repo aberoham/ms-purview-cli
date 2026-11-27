@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.0 - 2026-11-27
 
 - Add `purview auth login --browser` using the authorisation code flow with Proof Key for Code Exchange (PKCE) on a loopback redirect (`http://localhost:<port>/callback`), opening the system browser with none of the command's output streams attached.
 - Add `contrib/create-purview-app.sh` to create or update the tenant app registration, service principals, assignments and consent grants: dry run by default, `--apply` to make changes, each change sent once and read back on an unclear outcome, and reporting of existing consent grants broader than the plan.

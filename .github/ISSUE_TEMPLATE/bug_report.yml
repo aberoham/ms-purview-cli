@@ -13,7 +13,7 @@ body:
     attributes:
       label: "`purview version` output"
       description: Run `purview version` and paste the output.
-      placeholder: "purview 0.1.0-rc.1 <commit> aarch64-apple-darwin"
+      placeholder: "purview 0.1.0 <commit> aarch64-apple-darwin"
     validations:
       required: true
 

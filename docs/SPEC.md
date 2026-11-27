@@ -1582,6 +1582,12 @@ date       = YYYY-MM-DD
   ignoring case.
 - An address that fails the address check below is refused as a value (`KqlNotUnderstood`),
   for every address property, so every `participants:` leaf that parses is a full address.
+- A control character other than tab, line feed and carriage return, or a default-ignorable
+  code point (zero-width space, bidirectional control), is refused anywhere in the query,
+  and so is any control character inside a phrase: the terminal report removes them, so
+  the guard must not classify text the operator cannot see. `--term` refuses them too,
+  before `config.json` is read. `--since` and `--until` take exactly `YYYY-MM-DD`, as
+  `sent` does.
 - Parentheses and `NOT` nest at most 64 deep, so that a hostile query cannot exhaust the
   stack.
 - A refusal gives the column (characters from 1) and names the construct. It quotes the
@@ -1614,8 +1620,11 @@ First match wins:
 3. A token shorter than 4 characters → generic.
 4. A token of digits only, such as `2025` → generic.
 5. A trailing `*`: classify the stem, and a stem shorter than 6 characters → generic.
-6. A token holding a letter plus at least one of `- _ . / @ :` or a digit
-   (`orders-api`, `export_bucket`, `svc2`) → specific.
+   Rules 2 to 4 see the token with its `*`, so `a*` is decided by rule 3.
+6. A token holding a letter plus a digit, or plus one of `- _ . / @ :` with a letter or
+   digit on each side of it (`orders-api`, `export_bucket`, `svc2`; not `retention-`) →
+   specific. KQL may read such a separator as a space (Docs), so one at the edge of a word
+   is not evidence of a name.
 7. A token with at least one lower-case letter and an upper-case letter after its first
    character (`PagerDuty`, `GitHub`; not `RETENTION`) → specific.
 8. Otherwise → generic.

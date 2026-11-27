@@ -261,6 +261,13 @@ check whether the other repository needs the same fix.
   `--json` included, because the person signing in must see the code. Under
   `--json`, stdout still holds exactly one document, and a failure after
   the prompt still puts its error document on stdout.
+- A second exception: `kql` with a query that is not narrowed (exit 1,
+  `GenericQuery`) prints its report first, because the report is what the
+  command is for. In a table the report goes to stdout and `Error: …` to
+  stderr; under `--json` the one document is `{"analysis": …, "error": …}`,
+  whatever `--results-only` says, so `error` is where every failure puts
+  it. `KqlNotUnderstood` and every other failure follow the general rule.
+  The write commands' guard refusals are plain errors.
 - An explicit flag given a blank value (`--account ""`, `--client-id ""`,
   `--tenant-id ""`) is an error, raised before any fallback, configuration
   read or network call. An empty `PURVIEW_*` variable counts as unset.
@@ -274,10 +281,7 @@ check whether the other repository needs the same fix.
 - `operation get` exits 4 when the operation finished without
   succeeding, 5 at the `--wait` deadline and 130 on Ctrl-C, in the shapes
   of `docs/SPEC.md` section 3.3; exit 4 prints the whole envelope even
-  under `--results-only`. `kql` exits 1 with `GenericQuery` when the query
-  is not narrowed, after its report: in a table the report goes to stdout
-  and `Error: …` to stderr; under `--json` one document holds
-  `{"analysis": …, "error": …}`, whatever `--results-only` says. Exit code 3, the write-plan shapes and the JSON
+  under `--results-only`. Exit code 3, the write-plan shapes and the JSON
   Lines (JSONL) commands arrive with the pull requests that need them, as
   written in section 3.3.
 - Every string from the tenant or a file goes through `sanitize` or

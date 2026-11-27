@@ -32,12 +32,15 @@ pub fn run(
     selected_indices(&output.select, COLUMNS)?;
     let analysis = analyse(kql, config)?;
     if output.format == OutputFormat::Json {
+        // Every URL in the query keeps only what the trace keeps, as in
+        // the human report: a pasted link can carry a signature.
+        let report = crate::trace::redact_urls(&serde_json::to_value(&analysis)?, &env.redactor);
         if analysis.narrowed {
-            return Ok(Produced::success(Some(output.json_value(&analysis, 1)?)));
+            return Ok(Produced::success(Some(output.json_value(&report, 1)?)));
         }
         let mut document = error_value(&generic_query(&analysis));
         if let Value::Object(object) = &mut document {
-            object.insert("analysis".to_owned(), serde_json::to_value(&analysis)?);
+            object.insert("analysis".to_owned(), report);
         }
         return Ok(Produced {
             exit_code: 1,

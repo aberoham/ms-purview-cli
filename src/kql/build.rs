@@ -114,6 +114,16 @@ pub fn build(flags: &QueryFlags) -> Result<String> {
                         ordinal(index, count)
                     )));
                 }
+                if term
+                    .chars()
+                    .any(|character| character.is_control() || super::lexer::is_hidden(character))
+                {
+                    return Err(PurviewError::message(format!(
+                        "--term{} contains a control or invisible character, such as a tab or a \
+                         zero-width space",
+                        ordinal(index, count)
+                    )));
+                }
                 if term.contains('*') {
                     return Err(PurviewError::message(format!(
                         "--term{} contains a *: a quoted term cannot hold a wildcard; use --kql \
@@ -249,6 +259,14 @@ mod tests {
             },
             QueryFlags {
                 exclude_from: vec![marker.to_owned()],
+                ..QueryFlags::default()
+            },
+            QueryFlags {
+                terms: vec![format!("{marker}\tx")],
+                ..QueryFlags::default()
+            },
+            QueryFlags {
+                terms: vec![format!("{marker}\u{200B}")],
                 ..QueryFlags::default()
             },
             QueryFlags {

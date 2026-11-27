@@ -322,7 +322,7 @@ const DEFAULT_IGNORABLE: &[(char, char)] = &[
     ('\u{E0000}', '\u{E0FFF}'),
 ];
 
-fn is_default_ignorable(character: char) -> bool {
+pub(crate) fn is_default_ignorable(character: char) -> bool {
     DEFAULT_IGNORABLE
         .iter()
         .any(|&(first, last)| (first..=last).contains(&character))

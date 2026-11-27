@@ -166,7 +166,7 @@ impl Rule {
             Self::Short => "shorter than 4 characters",
             Self::DigitsOnly => "digits only",
             Self::ShortStem => "a * stem shorter than 6 characters",
-            Self::Punctuated => "a letter with - _ . / @ : or a digit",
+            Self::Punctuated => "a letter with a digit, or with - _ . / @ : between two characters",
             Self::MixedCase => "mixed case inside the word",
             Self::Plain => "an ordinary word",
         }
@@ -282,36 +282,40 @@ pub fn classify(text: &str, lists: &TermLists) -> TermClass {
 }
 
 /// Rules 2 to 8 for one whitespace-separated token.
+///
+/// A digit is any character Unicode counts as numeric, as the lexer
+/// accepts any alphanumeric character in a word.
 pub fn classify_token(token: &str) -> Rule {
-    let trimmed = token.trim_matches(TRIMMED);
-    // Rule 5 classifies the stem of a trailing `*` by the same rules, after
-    // its own check of the stem's length.
-    if let Some(stem) = trimmed.strip_suffix('*') {
-        let stem = stem.trim_matches(TRIMMED);
-        if stem.chars().count() < 6 {
-            return Rule::ShortStem;
-        }
-        return classify_plain(stem);
-    }
-    classify_plain(trimmed)
-}
-
-fn classify_plain(token: &str) -> Rule {
-    let lower = token.to_lowercase();
-    if BUILT_IN_GENERIC.contains(&lower.as_str()) {
+    let token = token.trim_matches(TRIMMED);
+    if BUILT_IN_GENERIC.contains(&token.to_lowercase().as_str()) {
         return Rule::BuiltInList;
     }
     if token.chars().count() < 4 {
         return Rule::Short;
     }
-    if token.chars().all(|character| character.is_ascii_digit()) {
+    if token.chars().all(char::is_numeric) {
         return Rule::DigitsOnly;
     }
-    let has_letter = token.chars().any(char::is_alphabetic);
-    let has_mark = token.chars().any(|character| {
-        matches!(character, '-' | '_' | '.' | '/' | '@' | ':') || character.is_ascii_digit()
+    // Rule 5 classifies the stem of a trailing `*` by the same rules, after
+    // its own check of the stem's length.
+    if let Some(stem) = token.strip_suffix('*') {
+        let stem = stem.trim_matches(TRIMMED);
+        if stem.chars().count() < 6 {
+            return Rule::ShortStem;
+        }
+        return classify_token(stem);
+    }
+    let chars: Vec<char> = token.chars().collect();
+    let has_letter = chars.iter().any(|character| character.is_alphabetic());
+    let has_digit = chars.iter().any(|character| character.is_numeric());
+    // A separator counts only between two letters or digits: KQL may read
+    // it as a space (Docs), and `retention-` would then be `retention`.
+    let joined = chars.windows(3).any(|window| {
+        matches!(window[1], '-' | '_' | '.' | '/' | '@' | ':')
+            && window[0].is_alphanumeric()
+            && window[2].is_alphanumeric()
     });
-    if has_letter && has_mark {
+    if has_letter && (has_digit || joined) {
         return Rule::Punctuated;
     }
     let has_lower = token.chars().any(char::is_lowercase);
@@ -343,6 +347,17 @@ mod tests {
             ("2025", Rule::DigitsOnly),
             ("12345678", Rule::DigitsOnly),
             ("order*", Rule::ShortStem),
+            ("a*", Rule::Short),
+            ("ab*", Rule::Short),
+            ("abc*", Rule::ShortStem),
+            ("retention-", Rule::Plain),
+            ("\"retention-\"", Rule::Plain),
+            ("retention_", Rule::Plain),
+            ("retention/", Rule::Plain),
+            ("-retention", Rule::Plain),
+            ("retention--policy", Rule::Plain),
+            ("svc٢", Rule::Punctuated),
+            ("٢٠٢٥", Rule::DigitsOnly),
             ("svc2*", Rule::ShortStem),
             ("orders-api*", Rule::Punctuated),
             ("sign-in*", Rule::BuiltInList),

@@ -26,7 +26,7 @@ reasons:
 $ purview kql --term orders-api --participant alex@contoso.example
 kql: "orders-api" AND participants:alex@contoso.example
 COLUMN  FIELD         VALUE                 NEGATED  CLASS      RULE
-1       term          "orders-api"                   specific   6: a letter with - _ . / @ : or a digit
+1       term          "orders-api"                   specific   6: a letter with a digit, or with - _ . / @ : between two characters
 18      participants  alex@contoso.example           narrowing  participants: on a full address
 verdict: narrowed
 ```
@@ -102,8 +102,12 @@ date       = YYYY-MM-DD
   `property:(…)`; ranges with `..`; any property not in the grammar, such
   as `body:`, `recipients:` or `title:`; `=`, `<` and `>`; a wildcard
   anywhere but the end of a word, or in a phrase; a quoted address;
-  unbalanced quotes or parentheses; control characters in a phrase; and
-  parentheses or `NOT` nested more than 64 deep.
+  unbalanced quotes or parentheses; any control character other than tab,
+  line feed and carriage return, and any of them inside a phrase; invisible
+  characters such as a zero-width space or a bidirectional control, anywhere;
+  and parentheses or `NOT` nested more than 64 deep.
+- A digit is any character Unicode counts as numeric, in words and in the
+  classifier alike.
 - A restriction is written with no space after the `:` or the comparison.
 - Property names are compared ignoring case. Values keep their case.
 - `kind:` accepts `email` and `microsoftteams` in any case.
@@ -148,9 +152,12 @@ classified. The first rule that matches wins:
 3. A token shorter than 4 characters → generic.
 4. A token of digits only, such as `2025` → generic.
 5. A trailing `*`: a stem shorter than 6 characters → generic; otherwise
-   the stem is classified by rules 2 to 8.
-6. A token holding a letter plus at least one of `- _ . / @ :` or a digit
-   (`orders-api`, `export_bucket`, `svc2`) → specific.
+   the stem is classified by rules 2 to 8. Rules 2 to 4 see the token with
+   its `*`, so `a*` is decided by rule 3.
+6. A token holding a letter plus a digit, or plus one of `- _ . / @ :` with a letter or
+   digit on each side of it (`orders-api`, `export_bucket`, `svc2`; not `retention-`) →
+   specific. KQL may read such a separator as a space (Docs), so one at the edge of a word
+   is not evidence of a name.
 7. A token with at least one lower-case letter and an upper-case letter
    after its first character (`PagerDuty`, `GitHub`; not `RETENTION`) →
    specific.

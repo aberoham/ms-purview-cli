@@ -263,20 +263,7 @@ impl Lexer {
             }
             _ => {}
         }
-        let mut text = word.clone();
-        if self.peek() == Some('*') {
-            self.position += 1;
-            text.push('*');
-            if !is_delimiter(self.peek()) && self.peek() != Some('"') {
-                return Err(KqlError::new(
-                    Self::column_of(start),
-                    "a wildcard is supported only once, at the end of a word",
-                ));
-            }
-        }
-        if word.contains("..") {
-            return Err(KqlError::new(column, "a range (..) is not supported"));
-        }
+        let text = self.finish_word(start, &word)?;
         if OPERATOR_WORDS.contains(&word.to_lowercase().as_str()) {
             return match (word.as_str(), text.len() == word.len()) {
                 ("AND", true) => Ok(TokenKind::And),
@@ -295,6 +282,29 @@ impl Lexer {
                      the word to search for it",
                 )),
             };
+        }
+        Ok(TokenKind::Word(text))
+    }
+
+    /// The rest of a word whose characters before any `*` are `word` and
+    /// began at `start`: an optional single trailing `*`, then a delimiter.
+    fn finish_word(&mut self, start: usize, word: &str) -> Result<String, KqlError> {
+        let mut text = word.to_owned();
+        if self.peek() == Some('*') {
+            self.position += 1;
+            text.push('*');
+            if !is_delimiter(self.peek()) && self.peek() != Some('"') {
+                return Err(KqlError::new(
+                    Self::column_of(start),
+                    "a wildcard is supported only once, at the end of a word",
+                ));
+            }
+        }
+        if word.contains("..") {
+            return Err(KqlError::new(
+                Self::column_of(start),
+                "a range (..) is not supported",
+            ));
         }
         match self.peek() {
             None => {}
@@ -315,7 +325,37 @@ impl Lexer {
                 ))
             }
         }
-        Ok(TokenKind::Word(text))
+        Ok(text)
+    }
+
+    /// A `subject:` value: a phrase, or a word that is not an operator and
+    /// is not followed by a property symbol. Read without `next_token`, so
+    /// that the lexer never recurses.
+    fn subject_value(&mut self, value_column: usize) -> Result<TokenKind, KqlError> {
+        let refused = || KqlError::new(value_column, "subject takes a word or a quoted phrase");
+        if self.peek() == Some('"') {
+            let value = self.phrase()?;
+            return Ok(TokenKind::Restriction(Restriction::Subject {
+                value,
+                quoted: true,
+            }));
+        }
+        if !self.peek().is_some_and(char::is_alphanumeric) {
+            return Err(refused());
+        }
+        let start = self.position;
+        let word = self.take_while(is_word_char);
+        if matches!(self.peek(), Some(':' | '>' | '<' | '=')) {
+            return Err(refused());
+        }
+        let value = self.finish_word(start, &word)?;
+        if OPERATOR_WORDS.contains(&word.to_lowercase().as_str()) {
+            return Err(refused());
+        }
+        Ok(TokenKind::Restriction(Restriction::Subject {
+            value,
+            quoted: false,
+        }))
     }
 
     /// A restriction: `property` has been read, and `symbol` (`:`, `>`,
@@ -422,28 +462,18 @@ impl Lexer {
             };
             return Ok(TokenKind::Restriction(Restriction::Kind(kind)));
         }
-        // subject: a phrase or a word.
-        match self.next_token()? {
-            Some(Token {
-                kind: TokenKind::Phrase(value),
-                ..
-            }) => Ok(TokenKind::Restriction(Restriction::Subject {
-                value,
-                quoted: true,
-            })),
-            Some(Token {
-                kind: TokenKind::Word(value),
-                ..
-            }) => Ok(TokenKind::Restriction(Restriction::Subject {
-                value,
-                quoted: false,
-            })),
-            _ => Err(KqlError::new(
-                value_column,
-                "subject takes a word or a quoted phrase",
-            )),
-        }
+        self.subject_value(value_column)
     }
+}
+
+/// A character a terminal may not show, or may show as space although KQL
+/// would not read it as one: a control character other than tab, line
+/// feed and carriage return, or a default-ignorable code point (a
+/// zero-width space, a bidirectional control). Refused anywhere in a
+/// query, so that what the report shows is what the guard classified.
+pub fn is_hidden(character: char) -> bool {
+    (character.is_control() && !matches!(character, '\t' | '\n' | '\r'))
+        || crate::output::is_default_ignorable(character)
 }
 
 /// ASCII punctuation that error messages may quote: it is one of the
@@ -470,6 +500,12 @@ pub fn parse_date(text: &str) -> Option<NaiveDate> {
 
 /// Every token of `query`, or the first construct the grammar refuses.
 pub fn tokens(query: &str) -> Result<Vec<Token>, KqlError> {
+    if let Some(index) = query.chars().position(is_hidden) {
+        return Err(KqlError::new(
+            index + 1,
+            "an invisible or control character; type the query again without it",
+        ));
+    }
     let mut lexer = Lexer {
         chars: query.chars().collect(),
         position: 0,
@@ -604,6 +640,36 @@ mod tests {
             let error = refused(query);
             assert_eq!(error.column, column, "{query}: {error:?}");
         }
+    }
+
+    #[test]
+    fn hidden_characters_are_refused_where_they_are() {
+        for (query, column) in [
+            ("\"follow-up\u{200B}\"", 11),
+            ("orders-api\u{200B}", 11),
+            ("a1aa\u{000B}AND b2bb", 5),
+            ("\u{202E}orders-api", 1),
+            ("orders-api AND\u{00A0}\u{FEFF}svc2", 16),
+        ] {
+            assert_eq!(refused(query).column, column, "{query:?}");
+        }
+        // Tab, line feed and carriage return separate tokens.
+        assert_eq!(kinds("a1aa\tAND\r\nb2bb").len(), 3);
+    }
+
+    #[test]
+    fn a_subject_value_is_read_without_recursion() {
+        for query in [
+            "subject:subject:x",
+            "subject:participants:alex@contoso.example",
+            "subject:AND",
+            "subject:near",
+            "subject:x=y",
+        ] {
+            assert_eq!(refused(query).column, 9, "{query}");
+        }
+        let deep = "subject:".repeat(200_000);
+        assert_eq!(refused(&deep).column, 9);
     }
 
     #[test]

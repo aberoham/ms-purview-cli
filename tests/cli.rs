@@ -151,7 +151,7 @@ fn argument_errors_without_json_go_to_stderr_only() {
         .code(1)
         .stdout(predicate::str::is_empty())
         .stderr(predicate::str::starts_with(
-            "Error: unexpected argument '--bogus' found\n",
+            "Error: an argument that this command does not take (not repeated here); quote a value that holds spaces\n",
         ))
         .stderr(predicate::str::contains("Usage: purview version"));
     purview()

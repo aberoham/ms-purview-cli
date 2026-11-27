@@ -236,14 +236,14 @@ struct QueryArgs {
     #[arg(
         long,
         value_name = "YYYY-MM-DD",
-        value_parser = parse_date,
+        value_parser = query_date,
         help = "Items sent on or after this date"
     )]
     since: Option<chrono::NaiveDate>,
     #[arg(
         long,
         value_name = "YYYY-MM-DD",
-        value_parser = parse_date,
+        value_parser = query_date,
         help = "Items sent on or before this date"
     )]
     until: Option<chrono::NaiveDate>,
@@ -262,6 +262,13 @@ struct QueryArgs {
         help = "A raw query in the guard's subset of KQL, instead of the flags above"
     )]
     kql: Option<String>,
+}
+
+/// A `--since` or `--until` date, in exactly the form the query takes, so
+/// that the flags and `--kql` accept the same dates.
+fn query_date(text: &str) -> std::result::Result<chrono::NaiveDate, String> {
+    crate::kql::lexer::parse_date(text)
+        .ok_or_else(|| "expected a date in the form YYYY-MM-DD".to_owned())
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -978,6 +985,20 @@ impl Printer {
         }
         let message = if error.kind() == ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand {
             format!("a command is required\n\n{}", rendered.trim_end())
+        } else if matches!(
+            error.kind(),
+            ErrorKind::UnknownArgument | ErrorKind::InvalidSubcommand
+        ) {
+            // Clap names the word it did not expect, and repeats it in its
+            // tip; the word could be part of a pasted value, such as the
+            // second word of an unquoted query. Only the usage is kept.
+            let usage = rendered
+                .find("Usage:")
+                .map_or("", |start| rendered[start..].trim_end());
+            format!(
+                "an argument that this command does not take (not repeated here); quote a \
+                 value that holds spaces\n\n{usage}"
+            )
         } else {
             let text = rendered.trim();
             text.strip_prefix("error: ").unwrap_or(text).to_owned()
@@ -2424,7 +2445,7 @@ mod tests {
         assert_eq!(printed["error"]["status"], 0);
         let message = printed["error"]["message"].as_str().unwrap();
         assert!(
-            message.starts_with("unexpected argument '--bogus'"),
+            message.starts_with("an argument that this command does not take"),
             "{message}"
         );
         assert!(captured.stderr.text().is_empty());
@@ -2438,7 +2459,7 @@ mod tests {
         let text = captured.stderr.text();
         assert_eq!(
             text.lines().next(),
-            Some("Error: unexpected argument '--bogus' found"),
+            Some("Error: an argument that this command does not take (not repeated here); quote a value that holds spaces"),
             "{text}"
         );
         assert!(text.contains("Usage: purview version"), "{text}");
@@ -2484,9 +2505,10 @@ mod tests {
                 let printed: Value = serde_json::from_str(&stdout).unwrap();
                 assert_eq!(Some(&printed), outcome.stdout_value.as_ref());
                 let message = printed["error"]["message"].as_str().unwrap();
-                assert!(message.contains("[redacted]"), "{message}");
+                // Clap's unexpected word is not repeated at all.
+                assert!(message.contains("does not take"), "{message}");
             } else {
-                assert!(stderr.contains("[redacted]"), "{stderr}");
+                assert!(stderr.contains("does not take"), "{stderr}");
             }
         }
     }

@@ -561,6 +561,18 @@ async fn a_report_zip_without_statistics_is_unchecked_and_strict_exits_4() {
             .start_file("Summary-1.csv", zip::write::SimpleFileOptions::default())
             .unwrap();
         writer.write_all(b"Job ID,j,x\r\n").unwrap();
+        // Locations without Statistics: an estimate needs both.
+        writer
+            .start_file("Locations-1.csv", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer
+            .write_all(
+                format!(
+                    "{LOCATIONS_HEADER}Exchange,Mailbox,alex@contoso.example,id-1,Mailbox,PrimaryMailBox,12,2048,Succeeded,,q\r\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
         writer.finish().unwrap();
     }
     setup.serve(buffer.into_inner()).await;

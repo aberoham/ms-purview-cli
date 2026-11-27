@@ -681,7 +681,7 @@ fn parse_reads_a_generated_zip_with_no_configuration() {
     }
     purview()
         .env("PURVIEW_CONFIG_DIR", &missing)
-        .args(["parse", "locations", "--with-hits", "--top", "1", "--plain"])
+        .args(["parse", "locations", "--with-hits", "--plain"])
         .arg(&zip)
         .assert()
         .success()

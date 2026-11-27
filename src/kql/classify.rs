@@ -92,9 +92,11 @@ pub const BUILT_IN_GENERIC: &[&str] = &[
 const TRIMMED: &[char] = &['.', ',', ';', ':', '!', '?', '\'', '"', '(', ')'];
 
 /// The address pattern of `docs/SPEC.md` section 6.3. It has no `*`, needs
-/// a non-empty part before `@`, and needs a domain of at least two labels.
+/// a part before `@` that starts with a letter or digit (so that no
+/// restriction reads `participants://…`), and needs a domain of at least
+/// two labels.
 static ADDRESS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^[A-Za-z0-9.!#$%&'+/=?^_`{|}~-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$")
+    Regex::new(r"^[A-Za-z0-9][A-Za-z0-9.!#$%&'+/=?^_`{|}~-]*@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$")
         .expect("the address pattern compiles")
 });
 
@@ -459,6 +461,9 @@ mod tests {
             "alex@contoso.example.",
             "alex @contoso.example",
             "alex@contoso.example\n",
+            "//files.contoso.example/r?sig=x@contoso.example",
+            ".alex@contoso.example",
+            "'alex@contoso.example",
         ] {
             assert!(!is_full_address(address), "{address:?}");
         }

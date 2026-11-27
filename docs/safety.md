@@ -51,7 +51,7 @@ same query flags. The groups are ANDed in this order:
 
 | Flag | KQL |
 |---|---|
-| `--term T` (repeatable) | each quoted, all ORed. A `"`, a `*`, a URL (`://`), or a control or invisible character inside a term is refused |
+| `--term T` (repeatable) | each quoted, all ORed. A `"`, a `*`, a web address (`http://` or `https://`), or a control or invisible character inside a term is refused |
 | `--participant ADDR` (repeatable) | `participants:ADDR`, all ORed. Each must be a full address |
 | `--since YYYY-MM-DD` | `sent>=YYYY-MM-DD` |
 | `--until YYYY-MM-DD` | `sent<=YYYY-MM-DD` |
@@ -105,8 +105,9 @@ date       = YYYY-MM-DD
   unbalanced quotes or parentheses; any control character other than tab,
   line feed and carriage return, and any of them inside a phrase; invisible
   characters such as a zero-width space or a bidirectional control, anywhere;
-  a URL (any phrase holding `://`), which can carry a signature in its query:
-  search for its host name or path without the scheme;
+  a web address (`http://` or `https://` in any case, anywhere), which can
+  carry a signature in its query: search for its host name or path without
+  the scheme;
   and parentheses or `NOT` nested more than 64 deep.
 - A digit is any character Unicode counts as numeric, in words and in the
   classifier alike.
@@ -134,7 +135,8 @@ Every address in `participants:`, `from:`, `to:`, `cc:` and `bcc:`, and every
 `--participant` and `--exclude-from` value, must be a full address:
 
 - it matches
-  ``^[A-Za-z0-9.!#$%&'+/=?^_`{|}~-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$``;
+  ``^[A-Za-z0-9][A-Za-z0-9.!#$%&'+/=?^_`{|}~-]*@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$``,
+  so the part before `@` starts with a letter or digit;
 - it has no `*`;
 - the part before `@` is not empty;
 - it is not quoted.

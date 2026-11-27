@@ -57,7 +57,9 @@ pub fn run(
         writeln!(
             env.stdout,
             "kql: {}",
-            sanitize(&crate::redact::shown(kql, &env.redactor))
+            // The table removes a carriage return, which separates
+            // tokens, so it is shown as a space, as tabs and line feeds are.
+            sanitize(&crate::redact::shown(kql, &env.redactor).replace('\r', " "))
         )?;
     }
     write_rows(&mut env.stdout, output, COLUMNS, &rows)?;

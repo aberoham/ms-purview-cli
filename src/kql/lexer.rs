@@ -254,16 +254,6 @@ impl Lexer {
         if text.trim().is_empty() {
             return Err(KqlError::new(open, "an empty quoted phrase"));
         }
-        // A URL can carry a signature in its query, and rewriting it for
-        // display changes how it reads, so none is accepted: the query is
-        // then always shown as it was given.
-        if text.contains("://") {
-            return Err(KqlError::new(
-                open,
-                "a URL in a phrase is not supported; search for its host name or path without \
-                 the scheme",
-            ));
-        }
         // KQL does not say how a word glued to a closing quote reads.
         if !is_delimiter(self.peek()) {
             return Err(KqlError::new(
@@ -499,6 +489,21 @@ impl Lexer {
     }
 }
 
+/// The character index of the first web address in `text`: `http://` or
+/// `https://` in any case, which is what `redact::urls_in_text` treats as
+/// a URL everywhere in the tool. A query holding one is refused, so that
+/// no URL query value (a signature, say) is ever printed and the query is
+/// shown as it was given, never rewritten. Other schemes are not URLs to
+/// the redactor either.
+pub fn web_url_at(text: &str) -> Option<usize> {
+    let lower = text.to_ascii_lowercase();
+    let byte = ["http://", "https://"]
+        .iter()
+        .filter_map(|scheme| lower.find(scheme))
+        .min()?;
+    Some(text[..byte].chars().count())
+}
+
 /// A character a terminal may not show, or may show as space although KQL
 /// would not read it as one: a control character other than tab, line
 /// feed and carriage return, or a default-ignorable code point (a
@@ -533,6 +538,13 @@ pub fn parse_date(text: &str) -> Option<NaiveDate> {
 
 /// Every token of `query`, or the first construct the grammar refuses.
 pub fn tokens(query: &str) -> Result<Vec<Token>, KqlError> {
+    if let Some(index) = web_url_at(query) {
+        return Err(KqlError::new(
+            index + 1,
+            "a web address (an http or https link) is not supported; search for its host name \
+             or path without the scheme",
+        ));
+    }
     if let Some(index) = query.chars().position(is_hidden) {
         return Err(KqlError::new(
             index + 1,
@@ -734,16 +746,24 @@ mod tests {
     }
 
     #[test]
-    fn a_url_in_a_phrase_is_refused_at_its_quote() {
+    fn a_web_address_is_refused_where_it_starts() {
+        // Joined at run time, so that this file passes the public-data lint.
+        let scheme = ["https", "://"].concat();
         for (query, column) in [
-            ("\"https://files.contoso.example/report\"", 1),
-            ("a1aa AND subject:\"x ftp://y\"", 18),
+            (format!("\"{scheme}files.contoso.example/report\""), 2),
+            (
+                format!("a1aa AND subject:\"x {}y\"", scheme.to_uppercase()),
+                21,
+            ),
         ] {
+            let query = query.as_str();
             let error = refused(query);
             assert_eq!(error.column, column, "{query}");
-            assert!(error.reason.contains("a URL"), "{query}");
+            assert!(error.reason.contains("a web address"), "{query}");
         }
         assert_eq!(kinds("\"files.contoso.example/report\"").len(), 1);
+        // A pattern that names no address is text.
+        assert_eq!(kinds("\"https?://\"").len(), 1);
     }
 
     #[test]

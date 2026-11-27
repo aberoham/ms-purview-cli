@@ -244,7 +244,7 @@ Query flags (shared with `search create`):
 
 | Flag | KQL |
 |---|---|
-| `--term T` (repeatable) | each quoted, all ORed. A `"`, a `*`, a URL (`://`), or a control or invisible character inside a term is refused |
+| `--term T` (repeatable) | each quoted, all ORed. A `"`, a `*`, a web address (`http://` or `https://`), or a control or invisible character inside a term is refused |
 | `--participant ADDR` (repeatable) | `participants:ADDR`, all ORed. Each must be a full address (section 6.3) |
 | `--since YYYY-MM-DD` | `sent>=YYYY-MM-DD` |
 | `--until YYYY-MM-DD` | `sent<=YYYY-MM-DD` |
@@ -1592,11 +1592,13 @@ date       = YYYY-MM-DD
   Unicode spaces are refused outside a phrase. A closing quote must be followed by a space,
   a parenthesis or the end, and a word must not be followed by a quote, so `"a"AND"b"` is
   refused. Property names and `kind:` values are folded to lower case as ASCII only.
-- A phrase holding `://` is refused, and so is a `--term` holding it: a URL can carry a
-  signature in its query, and redacting it for display changed how the reported query
-  parsed and was classified. With no URL in a query, `purview kql` prints the query and its
-  values as given (registered secrets are still redacted by every writer). A word cannot
-  hold `:`, so a URL cannot appear outside a phrase.
+- A web address is refused anywhere in a query, and in `--term`: `http://` or `https://` in
+  any case, the same test `redact::urls_in_text` uses for every output of the tool. A URL
+  can carry a signature in its query, and redacting it for display changed how the reported
+  query parsed and was classified. With none in a query, `purview kql` prints the JSON
+  `kql` as given (registered secrets are still redacted by every writer); the table's
+  `kql:` line shows tabs, line feeds and carriage returns as spaces. Other schemes, such as
+  `mailto:`, are not URLs to the redactor anywhere in the tool, and are not refused.
 - Parentheses and `NOT` nest at most 64 deep, so that a hostile query cannot exhaust the
   stack.
 - A refusal gives the column (characters from 1) and names the construct. It quotes the
@@ -1610,7 +1612,9 @@ date       = YYYY-MM-DD
 
 **Address check.** An address counts as narrowing only if:
 - it matches
-  ``^[A-Za-z0-9.!#$%&'+/=?^_`{|}~-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$``;
+  ``^[A-Za-z0-9][A-Za-z0-9.!#$%&'+/=?^_`{|}~-]*@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$``
+  (the part before `@` starts with a letter or digit, settled in PR 1.6, so that no
+  restriction reads `participants://…`);
 - it has no `*`;
 - the part before `@` is not empty;
 - it is not quoted.

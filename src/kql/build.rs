@@ -126,10 +126,10 @@ pub fn build(flags: &QueryFlags) -> Result<String> {
                         ordinal(index, count)
                     )));
                 }
-                if term.contains("://") {
+                if super::lexer::web_url_at(term).is_some() {
                     return Err(PurviewError::message(format!(
-                        "--term{} contains a URL, which a term cannot hold; search for its host \
-                         name or path without the scheme",
+                        "--term{} contains a web address (an http or https link), which a term \
+                         cannot hold; search for its host name or path without the scheme",
                         ordinal(index, count)
                     )));
                 }

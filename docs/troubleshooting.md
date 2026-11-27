@@ -112,8 +112,10 @@ from one release to the next reads the stored credential without a prompt.
 A prompt after an upgrade means the binary changed identity:
 
 - a source build replaced a release, or the other way round. They have
-  different signing identities. Choose **Always Allow** once, or sign the
-  source build with `contrib/resign.sh` (see "A source build on macOS");
+  different signing identities. A plain `cargo build` changes identity on
+  every rebuild, so first sign the source build with `contrib/resign.sh`
+  (see "A source build on macOS"), then choose **Always Allow** at the next
+  prompt; the grant then lasts across rebuilds;
 - a release binary was re-signed locally. Do not re-sign release binaries.
 
 Windows Credential Manager and the Linux kernel keyring do not prompt per
@@ -125,10 +127,13 @@ program. If the stored credential cannot be read at all, sign in again with
 A tenant can block the device code flow with a Conditional Access policy
 for authentication flows (Docs). The sign-in page then refuses the code
 after you enter it, and `auth login` fails with the identity platform's
-error. Sign in in the browser on the same computer instead:
+error. Sign in in the browser on the same computer instead: run the same
+`auth login` command again with `--browser` added. On a first sign-in that
+means keeping `--client-id` and `--tenant-id` (and `--read-only`, if you
+used it), because a sign-in that failed saved no registration:
 
 ```bash
-purview auth login --browser
+purview auth login --browser --client-id <application-client-id> --tenant-id <tenant-id>
 ```
 
 The browser flow needs a browser on the computer that runs `purview`,
@@ -159,15 +164,20 @@ Purview download host. Two errors mean the token is missing or refused:
   app. Grant the consent (see `docs/auth.md`, "`AADSTS65001` and
   `AADSTS65002`"), then run `purview auth refresh`.
 - **`DownloadRefused`** with status 401 or 403: the download service refused
-  the token. Run `purview auth refresh` and try again. If it is refused
-  again, check that the consent above exists and that the account holds an
-  eDiscovery role. A Graph token sent to the download host is answered with
-  401 (Observed), so a tool or script that uses a Graph token there fails
-  the same way.
+  the token. The command stops there and exits 1; files after that one are
+  not tried. Run `purview auth refresh` and run the download again. If it is
+  refused again, check that the consent above exists and that the account
+  holds an eDiscovery role. A Graph token sent to the download host is
+  answered with 401 (Observed), so a tool or script that uses a Graph token
+  there fails the same way.
 
-A file that cannot be downloaded does not stop the others: the command
-writes the rest, then exits 4 with `FileNotDownloadable` for that file.
-Running the same command again fetches only what is still missing.
+A file whose details make it impossible to download (no name, no download
+address, or a host the tool does not accept) is found before any file is
+fetched. The command writes the other files, then exits 4 with
+`FileNotDownloadable` for that one.
+
+Running the same command again fetches only what is still missing. With
+`--overwrite` it fetches every file again.
 
 ## `CrossOriginRedirect` on a download
 
@@ -175,32 +185,43 @@ The download service answered with a redirect to another origin (scheme,
 host or port). `purview` follows redirects only within the origin that the
 operation named, so it refused the redirect without contacting the other
 host, and the download token never left that origin. No redirect has been
-observed on a download (Observed); one to another origin means the service
-changed or something between you and it rewrote the answer, such as a
-proxy. The error names only the other origin. Report it with that origin
-and the output of `purview --verbose download <case> <op>`, which shows the
-redacted request addresses.
+observed on a download (Observed). Why one would point elsewhere is not
+known; a change in the service, or a proxy between you and it that
+rewrites answers, are possible causes (Assumption).
+
+To report it, give the `purview version` output, the error code, and which
+part of the origin changed (scheme, host or port), with the host replaced by
+a placeholder if it names your tenant or region. Do not paste download
+addresses or `--verbose` output into a public issue: their paths encode the
+case, the job and the file name.
 
 ## An operation that succeeded but missed some locations
 
 An estimate or report can end with status `succeeded` and still have
-failed to search some mailboxes. The operation's status alone does not
-show this; the per-location results are in the report files. In v0.1,
-download the operation's files with `purview download <case> <op>` and read
-the locations report in the zip. From v0.2, `purview parse failures` lists
-them and `--strict` turns them into exit 4.
+failed to search some mailboxes (Observed). The operation's status alone does
+not show this; the evidence is in the report files. In v0.1, download the
+operation's files with `purview download <case> <op>` and check, inside the
+zip:
+
+- for an estimate: `Locations-*.csv` rows with `Status=Failed`, and
+  `Statistics-*.csv` rows with `StatType=Error`;
+- for an item report: `Locations-*.csv` rows with `Status=Failed` (an item
+  report has no `Statistics-*.csv`).
+
+From v0.2, `purview parse failures <zip>` lists both, and the actions take
+`--strict`, which exits 4 when a run has failed locations or its evidence
+cannot be read.
 
 `purview operation get` exits 4 when the operation itself did not succeed
 (`partiallySucceeded`, `failed` or `submissionFailed`), with the reasons.
 
 ## A case in `closing` status
 
-`purview case list --status closing` shows cases the service is still
-closing. One observed close went from `active` to `closed` within seconds
-without showing `closing` (Observed), and some cases were seen in `closing`
-for longer (Observed); why is not known. v0.1 does not close cases, so it
-only reads this status. `purview case close` arrives in v0.2, and waits for
-the case to reach `closed`.
+`purview case list --status closing` shows cases in `closing` status. Some
+cases were seen in that status in one snapshot; how long they stayed there
+is not known (Observed). One observed close went from `active` to `closed`
+within seconds without showing `closing` (Observed). v0.1 does not close
+cases, so it only reads this status.
 
 ## Write commands (v0.2)
 

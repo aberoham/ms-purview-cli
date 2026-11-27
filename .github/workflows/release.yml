@@ -268,21 +268,32 @@ jobs:
           mkdir -p "$unpacked"
           tar xzf "${package}.tar.gz" -C "$unpacked"
           python3 .github/scripts/macos-signing.py sign "$unpacked/$package/bin/purview" com.aberoham.purview --notarize
-          # The signed binary must still run as the unsigned one did. This
-          # runner is Apple silicon, so only the native build is run; the
-          # Intel build was run unsigned on an Intel runner.
-          if [[ "$TARGET" == "$(uname -m | sed 's/^arm64$/aarch64/')-apple-darwin" ]]; then
-            "$unpacked/$package/bin/purview" version
-            "$unpacked/$package/bin/purview" --help >/dev/null
-            PURVIEW_CONFIG_DIR="$RUNNER_TEMP/no-config" "$unpacked/$package/bin/purview" \
-              kql --term orders-api --participant alex@contoso.example
-          fi
           tar czf "${package}.tar.gz" -C "$unpacked" "$package"
       # Runs whatever happened above, and before the upload action, so the
       # unlocked signing identity is gone before any further code runs.
       - name: Remove signing credentials
         if: always()
         run: python3 .github/scripts/macos-signing.py cleanup
+      # The signed archive must still run as the unsigned one did. It runs
+      # here, after the credentials are gone, with no secret in its
+      # environment. This runner is Apple silicon, so only the native build
+      # is run; the Intel build was run unsigned on an Intel runner.
+      - name: Smoke-test the signed archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="purview-${RELEASE_TAG}-${TARGET}"
+          if [[ "$TARGET" != "$(uname -m | sed 's/^arm64$/aarch64/')-apple-darwin" ]]; then
+            echo "Not native to this runner; the unsigned build was smoke-tested on its own runner."
+            exit 0
+          fi
+          signed="$RUNNER_TEMP/signed-smoke"
+          mkdir -p "$signed"
+          tar xzf "${package}.tar.gz" -C "$signed"
+          "$signed/$package/bin/purview" version
+          "$signed/$package/bin/purview" --help >/dev/null
+          PURVIEW_CONFIG_DIR="$RUNNER_TEMP/no-config" "$signed/$package/bin/purview" \
+            kql --term orders-api --participant alex@contoso.example
       - name: Replace the unsigned artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

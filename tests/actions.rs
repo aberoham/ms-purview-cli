@@ -471,6 +471,12 @@ async fn an_estimate_posts_once_polls_downloads_and_checks_the_collection() {
         "alex@contoso.example"
     );
     assert_eq!(result["failedLocations"], json!([]));
+    // Under the default limits, every check ran and none was passed.
+    assert_eq!(result["volume"]["exceeded"], false);
+    assert_eq!(result["volume"]["over"], json!([]));
+    assert_eq!(result["volume"]["unchecked"], json!([]));
+    assert_eq!(result["volume"]["limits"]["warn_hits"], 5000);
+    assert!(!run.stderr().contains("VOLUME"), "{}", run.stderr());
     let file = PathBuf::from(result["files"][0]["path"].as_str().unwrap());
     assert!(file.starts_with(setup.data_root().join("cases").join(CASE).join(OP)));
     assert!(file.exists());
@@ -771,6 +777,98 @@ async fn a_human_run_shows_the_plan_and_the_result() {
         stdout.contains("\"collection\": \"incomplete\""),
         "{stdout}"
     );
+}
+
+/// Writes `volume` into config.json, keeping the rest.
+fn set_volume(harness: &Harness, volume: Value) {
+    let file = harness.config_dir().join("config.json");
+    let mut config = harness.config();
+    config["volume"] = volume;
+    std::fs::write(&file, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn an_estimate_above_the_volume_limits_warns_loudly_and_still_succeeds() {
+    let setup = Setup::new().await;
+    setup.ready(0, false).await;
+    // The fixture: 15 items, 2,148 bytes, and locations of 12, 3 and 0 hits.
+    set_volume(
+        &setup.harness,
+        json!({"warn_hits": 14, "warn_hits_per_location": 2, "max_export_size": "2KiB"}),
+    );
+    let run = setup.run(&["--json", "--yes"]).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stdout());
+    let volume = &run.json()["results"]["result"]["volume"];
+    assert_eq!(volume["exceeded"], true);
+    assert_eq!(
+        volume["over"],
+        json!([
+            {"setting": "volume.warn_hits", "value": 15, "limit": 14},
+            {"setting": "volume.warn_hits_per_location", "value": 12, "limit": 2, "locations": 2},
+            {"setting": "volume.max_export_size", "value": 2148, "limit": 2048},
+        ])
+    );
+    let stderr = run.stderr();
+    assert!(
+        stderr.contains(
+            "warning: VOLUME: the estimate found 15 items, more than volume.warn_hits (14)"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "2 locations have more than volume.warn_hits_per_location (2) hits; the largest has 12"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("more than volume.max_export_size (2.0 KiB)"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("narrow the query"), "{stderr}");
+    // The warning names no location.
+    assert!(!stderr.contains("alex@contoso.example"), "{stderr}");
+    // --strict is about the collection, not the volume.
+    let run = setup.run(&["--json", "--yes", "--strict"]).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stdout());
+}
+
+#[tokio::test]
+async fn without_the_zip_hits_per_location_are_unchecked() {
+    let setup = Setup::new().await;
+    setup.ready(0, false).await;
+    set_volume(&setup.harness, json!({"warn_hits": 14}));
+    let run = setup.run(&["--json", "--yes", "--no-download"]).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stdout());
+    let volume = &run.json()["results"]["result"]["volume"];
+    assert_eq!(volume["exceeded"], true);
+    assert_eq!(volume["over"][0]["setting"], "volume.warn_hits");
+    assert_eq!(
+        volume["unchecked"],
+        json!(["volume.warn_hits_per_location"])
+    );
+    assert!(
+        run.stderr().contains("warning: VOLUME:"),
+        "{}",
+        run.stderr()
+    );
+    // --no-wait has no counts, so no volume.
+    let run = setup.run(&["--json", "--yes", "--no-wait"]).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stdout());
+    assert!(run.json()["results"]["result"].get("volume").is_none());
+}
+
+#[tokio::test]
+async fn a_bad_volume_setting_stops_the_estimate_before_any_request() {
+    let setup = Setup::new().await;
+    setup.ready(0, false).await;
+    set_volume(&setup.harness, json!({"max_export_size": "huge"}));
+    let run = setup.run(&["--json", "--yes"]).await;
+    assert_eq!(run.outcome.exit_code, 1, "{}", run.stdout());
+    let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
+    assert!(message.contains("volume.max_export_size"), "{message}");
+    assert!(!message.contains("huge"), "{message}");
+    assert!(setup.graph_requests().await.is_empty());
 }
 
 // Flow 5: the Graph token expires while the estimate is polled.

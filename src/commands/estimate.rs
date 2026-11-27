@@ -26,6 +26,7 @@ use crate::model::wire::{OperationDetail, OperationRecord, OperationStatus};
 use crate::output::sanitize;
 use crate::poll::{elapsed_text, PollEnd, Poller, Timing};
 use crate::report::estimate::{by_hits, Collection};
+use crate::report::volume::{Volume, VolumeLimits};
 use crate::report::{EvidenceOf, ReportFiles, ReportLimits};
 use crate::routes::{CaseId, OperationId, ReadRoute, SearchId, WriteRoute};
 use crate::safety::{
@@ -61,6 +62,7 @@ pub struct Estimate {
     flags: EstimateFlags,
     guard: Option<GuardConfig>,
     limits: Option<ReportLimits>,
+    volume: Option<VolumeLimits>,
     /// What the plan sends to, and when preflight ended, for
     /// reconciliation.
     planned: Option<(CaseId, SearchId, DateTime<Utc>)>,
@@ -74,6 +76,7 @@ impl Estimate {
             flags,
             guard: None,
             limits: None,
+            volume: None,
             planned: None,
             shown: None,
         }
@@ -85,11 +88,16 @@ impl WriteCommand for Estimate {
     fn check(&mut self, settings: &WriteSettings) -> Result<()> {
         self.guard = Some(settings.guard.clone());
         self.limits = Some(settings.report);
+        self.volume = Some(settings.volume);
         Ok(())
     }
 
     fn downloads(&self) -> bool {
         !self.flags.no_download && !self.flags.no_wait
+    }
+
+    fn reads_volume(&self) -> bool {
+        true
     }
 
     async fn plan(&mut self, preflight: &mut Preflight<'_>) -> Result<Planned> {
@@ -442,6 +450,10 @@ impl WriteCommand for Estimate {
                 );
             }
         }
+        let volume = volume_of(self.volume.unwrap_or_default(), &record, evidence.as_ref());
+        for line in volume.warnings() {
+            let _ = writeln!(log, "{line}");
+        }
         if let (Collection::Unchecked, Some(note), false) =
             (collection, &evidence_note, self.flags.no_download)
         {
@@ -467,7 +479,14 @@ impl WriteCommand for Estimate {
             }
         }
         Ok(Applied::Result {
-            result: result_value(&operation, &record, collection, evidence.as_ref(), files),
+            result: result_value(
+                &operation,
+                &record,
+                collection,
+                evidence.as_ref(),
+                files,
+                &volume,
+            ),
             reasons,
         })
     }
@@ -527,6 +546,27 @@ fn resume(after: &After<'_>, case: CaseId, operation: &OperationId) -> Vec<Strin
     ]
 }
 
+/// The volume check of a finished estimate (`docs/SPEC.md` section 6.9):
+/// its counts, and the hits per location when the zip was read.
+fn volume_of(
+    limits: VolumeLimits,
+    record: &OperationRecord,
+    evidence: Option<&ReportFiles>,
+) -> Volume {
+    let (items, size) = match record.detail() {
+        Some(OperationDetail::Estimate(estimate)) => {
+            (estimate.indexed_item_count, estimate.indexed_items_size)
+        }
+        _ => (None, None),
+    };
+    Volume::check(
+        limits,
+        items,
+        size,
+        evidence.and_then(|files| files.locations.as_ref()),
+    )
+}
+
 /// The estimate's result (`docs/SPEC.md` section 3.5).
 fn result_value(
     operation: &OperationId,
@@ -534,6 +574,7 @@ fn result_value(
     collection: Collection,
     evidence: Option<&ReportFiles>,
     files: Vec<Value>,
+    volume: &Volume,
 ) -> Value {
     let (indexed, indexed_size, unindexed, mailboxes) = match record.detail() {
         Some(OperationDetail::Estimate(estimate)) => (
@@ -572,5 +613,6 @@ fn result_value(
         "topLocations": top,
         "failedLocations": evidence.map(ReportFiles::failed_locations),
         "files": files,
+        "volume": volume.to_json(),
     })
 }

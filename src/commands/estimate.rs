@@ -234,7 +234,13 @@ impl WriteCommand for Estimate {
         if !self.flags.allow_concurrent {
             let active =
                 active_operations(preflight.graph, case, "estimateStatistics", preflight.log)
-                    .await?;
+                    .await
+                    .map_err(|error| {
+                        error.context(format!(
+                            "listing the operations of case {case} again after approval; \
+                             nothing was sent"
+                        ))
+                    })?;
             if !active.is_empty() {
                 return Err(PurviewError::ConcurrentOperation(format!(
                     "an estimate of case {case} was started after the plan was shown and may be \

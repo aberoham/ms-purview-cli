@@ -337,6 +337,12 @@ pub async fn get(
     check: Option<Check<'_>>,
 ) -> Result<Produced> {
     let command_started = session.env.clock.elapsed();
+    // With --check, resuming must check again, never download everything.
+    let resume_kind = if check.is_some() {
+        Resume::Check { wait: true }
+    } else {
+        Resume::WaitThenDownload
+    };
     let case = case_id(&session.graph, case, &mut session.env.stderr).await?;
     let route = ReadRoute::Operation(case, operation.clone());
     let record = match wait {
@@ -383,26 +389,10 @@ pub async fn get(
             match end {
                 PollEnd::Finished(record) => record,
                 PollEnd::TimedOut { last } => {
-                    return stopped(
-                        session,
-                        case,
-                        operation,
-                        last,
-                        waited,
-                        false,
-                        Resume::WaitThenDownload,
-                    );
+                    return stopped(session, case, operation, last, waited, false, resume_kind);
                 }
                 PollEnd::Interrupted { last } => {
-                    return stopped(
-                        session,
-                        case,
-                        operation,
-                        last,
-                        waited,
-                        true,
-                        Resume::WaitThenDownload,
-                    );
+                    return stopped(session, case, operation, last, waited, true, resume_kind);
                 }
             }
         }
@@ -424,7 +414,7 @@ pub async fn get(
                     Some(record),
                     waited,
                     true,
-                    Resume::Check,
+                    Resume::Check { wait: false },
                 );
             }
         },
@@ -703,9 +693,10 @@ fn show(
 pub(crate) enum Resume {
     /// The wait, then the download of every file.
     WaitThenDownload,
-    /// `operation get --check`, which fetches only the evidence file: an
-    /// export's other files are item content.
-    Check,
+    /// `operation get --check`, with `--wait` while the operation runs,
+    /// which fetches only the evidence file: an export's other files are
+    /// item content.
+    Check { wait: bool },
 }
 
 /// Exit 5 at the deadline, 130 on Ctrl-C: the last status read and the
@@ -743,8 +734,9 @@ pub(crate) fn stopped(
             format!("purview --account={account} operation get {case} {operation} --wait"),
             format!("purview --account={account} download {case} {operation}"),
         ],
-        Resume::Check => vec![format!(
-            "purview --account={account} operation get {case} {operation} --check"
+        Resume::Check { wait } => vec![format!(
+            "purview --account={account} operation get {case} {operation}{} --check",
+            if wait { " --wait" } else { "" }
         )],
     };
     let (exit_code, code, message) = if interrupted {

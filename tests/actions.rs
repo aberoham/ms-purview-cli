@@ -1348,3 +1348,29 @@ async fn an_estimate_started_while_the_prompt_was_open_may_be_a_duplicate() {
         .contains("after the plan was shown"));
     assert!(setup.posts().await.is_empty());
 }
+
+#[tokio::test]
+async fn a_wait_with_check_that_times_out_resumes_with_check() {
+    let setup = Setup::new().await;
+    setup.operation(1000, setup.succeeded()).await;
+    let run = setup
+        .run_raw(&[
+            "--json",
+            "operation",
+            "get",
+            CASE,
+            OP,
+            "--wait",
+            "--check",
+            "--wait-timeout",
+            "1m",
+        ])
+        .await;
+    assert_eq!(run.outcome.exit_code, 5, "{}", run.stdout());
+    let resume = run.json()["resume"].clone();
+    assert_eq!(resume.as_array().unwrap().len(), 1, "{resume}");
+    assert!(resume[0]
+        .as_str()
+        .unwrap()
+        .ends_with(&format!("operation get {CASE} {OP} --wait --check")));
+}

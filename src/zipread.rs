@@ -222,14 +222,17 @@ pub(crate) fn declared_entries(file: &mut File, len: u64) -> Result<u64> {
     }
     // ZIP64: the locator is the 20 bytes before the record, and names the
     // ZIP64 end of central directory record.
-    let locator_at = (len - tail_len + at as u64)
-        .checked_sub(20)
-        .ok_or_else(not_zip)?;
+    // A classic zip may hold exactly 65,535 entries, with no locator.
+    let Some(locator_at) = (len - tail_len + at as u64).checked_sub(20) else {
+        file.seek(SeekFrom::Start(0))?;
+        return Ok(classic);
+    };
     let mut locator = [0_u8; 20];
     file.seek(SeekFrom::Start(locator_at))?;
     file.read_exact(&mut locator)?;
     if !locator.starts_with(b"PK\x06\x07") {
-        return Err(not_zip());
+        file.seek(SeekFrom::Start(0))?;
+        return Ok(classic);
     }
     let record_at = u64::from_le_bytes(locator[8..16].try_into().map_err(|_| not_zip())?);
     let mut record = [0_u8; 40];

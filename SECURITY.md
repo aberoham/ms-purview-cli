@@ -18,11 +18,12 @@ Never include access tokens, refresh tokens, device codes, tenant or application
 
 - Tokens are kept only in the operating system's credential store (macOS Keychain, Windows Credential Manager or Linux kernel keyring). `config.json` and account files hold no secrets, and saving `config.json` refuses any value the redactor recognises.
 - Everything `purview` prints passes through a redactor that removes tokens it has seen; JavaScript Object Notation (JSON) is redacted as a value before serialisation.
+- Microsoft Graph requests, paging links included, go only to `https://graph.microsoft.com:443` below `/v1.0/`, with redirects disabled. The download token goes only to the one download origin named by each file, never with the Graph token, and a redirect to another origin is refused.
+- The crate sends only Graph reads; a test fails the build if `PATCH`, `PUT` or `DELETE` appears in the source.
 - A public-data lint (`tests/fixture_lint.rs`) runs in continuous integration (CI) on every pull request and every push to `main` to keep real tenant identifiers, addresses, URLs and home-directory paths out of the repository.
 
 ## Design rules for later pull requests
 
-- Microsoft Graph requests go only to `https://graph.microsoft.com`, with redirects disabled, and the download token goes only to the one download origin named by each operation (from the transport and download pull requests onwards).
 - The tool never places, changes or releases a hold, never deletes or reopens a case, and sends a Purview write only after a plan has been shown and approved. No Purview write command exists yet.
 
 ## Verifying releases

@@ -243,6 +243,20 @@ Examples:
     )]
     Kql(QueryArgs),
     #[command(
+        about = "Read an estimate or report zip on this computer",
+        long_about = "\
+Read an estimate or item report zip that 'purview download' wrote, with no \
+sign-in: the locations searched with their hits, the locations that failed, \
+or the summary and settings. The zip is read in memory through limits on \
+its entries and sizes (config.json limits), and nothing is extracted.",
+        after_help = "\
+Examples:
+  purview parse locations <zip> --top 10 --with-hits
+  purview parse failures <zip> --json
+  purview parse summary <zip>"
+    )]
+    Parse(ParseArgs),
+    #[command(
         about = "Show the version, commit and build target",
         after_help = "\
 Examples:
@@ -250,6 +264,67 @@ Examples:
   purview version --json"
     )]
     Version,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ParseArgs {
+    #[command(subcommand)]
+    command: ParseCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum ParseCommand {
+    #[command(
+        about = "List the locations searched, most hits first",
+        long_about = "\
+List the rows of the zip's Locations-*.csv, sorted by Count, most first, \
+then by location and subtype.",
+        after_help = "\
+Examples:
+  purview parse locations <zip> --top 10
+  purview parse locations <zip> --with-hits --subtype archive --json"
+    )]
+    Locations {
+        #[arg(value_name = "ZIP", help = "An estimate or report zip")]
+        zip: PathBuf,
+        #[arg(long, value_name = "N", help = "Only the first N locations")]
+        top: Option<usize>,
+        #[arg(long, help = "Only locations with at least one hit")]
+        with_hits: bool,
+        #[arg(long, value_enum, help = "Only primary, archive or system mailboxes")]
+        subtype: Option<SubTypeArg>,
+    },
+    #[command(
+        about = "List the locations that were not searched in full",
+        long_about = "\
+List the failed locations: the Locations-*.csv rows with Status Failed and \
+the Statistics-*.csv rows with StatType Error, joined by location and \
+subtype. An operation can succeed while locations failed.",
+        after_help = "\
+Examples:
+  purview parse failures <zip>"
+    )]
+    Failures {
+        #[arg(value_name = "ZIP", help = "An estimate or report zip")]
+        zip: PathBuf,
+    },
+    #[command(
+        about = "Show the summary and settings",
+        after_help = "\
+Examples:
+  purview parse summary <zip> --json"
+    )]
+    Summary {
+        #[arg(value_name = "ZIP", help = "An estimate or report zip")]
+        zip: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum SubTypeArg {
+    Primary,
+    Archive,
+    System,
 }
 
 /// The query flags, shared with `search create` (`docs/SPEC.md` section
@@ -1334,6 +1409,7 @@ async fn run(
             read_command(env, output, globals, ReadCommand::download(download)?).await
         }
         Command::Kql(query) => kql(env, output, query),
+        Command::Parse(parse) => parse_zip(env, output, parse.command),
         Command::Version => version(env, output),
     }
 }
@@ -1347,6 +1423,45 @@ fn kql(env: &mut Env, output: &OutputOptions, query: QueryArgs) -> Result<Outcom
     let stored = load_config(env, &dir)?;
     let guard = crate::kql::GuardConfig::from_config(&stored.extra)?;
     let produced = commands::kql::run(env, output, &kql, &guard)?;
+    Ok(Outcome {
+        exit_code: produced.exit_code,
+        stdout_value: produced.document,
+    })
+}
+
+/// `purview parse`: local. `--select` is checked, then config.json's
+/// limits, then the zip is read.
+fn parse_zip(env: &mut Env, output: &OutputOptions, command: ParseCommand) -> Result<Outcome> {
+    use commands::parse::{LocationFilters, SubType, What};
+    let (zip, what) = match command {
+        ParseCommand::Locations {
+            zip,
+            top,
+            with_hits,
+            subtype,
+        } => (
+            zip,
+            What::Locations(LocationFilters {
+                top,
+                with_hits,
+                sub_type: subtype.map(|subtype| match subtype {
+                    SubTypeArg::Primary => SubType::Primary,
+                    SubTypeArg::Archive => SubType::Archive,
+                    SubTypeArg::System => SubType::System,
+                }),
+            }),
+        ),
+        ParseCommand::Failures { zip } => (zip, What::Failures),
+        ParseCommand::Summary { zip } => (zip, What::Summary),
+    };
+    if zip.as_os_str().is_empty() {
+        return Err(PurviewError::message("<ZIP> was given an empty value"));
+    }
+    crate::output::selected_indices(&output.select, what.columns())?;
+    let dir = configuration_dir(env)?;
+    let stored = load_config(env, &dir)?;
+    let limits = crate::report::ReportLimits::from_config(&stored.extra)?;
+    let produced = commands::parse::run(env, output, &zip, limits, what)?;
     Ok(Outcome {
         exit_code: produced.exit_code,
         stdout_value: produced.document,

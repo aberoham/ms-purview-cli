@@ -274,6 +274,7 @@ fn help_is_success_and_lists_exactly_the_shipped_commands() {
             "operation",
             "download",
             "kql",
+            "parse",
             "version",
             "help"
         ],

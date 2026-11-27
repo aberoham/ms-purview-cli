@@ -13,7 +13,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 
-use super::action::{active_operations, check_search, started_since, ActionRun, Checked, Sent};
+use super::action::{
+    active_operations, check_search, resume, started_since, ActionRun, Checked, Sent,
+};
 use crate::error::{PurviewError, Result};
 use crate::graph::WriteResponse;
 use crate::kql::GuardConfig;
@@ -26,7 +28,7 @@ use crate::report::volume::{Volume, VolumeLimits};
 use crate::report::{EvidenceOf, ReportFiles, ReportLimits};
 use crate::routes::{CaseId, OperationId, SearchId, WriteRoute};
 use crate::safety::{
-    After, Applied, PlanInput, Planned, Preflight, Reconciled, WriteCommand, WritePlan,
+    After, Applied, Blocked, PlanInput, Planned, Preflight, Reconciled, WriteCommand, WritePlan,
     WriteSettings,
 };
 
@@ -135,7 +137,7 @@ impl WriteCommand for Estimate {
             ));
         }
         let blocked = (!active.is_empty() && !self.flags.allow_concurrent).then(|| {
-            format!(
+            Blocked::Concurrent(format!(
                 "case {case} has {} estimate{} not yet finished that may be a duplicate ({}); \
                  nothing was sent. Wait for {} with 'purview operation get {case} <op> --wait', \
                  or pass --allow-concurrent to start another",
@@ -147,7 +149,7 @@ impl WriteCommand for Estimate {
                     .collect::<Vec<_>>()
                     .join("; "),
                 if active.len() == 1 { "it" } else { "them" },
-            )
+            ))
         });
         let body = serde_json::to_value(EstimateRequest {
             statistics_options: IncludeQueryStats,
@@ -362,16 +364,6 @@ impl WriteCommand for Estimate {
         }
         Ok(Reconciled { candidates, notes })
     }
-}
-
-/// The commands that carry on from a submitted estimate, as the signed-in
-/// account.
-fn resume(after: &After<'_>, case: CaseId, operation: &OperationId) -> Vec<String> {
-    let account = super::operation::shell_word(&after.session.account.email);
-    vec![
-        format!("purview --account={account} operation get {case} {operation} --wait"),
-        format!("purview --account={account} download {case} {operation}"),
-    ]
 }
 
 /// The volume check of a finished estimate (`docs/SPEC.md` section 6.9):

@@ -9,6 +9,7 @@ pub mod estimate;
 pub mod kql;
 pub mod operation;
 pub mod parse;
+pub mod report;
 pub mod search;
 
 use std::io::Write;

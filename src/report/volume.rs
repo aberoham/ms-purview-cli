@@ -263,7 +263,7 @@ impl Volume {
 }
 
 /// `12345` as `12,345`.
-fn grouped(value: u64) -> String {
+pub(crate) fn grouped(value: u64) -> String {
     let digits = value.to_string();
     let mut out = String::new();
     for (index, digit) in digits.chars().enumerate() {
@@ -277,7 +277,7 @@ fn grouped(value: u64) -> String {
 
 /// Bytes in the largest binary unit that keeps one or more whole units,
 /// with one decimal place.
-fn size_text(bytes: u64) -> String {
+pub(crate) fn size_text(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["KiB", "MiB", "GiB", "TiB"];
     if bytes < 1 << 10 {
         return format!("{bytes} B");

@@ -51,6 +51,53 @@ impl Serialize for IncludeQueryStats {
     }
 }
 
+/// `POST …/searches/{search}/exportReport` (`docs/SPEC.md` section 7.5):
+/// every hit, from the locations with hits.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportReportRequest<'a> {
+    pub display_name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<&'a str>,
+    pub export_criteria: SearchHits,
+    pub export_location: ResponsiveLocations,
+    /// `Some` by default; `None` under `--no-teams-context`, a body not
+    /// yet observed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additional_options: Option<TeamsConversations>,
+}
+
+/// Serialises only as `"searchHits"`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SearchHits;
+
+impl Serialize for SearchHits {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str("searchHits")
+    }
+}
+
+/// Serialises only as `"responsiveLocations"`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResponsiveLocations;
+
+impl Serialize for ResponsiveLocations {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str("responsiveLocations")
+    }
+}
+
+/// Serialises only as `"teamsAndYammerConversations"`: the conversation
+/// around each Teams hit (`docs/SPEC.md` section 6.6).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TeamsConversations;
+
+impl Serialize for TeamsConversations {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str("teamsAndYammerConversations")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,5 +140,43 @@ mod tests {
         })
         .unwrap();
         assert_eq!(body, json!({"displayName": "n", "description": "d"}));
+    }
+
+    #[test]
+    fn a_report_body_is_the_observed_one_and_drops_only_what_is_absent() {
+        let body = serde_json::to_value(ExportReportRequest {
+            display_name: "report 2026-03-14 0930Z",
+            description: None,
+            export_criteria: SearchHits,
+            export_location: ResponsiveLocations,
+            additional_options: Some(TeamsConversations),
+        })
+        .unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "displayName": "report 2026-03-14 0930Z",
+                "exportCriteria": "searchHits",
+                "exportLocation": "responsiveLocations",
+                "additionalOptions": "teamsAndYammerConversations",
+            })
+        );
+        let body = serde_json::to_value(ExportReportRequest {
+            display_name: "n",
+            description: Some("why"),
+            export_criteria: SearchHits,
+            export_location: ResponsiveLocations,
+            additional_options: None,
+        })
+        .unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "displayName": "n",
+                "description": "why",
+                "exportCriteria": "searchHits",
+                "exportLocation": "responsiveLocations",
+            })
+        );
     }
 }

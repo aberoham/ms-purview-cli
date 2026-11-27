@@ -257,6 +257,17 @@ pub enum PurviewError {
     #[error("{0}")]
     ConcurrentOperation(String),
 
+    /// A report or export of a search whose latest estimate passes
+    /// `volume.max_export_size`, without `--allow-large` (`docs/SPEC.md`
+    /// section 6.9).
+    #[error("{0}")]
+    TooLarge(String),
+
+    /// A report or export of a search with no estimate whose size can be
+    /// compared with `volume.max_export_size`, without `--allow-large`.
+    #[error("{0}")]
+    VolumeUnchecked(String),
+
     /// A zip that is refused before or while it is read: not a zip, too
     /// many entries, a name that would leave its folder, or more bytes, or
     /// a higher ratio, than the limits allow. Never names an entry.
@@ -414,6 +425,8 @@ impl PurviewError {
             Self::SearchNameInUse(_) => ("SearchNameInUse", 0),
             Self::CaseNotActive(_) => ("CaseNotActive", 0),
             Self::ConcurrentOperation(_) => ("ConcurrentOperation", 0),
+            Self::TooLarge(_) => ("TooLarge", 0),
+            Self::VolumeUnchecked(_) => ("VolumeUnchecked", 0),
             Self::ScopeUnverified(_) => ("ScopeUnverified", 0),
             Self::ScopeNotAllowed(_) => ("ScopeNotAllowed", 0),
             Self::SearchHasSources(_) => ("SearchHasSources", 0),

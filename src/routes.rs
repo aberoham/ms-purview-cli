@@ -142,6 +142,9 @@ pub enum ReadRoute {
     /// `…/{case}/searches/{search}/custodianSources`, `noncustodialSources`
     /// or `additionalSources`
     SearchSources(CaseId, SearchId, SearchSources),
+    /// `…/{case}/searches/{search}/lastEstimateStatisticsOperation`: the
+    /// search's latest estimate (Docs).
+    LastEstimate(CaseId, SearchId),
     /// `…/{case}/operations`
     Operations(CaseId),
     /// `…/{case}/operations/{op}`
@@ -175,6 +178,12 @@ impl ReadRoute {
                 "searches",
                 &search.to_string(),
                 sources.segment(),
+            ]),
+            Self::LastEstimate(case, search) => push(&[
+                &case.to_string(),
+                "searches",
+                &search.to_string(),
+                "lastEstimateStatisticsOperation",
             ]),
             Self::Operations(case) => push(&[&case.to_string(), "operations"]),
             Self::Operation(case, operation) => {
@@ -491,6 +500,10 @@ mod tests {
             (
                 ReadRoute::LegalHoldSources(case, HoldId::parse("h").unwrap(), HoldSources::User),
                 format!("/{CASE}/legalHolds/h/userSources"),
+            ),
+            (
+                ReadRoute::LastEstimate(case, search),
+                format!("/{CASE}/searches/{SEARCH}/lastEstimateStatisticsOperation"),
             ),
             (ReadRoute::Operations(case), format!("/{CASE}/operations")),
             (

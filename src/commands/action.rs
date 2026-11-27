@@ -602,3 +602,13 @@ impl Finished {
         }
     }
 }
+
+/// The commands that carry on from a submitted action, as the signed-in
+/// account.
+pub fn resume(after: &After<'_>, case: CaseId, operation: &OperationId) -> Vec<String> {
+    let account = super::operation::shell_word(&after.session.account.email);
+    vec![
+        format!("purview --account={account} operation get {case} {operation} --wait"),
+        format!("purview --account={account} download {case} {operation}"),
+    ]
+}

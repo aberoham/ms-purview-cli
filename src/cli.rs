@@ -991,13 +991,17 @@ impl Printer {
         ) {
             // Clap names the word it did not expect, and repeats it in its
             // tip; the word could be part of a pasted value, such as the
-            // second word of an unquoted query. Only the usage is kept.
-            let usage = rendered
-                .find("Usage:")
-                .map_or("", |start| rendered[start..].trim_end());
+            // second word of an unquoted query. Only Clap's usage context
+            // is kept, which is built from the command, never the input.
+            let usage = match error.get(clap::error::ContextKind::Usage) {
+                Some(clap::error::ContextValue::StyledStr(usage)) => {
+                    format!("\n\n{}", usage.to_string().trim_end())
+                }
+                _ => String::new(),
+            };
             format!(
                 "an argument that this command does not take (not repeated here); quote a \
-                 value that holds spaces\n\n{usage}"
+                 value that holds spaces{usage}\n\nFor more information, try '--help'."
             )
         } else {
             let text = rendered.trim();

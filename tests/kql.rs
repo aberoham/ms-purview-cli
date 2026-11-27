@@ -377,7 +377,13 @@ async fn date_flags_take_exactly_the_form_the_query_takes() {
 
 #[tokio::test]
 async fn a_hidden_character_in_a_term_is_refused_before_config_json() {
-    for term in ["follow-up\u{200B}", "follow\tup"] {
+    for term in [
+        "follow-up\u{200B}",
+        "follow\tup",
+        "\torders-api",
+        "orders-api\u{000B}",
+        "orders-api\n",
+    ] {
         let (code, _, stderr, _) = run(Some("{not json"), &["kql", "--term", term]).await;
         assert_eq!(code, 1);
         assert!(stderr.contains("control or invisible"), "{stderr}");
@@ -385,4 +391,75 @@ async fn a_hidden_character_in_a_term_is_refused_before_config_json() {
     let (code, _, _, value) = run(None, &["--json", "kql", "--kql", "\"follow-up\u{200B}\""]).await;
     assert_eq!(code, 1);
     assert_eq!(value.unwrap()["error"]["code"], "KqlNotUnderstood");
+}
+
+#[tokio::test]
+async fn the_rule_column_redacts_url_queries_in_tokens() {
+    let marker = ["sample", "marker"].concat();
+    let term = format!("review {}b?sig={marker}", ["https", "://"].concat());
+    for format in [&[][..], &["--plain"][..]] {
+        let mut args = format.to_vec();
+        args.extend_from_slice(&["kql", "--term", term.as_str()]);
+        let (code, stdout, stderr, _) = run(None, &args).await;
+        assert_eq!(code, 1, "{stderr}");
+        assert!(stdout.contains("review 8"), "{stdout}");
+        assert!(!stdout.contains(&marker), "{stdout}");
+    }
+}
+
+#[tokio::test]
+async fn the_redacted_query_still_parses_and_keeps_its_quotes() {
+    let marker = ["sample", "marker"].concat();
+    let link = [
+        "https://",
+        "files.contoso.example",
+        "/report?sig=",
+        marker.as_str(),
+    ]
+    .concat();
+    for (kql, code) in [
+        (format!("\"{link}\" AND orders-api"), 0),
+        (format!("\"{link}\" OR retention"), 1),
+    ] {
+        let (exit, stdout, _, value) = run(None, &["--json", "kql", "--kql", kql.as_str()]).await;
+        assert_eq!(exit, code);
+        assert!(!stdout.contains(&marker), "{stdout}");
+        let value = value.unwrap();
+        let reported = if code == 0 {
+            value["results"]["kql"].as_str().unwrap().to_owned()
+        } else {
+            value["analysis"]["kql"].as_str().unwrap().to_owned()
+        };
+        assert!(
+            reported.starts_with("\"https://files.contoso.example/report?"),
+            "{reported}"
+        );
+        let (again, _, stderr, _) = run(None, &["kql", "--kql", reported.as_str()]).await;
+        assert_eq!(again, code, "{reported}: {stderr}");
+        let (_, stdout, _, _) = run(None, &["kql", "--kql", kql.as_str()]).await;
+        let line = stdout.lines().next().unwrap();
+        assert!(
+            line.contains("\" AND orders-api") || line.contains("\" OR retention"),
+            "{line}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_unexpected_argument_holding_usage_is_not_repeated() {
+    let marker = ["Usage:", "sample", "marker"].concat();
+    for json in [true, false] {
+        let mut args = vec![];
+        if json {
+            args.push("--json");
+        }
+        args.extend_from_slice(&["kql", "--kql", "orders-api", marker.as_str()]);
+        let (code, stdout, stderr, _) = run(None, &args).await;
+        assert_eq!(code, 1);
+        assert!(!stdout.contains("samplemarker") && !stderr.contains("samplemarker"));
+        assert!(
+            (stdout.clone() + &stderr).contains("Usage: purview kql"),
+            "{stdout}{stderr}"
+        );
+    }
 }

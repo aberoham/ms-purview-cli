@@ -34,7 +34,16 @@ pub fn run(
     if output.format == OutputFormat::Json {
         // Every URL in the query keeps only what the trace keeps, as in
         // the human report: a pasted link can carry a signature.
-        let report = crate::trace::redact_urls(&serde_json::to_value(&analysis)?, &env.redactor);
+        let mut report =
+            crate::trace::redact_urls(&serde_json::to_value(&analysis)?, &env.redactor);
+        if let Value::Object(object) = &mut report {
+            object.insert(
+                "kql".to_owned(),
+                Value::String(redact_phrases(kql, |text| {
+                    crate::redact::urls_in_text(text, &env.redactor)
+                })),
+            );
+        }
         if analysis.narrowed {
             return Ok(Produced::success(Some(output.json_value(&report, 1)?)));
         }
@@ -56,7 +65,10 @@ pub fn run(
         writeln!(
             env.stdout,
             "kql: {}",
-            sanitize(&crate::redact::shown(kql, &env.redactor))
+            sanitize(&redact_phrases(kql, |text| crate::redact::shown(
+                text,
+                &env.redactor
+            )))
         )?;
     }
     write_rows(&mut env.stdout, output, COLUMNS, &rows)?;
@@ -95,7 +107,13 @@ fn row(leaf: &LeafReport, redactor: &crate::redact::Redactor) -> Vec<String> {
             let tokens: Vec<String> = leaf
                 .tokens
                 .iter()
-                .map(|token| format!("{} {}", token.token, token.rule))
+                .map(|token| {
+                    format!(
+                        "{} {}",
+                        crate::redact::shown(&token.token, redactor),
+                        token.rule
+                    )
+                })
                 .collect();
             format!("{} ({})", leaf.reason, tokens.join(", "))
         }
@@ -108,4 +126,42 @@ fn row(leaf: &LeafReport, redactor: &crate::redact::Redactor) -> Vec<String> {
         leaf.class.to_owned(),
         rule,
     ]
+}
+
+/// `kql` with `redact` applied to the text inside each pair of quotes, and
+/// the quotes and everything outside them kept. URL redaction in free text
+/// runs to the next space, so applied to the whole query it would take a
+/// closing quote with it. A URL can only stand in a phrase: a word cannot
+/// hold `:`, so the rest of the query needs nothing redacted. The query
+/// has parsed, so its quotes pair up and a phrase holds no quote.
+fn redact_phrases(kql: &str, redact: impl Fn(&str) -> String) -> String {
+    let mut out = String::with_capacity(kql.len());
+    let mut parts = kql.split('"');
+    if let Some(first) = parts.next() {
+        out.push_str(first);
+    }
+    for (index, part) in parts.enumerate() {
+        out.push('"');
+        if index % 2 == 0 {
+            out.push_str(&redact(part));
+        } else {
+            out.push_str(part);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_phrases;
+
+    #[test]
+    fn only_phrase_text_is_redacted() {
+        let shout = |text: &str| text.to_uppercase();
+        assert_eq!(
+            redact_phrases(r#"a1aa AND "x y" OR subject:"z" AND b2bb"#, shout),
+            r#"a1aa AND "X Y" OR subject:"Z" AND b2bb"#
+        );
+        assert_eq!(redact_phrases("a1aa", shout), "a1aa");
+    }
 }

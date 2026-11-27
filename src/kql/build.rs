@@ -101,6 +101,18 @@ pub fn build(flags: &QueryFlags) -> Result<String> {
             .iter()
             .enumerate()
             .map(|(index, term)| {
+                // Checked before trimming, which would remove a control
+                // character at either end.
+                if term
+                    .chars()
+                    .any(|character| character.is_control() || super::lexer::is_hidden(character))
+                {
+                    return Err(PurviewError::message(format!(
+                        "--term{} contains a control or invisible character, such as a tab or a \
+                         zero-width space",
+                        ordinal(index, count)
+                    )));
+                }
                 let term = term.trim();
                 if term.is_empty() {
                     return Err(PurviewError::message(format!(
@@ -111,16 +123,6 @@ pub fn build(flags: &QueryFlags) -> Result<String> {
                 if term.contains('"') {
                     return Err(PurviewError::message(format!(
                         "--term{} contains a double quote (\"), which a quoted term cannot hold",
-                        ordinal(index, count)
-                    )));
-                }
-                if term
-                    .chars()
-                    .any(|character| character.is_control() || super::lexer::is_hidden(character))
-                {
-                    return Err(PurviewError::message(format!(
-                        "--term{} contains a control or invisible character, such as a tab or a \
-                         zero-width space",
                         ordinal(index, count)
                     )));
                 }

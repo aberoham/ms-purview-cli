@@ -196,7 +196,7 @@ On macOS, `cargo build` produces an ad-hoc-signed binary, whose identity changes
 
 - [docs/auth.md](docs/auth.md): permissions, the app registration (setup script and manual steps), consent choices and sign-in
 - [docs/safety.md](docs/safety.md): the guard against generic tenant-wide searches: the supported query grammar, the term classifier and its settings
-- [docs/troubleshooting.md](docs/troubleshooting.md): installing, verifying checksums and checking binary signatures
+- [docs/troubleshooting.md](docs/troubleshooting.md): installing, verifying checksums and checking binary signatures; keychain prompts, sign-in, role and download errors
 - [docs/macos-signing.md](docs/macos-signing.md): how macOS releases are signed and notarised
 - [docs/api-notes.md](docs/api-notes.md): observed Microsoft Graph and Purview service behaviour
 - [docs/SPEC.md](docs/SPEC.md): design, safety model and phased implementation plan

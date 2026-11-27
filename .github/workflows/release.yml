@@ -129,11 +129,12 @@ jobs:
           package="purview-${RELEASE_TAG}-${TARGET}"
           mkdir -p "dist/${package}/bin" "dist/${package}/share/doc/purview/contrib"
           cp "target/${TARGET}/release/purview" "dist/${package}/bin/purview"
-          cp README.md LICENSE NOTICE "dist/${package}/share/doc/purview/"
+          cp README.md LICENSE NOTICE CHANGELOG.md "dist/${package}/share/doc/purview/"
           cp -R docs "dist/${package}/share/doc/purview/docs"
-          # For source builds. Signed releases must not be re-signed; see
+          # The app registration script (docs/auth.md), and resign.sh for
+          # source builds. Signed releases must not be re-signed; see
           # docs/troubleshooting.md.
-          cp contrib/resign.sh "dist/${package}/share/doc/purview/contrib/"
+          cp contrib/create-purview-app.sh contrib/resign.sh "dist/${package}/share/doc/purview/contrib/"
           tar czf "${package}.tar.gz" -C dist "${package}"
 
       - name: Package (windows)
@@ -142,9 +143,10 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $package = "purview-$env:RELEASE_TAG-$env:TARGET"
-          New-Item -ItemType Directory -Force -Path "dist/$package/bin", "dist/$package/share/doc/purview" | Out-Null
+          New-Item -ItemType Directory -Force -Path "dist/$package/bin", "dist/$package/share/doc/purview/contrib" | Out-Null
           Copy-Item "target/$env:TARGET/release/purview.exe" "dist/$package/bin/purview.exe"
-          Copy-Item -Path @("README.md", "LICENSE", "NOTICE") -Destination "dist/$package/share/doc/purview/"
+          Copy-Item -Path @("README.md", "LICENSE", "NOTICE", "CHANGELOG.md") -Destination "dist/$package/share/doc/purview/"
+          Copy-Item "contrib/create-purview-app.sh" "dist/$package/share/doc/purview/contrib/"
           Copy-Item -Recurse "docs" "dist/$package/share/doc/purview/docs"
           Compress-Archive -Path "dist/$package" -DestinationPath "$package.zip"
 
@@ -166,9 +168,14 @@ jobs:
             exit 1
           fi
           "smoke/${package}/bin/purview" --help >/dev/null
-          test -f "smoke/${package}/share/doc/purview/LICENSE"
-          test -f "smoke/${package}/share/doc/purview/docs/macos-signing.md"
+          # Local: no sign-in, no network, and no configuration directory.
+          PURVIEW_CONFIG_DIR="$RUNNER_TEMP/no-config" "smoke/${package}/bin/purview" \
+            kql --term orders-api --participant alex@contoso.example
+          for file in LICENSE NOTICE README.md CHANGELOG.md docs/macos-signing.md docs/safety.md; do
+            test -f "smoke/${package}/share/doc/purview/${file}"
+          done
           test -x "smoke/${package}/share/doc/purview/contrib/resign.sh"
+          test -x "smoke/${package}/share/doc/purview/contrib/create-purview-app.sh"
 
       # The Linux archives promise a static binary that runs on any
       # distribution, so it must have no program interpreter and no shared
@@ -205,7 +212,12 @@ jobs:
           $expected = "purview $($env:RELEASE_TAG.Substring(1)) $env:GITHUB_SHA $env:TARGET"
           if ($reported -cne $expected) { throw "purview version printed '$reported', expected '$expected'" }
           & "smoke/$package/bin/purview.exe" --help | Out-Null
-          if (-not (Test-Path "smoke/$package/share/doc/purview/docs/macos-signing.md")) { throw "docs missing from $package.zip" }
+          $env:PURVIEW_CONFIG_DIR = Join-Path $env:RUNNER_TEMP "no-config"
+          & "smoke/$package/bin/purview.exe" kql --term orders-api --participant alex@contoso.example
+          Remove-Item Env:PURVIEW_CONFIG_DIR
+          foreach ($file in @("LICENSE", "NOTICE", "README.md", "CHANGELOG.md", "docs/macos-signing.md", "docs/safety.md", "contrib/create-purview-app.sh")) {
+            if (-not (Test-Path "smoke/$package/share/doc/purview/$file")) { throw "$file missing from $package.zip" }
+          }
 
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -256,6 +268,15 @@ jobs:
           mkdir -p "$unpacked"
           tar xzf "${package}.tar.gz" -C "$unpacked"
           python3 .github/scripts/macos-signing.py sign "$unpacked/$package/bin/purview" com.aberoham.purview --notarize
+          # The signed binary must still run as the unsigned one did. This
+          # runner is Apple silicon, so only the native build is run; the
+          # Intel build was run unsigned on an Intel runner.
+          if [[ "$TARGET" == "$(uname -m | sed 's/^arm64$/aarch64/')-apple-darwin" ]]; then
+            "$unpacked/$package/bin/purview" version
+            "$unpacked/$package/bin/purview" --help >/dev/null
+            PURVIEW_CONFIG_DIR="$RUNNER_TEMP/no-config" "$unpacked/$package/bin/purview" \
+              kql --term orders-api --participant alex@contoso.example
+          fi
           tar czf "${package}.tar.gz" -C "$unpacked" "$package"
       # Runs whatever happened above, and before the upload action, so the
       # unlocked signing identity is gone before any further code runs.

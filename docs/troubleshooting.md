@@ -1,7 +1,10 @@
 # Troubleshooting
 
-This page covers installing and checking the `purview` binary. Sections for
-sign-in, searches and downloads arrive with the commands that need them.
+This page covers installing and checking the `purview` binary, then signing
+in, reading cases and downloading files. Entries for the write commands
+(`ScopeUnverified`, `WriteOutcomeUnknown`, closing a case) arrive with them in
+v0.2; they are listed at the end so that a search for the code finds this
+page.
 
 ## Which binary is running
 
@@ -99,3 +102,114 @@ dependencies, so it runs on any distribution for its architecture. An
 `Exec format error` means the archive is for the other architecture: use
 `x86_64-unknown-linux-musl` on x86-64 and `aarch64-unknown-linux-musl` on
 Arm64.
+
+## Keychain or credential-store prompts after an upgrade
+
+macOS asks for the keychain password, or to allow access, when a program it
+does not recognise reads the `purview` keychain item. The release binaries
+are signed with one stable identity, `com.aberoham.purview`, so an upgrade
+from one release to the next reads the stored credential without a prompt.
+A prompt after an upgrade means the binary changed identity:
+
+- a source build replaced a release, or the other way round. They have
+  different signing identities. Choose **Always Allow** once, or sign the
+  source build with `contrib/resign.sh` (see "A source build on macOS");
+- a release binary was re-signed locally. Do not re-sign release binaries.
+
+Windows Credential Manager and the Linux kernel keyring do not prompt per
+program. If the stored credential cannot be read at all, sign in again with
+`purview auth login`.
+
+## The device code is refused by Conditional Access
+
+A tenant can block the device code flow with a Conditional Access policy
+for authentication flows (Docs). The sign-in page then refuses the code
+after you enter it, and `auth login` fails with the identity platform's
+error. Sign in in the browser on the same computer instead:
+
+```bash
+purview auth login --browser
+```
+
+The browser flow needs a browser on the computer that runs `purview`,
+because the sign-in returns to a loopback address. Over a remote shell,
+ask the tenant administrator whether the policy can exclude the app
+registration.
+
+## 403 without the Purview role
+
+`purview auth status` reports `purviewRole: denied` when Graph answers its
+case read with HTTP 403. The likely cause is that the account holds no
+eDiscovery role: it needs the eDiscovery Manager or eDiscovery
+Administrator subgroup of the eDiscovery Manager role group, assigned in the
+Microsoft Purview portal (Docs). That a missing role gives 403 has not been
+observed yet (Assumption).
+
+`purviewRole: unknown` means the read failed another way, such as a network
+error or a Graph outage; `purview auth status --verbose` logs the
+request on stderr.
+
+## 401 or 403 on a download
+
+`purview download` sends the download token, not the Graph token, to the
+Purview download host. Two errors mean the token is missing or refused:
+
+- **`DownloadNotConsented`**: the account has no download token, because the
+  app has no consent for `eDiscovery.Download.Read` on the Purview eDiscovery
+  app. Grant the consent (see `docs/auth.md`, "`AADSTS65001` and
+  `AADSTS65002`"), then run `purview auth refresh`.
+- **`DownloadRefused`** with status 401 or 403: the download service refused
+  the token. Run `purview auth refresh` and try again. If it is refused
+  again, check that the consent above exists and that the account holds an
+  eDiscovery role. A Graph token sent to the download host is answered with
+  401 (Observed), so a tool or script that uses a Graph token there fails
+  the same way.
+
+A file that cannot be downloaded does not stop the others: the command
+writes the rest, then exits 4 with `FileNotDownloadable` for that file.
+Running the same command again fetches only what is still missing.
+
+## `CrossOriginRedirect` on a download
+
+The download service answered with a redirect to another origin (scheme,
+host or port). `purview` follows redirects only within the origin that the
+operation named, so it refused the redirect without contacting the other
+host, and the download token never left that origin. No redirect has been
+observed on a download (Observed); one to another origin means the service
+changed or something between you and it rewrote the answer, such as a
+proxy. The error names only the other origin. Report it with that origin
+and the output of `purview --verbose download <case> <op>`, which shows the
+redacted request addresses.
+
+## An operation that succeeded but missed some locations
+
+An estimate or report can end with status `succeeded` and still have
+failed to search some mailboxes. The operation's status alone does not
+show this; the per-location results are in the report files. In v0.1,
+download the operation's files with `purview download <case> <op>` and read
+the locations report in the zip. From v0.2, `purview parse failures` lists
+them and `--strict` turns them into exit 4.
+
+`purview operation get` exits 4 when the operation itself did not succeed
+(`partiallySucceeded`, `failed` or `submissionFailed`), with the reasons.
+
+## A case in `closing` status
+
+`purview case list --status closing` shows cases the service is still
+closing. One observed close went from `active` to `closed` within seconds
+without showing `closing` (Observed), and some cases were seen in `closing`
+for longer (Observed); why is not known. v0.1 does not close cases, so it
+only reads this status. `purview case close` arrives in v0.2, and waits for
+the case to reach `closed`.
+
+## Write commands (v0.2)
+
+These errors come from the write commands, which arrive in v0.2. Their
+entries will be written with those commands:
+
+- **`ScopeUnverified`**: an action on an existing search was refused because
+  the search's read did not show that it covers every tenant mailbox.
+- **`WriteOutcomeUnknown`**: a write was sent but its outcome is not known,
+  for example because the connection dropped; the command lists what to
+  check before trying again, because writes are never retried
+  automatically.

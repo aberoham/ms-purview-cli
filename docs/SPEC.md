@@ -2433,10 +2433,12 @@ with no path filter, so docs-only changes are checked. It runs the public-data l
 3. Build `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-musl`,
    `aarch64-unknown-linux-musl` and `x86_64-pc-windows-msvc`. Check that the Linux binaries
    are statically linked.
-4. Package `bin/purview` and `share/doc/purview/` (`docs/` without anything private; the
-   lint has already refused `docs/reviews/`).
+4. Package `bin/purview` and `share/doc/purview/`: `README.md`, `LICENSE`, `NOTICE`,
+   `CHANGELOG.md`, `docs/` (without anything private; the lint has already refused
+   `docs/reviews/`), and `contrib/create-purview-app.sh` (plus `contrib/resign.sh` in the
+   Unix archives).
 5. Smoke-test each archive with the commands that release ships (section 11 lists them per
-   release).
+   release), and run them again on the signed Apple silicon binary after notarisation.
 6. Sign the macOS builds, as `entra` does:
    - Developer ID, stable identifier `com.aberoham.purview`, hardened runtime and a secure
      timestamp;

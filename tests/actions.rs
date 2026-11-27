@@ -831,6 +831,19 @@ async fn an_estimate_above_the_volume_limits_warns_loudly_and_still_succeeds() {
     // --strict is about the collection, not the volume.
     let run = setup.run(&["--json", "--yes", "--strict"]).await;
     assert_eq!(run.outcome.exit_code, 0, "{}", run.stdout());
+    // A human run warns on stderr and shows volume in the result.
+    let run = setup.run(&["--yes"]).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
+    assert!(
+        run.stderr().contains("warning: VOLUME:"),
+        "{}",
+        run.stderr()
+    );
+    assert!(
+        run.stdout().contains("\"exceeded\": true"),
+        "{}",
+        run.stdout()
+    );
 }
 
 #[tokio::test]
@@ -863,12 +876,149 @@ async fn a_bad_volume_setting_stops_the_estimate_before_any_request() {
     let setup = Setup::new().await;
     setup.ready(0, false).await;
     set_volume(&setup.harness, json!({"max_export_size": "huge"}));
+    let identity_before = setup
+        .harness
+        .identity
+        .received_requests()
+        .await
+        .unwrap()
+        .len();
     let run = setup.run(&["--json", "--yes"]).await;
     assert_eq!(run.outcome.exit_code, 1, "{}", run.stdout());
     let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
     assert!(message.contains("volume.max_export_size"), "{message}");
     assert!(!message.contains("huge"), "{message}");
+    assert_eq!(run.stderr(), "");
     assert!(setup.graph_requests().await.is_empty());
+    assert_eq!(
+        setup
+            .harness
+            .identity
+            .received_requests()
+            .await
+            .unwrap()
+            .len(),
+        identity_before
+    );
+
+    // With no account signed in, the setting is still the error.
+    let harness = Harness::new().await;
+    let dir = harness.config_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::to_vec(&json!({"volume": {"warn_hits": -1}})).unwrap(),
+    )
+    .unwrap();
+    let run = harness
+        .run(&["--json", "estimate", CASE, SEARCH, "--yes"])
+        .await;
+    assert_eq!(run.outcome.exit_code, 1, "{}", run.stdout());
+    let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
+    assert!(message.contains("volume.warn_hits"), "{message}");
+}
+
+#[tokio::test]
+async fn a_failed_estimate_uses_none_of_its_counts() {
+    let setup = Setup::new().await;
+    setup
+        .preflight(
+            fixture_value(&setup.harness, "search-get-mailboxes.json"),
+            json!({"value": []}),
+        )
+        .await;
+    setup.accept(&setup.key_form_location()).await;
+    setup.operation(0, operation("failed", json!([]))).await;
+    set_volume(
+        &setup.harness,
+        json!({"warn_hits": 1, "max_export_size": "1KiB"}),
+    );
+    let run = setup.run(&["--json", "--yes"]).await;
+    assert_eq!(run.outcome.exit_code, 4, "{}", run.stdout());
+    let volume = &run.json()["results"]["result"]["volume"];
+    assert_eq!(volume["exceeded"], false);
+    assert_eq!(
+        volume["unchecked"],
+        json!([
+            "volume.warn_hits",
+            "volume.warn_hits_per_location",
+            "volume.max_export_size"
+        ])
+    );
+    assert!(!run.stderr().contains("VOLUME"), "{}", run.stderr());
+}
+
+#[tokio::test]
+async fn a_count_graph_gives_as_another_type_is_unchecked_and_named() {
+    let setup = Setup::new().await;
+    setup
+        .preflight(
+            fixture_value(&setup.harness, "search-get-mailboxes.json"),
+            json!({"value": []}),
+        )
+        .await;
+    setup.accept(&setup.key_form_location()).await;
+    let mut last = setup.succeeded();
+    last["indexedItemCount"] = json!(-5);
+    setup.operation(0, last).await;
+    setup.serve(estimate_zip(false)).await;
+    let run = setup.run(&["--json", "--yes"]).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stdout());
+    assert_eq!(
+        run.json()["results"]["result"]["volume"]["unchecked"],
+        json!(["volume.warn_hits"])
+    );
+    assert!(
+        run.stderr()
+            .contains("has fields that are not counts (indexedItemCount)"),
+        "{}",
+        run.stderr()
+    );
+}
+
+#[tokio::test]
+async fn a_second_locations_file_leaves_hits_per_location_unchecked() {
+    let setup = Setup::new().await;
+    setup
+        .preflight(
+            fixture_value(&setup.harness, "search-get-mailboxes.json"),
+            json!({"value": []}),
+        )
+        .await;
+    setup.accept(&setup.key_form_location()).await;
+    setup.operation(0, setup.succeeded()).await;
+    // The estimate zip, with a second Locations file whose one row has
+    // more hits than the limit.
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(estimate_zip(false))).unwrap();
+    let mut buffer = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = zip::ZipWriter::new(&mut buffer);
+        for index in 0..zip.len() {
+            writer.raw_copy_file(zip.by_index(index).unwrap()).unwrap();
+        }
+        let options = zip::write::SimpleFileOptions::default();
+        writer
+            .start_file("Locations-2026-01-05_09-30-00.csv", options)
+            .unwrap();
+        writer
+            .write_all(
+                format!(
+                    "{LOCATIONS_HEADER}Exchange,Mailbox,sam@contoso.example,id-2,Mailbox,PrimaryMailBox,5000,9,Succeeded,,q\r\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        writer.finish().unwrap();
+    }
+    setup.serve(buffer.into_inner()).await;
+    let run = setup.run(&["--json", "--yes"]).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stdout());
+    let volume = &run.json()["results"]["result"]["volume"];
+    assert_eq!(volume["exceeded"], false);
+    assert_eq!(
+        volume["unchecked"],
+        json!(["volume.warn_hits_per_location"])
+    );
 }
 
 // Flow 5: the Graph token expires while the estimate is polled.

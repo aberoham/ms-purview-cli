@@ -110,18 +110,22 @@ pub struct Over {
 pub struct Volume {
     pub limits: Option<VolumeLimits>,
     pub over: Vec<Over>,
-    /// The keys that could not be checked, for want of a count.
+    /// The keys that could not be checked in full, for want of a count.
+    /// A limit can be both passed and unchecked: some locations' hits
+    /// passed it, and others' could not be read.
     pub unchecked: Vec<&'static str>,
 }
 
 impl Volume {
     /// Checks the estimate's item count and size, and the hits of each
-    /// row of `Locations-*.csv` when the zip was read.
+    /// row of `Locations-*.csv` when the zip was read. `duplicated` says
+    /// the zip held a second Locations file, which was not read.
     pub fn check(
         limits: VolumeLimits,
         items: Option<u64>,
         size: Option<u64>,
         locations: Option<&Locations>,
+        duplicated: bool,
     ) -> Self {
         let mut volume = Self {
             limits: Some(limits),
@@ -152,6 +156,16 @@ impl Volume {
                         limit: limits.warn_hits_per_location,
                         locations: Some(over.len()),
                     });
+                }
+                // A location whose hits are not known, such as a failed
+                // one, a row without a location, a file without `Count`,
+                // or a second file, may pass the limit unseen.
+                if duplicated
+                    || locations.missing_columns.contains(&"Count")
+                    || locations.unusable_rows > 0
+                    || locations.rows.iter().any(|row| row.count.is_none())
+                {
+                    volume.unchecked.push("warn_hits_per_location");
                 }
             }
             None => volume.unchecked.push("warn_hits_per_location"),
@@ -223,13 +237,19 @@ impl Volume {
                         grouped(over.value)
                     )
                 }
-                _ => format!(
-                    "warning: VOLUME: the estimate's indexed size is {}, more than \
-                     volume.max_export_size ({}); with Teams context an export can be several \
-                     times larger",
-                    size_text(over.value),
-                    size_text(over.limit)
-                ),
+                _ => {
+                    let (mut value, mut limit) = (size_text(over.value), size_text(over.limit));
+                    // Rounded alike, they would read as equal.
+                    if value == limit {
+                        value = format!("{} bytes", grouped(over.value));
+                        limit = format!("{} bytes", grouped(over.limit));
+                    }
+                    format!(
+                        "warning: VOLUME: the estimate's indexed size is {value}, more than \
+                         volume.max_export_size ({limit}); with Teams context an export can be \
+                         several times larger"
+                    )
+                }
             })
             .collect();
         lines.push(
@@ -360,16 +380,23 @@ mod tests {
             rows: vec![row(Some(5)), row(None)],
             ..Locations::default()
         };
-        let quiet = Volume::check(limits, Some(10), Some(100), Some(&at));
+        let quiet = Volume::check(limits, Some(10), Some(100), Some(&at), false);
         assert!(!quiet.exceeded());
-        assert!(quiet.unchecked.is_empty());
+        // The row without a count leaves the per-location check unchecked.
+        assert_eq!(quiet.unchecked, vec!["warn_hits_per_location"]);
         assert!(quiet.warnings().is_empty());
+        let counted = Locations {
+            rows: vec![row(Some(5))],
+            ..Locations::default()
+        };
+        let quiet = Volume::check(limits, Some(10), Some(100), Some(&counted), false);
+        assert!(quiet.unchecked.is_empty());
 
         let above = Locations {
             rows: vec![row(Some(6)), row(Some(9)), row(Some(2))],
             ..Locations::default()
         };
-        let loud = Volume::check(limits, Some(11), Some(101), Some(&above));
+        let loud = Volume::check(limits, Some(11), Some(101), Some(&above), false);
         assert!(loud.exceeded());
         assert_eq!(
             loud.over,
@@ -411,7 +438,7 @@ mod tests {
 
     #[test]
     fn missing_counts_are_unchecked_not_passed() {
-        let volume = Volume::check(VolumeLimits::default(), None, None, None);
+        let volume = Volume::check(VolumeLimits::default(), None, None, None, false);
         assert!(!volume.exceeded());
         assert_eq!(
             volume.to_json()["unchecked"],
@@ -421,6 +448,69 @@ mod tests {
                 "volume.max_export_size"
             ])
         );
+    }
+
+    #[test]
+    fn locations_whose_hits_are_not_all_known_are_unchecked_but_still_passed() {
+        let limits = VolumeLimits {
+            warn_hits: 100,
+            warn_hits_per_location: 5,
+            max_export_size: 100,
+        };
+        let one_over = || Locations {
+            rows: vec![row(Some(9))],
+            ..Locations::default()
+        };
+        let cases: [(Locations, bool); 4] = [
+            (one_over(), true),
+            (
+                Locations {
+                    missing_columns: vec!["Count"],
+                    ..one_over()
+                },
+                false,
+            ),
+            (
+                Locations {
+                    unusable_rows: 1,
+                    ..one_over()
+                },
+                false,
+            ),
+            (
+                Locations {
+                    rows: vec![row(Some(9)), row(None)],
+                    ..Locations::default()
+                },
+                false,
+            ),
+        ];
+        for (locations, duplicated) in cases {
+            let volume = Volume::check(limits, Some(1), Some(1), Some(&locations), duplicated);
+            assert_eq!(
+                volume.unchecked,
+                vec!["warn_hits_per_location"],
+                "{locations:?}"
+            );
+            assert_eq!(volume.over.len(), 1);
+            assert!(volume.warnings()[0].contains("1 location has more than"));
+        }
+    }
+
+    #[test]
+    fn a_size_just_over_the_limit_is_shown_in_bytes() {
+        let limits = VolumeLimits::default();
+        let volume = Volume::check(limits, None, Some((10 << 30) + 1), None, false);
+        let line = &volume.warnings()[0];
+        assert!(
+            line.contains(
+                "is 10,737,418,241 bytes, more than volume.max_export_size (10,737,418,240 bytes)"
+            ),
+            "{line}"
+        );
+        let volume = Volume::check(limits, None, Some(12 << 30), None, false);
+        assert!(volume.warnings()[0]
+            .contains("is 12.0 GiB, more than volume.max_export_size (10.0 GiB)"));
     }
 
     #[test]

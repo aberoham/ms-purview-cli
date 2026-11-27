@@ -1966,9 +1966,14 @@ is an error before sign-in that names the key and not the value. Only `estimate`
 
 A value above its limit, not equal to it, passes it. Each limit passed is a line on stderr
 starting `warning: VOLUME:`, then one line on what to do; the lines give counts, never a
-location's name. `result.volume` carries the same (section 3.5). A count Graph did not give,
-or the Locations file when the zip was not read, leaves that limit in `unchecked`. The
-warning never changes the exit code, `--strict` included.
+location's name. `result.volume` carries the same (section 3.5). A count Graph did not give
+or gave as something other than a count (which also gets the warning of section 7.1) leaves
+that limit in `unchecked`. `warn_hits_per_location` is `unchecked`, and still in `over` when a
+readable row passed it, when the zip was not read, when any location's hits are not known (a
+failed location, a row with no location, a file with no `Count` column), or when the zip
+holds a second Locations file, which is not read. An estimate that did not succeed or
+partly succeed has every limit `unchecked` and prints no volume warning: its counts are not
+used. The warning never changes the exit code, `--strict` included.
 
 The estimate undercounts what a report or export collects. With Teams context on, an export
 held about four times the estimated count (Observed, one run), and a report about 10 to 37

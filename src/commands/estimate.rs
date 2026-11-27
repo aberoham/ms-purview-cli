@@ -365,6 +365,11 @@ impl WriteCommand for Estimate {
                  named, is not an estimate; nothing was downloaded. {reconcile_hint}"
             )));
         }
+        super::operation::warn_invalid_counts(
+            &after.session.env.redactor.clone(),
+            &mut after.session.env.stderr,
+            std::iter::once(&record),
+        );
         let mut reasons: Vec<Value> = Vec::new();
         let mut files: Vec<Value> = Vec::new();
         let mut evidence: Option<ReportFiles> = None;
@@ -547,12 +552,20 @@ fn resume(after: &After<'_>, case: CaseId, operation: &OperationId) -> Vec<Strin
 }
 
 /// The volume check of a finished estimate (`docs/SPEC.md` section 6.9):
-/// its counts, and the hits per location when the zip was read.
+/// its counts, and the hits per location when the zip was read. The
+/// counts of an estimate that failed, or whose status is not known, are
+/// not used: every limit is unchecked.
 fn volume_of(
     limits: VolumeLimits,
     record: &OperationRecord,
     evidence: Option<&ReportFiles>,
 ) -> Volume {
+    if !matches!(
+        record.status,
+        OperationStatus::Succeeded | OperationStatus::PartiallySucceeded
+    ) {
+        return Volume::check(limits, None, None, None, false);
+    }
     let (items, size) = match record.detail() {
         Some(OperationDetail::Estimate(estimate)) => {
             (estimate.indexed_item_count, estimate.indexed_items_size)
@@ -564,6 +577,7 @@ fn volume_of(
         items,
         size,
         evidence.and_then(|files| files.locations.as_ref()),
+        evidence.is_some_and(|files| files.duplicates.contains(&"Locations")),
     )
 }
 

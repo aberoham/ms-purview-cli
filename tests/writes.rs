@@ -14,12 +14,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use ms_purview_cli::commands::Session;
 use ms_purview_cli::env::{Env, ScriptedInput};
 use ms_purview_cli::error::{PurviewError, Result};
 use ms_purview_cli::graph::WriteResponse;
 use ms_purview_cli::routes::{CaseId, Query, ReadRoute, WriteRoute};
-use ms_purview_cli::safety::{self, PlanInput, WriteCommand, WritePlan};
+use ms_purview_cli::safety::{self, PlanInput, Preflight, WriteCommand, WritePlan};
 use ms_purview_cli::secrets::store_value;
 use serde_json::{json, Value};
 use support::*;
@@ -33,8 +32,7 @@ const SEARCHES: &str =
 /// A write that exists only here.
 struct StubWrite {
     refuse_check: bool,
-    /// An account or tenant for the plan other than the signed-in one, set
-    /// on the session too, as a command that changed it would.
+    /// An account or tenant for the plan other than the signed-in one.
     plan_account: Option<&'static str>,
     plan_tenant: Option<&'static str>,
 }
@@ -48,28 +46,20 @@ impl WriteCommand for StubWrite {
         Ok(())
     }
 
-    async fn plan(&mut self, session: &mut Session<'_>) -> Result<WritePlan> {
-        if let Some(account) = self.plan_account {
-            session.account.email = account.to_owned();
-        }
-        if let Some(tenant) = self.plan_tenant {
-            session.account.tenant_id = tenant.to_owned();
-        }
+    async fn plan(&mut self, preflight: &mut Preflight<'_>) -> Result<WritePlan> {
         let case = CaseId::parse(CASE).unwrap();
-        let record = session
+        let record = preflight
             .graph
-            .get(
-                &ReadRoute::Case(case),
-                &Query::new(),
-                &mut session.env.stderr,
-            )
+            .get(&ReadRoute::Case(case), &Query::new(), preflight.log)
             .await?;
         WritePlan::new(PlanInput {
             command: "stub create",
             account: self
                 .plan_account
-                .map_or_else(|| session.account.email.clone(), str::to_owned),
-            tenant: session.account.tenant_id.clone(),
+                .map_or_else(|| preflight.account.email.clone(), str::to_owned),
+            tenant: self
+                .plan_tenant
+                .map_or_else(|| preflight.account.tenant_id.clone(), str::to_owned),
             route: WriteRoute::CreateSearch(case),
             body: json!({
                 "displayName": "Stub search",
@@ -84,7 +74,7 @@ impl WriteCommand for StubWrite {
 
     async fn applied(
         &mut self,
-        _session: &mut Session<'_>,
+        _preflight: &mut Preflight<'_>,
         response: WriteResponse,
     ) -> Result<Value> {
         Ok(json!({
@@ -93,7 +83,7 @@ impl WriteCommand for StubWrite {
         }))
     }
 
-    async fn reconcile(&mut self, _session: &mut Session<'_>) -> Result<Vec<String>> {
+    async fn reconcile(&mut self, _preflight: &mut Preflight<'_>) -> Result<Vec<String>> {
         Ok(vec!["a search named Stub search".into()])
     }
 }

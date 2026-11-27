@@ -120,7 +120,8 @@ fn the_crate_holds_no_http_write_method_but_post() {
     assert!(files.len() > 10, "{files:?}");
     let mut findings = Vec::new();
     for path in &files {
-        let text = std::fs::read_to_string(path).unwrap();
+        // A Windows checkout may have CRLF endings; the checks read LF.
+        let text = std::fs::read_to_string(path).unwrap().replace("\r\n", "\n");
         let name = path.strip_prefix(root).unwrap().display().to_string();
         findings.extend(scan(&name, &text));
     }
@@ -249,7 +250,8 @@ fn a_post_is_built_only_in_send_write_and_the_token_client() {
     let mut problems = Vec::new();
     let mut found = 0;
     for path in &files {
-        let text = std::fs::read_to_string(path).unwrap();
+        // A Windows checkout may have CRLF endings; the checks read LF.
+        let text = std::fs::read_to_string(path).unwrap().replace("\r\n", "\n");
         let name = path.strip_prefix(root).unwrap().display().to_string();
         problems.extend(misplaced_posts(&name, &text));
         if allowed_posts().iter().any(|(file, _)| name.ends_with(file)) {
@@ -308,7 +310,8 @@ fn callers(root: &Path, name: &str) -> Vec<(String, String)> {
     rust_files(&root.join("src"), &mut files);
     let mut found = Vec::new();
     for path in &files {
-        let text = std::fs::read_to_string(path).unwrap();
+        // A Windows checkout may have CRLF endings; the checks read LF.
+        let text = std::fs::read_to_string(path).unwrap().replace("\r\n", "\n");
         let code = production_code(&text);
         let file = path.strip_prefix(root).unwrap().display().to_string();
         let mut offset = 0;
@@ -363,4 +366,67 @@ fn the_scanner_reads_past_a_statement_level_cfg_test() {
         enclosing_function(code, code.find("fn b").unwrap() + 6).as_deref(),
         Some("b")
     );
+}
+
+/// What `production_code` relies on, in every source file: a unit-test
+/// module is the last item of its file (after it, only its own indented
+/// lines, blank lines and its closing brace), and none is declared as a
+/// separate file with `mod tests;`. Also, the protected functions are not
+/// imported under another name, which `callers` could not follow.
+fn layout_problems(file: &str, text: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    let marker = "#[cfg(test)]\nmod tests";
+    if let Some(index) = text.find(marker) {
+        let rest = &text[index + marker.len()..];
+        if rest.trim_start().starts_with(';') {
+            problems.push(format!("{file}: mod tests is declared in another file"));
+        }
+        let after_open = rest
+            .split_once('\n')
+            .map(|(_, tail)| tail)
+            .unwrap_or_default();
+        for line in after_open.lines() {
+            let column_zero = !line.is_empty() && !line.starts_with([' ', '\t']);
+            if column_zero && line != "}" {
+                problems.push(format!("{file}: an item follows the test module"));
+                break;
+            }
+        }
+    }
+    let code = production_code(text);
+    for name in [
+        ["dec", "ide"].concat(),
+        ["send_wr", "ite"].concat(),
+        ["appr", "ove"].concat(),
+    ] {
+        if code.contains(&format!("{name} as ")) {
+            problems.push(format!("{file}: {name} is imported under another name"));
+        }
+    }
+    problems
+}
+
+#[test]
+fn test_modules_end_their_files_and_protected_names_are_not_renamed() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    rust_files(&root.join("src"), &mut files);
+    let mut problems = Vec::new();
+    for path in &files {
+        // A Windows checkout may have CRLF endings; the checks read LF.
+        let text = std::fs::read_to_string(path).unwrap().replace("\r\n", "\n");
+        let name = path.strip_prefix(root).unwrap().display().to_string();
+        problems.extend(layout_problems(&name, &text));
+    }
+    assert!(problems.is_empty(), "{problems:#?}");
+    let marker = "#[cfg(test)]\nmod tests";
+    for sample in [
+        format!("fn a() {{}}\n{marker} {{\n    fn t() {{}}\n}}\nfn after() {{}}\n"),
+        format!("fn a() {{}}\n{marker};\n"),
+        format!("use crate::safety::{} as d;\n", ["dec", "ide"].concat()),
+    ] {
+        assert!(!layout_problems("src/x.rs", &sample).is_empty(), "{sample}");
+    }
+    let good = format!("fn a() {{}}\n{marker} {{\n    fn t() {{}}\n\n}}\n");
+    assert!(layout_problems("src/x.rs", &good).is_empty());
 }

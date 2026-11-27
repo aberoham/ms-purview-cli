@@ -858,20 +858,24 @@ impl StoredTokenProvider {
                     crate::output::sanitize(&email)
                 ))
             })?;
+        // The same person signed in again while this command ran, through
+        // any registration: that sign-in stands, and this command's session
+        // does not. Checked before the registration, so the advice does not
+        // remove the newer sign-in.
+        if loaded.belongs_to(&state.credential.tid, &state.credential.oid)
+            && loaded.sign_in != state.credential.sign_in
+        {
+            return Err(PurviewError::message(
+                "this account signed in again while the command ran, so it stopped; nothing \
+                 was sent. Run the command again",
+            ));
+        }
         if !loaded.same_owner(&state.credential) {
             // Refused before any redemption with someone else's tokens.
             return Err(PurviewError::message(
                 "the stored credential now belongs to another app registration or identity; \
                  nothing was sent. Run 'purview auth logout' for this account, then sign in \
                  again",
-            ));
-        }
-        if loaded.sign_in != state.credential.sign_in {
-            // The same person signed in again while this command ran; that
-            // sign-in stands, and this command's session does not.
-            return Err(PurviewError::message(
-                "this account signed in again while the command ran, so it stopped; nothing \
-                 was sent. Run the command again",
             ));
         }
         let mut loaded = loaded;
@@ -1905,8 +1909,10 @@ mod tests {
         store.fail_write(1);
         assert!(setup.provider.graph(Duration::from_secs(60)).await.is_err());
         // Before the next call reloads, the person signs in again.
+        // Through another app registration, so the registration differs too.
         let mut newer = credential(3600, None);
         newer.sign_in = Some("sign-in-0004".into());
+        newer.client_id = "00000000-0000-4000-8000-000000000071".into();
         newer.refresh_token = SecretString::new("canary-refresh-0095");
         newer.save(setup.memory.as_ref()).unwrap();
         let error = setup
@@ -1915,6 +1921,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("signed in again"), "{error}");
+        assert!(!error.to_string().contains("logout"), "{error}");
         assert_eq!(stored(&setup)["sign_in"], "sign-in-0004");
     }
 

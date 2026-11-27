@@ -16,10 +16,10 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::commands::Session;
+use crate::config::AccountRecord;
 use crate::env::Input;
 use crate::error::{PurviewError, Result};
-use crate::graph::WriteResponse;
+use crate::graph::{GraphClient, WriteResponse};
 use crate::output::{sanitize, sanitize_multiline};
 use crate::redact::Redactor;
 use crate::routes::WriteRoute;
@@ -340,6 +340,19 @@ pub(crate) async fn decide(
     })
 }
 
+/// What a write command gets while it plans, reconciles or reads its
+/// result: the Graph client, the signed-in account and a log for notices.
+/// Not `Env`: the terminal, the approval input and the prompt belong to the
+/// runner, so a command cannot take part in its own approval. The account
+/// is shared, so the command cannot change whom the plan is checked
+/// against.
+pub struct Preflight<'a> {
+    pub graph: &'a GraphClient,
+    pub account: &'a AccountRecord,
+    pub log: &'a mut (dyn Write + Send),
+    pub verbose: bool,
+}
+
 /// The body of one write command, run by `cli`'s write runner, which
 /// checks `--no-write` and the read-only session, signs in, decides on the
 /// plan, sends it and prints the outcome.
@@ -353,18 +366,18 @@ pub trait WriteCommand: Send {
 
     /// The read-only preflight, then the plan. Only Graph GETs and token
     /// refreshes may be sent here.
-    async fn plan(&mut self, session: &mut Session<'_>) -> Result<WritePlan>;
+    async fn plan(&mut self, preflight: &mut Preflight<'_>) -> Result<WritePlan>;
 
     /// The result shown after Graph accepted the write.
     async fn applied(
         &mut self,
-        session: &mut Session<'_>,
+        preflight: &mut Preflight<'_>,
         response: WriteResponse,
     ) -> Result<Value>;
 
     /// After an unclear outcome: what the write may have created, for the
     /// person to check. Reads only.
-    async fn reconcile(&mut self, _session: &mut Session<'_>) -> Result<Vec<String>> {
+    async fn reconcile(&mut self, _preflight: &mut Preflight<'_>) -> Result<Vec<String>> {
         Ok(Vec::new())
     }
 }

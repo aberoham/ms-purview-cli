@@ -24,7 +24,7 @@ use crate::output::{
 use crate::poll;
 use crate::routes::OperationId;
 use crate::routes::{Query, ReadRoute};
-use crate::safety::{self, ApprovalSettings, Decision, NotApplied, WriteCommand};
+use crate::safety::{self, ApprovalSettings, Decision, NotApplied, Preflight, WriteCommand};
 use crate::secrets::{delete_value, entry_exists, token_key, CredentialLock};
 use crate::token::{Access, Credential, IdentityEndpoint, StoredPrincipal, StoredTokenProvider};
 use crate::trace::TraceSink;
@@ -1462,14 +1462,7 @@ async fn write_command(
     let provider = Arc::new(token_provider(env, credential)?);
     let trace = open_trace(env, globals)?;
     let graph = Arc::new(graph_client(env, globals, provider, trace)?);
-    let mut session = Session {
-        env,
-        output,
-        graph,
-        account,
-        verbose: globals.verbose,
-    };
-    run_write(&mut session, globals, command)
+    run_write(env, output, globals, &account, &graph, command)
         .await
         .map_err(|error| {
             if error.is_token_unavailable() {
@@ -1484,58 +1477,57 @@ async fn write_command(
         })
 }
 
-/// Preflight, decision, send and output for one signed-in write.
+/// Preflight, decision, send and output for one signed-in write. The
+/// command never sees `Env`: it gets a `Preflight` with the Graph client,
+/// the signed-in account (shared, so it cannot change it) and stderr for
+/// notices. The terminal state, the approval input and the prompt stay here.
 async fn run_write(
-    session: &mut Session<'_>,
+    env: &mut Env,
+    output: &OutputOptions,
     globals: &Globals,
+    account: &AccountRecord,
+    graph: &Arc<GraphClient>,
     command: &mut dyn WriteCommand,
 ) -> Result<Outcome> {
-    let json = matches!(session.output.format, OutputFormat::Json);
-    // Taken before the command runs, which gets the session mutably: the
-    // plan must name the account and tenant that signed in, and the write
-    // goes through the client made for them, whatever the command changed.
-    let signed_in = (
-        session.account.email.clone(),
-        session.account.tenant_id.clone(),
-    );
-    let graph = session.graph.clone();
-    let plan = command.plan(session).await?;
-    if !plan.account().eq_ignore_ascii_case(&signed_in.0)
-        || !plan.tenant().eq_ignore_ascii_case(&signed_in.1)
+    let json = matches!(output.format, OutputFormat::Json);
+    let settings = ApprovalSettings {
+        dry_run: globals.dry_run,
+        yes: globals.yes,
+        no_input: globals.no_input,
+        interactive: env.stdin_is_terminal && env.stderr_is_terminal,
+    };
+    let input = env.input.clone();
+    let redactor = env.redactor.clone();
+    let plan = command
+        .plan(&mut Preflight {
+            graph,
+            account,
+            log: &mut env.stderr,
+            verbose: globals.verbose,
+        })
+        .await?;
+    if !plan.account().eq_ignore_ascii_case(&account.email)
+        || !plan.tenant().eq_ignore_ascii_case(&account.tenant_id)
     {
         return Err(PurviewError::message(
             "the write's plan names another account or tenant than the signed-in one; nothing \
              was sent",
         ));
     }
-    let settings = ApprovalSettings {
-        dry_run: globals.dry_run,
-        yes: globals.yes,
-        no_input: globals.no_input,
-        interactive: session.env.stdin_is_terminal && session.env.stderr_is_terminal,
-    };
-    let input = session.env.input.clone();
-    let redactor = session.env.redactor.clone();
-    let decision = safety::decide(
-        plan,
-        settings,
-        input.as_ref(),
-        &mut session.env.stderr,
-        &redactor,
-    )
-    .await?;
+    let decision =
+        safety::decide(plan, settings, input.as_ref(), &mut env.stderr, &redactor).await?;
     match decision {
         Decision::DryRun(plan) => {
             if json {
-                let value = session.output.untrusted_json_value(
+                let value = output.untrusted_json_value(
                     safety::results_value(&plan, false, None),
                     1,
                     &redactor,
                 )?;
                 return Ok(Outcome::success(Some(value)));
             }
-            plan.write_text(&mut session.env.stdout, &redactor)?;
-            writeln!(session.env.stdout, "Dry run: nothing was sent.")?;
+            plan.write_text(&mut env.stdout, &redactor)?;
+            writeln!(env.stdout, "Dry run: nothing was sent.")?;
             Ok(Outcome::success(None))
         }
         Decision::NotApplied(plan, reason) => {
@@ -1545,7 +1537,7 @@ async fn run_write(
                 // keeping the notice that --wrap-untrusted adds.
                 let options = OutputOptions {
                     results_only: false,
-                    ..session.output.clone()
+                    ..output.clone()
                 };
                 let mut envelope = options.untrusted_json_value(
                     safety::not_applied_value(&plan, reason),
@@ -1565,9 +1557,9 @@ async fn run_write(
             }
             // A declined plan was shown with the question.
             if reason == NotApplied::ConfirmationRequired {
-                plan.write_text(&mut session.env.stderr, &redactor)?;
+                plan.write_text(&mut env.stderr, &redactor)?;
             }
-            writeln!(session.env.stderr, "{}", reason.message())?;
+            writeln!(env.stderr, "{}", reason.message())?;
             Ok(Outcome {
                 exit_code: 3,
                 stdout_value: None,
@@ -1575,14 +1567,20 @@ async fn run_write(
         }
         Decision::Approved(write) => {
             if write.by_flag() && !json {
-                write
-                    .plan()
-                    .write_text(&mut session.env.stderr, &redactor)?;
+                write.plan().write_text(&mut env.stderr, &redactor)?;
             }
-            let (plan, response) = match graph.send_write(write, &mut session.env.stderr).await {
+            let (plan, response) = match graph.send_write(write, &mut env.stderr).await {
                 Ok(sent) => sent,
                 Err(PurviewError::WriteOutcomeUnknown { reason, .. }) => {
-                    let candidates = match command.reconcile(session).await {
+                    let found = command
+                        .reconcile(&mut Preflight {
+                            graph,
+                            account,
+                            log: &mut env.stderr,
+                            verbose: globals.verbose,
+                        })
+                        .await;
+                    let candidates = match found {
                         Ok(candidates) => candidates,
                         Err(error) => vec![format!(
                             "nothing could be listed, because the check failed: {error}"
@@ -1592,21 +1590,32 @@ async fn run_write(
                 }
                 Err(error) => return Err(error),
             };
-            let result = command.applied(session, response).await.map_err(|error| {
-                error.context("the write was applied, but its result could not be read")
-            })?;
+            let result = command
+                .applied(
+                    &mut Preflight {
+                        graph,
+                        account,
+                        log: &mut env.stderr,
+                        verbose: globals.verbose,
+                    },
+                    response,
+                )
+                .await
+                .map_err(|error| {
+                    error.context("the write was applied, but its result could not be read")
+                })?;
             if json {
-                let value = session.output.untrusted_json_value(
+                let value = output.untrusted_json_value(
                     safety::results_value(&plan, true, Some(result)),
                     1,
                     &redactor,
                 )?;
                 return Ok(Outcome::success(Some(value)));
             }
-            writeln!(session.env.stdout, "Applied: purview {}", plan.command())?;
+            writeln!(env.stdout, "Applied: purview {}", plan.command())?;
             let shown = redactor.redact_value(&crate::trace::redact_urls(&result, &redactor));
             let text = serde_json::to_string_pretty(&shown)?;
-            writeln!(session.env.stdout, "{}", sanitize_multiline(&text))?;
+            writeln!(env.stdout, "{}", sanitize_multiline(&text))?;
             Ok(Outcome::success(None))
         }
     }

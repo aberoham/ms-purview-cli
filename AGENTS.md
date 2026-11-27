@@ -199,7 +199,10 @@ timeout. It carries the Graph base URL (`origin::GRAPH_BASE` in production,
   `--yes`, the `Apply? [y/N]` prompt through `Env`'s `Input`, exit 3 as
   `ConfirmationRequired` or `Declined`), `ApprovedWrite`, which only
   `approve` builds from an `Approval` only this module makes, and the
-  `WriteCommand` trait (`check`, `plan`, `applied`, `reconcile`). `cli`'s
+  `WriteCommand` trait (`check`, `plan`, `applied`, `reconcile`), whose
+  methods get a `Preflight` (the Graph client, the signed-in account,
+  shared, and stderr), never `Env`, so a command cannot touch the terminal
+  state, the approval input or the prompt. `cli`'s
   `write_command` runs one: `--no-write`, `check` and the naming templates
   before sign-in, then the read-only check on the credential's `access`,
   then preflight, decision, send and output. `cli::execute_write_with`
@@ -319,7 +322,9 @@ check whether the other repository needs the same fix.
   `sanitize_multiline` before it reaches a terminal. JSON keeps the original
   value, apart from two changes. Every URL is redacted as in the trace (a
   string that is one URL keeps only its OData options; a URL in other text
-  keeps only scheme, host and path), and `--wrap-untrusted` wraps every
+  keeps only scheme, host and path; an object key holding a URL is
+  redacted too, and two keys that become one keep both values, the second
+  as `<key> (2)`), and `--wrap-untrusted` wraps every
   string under a key in `output::UNTRUSTED_KEYS`, at any depth. Human views
   put tenant text through `redact::shown` once, before it is sanitised or
   cut.

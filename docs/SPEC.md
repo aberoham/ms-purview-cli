@@ -1554,7 +1554,9 @@ account (Docs).
   `safety::decide` calls, and only the write runner in `cli` calls `decide` and
   `GraphClient::send_write` (a source scan checks both). `send_write` takes it by value, so
   one approval sends once, and sends exactly the stored method, path and bytes. No other
-  code path can send a non-`GET` request. The runner also refuses a plan that names another
+  code path can send a non-`GET` request. A command's preflight, reconciliation and result
+  reading get the Graph client, the signed-in account and a log, never the terminal state,
+  the approval input or the prompt. The runner also refuses a plan that names another
   account or tenant than the signed-in one. The human plan shows the preflight results, and
   goes through the same URL and secret redaction as JSON.
 - **Testing.** Each wiremock origin records every request. For each write, tests assert:

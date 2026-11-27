@@ -176,8 +176,11 @@ address, or a host the tool does not accept) is found before any file is
 fetched. The command writes the other files, then exits 4 with
 `FileNotDownloadable` for that one.
 
-Running the same command again fetches only what is still missing. With
-`--overwrite` it fetches every file again.
+Either error, `DownloadNotConsented` or `DownloadRefused`, stops the
+download with exit 1. Files already written stay recorded in
+`manifest.json` in the output directory, and running the same command again
+fetches only what is still missing. With `--overwrite` it fetches every file
+again.
 
 ## `CrossOriginRedirect` on a download
 
@@ -189,9 +192,12 @@ observed on a download (Observed). Why one would point elsewhere is not
 known; a change in the service, or a proxy between you and it that
 rewrites answers, are possible causes (Assumption).
 
-To report it, give the `purview version` output, the error code, and which
-part of the origin changed (scheme, host or port), with the host replaced by
-a placeholder if it names your tenant or region. Do not paste download
+To report it, give the `purview version` output, the error code, and, if
+you know it, which part of the origin changed (scheme, host or port), with
+the host replaced by a placeholder if it names your tenant or region. If the
+error says `an address with no origin`, quote that phrase instead: the
+redirect pointed to an address the tool cannot give an origin, such as one
+that carries a user name. Do not paste download
 addresses or `--verbose` output into a public issue: their paths encode the
 case, the job and the file name.
 

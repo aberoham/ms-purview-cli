@@ -13,8 +13,10 @@ the binary has `purview version`, `purview auth login` (device code, or
 `--browser`), `auth refresh`, `auth status`, `auth list` and `auth logout`,
 `case list`, `case get`, `search list`, `search get`, `operation list` and
 `operation get` (with `--wait`), `download`, `kql`, and the global options `--verbose`,
-`--timeout`, `--trace` and `--wrap-untrusted`. Do not add stubs for commands
-that a later pull request owns.
+`--timeout`, `--trace` and `--wrap-untrusted`. The write options `--yes`,
+`--dry-run` and `--no-write` are parsed, and the safety framework they drive
+is in place (`src/safety.rs`), but no command uses them until the write
+commands arrive. Do not add stubs for commands that a later pull request owns.
 
 The tool never places, changes or releases a hold, never deletes or reopens a
 case, and sends a Purview write only after a plan has been approved
@@ -119,6 +121,8 @@ that the test files pass their own scan.
   logout and refresh commits across processes; `Env::in_memory()` has none
   until a test sets them. It carries the `Interrupt` that ends an operation wait (tokio's Ctrl-C
   handler in production, a `ManualInterrupt` that tests fire in
+  `Env::in_memory()`), the `Input` a write's `Apply? [y/N]` answer is read
+  from (standard input in production, a `ScriptedInput` with no answers in
   `Env::in_memory()`), and the `BrowserOpener` that
 `auth login --browser` uses (the system browser in production, `NoBrowser`
 in `Env::in_memory()`, and the harness's `ScriptedBrowser`, which plays the
@@ -184,7 +188,29 @@ timeout. It carries the Graph base URL (`origin::GRAPH_BASE` in production,
   with Graph's error), the 8 MiB body limit and the Graph error allow-list.
   Every request method takes the command's stderr for `--verbose` lines.
   A token the provider cannot supply is `PurviewError::TokenUnavailable`,
-  so a caller can tell a broken sign-in from Graph's answer.
+  so a caller can tell a broken sign-in from Graph's answer. `send_write`
+  takes a `safety::ApprovedWrite` and sends its one POST with the planned
+  bytes, its token valid for five minutes, never again: a refused
+  connection is `GraphUnreachable` (nothing sent), a 4xx is Graph's error,
+  and no answer, a timeout, 429, a 5xx or an unreadable 2xx is
+  `WriteOutcomeUnknown`. The trace records the POST body.
+- `src/safety.rs` is `WritePlan` (the body serialised once, the SHA-256 of
+  method, path and body, effects, warnings, preflight), `decide` (dry run,
+  `--yes`, the `Apply? [y/N]` prompt through `Env`'s `Input`, exit 3 as
+  `ConfirmationRequired` or `Declined`), `ApprovedWrite`, which only
+  `approve` builds from an `Approval` only this module makes, and the
+  `WriteCommand` trait (`check`, `plan`, `applied`, `reconcile`), whose
+  methods get a `Preflight` (the Graph client, the signed-in account,
+  shared, and stderr), never `Env`, so a command cannot touch the terminal
+  state, the approval input or the prompt. `cli`'s
+  `write_command` runs one: `--no-write`, `check` and the naming templates
+  before sign-in, then the read-only check on the credential's `access`,
+  then preflight, decision, send and output. `cli::execute_write_with`
+  (`#[doc(hidden)]`) runs a `WriteCommand` with the global options, for
+  tests, so the framework is tested before any write subcommand exists.
+- `src/naming.rs` parses and renders the `naming` templates of
+  `config.json` (`docs/SPEC.md` section 5.5); an unknown variable is
+  refused without being repeated.
 - `src/download.rs` is `DownloadRule` (the host pattern of `docs/SPEC.md`
   section 4.7), `DownloadClient` (the download token and
   `X-AllowWithAADToken` only, same-origin redirects followed by hand, no
@@ -214,8 +240,12 @@ timeout. It carries the Graph base URL (`origin::GRAPH_BASE` in production,
   host names match the production pattern;
   `tests/kql.rs` runs `purview kql` in-process with no reachable host;
   `tests/graph.rs` drives `GraphClient`, and `Poller` over it, against
-  wiremock with a fake token provider; `tests/write_allow_list.rs` scans `src/` and `build.rs` for
-  HTTP write methods; `tests/fixture_lint.rs` is the public-data lint.
+  wiremock with a fake token provider; `tests/writes.rs` runs a write
+  command that exists only in the test through `execute_write_with`,
+  recording every request to the mock Graph and identity platform;
+  `tests/write_allow_list.rs` scans `src/` and `build.rs` for HTTP write
+  methods, and allows a POST to be built only in `send_write` and the
+  identity client; `tests/fixture_lint.rs` is the public-data lint.
 - `contrib/resign.sh` gives local macOS builds a stable signing identity.
   `contrib/install.sh` tests, builds, signs and installs the per-user
   `~/.local/bin/purview`.
@@ -283,14 +313,18 @@ check whether the other repository needs the same fix.
 - `operation get` exits 4 when the operation finished without
   succeeding, 5 at the `--wait` deadline and 130 on Ctrl-C, in the shapes
   of `docs/SPEC.md` section 3.3; exit 4 prints the whole envelope even
-  under `--results-only`. Exit code 3, the write-plan shapes and the JSON
-  Lines (JSONL) commands arrive with the pull requests that need them, as
-  written in section 3.3.
+  under `--results-only`. A write that is not approved exits 3 with
+  `{"plan", "applied": false, "error"}`, whole even under `--results-only`;
+  a write that ran, or a dry run, prints `{"results": {"applied", "plan",
+  "result"}, "count": 1}`. The JSON Lines (JSONL) commands arrive with the
+  pull requests that need them, as written in section 3.3.
 - Every string from the tenant or a file goes through `sanitize` or
   `sanitize_multiline` before it reaches a terminal. JSON keeps the original
   value, apart from two changes. Every URL is redacted as in the trace (a
   string that is one URL keeps only its OData options; a URL in other text
-  keeps only scheme, host and path), and `--wrap-untrusted` wraps every
+  keeps only scheme, host and path; an object key holding a URL is
+  redacted too, and two keys that become one keep both values, the second
+  as `<key> (2)`), and `--wrap-untrusted` wraps every
   string under a key in `output::UNTRUSTED_KEYS`, at any depth. Human views
   put tenant text through `redact::shown` once, before it is sanitised or
   cut.
@@ -345,11 +379,11 @@ These rules apply to Graph and to downloads. Do not weaken them.
 
 ## Write allow list
 
-The crate sends Graph `GET`s only; no write is sent yet. Every Purview
-write is a `WriteRoute` variant, and `WriteRoute::ALL` is the six POSTs in
-`docs/SPEC.md` section 4.3: create case, close case, create search,
-estimate statistics, export report and export result. The transport that
-sends them, `GraphClient::send_write`, arrives in pull request 2.1. No
+Every Purview write is a `WriteRoute` variant, and `WriteRoute::ALL` is the
+six POSTs in `docs/SPEC.md` section 4.3: create case, close case, create
+search, estimate statistics, export report and export result. They are sent
+only by `GraphClient::send_write`, which takes an `ApprovedWrite`; no
+command sends one yet. No
 `PATCH`, `PUT` or `DELETE` may exist in the crate, in code, strings or
 comments, and `tests/write_allow_list.rs` scans the source tree for them
 and for calls that would choose a method at run time. Adding a write needs a
@@ -363,7 +397,10 @@ Preserve these so that users do not have to sign in again after an upgrade:
 - service name `purview`, key `purview:token:<email>`, macOS label
   `purview — <email>` and description `Microsoft Purview eDiscovery token`;
 - the stored JSON shape with `"version": 1`, including the principal's
-  `tid` and `oid` and the issuing `client_id` and `tenant_id`
+  `tid` and `oid` and the issuing `client_id` and `tenant_id`, and the
+  optional `access` (`read-write` or `read-only`) that decides whether the
+  account may write, and the optional `sign_in` id that ties refreshes to
+  one sign-in; a credential without them reads as before
   (`docs/SPEC.md` section 5.1);
 - the `config.json` and `accounts/<email>.json` shapes (section 5.3).
 

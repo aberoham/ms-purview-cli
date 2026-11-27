@@ -210,6 +210,52 @@ pub struct Credential {
     pub refresh_token: SecretString,
     pub graph: AccessToken,
     pub download: Option<AccessToken>,
+    /// How the account signed in, which decides whether it may write. The
+    /// token's scope cannot: the identity platform grants every consented
+    /// permission whatever was asked for (Observed, PR 1.4). `None` for a
+    /// credential stored before this was recorded, which may not write.
+    pub access: Option<Access>,
+    /// A random id made at sign-in, which refreshes keep. A refresh stores
+    /// its tokens only over the same sign-in, so a session that another
+    /// `auth login` replaced while it ran (with another access, scope or
+    /// registration) cannot write its older credential back. `None` for a
+    /// credential stored before this was recorded.
+    pub sign_in: Option<String>,
+}
+
+/// Whether a sign-in may write to Purview: `auth login` without or with
+/// `--read-only`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    ReadWrite,
+    ReadOnly,
+}
+
+impl Access {
+    pub fn from_read_only(read_only: bool) -> Self {
+        if read_only {
+            Self::ReadOnly
+        } else {
+            Self::ReadWrite
+        }
+    }
+
+    /// The stored form.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadWrite => "read-write",
+            Self::ReadOnly => "read-only",
+        }
+    }
+
+    /// The stored form read back; anything else is unrecorded.
+    fn parse(text: &str) -> Option<Self> {
+        match text {
+            "read-write" => Some(Self::ReadWrite),
+            "read-only" => Some(Self::ReadOnly),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Debug for Credential {
@@ -224,6 +270,7 @@ impl fmt::Debug for Credential {
             .field("refresh_token", &self.refresh_token)
             .field("graph", &self.graph)
             .field("download", &self.download)
+            .field("access", &self.access)
             .finish()
     }
 }
@@ -242,6 +289,10 @@ struct StoredRecord<'a> {
     graph: StoredToken<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     download: Option<StoredToken<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    access: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sign_in: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -267,6 +318,12 @@ struct LoadedRecord {
     graph: LoadedToken,
     #[serde(default)]
     download: Option<LoadedToken>,
+    /// Not required, and read leniently: a credential without it, or with
+    /// a value this release does not know, can read but not write.
+    #[serde(default)]
+    access: Option<serde_json::Value>,
+    #[serde(default)]
+    sign_in: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -369,6 +426,8 @@ impl Credential {
             refresh_token: self.refresh_token.expose(),
             graph: stored(&self.graph),
             download: self.download.as_ref().map(stored),
+            access: self.access.map(Access::as_str),
+            sign_in: self.sign_in.as_deref(),
         };
         Ok(serde_json::to_string(&record)?)
     }
@@ -405,6 +464,17 @@ impl Credential {
                 .download
                 .map(LoadedToken::into_access_token)
                 .filter(|token| !token.token.is_empty()),
+            access: record
+                .access
+                .as_ref()
+                .and_then(serde_json::Value::as_str)
+                .and_then(Access::parse),
+            sign_in: record
+                .sign_in
+                .as_ref()
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+                .map(str::to_owned),
         };
         credential.register(redactor);
         let damaged = |what: &str| {
@@ -747,13 +817,18 @@ impl StoredTokenProvider {
     }
 
     /// Refuses to write over the key unless it holds a credential of the
-    /// same principal through the same registration as `expected`.
+    /// same principal through the same registration as `expected`, from the
+    /// same sign-in: a sign-in made while this provider ran (`--read-only`,
+    /// or with other permissions) must not be undone by an older session's
+    /// refresh.
     fn verify_owner(&self, expected: &Credential) -> Result<()> {
         let stored = Credential::load(self.store.as_ref(), &expected.email, &self.redactor)
             .ok()
             .flatten();
         match stored {
-            Some(stored) if stored.same_owner(expected) => Ok(()),
+            Some(stored) if stored.same_owner(expected) && stored.sign_in == expected.sign_in => {
+                Ok(())
+            }
             _ => Err(PurviewError::message(format!(
                 "the credential for {} was replaced or removed by another command while this \
                  one ran, so nothing was stored; run the command again",
@@ -783,6 +858,18 @@ impl StoredTokenProvider {
                     crate::output::sanitize(&email)
                 ))
             })?;
+        // The same person signed in again while this command ran, through
+        // any registration: that sign-in stands, and this command's session
+        // does not. Checked before the registration, so the advice does not
+        // remove the newer sign-in.
+        if loaded.belongs_to(&state.credential.tid, &state.credential.oid)
+            && loaded.sign_in != state.credential.sign_in
+        {
+            return Err(PurviewError::message(
+                "this account signed in again while the command ran, so it stopped; nothing \
+                 was sent. Run the command again",
+            ));
+        }
         if !loaded.same_owner(&state.credential) {
             // Refused before any redemption with someone else's tokens.
             return Err(PurviewError::message(
@@ -850,6 +937,19 @@ impl TokenProvider for StoredTokenProvider {
         {
             let refreshed = self.refresh_graph(&state.credential).await?;
             self.commit(&mut state, refreshed, WriteKind::Graph).await?;
+            // The new token is stored either way, but a request that needs
+            // it to last longer than the identity platform gave is not sent.
+            if !state
+                .credential
+                .graph
+                .valid_for(self.clock.now(), min_validity)
+            {
+                return Err(PurviewError::message(format!(
+                    "the refreshed Graph token is valid for less than the {} seconds this \
+                     request needs, so it was not sent; try again later",
+                    min_validity.as_secs()
+                )));
+            }
         }
         Ok(GraphToken(state.credential.graph.token.clone()))
     }
@@ -942,6 +1042,8 @@ mod tests {
                 "eDiscovery.ReadWrite.All openid",
             ),
             download: download.map(|seconds| token(seconds, "canary-download-0001", "d")),
+            access: Some(Access::ReadWrite),
+            sign_in: Some("sign-in-0001".into()),
         }
     }
 
@@ -1036,7 +1138,7 @@ mod tests {
                  \"{TENANT}\", refresh_token: [redacted], graph: AccessToken {{ token: \
                  [redacted], expires_at: 2026-01-05T09:01:40Z, scope: \"eDiscovery.ReadWrite.All \
                  openid\" }}, download: Some(AccessToken {{ token: [redacted], expires_at: \
-                 2026-01-05T09:01:40Z, scope: \"d\" }}) }}"
+                 2026-01-05T09:01:40Z, scope: \"d\" }}), access: Some(ReadWrite) }}"
             )
         );
     }
@@ -1060,14 +1162,52 @@ mod tests {
                     "expires_at": "2026-01-05T10:00:00Z",
                     "scope": "eDiscovery.ReadWrite.All openid",
                 },
+                "access": "read-write",
+                "sign_in": "sign-in-0001",
             })
         );
         let redactor = Redactor::new();
         let loaded = Credential::from_json(&original.to_json().unwrap(), &redactor).unwrap();
+        assert_eq!(loaded.access, Some(Access::ReadWrite));
         assert_eq!(loaded.graph.expires_at, original.graph.expires_at);
         assert!(loaded.download.is_none());
         assert!(redactor.recognises("canary-refresh-0001"));
         assert!(redactor.recognises("canary-graph-0001"));
+    }
+
+    #[test]
+    fn access_is_read_back_and_anything_unknown_is_unrecorded() {
+        let redactor = Redactor::new();
+        let stored = |access: Option<Value>| {
+            let mut value: Value =
+                serde_json::from_str(&credential(3600, None).to_json().unwrap()).unwrap();
+            match access {
+                Some(access) => value["access"] = access,
+                None => {
+                    value.as_object_mut().unwrap().remove("access");
+                }
+            }
+            Credential::from_json(&value.to_string(), &redactor)
+                .unwrap()
+                .access
+        };
+        assert_eq!(stored(Some(json!("read-write"))), Some(Access::ReadWrite));
+        assert_eq!(stored(Some(json!("read-only"))), Some(Access::ReadOnly));
+        for unrecorded in [
+            None,
+            Some(json!("Read-Write")),
+            Some(json!(true)),
+            Some(Value::Null),
+        ] {
+            assert_eq!(stored(unrecorded.clone()), None, "{unrecorded:?}");
+        }
+        let mut read_only = credential(3600, None);
+        read_only.access = Some(Access::ReadOnly);
+        let value: Value = serde_json::from_str(&read_only.to_json().unwrap()).unwrap();
+        assert_eq!(value["access"], "read-only");
+        read_only.access = None;
+        let value: Value = serde_json::from_str(&read_only.to_json().unwrap()).unwrap();
+        assert!(value.get("access").is_none());
     }
 
     #[test]
@@ -1756,6 +1896,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reload_refuses_a_credential_from_a_newer_sign_in() {
+        let memory = Arc::new(MemoryStore::default());
+        let store = Arc::new(CommitsThenFails::new(memory.clone()));
+        let setup = setup_with(credential(0, None), store.clone(), memory).await;
+        Mock::given(method("POST"))
+            .respond_with(response("canary-graph-0002", "canary-refresh-0002"))
+            .expect(1)
+            .mount(&setup.server)
+            .await;
+        // The refresh is stored, and the store then reports a failure.
+        store.fail_write(1);
+        assert!(setup.provider.graph(Duration::from_secs(60)).await.is_err());
+        // Before the next call reloads, the person signs in again.
+        // Through another app registration, so the registration differs too.
+        let mut newer = credential(3600, None);
+        newer.sign_in = Some("sign-in-0004".into());
+        newer.client_id = "00000000-0000-4000-8000-000000000071".into();
+        newer.refresh_token = SecretString::new("canary-refresh-0095");
+        newer.save(setup.memory.as_ref()).unwrap();
+        let error = setup
+            .provider
+            .graph(Duration::from_secs(60))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("signed in again"), "{error}");
+        assert!(!error.to_string().contains("logout"), "{error}");
+        assert_eq!(stored(&setup)["sign_in"], "sign-in-0004");
+    }
+
+    #[tokio::test]
     async fn a_reload_leaves_a_graph_token_stored_after_the_invalidation_alone() {
         let memory = Arc::new(MemoryStore::default());
         let store = Arc::new(CommitsThenFails::new(memory.clone()));
@@ -1801,6 +1971,103 @@ mod tests {
             "{error}"
         );
         assert_eq!(stored(&setup)["refresh_token"], "canary-refresh-0099");
+    }
+
+    #[tokio::test]
+    async fn a_refreshed_token_too_short_for_the_request_is_not_used() {
+        let setup = setup(credential(0, None)).await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "canary-graph-0002",
+                "refresh_token": "canary-refresh-0002",
+                "expires_in": 120,
+                "scope": "eDiscovery.ReadWrite.All openid",
+            })))
+            .expect(1)
+            .mount(&setup.server)
+            .await;
+        let error = setup
+            .provider
+            .graph(Duration::from_secs(300))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("less than the 300 seconds"),
+            "{error}"
+        );
+        // The rotation was stored, so the newest refresh token is kept.
+        assert_eq!(stored(&setup)["refresh_token"], "canary-refresh-0002");
+        // A request that needs less can use it, without another redemption.
+        let token = setup.provider.graph(Duration::from_secs(60)).await.unwrap();
+        assert_eq!(token.expose(), "canary-graph-0002");
+    }
+
+    #[tokio::test]
+    async fn a_refresh_is_not_committed_over_a_sign_in_that_changed_access() {
+        let setup = setup(credential(0, None)).await;
+        Mock::given(method("POST"))
+            .respond_with(response("canary-graph-0002", "canary-refresh-0002"))
+            .expect(1)
+            .mount(&setup.server)
+            .await;
+        // While this read-write provider runs, the same person signs in
+        // again with --read-only through the same registration.
+        let mut read_only = credential(3600, None);
+        read_only.access = Some(Access::ReadOnly);
+        read_only.sign_in = Some("sign-in-0002".into());
+        read_only.refresh_token = SecretString::new("canary-refresh-0098");
+        read_only.save(setup.memory.as_ref()).unwrap();
+        let error = setup
+            .provider
+            .graph(Duration::from_secs(60))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("replaced or removed by another command"),
+            "{error}"
+        );
+        let stored = stored(&setup);
+        assert_eq!(stored["access"], "read-only");
+        assert_eq!(stored["refresh_token"], "canary-refresh-0098");
+    }
+
+    #[tokio::test]
+    async fn a_refresh_is_not_committed_over_a_newer_sign_in_with_other_permissions() {
+        let setup = setup(credential(0, None)).await;
+        Mock::given(method("POST"))
+            .respond_with(response("canary-graph-0002", "canary-refresh-0002"))
+            .expect(1)
+            .mount(&setup.server)
+            .await;
+        // A newer read-write sign-in whose token lacks the write permission.
+        let mut newer = credential(3600, None);
+        newer.sign_in = Some("sign-in-0003".into());
+        newer.graph.scope = "eDiscovery.Read.All openid".into();
+        newer.refresh_token = SecretString::new("canary-refresh-0097");
+        newer.save(setup.memory.as_ref()).unwrap();
+        assert!(setup.provider.graph(Duration::from_secs(60)).await.is_err());
+        let stored = stored(&setup);
+        assert_eq!(stored["graph"]["scope"], "eDiscovery.Read.All openid");
+        assert_eq!(stored["sign_in"], "sign-in-0003");
+    }
+
+    #[tokio::test]
+    async fn a_refresh_of_the_same_sign_in_by_another_command_is_kept() {
+        let setup = setup(credential(0, None)).await;
+        Mock::given(method("POST"))
+            .respond_with(response("canary-graph-0002", "canary-refresh-0002"))
+            .expect(1)
+            .mount(&setup.server)
+            .await;
+        // Another command refreshed the same sign-in: same id, new tokens.
+        let mut refreshed = credential(10, None);
+        refreshed.refresh_token = SecretString::new("canary-refresh-0096");
+        refreshed.save(setup.memory.as_ref()).unwrap();
+        let token = setup.provider.graph(Duration::from_secs(60)).await.unwrap();
+        assert_eq!(token.expose(), "canary-graph-0002");
+        assert_eq!(stored(&setup)["sign_in"], "sign-in-0001");
     }
 
     #[test]

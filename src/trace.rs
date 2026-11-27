@@ -284,7 +284,7 @@ fn response_value(response: TracedResponse<'_>, request: &Url, redactor: &Redact
 /// A copy of `value` with every URL inside any string passed through
 /// `redact::url`: whole-string links such as `downloadUrl` and
 /// `@odata.nextLink`, and links quoted in free text such as an error
-/// message.
+/// message. Object keys are strings too, and are redacted the same way.
 pub fn redact_urls(value: &Value, redactor: &Redactor) -> Value {
     match value {
         Value::String(text) => Value::String(redact::urls_in_text(text, redactor)),
@@ -294,11 +294,23 @@ pub fn redact_urls(value: &Value, redactor: &Redactor) -> Value {
                 .map(|item| redact_urls(item, redactor))
                 .collect(),
         ),
-        Value::Object(map) => Value::Object(
-            map.iter()
-                .map(|(key, item)| (key.clone(), redact_urls(item, redactor)))
-                .collect(),
-        ),
+        Value::Object(map) => {
+            // Two keys can redact to one (the same link with different
+            // signatures): the later ones get " (2)", " (3)" and so on, so
+            // no value is lost from what a person reads.
+            let mut out = serde_json::Map::new();
+            for (key, item) in map {
+                let shown = redact::urls_in_text(key, redactor);
+                let mut unique = shown.clone();
+                let mut copy = 1;
+                while out.contains_key(&unique) {
+                    copy += 1;
+                    unique = format!("{shown} ({copy})");
+                }
+                out.insert(unique, redact_urls(item, redactor));
+            }
+            Value::Object(out)
+        }
         other => other.clone(),
     }
 }
@@ -625,5 +637,22 @@ mod tests {
             "{error}"
         );
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn keys_that_redact_to_one_keep_every_value() {
+        let redactor = Redactor::new();
+        let first = ["https://", "files.contoso.example/a?sig=canary-sig-0101"].concat();
+        let second = ["https://", "files.contoso.example/a?sig=canary-sig-0102"].concat();
+        let value = serde_json::json!({ first: 1, second: 2, "plain": 3 });
+        let shown = redact_urls(&value, &redactor);
+        let object = shown.as_object().unwrap();
+        assert_eq!(object.len(), 3, "{shown}");
+        let text = shown.to_string();
+        assert!(!text.contains("canary-sig"), "{text}");
+        let mut values: Vec<i64> = object.values().map(|v| v.as_i64().unwrap()).collect();
+        values.sort();
+        assert_eq!(values, [1, 2, 3]);
+        assert_eq!(object["plain"], 3);
     }
 }

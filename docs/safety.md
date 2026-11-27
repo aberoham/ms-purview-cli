@@ -1,10 +1,55 @@
 # Safety
 
-This page describes how `purview` keeps a tenant-wide search narrow. The
-rest of the safety design (what each write changes, the plan and approval
-step, the action preflight, holds, duplicates and secrets) is added here
+This page describes how `purview` plans and approves a write, and how it
+keeps a tenant-wide search narrow. The rest of the safety design (what each
+write changes, the action preflight, holds and duplicates) is added here
 with the write commands. Until then, `docs/SPEC.md` section 6 is the
 design.
+
+## Plan, approve, send
+
+No release has a write command yet; this is the framework they will run
+through. Every write runs the same steps, in this order:
+
+1. **Before sign-in.** `--no-write` (or `PURVIEW_NO_WRITE=true`) refuses the
+   command with `WriteRefused`. Then the command's own arguments are checked,
+   including the guard for a query given on the command line, and the naming
+   templates in `config.json`.
+2. **The session.** The stored credential must record a read-write sign-in.
+   A `--read-only` sign-in, or a credential from v0.1 that records neither,
+   is refused with `ReadOnlySession` before any request is sent. See
+   `docs/auth.md`.
+3. **Preflight.** The command reads what it needs from Graph. Only GET
+   requests, and token refreshes from the identity platform, are sent.
+4. **The plan.** The account and tenant, the method and path, the body as
+   it will be sent, a SHA-256 digest of method, path and body, the effects as
+   plain sentences, warnings, and what the preflight found.
+5. **Approval.**
+   - `--dry-run` prints the plan and sends nothing (exit 0). It wins over
+     `--yes`.
+   - `--yes` (or `PURVIEW_YES=true`) approves.
+   - Otherwise, when standard input and standard error are both terminals
+     and `--no-input` is not given, the plan is shown on standard error
+     followed by `Apply? [y/N]`. Only `y` or `yes` approves.
+   - Otherwise nothing is sent, and the command exits 3 with
+     `ConfirmationRequired`; a declined prompt exits 3 with `Declined`.
+6. **Send.** The approved request is sent once, exactly as planned. It is
+   never sent again automatically. If Graph refuses it (a 4xx), the command
+   fails with Graph's error, and nothing changed. If the outcome is not clear
+   (no answer, a timeout, HTTP 429 or a 5xx, or an answer that cannot be
+   read), the command lists what the write may have created and fails with
+   `WriteOutcomeUnknown`. Check those before running the command again.
+
+The code makes the order hard to break: the only request method that can
+send a POST takes an approved plan, and only the approval step can make
+one. A test fails the build if a POST is built anywhere else.
+
+Under `--json`, exit 0 prints `{"results": {"applied", "plan", "result"},
+"count": 1}`, with `applied` false and `result` null after a dry run, and
+exit 3 prints `{"plan", "applied": false, "error": {"code", "status",
+"message"}}` whatever `--results-only` says. In a table, a dry run prints the
+plan on standard output; exit 3 puts the plan and the reason on standard
+error.
 
 ## The guard against generic tenant-wide searches
 

@@ -31,7 +31,7 @@ use crate::env::{BrowserOpener, Clock};
 use crate::error::{OAuthDetails, PurviewError, Result};
 use crate::output::sanitize;
 use crate::redact::Redactor;
-use crate::token::{AccessToken, Credential, SecretString};
+use crate::token::{Access, AccessToken, Credential, SecretString};
 
 /// Microsoft Graph, the prefix of its delegated scopes.
 pub const GRAPH_RESOURCE: &str = "https://graph.microsoft.com/";
@@ -573,7 +573,7 @@ pub async fn login_device_code(
     )?;
     prompt.flush()?;
     let token = identity.poll_device_code(&code, deadline, clock).await?;
-    complete_login(identity, clock, token, &scope).await
+    complete_login(identity, clock, token, &scope, read_only).await
 }
 
 /// The part of a sign-in after the Graph token arrives, whichever flow
@@ -584,6 +584,7 @@ async fn complete_login(
     clock: &dyn Clock,
     token: TokenResponse,
     scope: &str,
+    read_only: bool,
 ) -> Result<LoginOutcome> {
     let claims = account_claims(token.id_token.as_ref())?;
     let refresh_token = token
@@ -613,6 +614,8 @@ async fn complete_login(
         refresh_token,
         graph: AccessToken::from_response(&token, clock.now(), scope),
         download: None,
+        access: Some(Access::from_read_only(read_only)),
+        sign_in: Some(random_urlsafe(16)?),
     };
     let download_scope = download_scope();
     let download_refused = match identity
@@ -700,7 +703,7 @@ fn pkce_challenge(verifier: &str) -> String {
 }
 
 /// `bytes` random bytes from the operating system, as base64url text.
-fn random_urlsafe(bytes: usize) -> Result<String> {
+pub(crate) fn random_urlsafe(bytes: usize) -> Result<String> {
     let mut buffer = vec![0_u8; bytes];
     getrandom::fill(&mut buffer).map_err(|error| {
         PurviewError::message(format!("could not generate a random value: {error}"))
@@ -1141,7 +1144,7 @@ pub async fn login_browser(
     let token = identity
         .exchange_code(&code, &redirect_uri, &pkce.verifier, &scope)
         .await?;
-    complete_login(identity, clock, token, &scope).await
+    complete_login(identity, clock, token, &scope, read_only).await
 }
 
 /// Warns that the browser did not open. A closed channel means the opener

@@ -4,9 +4,11 @@
 //! - A request goes out only when its URL has exactly the Graph origin
 //!   and lies below the Graph base path; paging links are checked the same
 //!   way. Redirects are disabled.
-//! - Requests are built from `routes::ReadRoute` only. Every read is a
-//!   `GET`. `send_write`, for the six `routes::WriteRoute` POSTs, arrives
-//!   with the first write command.
+//! - Reads are built from `routes::ReadRoute`, and every read is a `GET`.
+//!   The only other request is `send_write`, which takes a
+//!   `safety::ApprovedWrite` and sends its one `POST` exactly as approved.
+//!   A POST is never sent again: an outcome that is not clear is
+//!   `WriteOutcomeUnknown` (`docs/SPEC.md` section 4.3).
 //! - A GET makes at most `MAX_GET_ATTEMPTS` attempts, every send counted.
 //!   It is retried after a connection error, a timeout, a truncated body,
 //!   or HTTP 429, 500, 502, 503 or 504, waiting for `Retry-After` (seconds
@@ -21,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use reqwest::header::{HeaderMap, ACCEPT, RETRY_AFTER};
+use reqwest::header::{HeaderMap, ACCEPT, CONTENT_TYPE, LOCATION, RETRY_AFTER};
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::Value;
@@ -33,6 +35,7 @@ use crate::origin::Origin;
 use crate::output::sanitize;
 use crate::redact::{self, Redactor};
 use crate::routes::{build_url, Query, ReadRoute};
+use crate::safety::{ApprovedWrite, WritePlan};
 use crate::token::TokenProvider;
 use crate::trace::{Exchange, TraceSink, TracedBody, TracedResponse};
 
@@ -51,6 +54,9 @@ pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 /// A GET's token must stay valid at least this long (`docs/SPEC.md`
 /// section 4.5).
 pub const GET_TOKEN_VALIDITY: Duration = Duration::from_secs(60);
+/// A POST's token must stay valid at least this long (`docs/SPEC.md`
+/// section 4.5), so that a 401 should not happen.
+pub const POST_TOKEN_VALIDITY: Duration = Duration::from_secs(300);
 /// `--timeout 0`, and no `--timeout`, mean this.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 /// The largest `--timeout`.
@@ -134,6 +140,17 @@ impl std::fmt::Debug for GraphClient {
             .field("verbose", &self.verbose)
             .finish_non_exhaustive()
     }
+}
+
+/// Graph's answer to an approved write that it accepted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WriteResponse {
+    pub status: u16,
+    /// The `Location` header, as given; an action names its operation
+    /// there (`docs/SPEC.md` section 4.4).
+    pub location: Option<String>,
+    /// The body, when it is a JSON object; a 202 has none.
+    pub body: Option<Value>,
 }
 
 /// What one attempt produced.
@@ -385,6 +402,184 @@ impl GraphClient {
         }
     }
 
+    /// Sends the approved POST once: the method, path and bytes in the
+    /// plan, nothing else. A 2xx with a readable body is the response. Any
+    /// other 4xx is Graph's error, and the write was not applied. No
+    /// response, a timeout, 429 or a 5xx leave the outcome unknown, as does
+    /// a 2xx whose body cannot be read: each is `WriteOutcomeUnknown`, and
+    /// the request is never sent again, whatever `Retry-After` says. A
+    /// connection that could not be opened sent nothing and is
+    /// `GraphUnreachable`.
+    pub(crate) async fn send_write(
+        &self,
+        write: ApprovedWrite,
+        log: &mut (dyn Write + Send),
+    ) -> Result<(WritePlan, WriteResponse)> {
+        let url = build_url(&self.base, &write.route().segments(), &Query::new())?;
+        if !self.admits(&url) {
+            return Err(PurviewError::ForeignOrigin {
+                what: "request URL",
+                url: sanitize(&self.redactor.redact(&redact::url(&url, &self.redactor))),
+            });
+        }
+        let token = self
+            .tokens
+            .graph(POST_TOKEN_VALIDITY)
+            .await
+            .map_err(|error| {
+                self.log_notes(log);
+                PurviewError::TokenUnavailable(Box::new(error))
+            })?;
+        self.log_notes(log);
+        let shown = sanitize(&self.redactor.redact(&redact::url(&url, &self.redactor)));
+        self.log(log, &format!("{} {shown}", write.method()));
+        let started = self.clock.elapsed();
+        let sent = self
+            .http
+            .post(url.clone())
+            .bearer_auth(token.expose())
+            .header(ACCEPT, "application/json")
+            .header(CONTENT_TYPE, "application/json")
+            .body(write.body().to_vec())
+            .send()
+            .await;
+        drop(token);
+        let response =
+            match sent {
+                Ok(response) => response,
+                Err(error) if error.is_builder() => return Err(PurviewError::message(
+                    "the Graph request could not be built: the stored Graph token is not a valid \
+                     header value; nothing was sent. Run 'purview auth login' again",
+                )),
+                Err(error) if error.is_connect() => {
+                    let reason = transport_failure(&error);
+                    self.record_write(&url, &write, None, Some(&reason), log);
+                    return Err(PurviewError::GraphUnreachable {
+                        reason,
+                        attempts: 1,
+                    });
+                }
+                Err(error) => {
+                    let reason = transport_failure(&error);
+                    self.record_write(&url, &write, None, Some(&reason), log);
+                    self.log(log, &reason);
+                    return Err(unknown(format!("{reason} before Graph answered")));
+                }
+            };
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = match read_body(response).await {
+            Ok(body) => Some(body),
+            Err(reason) => {
+                self.log(log, &reason);
+                None
+            }
+        };
+        let took = self.clock.elapsed().saturating_sub(started);
+        self.record_write(
+            &url,
+            &write,
+            Some((status, &headers, body.as_deref().unwrap_or_default())),
+            None,
+            log,
+        );
+        self.log(
+            log,
+            &format!(
+                "HTTP {} in {} ms{}",
+                status.as_u16(),
+                took.as_millis(),
+                header_text(&headers, "request-id")
+                    .map(|id| format!(", request-id {}", sanitize(&self.redactor.redact(&id))))
+                    .unwrap_or_default()
+            ),
+        );
+        if status.is_success() {
+            let Some(body) = body else {
+                return Err(unknown(format!(
+                    "Graph accepted the request (HTTP {}), but its response could not be read",
+                    status.as_u16()
+                )));
+            };
+            let body = match serde_json::from_slice::<Value>(&body) {
+                Ok(value @ Value::Object(_)) => Some(value),
+                // An empty answer is expected only where Graph sends no
+                // object; a create that answers with nothing is unclear.
+                _ if body.iter().all(u8::is_ascii_whitespace)
+                    && !write.route().answers_with_object() =>
+                {
+                    None
+                }
+                _ => {
+                    return Err(unknown(format!(
+                        "Graph accepted the request (HTTP {}), but its response is not a JSON \
+                         object",
+                        status.as_u16()
+                    )))
+                }
+            };
+            return Ok((
+                write.into_plan(),
+                WriteResponse {
+                    status: status.as_u16(),
+                    location: header_text(&headers, LOCATION.as_str()),
+                    body,
+                },
+            ));
+        }
+        let error = self.graph_error(status, &headers, body.as_deref().unwrap_or_default());
+        // A redirect is not followed, and the POST before it may have been
+        // processed (a 303 says so), so it is unclear too.
+        // Only a client error says the request was refused; 408 and 429
+        // say nothing about whether it ran.
+        let refused = status.is_client_error()
+            && status != StatusCode::REQUEST_TIMEOUT
+            && status != StatusCode::TOO_MANY_REQUESTS;
+        if !refused {
+            return Err(unknown(format!(
+                "Graph answered HTTP {} ({})",
+                status.as_u16(),
+                error
+            )));
+        }
+        Err(error)
+    }
+
+    /// Writes a POST exchange to the trace, its body included.
+    fn record_write(
+        &self,
+        url: &Url,
+        write: &ApprovedWrite,
+        response: Option<(StatusCode, &HeaderMap, &[u8])>,
+        error: Option<&str>,
+        log: &mut (dyn Write + Send),
+    ) {
+        let Some(trace) = &self.trace else {
+            return;
+        };
+        let request_body = serde_json::from_slice::<Value>(write.body()).ok();
+        let exchange = Exchange {
+            method: write.method(),
+            url,
+            request_body: request_body.as_ref(),
+            response: response.map(|(status, headers, body)| TracedResponse {
+                status: status.as_u16(),
+                headers,
+                body: TracedBody::Json(body),
+            }),
+            error,
+        };
+        if let Err(error) = trace.record(&exchange) {
+            if !self.trace_failed.swap(true, Ordering::Relaxed) {
+                let _ = writeln!(
+                    log,
+                    "warning: could not write a trace file: {}",
+                    sanitize(&error.to_string())
+                );
+            }
+        }
+    }
+
     /// Sends one GET and reads its body. For a success, a body that is cut
     /// off or times out is transient and one over the limit is refused. For
     /// any other status the status and headers are what matter (a 403
@@ -630,6 +825,39 @@ fn header_text(headers: &HeaderMap, name: &str) -> Option<String> {
         .get(name)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned)
+}
+
+/// A write whose outcome is not known; the command adds what it finds.
+fn unknown(reason: String) -> PurviewError {
+    PurviewError::WriteOutcomeUnknown {
+        reason,
+        candidates: Vec::new(),
+    }
+}
+
+/// A POST response's body, up to `MAX_RESPONSE_BYTES`, or why it could not
+/// be read in full.
+async fn read_body(mut response: reqwest::Response) -> std::result::Result<Vec<u8>, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+    {
+        return Err(too_large().to_string());
+    }
+    let mut body = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+                    return Err(too_large().to_string());
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => return Ok(body),
+            Err(error) if error.is_timeout() => return Err("the response timed out".to_owned()),
+            Err(_) => return Err("the response was cut off".to_owned()),
+        }
+    }
 }
 
 fn too_large() -> PurviewError {

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add the safety framework the write commands will run through: a plan with the body serialised once and its SHA-256 digest, approval by `--yes` or an `Apply? [y/N]` prompt at a terminal, `--dry-run` (which wins over `--yes`), exit 3 with `ConfirmationRequired` or `Declined` when nothing is approved, `--no-write` (`PURVIEW_NO_WRITE`) refusing every write before sign-in, and one POST per approved plan that is never sent again; an unclear outcome lists what it may have created and fails with `WriteOutcomeUnknown`. No command writes yet.
+- `auth login` records in the stored credential whether it was a read-only sign-in. Writes go by that record, because a `--read-only` token still carries `eDiscovery.ReadWrite.All`; a credential stored by v0.1 reads as before, but must sign in again before it can write.
+- Check the `naming` templates in `config.json` before a write signs in; an unknown variable is refused without being repeated.
 - Errors about `--account`, `--client-id` and `--tenant-id`, and their `PURVIEW_ACCOUNT`, `PURVIEW_CLIENT_ID` and `PURVIEW_TENANT_ID` variables, no longer repeat the value given; they name the flag or variable instead.
 
 ## v0.1.0 - 2026-11-27

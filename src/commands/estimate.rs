@@ -583,7 +583,8 @@ fn volume_of(
         items,
         size,
         evidence.and_then(|files| files.locations.as_ref()),
-        collection == Collection::Complete,
+        // A partial success may have left a location out of the files.
+        record.status == OperationStatus::Succeeded && collection == Collection::Complete,
     )
 }
 

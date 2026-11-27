@@ -1035,6 +1035,32 @@ async fn a_failed_location_with_a_count_leaves_hits_per_location_unchecked() {
 }
 
 #[tokio::test]
+async fn a_partial_success_leaves_hits_per_location_unchecked() {
+    let setup = Setup::new().await;
+    setup
+        .preflight(
+            fixture_value(&setup.harness, "search-get-mailboxes.json"),
+            json!({"value": []}),
+        )
+        .await;
+    setup.accept(&setup.key_form_location()).await;
+    let mut last = setup.succeeded();
+    last["status"] = json!("partiallySucceeded");
+    setup.operation(0, last).await;
+    setup.serve(estimate_zip(false)).await;
+    set_volume(&setup.harness, json!({"warn_hits": 14}));
+    let run = setup.run(&["--json", "--yes"]).await;
+    let result = &run.json()["results"]["result"];
+    assert_eq!(result["collection"], "complete", "{}", run.stdout());
+    // Its counts are still used, and its hits per location unchecked.
+    assert_eq!(result["volume"]["over"][0]["setting"], "volume.warn_hits");
+    assert_eq!(
+        result["volume"]["unchecked"],
+        json!(["volume.warn_hits_per_location"])
+    );
+}
+
+#[tokio::test]
 async fn a_second_locations_file_leaves_hits_per_location_unchecked() {
     let setup = Setup::new().await;
     setup

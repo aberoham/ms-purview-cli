@@ -1969,8 +1969,8 @@ starting `warning: VOLUME:`, then one line on what to do; the lines give counts,
 location's name. `result.volume` carries the same (section 3.5). A count Graph did not give
 or gave as something other than a count (which also gets the warning of section 7.1) leaves
 that limit in `unchecked`. `warn_hits_per_location` is `unchecked`, and still in `over` when a
-readable row passed it, unless the zip was read, `collection` is `complete` and every
-Locations row has a count. So a failed location in either file, a row with no location, a
+readable row passed it, unless the estimate `succeeded`, the zip was read, `collection` is
+`complete` and every Locations row has a count. So a failed location in either file, a row with no location, a
 file with no `Count` column and a second Locations file all leave it `unchecked`. An estimate that did not succeed or
 partly succeed has every limit `unchecked` and prints no volume warning: its counts are not
 used. The warning never changes the exit code, `--strict` included.

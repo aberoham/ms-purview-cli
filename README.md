@@ -172,7 +172,7 @@ On macOS, `cargo build` produces an ad-hoc-signed binary, whose identity changes
 
 `purview` has no app registration of its own. Create a single-tenant public-client registration in your Microsoft Entra ID tenant before signing in.
 
-1. **Create the app registration.** With the Azure CLI (signed in as a Cloud Application Administrator, Application Administrator or higher), run `contrib/create-purview-app.sh` from a checkout of `main`. It performs a dry run by default and changes nothing until you pass `--apply`. The script grants `eDiscovery.ReadWrite.All` by default, and `auth login --read-only` alone does not narrow the registration's grant. For a read-only setup, add `READ_ONLY=1` to both the dry run and the `--apply` run (for example `READ_ONLY=1 TENANT_ID=<tenant-id> ASSIGN_USERS="alex@contoso.example" ./contrib/create-purview-app.sh`) and then sign in with the command the script prints at the end, which includes both identifiers and `--read-only`.
+1. **Create the app registration.** With the Azure CLI (signed in as a Cloud Application Administrator, Application Administrator or higher), run `contrib/create-purview-app.sh`. Run the commands below from the root of a source checkout, or from `share/doc/purview` in an unpacked release archive (`cd share/doc/purview` first), where the script is `contrib/create-purview-app.sh` too. It performs a dry run by default and changes nothing until you pass `--apply`. The script grants `eDiscovery.ReadWrite.All` by default, and `auth login --read-only` alone does not narrow the registration's grant. For a read-only setup, add `READ_ONLY=1` to both the dry run and the `--apply` run (for example `READ_ONLY=1 TENANT_ID=<tenant-id> ASSIGN_USERS="alex@contoso.example" ./contrib/create-purview-app.sh`) and then sign in with the command the script prints at the end, which includes both identifiers and `--read-only`.
 
    ```bash
    az login --tenant <tenant-id>
@@ -196,7 +196,7 @@ On macOS, `cargo build` produces an ad-hoc-signed binary, whose identity changes
 
 - [docs/auth.md](docs/auth.md): permissions, the app registration (setup script and manual steps), consent choices and sign-in
 - [docs/safety.md](docs/safety.md): the guard against generic tenant-wide searches: the supported query grammar, the term classifier and its settings
-- [docs/troubleshooting.md](docs/troubleshooting.md): installing, verifying checksums and checking binary signatures
+- [docs/troubleshooting.md](docs/troubleshooting.md): installing, verifying checksums and checking binary signatures; keychain prompts, sign-in, role and download errors
 - [docs/macos-signing.md](docs/macos-signing.md): how macOS releases are signed and notarised
 - [docs/api-notes.md](docs/api-notes.md): observed Microsoft Graph and Purview service behaviour
 - [docs/SPEC.md](docs/SPEC.md): design, safety model and phased implementation plan

@@ -1,7 +1,10 @@
 # Troubleshooting
 
-This page covers installing and checking the `purview` binary. Sections for
-sign-in, searches and downloads arrive with the commands that need them.
+This page covers installing and checking the `purview` binary, then signing
+in, reading cases and downloading files. Entries for the write commands
+(`ScopeUnverified`, `WriteOutcomeUnknown`, closing a case) arrive with them in
+v0.2; they are listed at the end so that a search for the code finds this
+page.
 
 ## Which binary is running
 
@@ -99,3 +102,142 @@ dependencies, so it runs on any distribution for its architecture. An
 `Exec format error` means the archive is for the other architecture: use
 `x86_64-unknown-linux-musl` on x86-64 and `aarch64-unknown-linux-musl` on
 Arm64.
+
+## Keychain or credential-store prompts after an upgrade
+
+macOS asks for the keychain password, or to allow access, when a program it
+does not recognise reads the `purview` keychain item. The release binaries
+are signed with one stable identity, `com.aberoham.purview`, so an upgrade
+from one release to the next reads the stored credential without a prompt.
+A prompt after an upgrade means the binary changed identity:
+
+- a source build replaced a release, or the other way round. They have
+  different signing identities. A plain `cargo build` changes identity on
+  every rebuild, so first sign the source build with `contrib/resign.sh`
+  (see "A source build on macOS"), then choose **Always Allow** at the next
+  prompt; the grant then lasts across rebuilds;
+- a release binary was re-signed locally. Do not re-sign release binaries.
+
+Windows Credential Manager and the Linux kernel keyring do not prompt per
+program. If the stored credential cannot be read at all, sign in again with
+`purview auth login`.
+
+## The device code is refused by Conditional Access
+
+A tenant can block the device code flow with a Conditional Access policy
+for authentication flows (Docs). The sign-in page then refuses the code
+after you enter it, and `auth login` fails with the identity platform's
+error. Sign in in the browser on the same computer instead: run the same
+`auth login` command again with `--browser` added. On a first sign-in that
+means keeping `--client-id` and `--tenant-id` (and `--read-only`, if you
+used it), because a sign-in that failed saved no registration:
+
+```bash
+purview auth login --browser --client-id <application-client-id> --tenant-id <tenant-id>
+```
+
+The browser flow needs a browser on the computer that runs `purview`,
+because the sign-in returns to a loopback address. Over a remote shell,
+ask the tenant administrator whether the policy can exclude the app
+registration.
+
+## 403 without the Purview role
+
+`purview auth status` reports `purviewRole: denied` when Graph answers its
+case read with HTTP 403. The likely cause is that the account holds no
+eDiscovery role: it needs the eDiscovery Manager or eDiscovery
+Administrator subgroup of the eDiscovery Manager role group, assigned in the
+Microsoft Purview portal (Docs). That a missing role gives 403 has not been
+observed yet (Assumption).
+
+`purviewRole: unknown` means the read failed another way, such as a network
+error or a Graph outage; `purview auth status --verbose` logs the
+request on stderr.
+
+## 401 or 403 on a download
+
+`purview download` sends the download token, not the Graph token, to the
+Purview download host. Two errors mean the token is missing or refused:
+
+- **`DownloadNotConsented`**: the account has no download token, because the
+  app has no consent for `eDiscovery.Download.Read` on the Purview eDiscovery
+  app. Grant the consent (see `docs/auth.md`, "`AADSTS65001` and
+  `AADSTS65002`"), then run `purview auth refresh`.
+- **`DownloadRefused`** with status 401 or 403: the download service refused
+  the token. The command stops there and exits 1; files after that one are
+  not tried. Run `purview auth refresh` and run the download again. If it is
+  refused again, check that the consent above exists and that the account
+  holds an eDiscovery role. A Graph token sent to the download host is
+  answered with 401 (Observed), so a tool or script that uses a Graph token
+  there fails the same way.
+
+A file whose details make it impossible to download (no name, no download
+address, or a host the tool does not accept) is found before any file is
+fetched. The command writes the other files, then exits 4 with
+`FileNotDownloadable` for that one.
+
+Either error, `DownloadNotConsented` or `DownloadRefused`, stops the
+download with exit 1. Files already written stay recorded in
+`manifest.json` in the output directory, and running the same command again
+fetches only what is still missing. With `--overwrite` it fetches every file
+again.
+
+## `CrossOriginRedirect` on a download
+
+The download service answered with a redirect whose target has a different
+origin (scheme, host or port), or no origin the tool accepts. `purview`
+follows redirects only within the origin that the operation named, so it
+stopped before sending a request to that target, and the download token
+never left that origin. No redirect has been
+observed on a download (Observed). Why one would point elsewhere is not
+known; a change in the service, or a proxy between you and it that
+rewrites answers, are possible causes (Assumption).
+
+To report it, give the `purview version` output, the error code, and, if
+you know it, which part of the origin changed (scheme, host or port), with
+the host replaced by a placeholder if it names your tenant or region. If the
+error says `an address with no origin`, quote that phrase instead: the
+redirect pointed to an address the tool cannot give an origin, such as one
+that carries a user name. Do not paste download
+addresses or `--verbose` output into a public issue: their paths encode the
+case, the job and the file name.
+
+## An operation that succeeded but missed some locations
+
+An estimate or report can end with status `succeeded` and still have
+failed to search some mailboxes (Observed). The operation's status alone does
+not show this; the evidence is in the report files. In v0.1, download the
+operation's files with `purview download <case> <op>` and check, inside the
+zip:
+
+- for an estimate: `Locations-*.csv` rows with `Status=Failed`, and
+  `Statistics-*.csv` rows with `StatType=Error`;
+- for an item report: `Locations-*.csv` rows with `Status=Failed` (an item
+  report has no `Statistics-*.csv`).
+
+From v0.2, `purview parse failures <zip>` lists both, and the actions take
+`--strict`, which exits 4 when a run has failed locations or its evidence
+cannot be read.
+
+`purview operation get` exits 4 when the operation itself did not succeed
+(`partiallySucceeded`, `failed` or `submissionFailed`), with the reasons.
+
+## A case in `closing` status
+
+`purview case list --status closing` shows cases in `closing` status. Some
+cases were seen in that status in one snapshot; how long they stayed there
+is not known (Observed). One observed close went from `active` to `closed`
+within seconds without showing `closing` (Observed). v0.1 does not close
+cases, so it only reads this status.
+
+## Write commands (v0.2)
+
+These errors come from the write commands, which arrive in v0.2. Their
+entries will be written with those commands:
+
+- **`ScopeUnverified`**: an action on an existing search was refused because
+  the search's read did not show that it covers every tenant mailbox.
+- **`WriteOutcomeUnknown`**: a write was sent but its outcome is not known,
+  for example because the connection dropped; the command lists what to
+  check before trying again, because writes are never retried
+  automatically.

@@ -615,6 +615,7 @@ async fn complete_login(
         graph: AccessToken::from_response(&token, clock.now(), scope),
         download: None,
         access: Some(Access::from_read_only(read_only)),
+        sign_in: Some(random_urlsafe(16)?),
     };
     let download_scope = download_scope();
     let download_refused = match identity
@@ -702,7 +703,7 @@ fn pkce_challenge(verifier: &str) -> String {
 }
 
 /// `bytes` random bytes from the operating system, as base64url text.
-fn random_urlsafe(bytes: usize) -> Result<String> {
+pub(crate) fn random_urlsafe(bytes: usize) -> Result<String> {
     let mut buffer = vec![0_u8; bytes];
     getrandom::fill(&mut buffer).map_err(|error| {
         PurviewError::message(format!("could not generate a random value: {error}"))

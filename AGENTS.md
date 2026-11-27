@@ -394,7 +394,8 @@ Preserve these so that users do not have to sign in again after an upgrade:
 - the stored JSON shape with `"version": 1`, including the principal's
   `tid` and `oid` and the issuing `client_id` and `tenant_id`, and the
   optional `access` (`read-write` or `read-only`) that decides whether the
-  account may write; a credential without it reads as before
+  account may write, and the optional `sign_in` id that ties refreshes to
+  one sign-in; a credential without them reads as before
   (`docs/SPEC.md` section 5.1);
 - the `config.json` and `accounts/<email>.json` shapes (section 5.3).
 

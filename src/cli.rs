@@ -1491,13 +1491,17 @@ async fn run_write(
     command: &mut dyn WriteCommand,
 ) -> Result<Outcome> {
     let json = matches!(session.output.format, OutputFormat::Json);
+    // Taken before the command runs, which gets the session mutably: the
+    // plan must name the account and tenant that signed in, and the write
+    // goes through the client made for them, whatever the command changed.
+    let signed_in = (
+        session.account.email.clone(),
+        session.account.tenant_id.clone(),
+    );
+    let graph = session.graph.clone();
     let plan = command.plan(session).await?;
-    // The plan shown is the session's: a command cannot name another
-    // account or tenant than the one that signed in.
-    if !plan.account().eq_ignore_ascii_case(&session.account.email)
-        || !plan
-            .tenant()
-            .eq_ignore_ascii_case(&session.account.tenant_id)
+    if !plan.account().eq_ignore_ascii_case(&signed_in.0)
+        || !plan.tenant().eq_ignore_ascii_case(&signed_in.1)
     {
         return Err(PurviewError::message(
             "the write's plan names another account or tenant than the signed-in one; nothing \
@@ -1575,7 +1579,6 @@ async fn run_write(
                     .plan()
                     .write_text(&mut session.env.stderr, &redactor)?;
             }
-            let graph = session.graph.clone();
             let (plan, response) = match graph.send_write(write, &mut session.env.stderr).await {
                 Ok(sent) => sent,
                 Err(PurviewError::WriteOutcomeUnknown { reason, .. }) => {

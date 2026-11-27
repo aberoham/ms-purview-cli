@@ -33,7 +33,10 @@ every permission consented for the app, whatever the sign-in asked for
 `"access": "read-write"` or `"read-only"`, and the write commands go by that
 record. A credential stored by v0.1, which has no record, can read and download
 as before, but every write refuses it with `ReadOnlySession` until you run
-`purview auth login` again. A refresh keeps the record as it was.
+`purview auth login` again. A refresh keeps the record as it was. Each sign-in
+also gets a random id that its refreshes keep: if you sign in again while
+another `purview` command runs, that command stops at its next refresh rather
+than write its older credential over the new one.
 
 Permissions are not enough on their own. The person signing in also needs a
 Purview role: membership of the eDiscovery Manager or eDiscovery Administrator

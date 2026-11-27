@@ -161,6 +161,31 @@ fn the_scan_finds_each_forbidden_form() {
     }
 }
 
+/// The part of a source file that is not its unit-test module: everything
+/// before `#[cfg(test)]` followed by `mod tests`, at the start of a line.
+/// A `#[cfg(test)]` on anything else, such as one statement, is scanned.
+fn production_code(text: &str) -> &str {
+    let marker = "#[cfg(test)]\nmod tests";
+    if text.starts_with(marker) {
+        return "";
+    }
+    match text.find(&format!("\n{marker}")) {
+        Some(index) => &text[..index + 1],
+        None => text,
+    }
+}
+
+/// The name of the function whose signature comes last before `at`.
+fn enclosing_function(code: &str, at: usize) -> Option<String> {
+    let before = &code[..at];
+    let start = before.rfind("fn ")? + 3;
+    let name: String = before[start..]
+        .chars()
+        .take_while(|character| character.is_alphanumeric() || *character == '_')
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
 /// The functions allowed to build an HTTP POST with reqwest's `.post(`,
 /// by file: `GraphClient::send_write`, and the identity client's `post`.
 fn allowed_posts() -> Vec<(&'static str, String)> {
@@ -176,8 +201,7 @@ fn allowed_posts() -> Vec<(&'static str, String)> {
 /// `auth.rs`.
 fn misplaced_posts(file: &str, text: &str) -> Vec<String> {
     let call = [".po", "st("].concat();
-    let wrapper = ["self.po", "st("].concat();
-    let code = text.split("#[cfg(test)]").next().unwrap_or_default();
+    let code = production_code(text);
     let allowed = allowed_posts()
         .into_iter()
         .find(|(name, _)| file.ends_with(name))
@@ -193,17 +217,22 @@ fn misplaced_posts(file: &str, text: &str) -> Vec<String> {
     let mut inside = 0;
     let mut offset = 0;
     for line in code.split_inclusive('\n') {
-        let at = offset;
+        let start = offset;
         offset += line.len();
-        if line.trim_start().starts_with("//") || !line.contains(&call) {
+        if line.trim_start().starts_with("//") {
             continue;
         }
-        if line.contains(&wrapper) && file.ends_with("auth.rs") {
-            continue;
-        }
-        match &span {
-            Some(span) if span.contains(&at) => inside += 1,
-            _ => problems.push(format!("{file}: a POST at byte {at}")),
+        // Each call on the line counts, not the line.
+        for (column, _) in line.match_indices(&call) {
+            let at = start + column;
+            let is_wrapper = column >= 4 && line[..column].ends_with("self");
+            if is_wrapper && file.ends_with("auth.rs") {
+                continue;
+            }
+            match &span {
+                Some(span) if span.contains(&at) => inside += 1,
+                _ => problems.push(format!("{file}: a POST at byte {at}")),
+            }
         }
     }
     if inside > 1 {
@@ -255,29 +284,47 @@ fn the_post_check_finds_a_post_in_the_wrong_place() {
         ("src/download.rs", format!("fn f() {{ c{post}u); }}\n")),
         // The wrapper's spelling outside auth.rs.
         ("src/download.rs", format!("fn f() {{ {wrapper}u); }}\n")),
+        // Two on one line in the allowed function.
+        (
+            "src/graph.rs",
+            format!("impl X {{\n    {send}) {{\n        c{post}u); c{post}v);\n    }}\n}}\n"),
+        ),
+        // After a #[cfg(test)] that guards one statement, not the tests.
+        (
+            "src/config.rs",
+            format!("fn f() {{\n    #[cfg(test)]\n    let a = 1;\n}}\nfn g() {{ c{post}u); }}\n"),
+        ),
     ] {
         assert!(!misplaced_posts(file, &text).is_empty(), "{file}: {text}");
     }
 }
 
-/// The files outside tests that call `name(`, by path.
-fn callers(root: &Path, name: &str) -> Vec<String> {
+/// Every call of `name(` outside unit-test modules, as (file, enclosing
+/// function), one entry per call.
+fn callers(root: &Path, name: &str) -> Vec<(String, String)> {
     let mut files = Vec::new();
     rust_files(&root.join("src"), &mut files);
-    let mut found: Vec<String> = files
-        .iter()
-        .filter(|path| {
-            let text = std::fs::read_to_string(path).unwrap();
-            // Unit tests sit after `#[cfg(test)]` and may call anything.
-            let code = text.split("#[cfg(test)]").next().unwrap_or_default();
-            code.lines()
-                .filter(|line| !line.trim_start().starts_with("//"))
-                .any(|line| {
-                    line.contains(&format!("{name}(")) && !line.contains(&format!("fn {name}("))
-                })
-        })
-        .map(|path| path.strip_prefix(root).unwrap().display().to_string())
-        .collect();
+    let mut found = Vec::new();
+    for path in &files {
+        let text = std::fs::read_to_string(path).unwrap();
+        let code = production_code(&text);
+        let file = path.strip_prefix(root).unwrap().display().to_string();
+        let mut offset = 0;
+        for line in code.split_inclusive('\n') {
+            let start = offset;
+            offset += line.len();
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            for (column, _) in line.match_indices(&format!("{name}(")) {
+                if line[..column].ends_with("fn ") {
+                    continue;
+                }
+                let function = enclosing_function(code, start + column).unwrap_or_default();
+                found.push((file.clone(), function));
+            }
+        }
+    }
     found.sort();
     found
 }
@@ -285,13 +332,32 @@ fn callers(root: &Path, name: &str) -> Vec<String> {
 #[test]
 fn only_the_write_runner_decides_and_sends() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let cli = ["src", "cli.rs"].join(std::path::MAIN_SEPARATOR_STR);
+    let runner = (
+        ["src", "cli.rs"].join(std::path::MAIN_SEPARATOR_STR),
+        "run_write".to_owned(),
+    );
     assert_eq!(
         callers(root, &["safety::dec", "ide"].concat()),
-        std::slice::from_ref(&cli)
+        std::slice::from_ref(&runner)
     );
-    assert_eq!(callers(root, &[".send_wr", "ite"].concat()), [cli]);
+    assert_eq!(
+        callers(root, &[".send_wr", "ite"].concat()),
+        std::slice::from_ref(&runner)
+    );
+    let safety = ["src", "safety.rs"].join(std::path::MAIN_SEPARATOR_STR);
     assert!(callers(root, &["appr", "ove"].concat())
         .iter()
-        .all(|file| file.ends_with("safety.rs")));
+        .all(|(file, function)| *file == safety && function == "decide"));
+}
+
+#[test]
+fn the_scanner_reads_past_a_statement_level_cfg_test() {
+    let text = "fn a() {\n    #[cfg(test)]\n    let x = 1;\n}\nfn b() {}\n#[cfg(test)]\nmod tests {\n    fn c() {}\n}\n";
+    let code = production_code(text);
+    assert!(code.contains("fn b()"));
+    assert!(!code.contains("fn c()"));
+    assert_eq!(
+        enclosing_function(code, code.find("fn b").unwrap() + 6).as_deref(),
+        Some("b")
+    );
 }

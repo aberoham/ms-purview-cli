@@ -635,7 +635,11 @@ mod tests {
             body: json!({"description": format!("see {signed} and {secret}")}),
             effects: vec![format!("e {secret}")],
             warnings: vec![format!("w {signed}")],
-            preflight: vec![json!({"case": "none with that name"}), json!("holds: none")],
+            preflight: vec![
+                json!({"case": "none with that name"}),
+                json!("holds: none"),
+                json!({ signed.clone(): "a signed link used as a key" }),
+            ],
         };
         let mut out = Vec::new();
         WritePlan::new(input)

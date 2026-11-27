@@ -284,7 +284,7 @@ fn response_value(response: TracedResponse<'_>, request: &Url, redactor: &Redact
 /// A copy of `value` with every URL inside any string passed through
 /// `redact::url`: whole-string links such as `downloadUrl` and
 /// `@odata.nextLink`, and links quoted in free text such as an error
-/// message.
+/// message. Object keys are strings too, and are redacted the same way.
 pub fn redact_urls(value: &Value, redactor: &Redactor) -> Value {
     match value {
         Value::String(text) => Value::String(redact::urls_in_text(text, redactor)),
@@ -296,7 +296,12 @@ pub fn redact_urls(value: &Value, redactor: &Redactor) -> Value {
         ),
         Value::Object(map) => Value::Object(
             map.iter()
-                .map(|(key, item)| (key.clone(), redact_urls(item, redactor)))
+                .map(|(key, item)| {
+                    (
+                        redact::urls_in_text(key, redactor),
+                        redact_urls(item, redactor),
+                    )
+                })
                 .collect(),
         ),
         other => other.clone(),

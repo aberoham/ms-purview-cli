@@ -1260,7 +1260,7 @@ whatever properties can be read, with `error: "unsupportedClass"` when they have
  "client_id":"<application-client-id>","tenant_id":"<tenant-id>","refresh_token":"…",
  "graph":{"access_token":"…","expires_at":"…","scope":"…"},
  "download":{"access_token":"…","expires_at":"…","scope":"…"},
- "access":"read-write"}
+ "access":"read-write","sign_in":"<random id>"}
 ```
 
 `download` may be absent. `tid` and `oid` are the id token's claims for the identity the
@@ -1278,8 +1278,12 @@ token`. Windows chunking and Linux keyutils behave as in `entra`. The credential
 only place a token is ever persisted.
 
 `access` records how the account signed in: `read-write`, or `read-only` after `auth login
---read-only` (from PR 2.1). A refresh keeps it, and refuses to store over a credential whose
-`access` another sign-in changed meanwhile, as it refuses one of another principal. A
+--read-only` (from PR 2.1). `sign_in` is a random id made at each sign-in, which refreshes
+keep. A refresh stores its tokens only over a credential of the same principal and
+registration from the same sign-in, so a session that another `auth login` replaced while it
+ran (with another access, scope or registration) cannot write its older credential back; it
+stops and asks for the command to be run again. Two commands of one sign-in still refresh
+side by side. A
 refreshed token that does not last as long as the request needs (five minutes before a POST)
 is stored but not used. A credential without it, as v0.1 stored, or
 with any other value, is read and refreshed as before but counts as neither.

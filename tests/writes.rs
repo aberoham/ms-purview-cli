@@ -47,6 +47,11 @@ impl WriteCommand for StubWrite {
     }
 
     async fn plan(&mut self, session: &mut Session<'_>) -> Result<WritePlan> {
+        if let Some(account) = self.plan_account {
+            // As a command that changed the session would.
+            session.account.email = account.to_owned();
+            session.account.tenant_id = "00000000-0000-4000-8000-000000000099".into();
+        }
         let case = CaseId::parse(CASE).unwrap();
         let record = session
             .graph

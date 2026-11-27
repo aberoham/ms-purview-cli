@@ -215,6 +215,12 @@ pub struct Credential {
     /// permission whatever was asked for (Observed, PR 1.4). `None` for a
     /// credential stored before this was recorded, which may not write.
     pub access: Option<Access>,
+    /// A random id made at sign-in, which refreshes keep. A refresh stores
+    /// its tokens only over the same sign-in, so a session that another
+    /// `auth login` replaced while it ran (with another access, scope or
+    /// registration) cannot write its older credential back. `None` for a
+    /// credential stored before this was recorded.
+    pub sign_in: Option<String>,
 }
 
 /// Whether a sign-in may write to Purview: `auth login` without or with
@@ -285,6 +291,8 @@ struct StoredRecord<'a> {
     download: Option<StoredToken<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     access: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sign_in: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -314,6 +322,8 @@ struct LoadedRecord {
     /// a value this release does not know, can read but not write.
     #[serde(default)]
     access: Option<serde_json::Value>,
+    #[serde(default)]
+    sign_in: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -417,6 +427,7 @@ impl Credential {
             graph: stored(&self.graph),
             download: self.download.as_ref().map(stored),
             access: self.access.map(Access::as_str),
+            sign_in: self.sign_in.as_deref(),
         };
         Ok(serde_json::to_string(&record)?)
     }
@@ -458,6 +469,12 @@ impl Credential {
                 .as_ref()
                 .and_then(serde_json::Value::as_str)
                 .and_then(Access::parse),
+            sign_in: record
+                .sign_in
+                .as_ref()
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+                .map(str::to_owned),
         };
         credential.register(redactor);
         let damaged = |what: &str| {
@@ -800,16 +817,16 @@ impl StoredTokenProvider {
     }
 
     /// Refuses to write over the key unless it holds a credential of the
-    /// same principal through the same registration as `expected`, with the
-    /// same access: a sign-in that changed it while this provider ran (a
-    /// `--read-only` sign-in, say) must not be undone by an older session's
+    /// same principal through the same registration as `expected`, from the
+    /// same sign-in: a sign-in made while this provider ran (`--read-only`,
+    /// or with other permissions) must not be undone by an older session's
     /// refresh.
     fn verify_owner(&self, expected: &Credential) -> Result<()> {
         let stored = Credential::load(self.store.as_ref(), &expected.email, &self.redactor)
             .ok()
             .flatten();
         match stored {
-            Some(stored) if stored.same_owner(expected) && stored.access == expected.access => {
+            Some(stored) if stored.same_owner(expected) && stored.sign_in == expected.sign_in => {
                 Ok(())
             }
             _ => Err(PurviewError::message(format!(
@@ -841,13 +858,20 @@ impl StoredTokenProvider {
                     crate::output::sanitize(&email)
                 ))
             })?;
-        if !loaded.same_owner(&state.credential) || loaded.access != state.credential.access {
-            // Refused before any redemption with someone else's tokens, or
-            // with a session whose access another sign-in changed.
+        if !loaded.same_owner(&state.credential) {
+            // Refused before any redemption with someone else's tokens.
             return Err(PurviewError::message(
                 "the stored credential now belongs to another app registration or identity; \
                  nothing was sent. Run 'purview auth logout' for this account, then sign in \
                  again",
+            ));
+        }
+        if loaded.sign_in != state.credential.sign_in {
+            // The same person signed in again while this command ran; that
+            // sign-in stands, and this command's session does not.
+            return Err(PurviewError::message(
+                "this account signed in again while the command ran, so it stopped; nothing \
+                 was sent. Run the command again",
             ));
         }
         let mut loaded = loaded;
@@ -1015,6 +1039,7 @@ mod tests {
             ),
             download: download.map(|seconds| token(seconds, "canary-download-0001", "d")),
             access: Some(Access::ReadWrite),
+            sign_in: Some("sign-in-0001".into()),
         }
     }
 
@@ -1134,6 +1159,7 @@ mod tests {
                     "scope": "eDiscovery.ReadWrite.All openid",
                 },
                 "access": "read-write",
+                "sign_in": "sign-in-0001",
             })
         );
         let redactor = Redactor::new();
@@ -1954,6 +1980,7 @@ mod tests {
         // again with --read-only through the same registration.
         let mut read_only = credential(3600, None);
         read_only.access = Some(Access::ReadOnly);
+        read_only.sign_in = Some("sign-in-0002".into());
         read_only.refresh_token = SecretString::new("canary-refresh-0098");
         read_only.save(setup.memory.as_ref()).unwrap();
         let error = setup
@@ -1970,6 +1997,43 @@ mod tests {
         let stored = stored(&setup);
         assert_eq!(stored["access"], "read-only");
         assert_eq!(stored["refresh_token"], "canary-refresh-0098");
+    }
+
+    #[tokio::test]
+    async fn a_refresh_is_not_committed_over_a_newer_sign_in_with_other_permissions() {
+        let setup = setup(credential(0, None)).await;
+        Mock::given(method("POST"))
+            .respond_with(response("canary-graph-0002", "canary-refresh-0002"))
+            .expect(1)
+            .mount(&setup.server)
+            .await;
+        // A newer read-write sign-in whose token lacks the write permission.
+        let mut newer = credential(3600, None);
+        newer.sign_in = Some("sign-in-0003".into());
+        newer.graph.scope = "eDiscovery.Read.All openid".into();
+        newer.refresh_token = SecretString::new("canary-refresh-0097");
+        newer.save(setup.memory.as_ref()).unwrap();
+        assert!(setup.provider.graph(Duration::from_secs(60)).await.is_err());
+        let stored = stored(&setup);
+        assert_eq!(stored["graph"]["scope"], "eDiscovery.Read.All openid");
+        assert_eq!(stored["sign_in"], "sign-in-0003");
+    }
+
+    #[tokio::test]
+    async fn a_refresh_of_the_same_sign_in_by_another_command_is_kept() {
+        let setup = setup(credential(0, None)).await;
+        Mock::given(method("POST"))
+            .respond_with(response("canary-graph-0002", "canary-refresh-0002"))
+            .expect(1)
+            .mount(&setup.server)
+            .await;
+        // Another command refreshed the same sign-in: same id, new tokens.
+        let mut refreshed = credential(10, None);
+        refreshed.refresh_token = SecretString::new("canary-refresh-0096");
+        refreshed.save(setup.memory.as_ref()).unwrap();
+        let token = setup.provider.graph(Duration::from_secs(60)).await.unwrap();
+        assert_eq!(token.expose(), "canary-graph-0002");
+        assert_eq!(stored(&setup)["sign_in"], "sign-in-0001");
     }
 
     #[test]

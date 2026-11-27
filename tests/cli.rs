@@ -527,6 +527,12 @@ fn create_argument_errors_need_no_network() {
             "case".into(),
             "create".into(),
             "--topic".into(),
+            format!("Orders\u{2028}review {canary}"),
+        ],
+        vec![
+            "case".into(),
+            "create".into(),
+            "--topic".into(),
             "Orders".into(),
             "--name".into(),
             tab.clone(),

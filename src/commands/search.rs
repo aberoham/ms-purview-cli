@@ -475,14 +475,16 @@ impl WriteCommand for SearchCreate {
         };
         let record = SearchRecord::from_value(body.clone());
         let check = |what: &str, echoed: Option<&str>, sent: &str, log: &mut dyn Write| {
-            if echoed != Some(sent) {
-                let _ = writeln!(
-                    log,
-                    "warning: Graph's answer {} {what} that differs from the one sent; check \
-                     the search with 'purview search get' before running an action on it",
-                    if echoed.is_some() { "has a" } else { "has no" },
-                );
-            }
+            let found = match echoed {
+                Some(echoed) if echoed == sent => return,
+                Some(_) => format!("a {what} that differs from the one sent"),
+                None => format!("no {what}"),
+            };
+            let _ = writeln!(
+                log,
+                "warning: Graph's answer has {found}; check the search with 'purview search get' \
+                 before running an action on it"
+            );
         };
         check(
             "contentQuery",
@@ -520,7 +522,7 @@ impl WriteCommand for SearchCreate {
         let (listing, failure) = preflight
             .graph
             .list_partial(&ReadRoute::Searches(case), &Query::new(), preflight.log)
-            .await;
+            .await?;
         let incomplete = failure.is_some() || listing.stopped.is_some();
         let (matches, unreadable) = same_name(listing.items, &self.name);
         let candidates: Vec<String> = matches

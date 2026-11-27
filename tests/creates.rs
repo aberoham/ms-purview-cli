@@ -1038,3 +1038,172 @@ async fn a_dry_run_with_an_expired_token_refreshes_once_for_each_create() {
         assert!(writes(&harness).await.is_empty(), "{search}");
     }
 }
+
+// agy round-1 fixes.
+
+#[tokio::test]
+async fn a_reconciliation_whose_first_read_fails_says_the_check_failed() {
+    let harness = signed_in().await;
+    Mock::given(method("GET"))
+        .and(path(CASES))
+        .respond_with(json_response(200, page(vec![])))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&harness.graph)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(CASES))
+        .respond_with(json_response(
+            400,
+            json!({"error": {"code": "BadRequest", "message": "x"}}),
+        ))
+        .with_priority(2)
+        .mount(&harness.graph)
+        .await;
+    mount_post(
+        &harness,
+        CASES,
+        json_response(503, json!({"error": {"code": "ServiceUnavailable"}})),
+    )
+    .await;
+    let run = harness.run(&case_create(&["--json", "--yes"])).await;
+    assert_eq!(run.outcome.exit_code, 1);
+    let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
+    assert!(
+        message.contains("The check for what it may have created failed (BadRequest, HTTP 400)"),
+        "{message}"
+    );
+    assert!(
+        !message.contains("No case with the name was listed"),
+        "{message}"
+    );
+    assert_eq!(writes(&harness).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_case_named_by_name_next_to_an_unreadable_entry_is_refused() {
+    let harness = ready_for_search(created_search(QUERY)).await;
+    mount_get(
+        &harness,
+        CASES,
+        page(vec![
+            case(CASE, "Orders review", "active"),
+            json!({"id": NEW_CASE, "status": "active"}),
+        ]),
+    )
+    .await;
+    let mut args = search_create(&["--json", "--yes"]);
+    args[2] = "Orders review";
+    let run = harness.run(&args).await;
+    assert_eq!(run.outcome.exit_code, 1, "{}", run.stdout());
+    assert!(run.json()["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("cannot be read"));
+    assert!(writes(&harness).await.is_empty());
+}
+
+/// SPEC 8.5 item 10 for the creates: a success and an unclear outcome,
+/// with --trace and --verbose, leave no token anywhere.
+#[tokio::test]
+async fn traced_and_verbose_creates_leave_no_tokens() {
+    let harness = signed_in().await;
+    mount_get_then(
+        &harness,
+        CASES,
+        page(vec![]),
+        page(vec![case(NEW_CASE, CASE_NAME, "active")]),
+    )
+    .await;
+    mount_post(&harness, CASES, created_case()).await;
+    let trace = harness.root.path().join("trace");
+    // The argument helpers take static text; a test may leak one path.
+    let trace: &'static str = Box::leak(trace.to_str().unwrap().to_owned().into_boxed_str());
+    let run = harness
+        .run(&case_create(&[
+            "--json",
+            "--yes",
+            "--verbose",
+            "--trace",
+            &trace,
+        ]))
+        .await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
+    harness.assert_no_canaries(&run);
+
+    let harness = signed_in().await;
+    mount_get(
+        &harness,
+        &format!("{CASES}/{CASE}"),
+        graph_fixture("case-get.json", &harness.graph.uri()),
+    )
+    .await;
+    mount_get_then(
+        &harness,
+        &searches_path(),
+        page(vec![]),
+        page(vec![search(NEW_SEARCH, "orders-api-mail")]),
+    )
+    .await;
+    mount_post(
+        &harness,
+        &searches_path(),
+        json_response(503, json!({"error": {"code": "ServiceUnavailable"}})),
+    )
+    .await;
+    let trace = harness.root.path().join("trace");
+    // The argument helpers take static text; a test may leak one path.
+    let trace: &'static str = Box::leak(trace.to_str().unwrap().to_owned().into_boxed_str());
+    let run = harness
+        .run(&search_create(&[
+            "--json",
+            "--yes",
+            "--verbose",
+            "--trace",
+            &trace,
+        ]))
+        .await;
+    assert_eq!(run.outcome.exit_code, 1);
+    assert_eq!(run.json()["error"]["code"], "WriteOutcomeUnknown");
+    assert!(std::fs::read_dir(harness.root.path().join("trace"))
+        .unwrap()
+        .next()
+        .is_some());
+    harness.assert_no_canaries(&run);
+}
+
+#[tokio::test]
+async fn reuse_works_with_dry_run_results_only_and_wrap_untrusted() {
+    let harness = signed_in().await;
+    mount_get(&harness, CASES, page(vec![case(CASE, CASE_NAME, "active")])).await;
+    let run = harness
+        .run(&case_create(&["--json", "--dry-run", "--reuse-existing"]))
+        .await;
+    assert_eq!(run.outcome.exit_code, 0);
+    assert_eq!(run.json()["results"]["reused"], true);
+    let run = harness
+        .run(&case_create(&[
+            "--json",
+            "--results-only",
+            "--reuse-existing",
+        ]))
+        .await;
+    assert_eq!(run.outcome.exit_code, 0);
+    assert_eq!(run.json()["reused"], true);
+    assert_eq!(run.json()["result"]["id"], CASE);
+    let run = harness
+        .run(&case_create(&[
+            "--json",
+            "--wrap-untrusted",
+            "--reuse-existing",
+        ]))
+        .await;
+    assert_eq!(run.outcome.exit_code, 0);
+    let document = run.json();
+    assert!(document["results"]["result"]["displayName"]
+        .as_str()
+        .unwrap()
+        .starts_with("[UNTRUSTED:"));
+    assert!(document.get("untrustedNotice").is_some());
+    assert!(writes(&harness).await.is_empty());
+}

@@ -892,6 +892,7 @@ async fn login_refuses_an_identity_other_than_the_account_asked_for() {
         "{message}"
     );
     assert!(message.contains("nothing was stored"), "{message}");
+    assert!(!message.contains(ALEX), "{message}");
     assert_eq!(harness.credentials(), [ALEX]);
     assert_eq!(harness.stored(ALEX).unwrap(), before);
     assert_eq!(harness.config(), config_before);
@@ -919,6 +920,11 @@ async fn an_account_that_matches_several_upns_is_refused() {
         assert_eq!(run.outcome.exit_code, 1, "{args:?}");
         assert!(
             run.stderr().contains("matches several signed-in accounts"),
+            "{args:?}: {}",
+            run.stderr()
+        );
+        assert!(
+            !run.stderr().contains("shared@"),
             "{args:?}: {}",
             run.stderr()
         );
@@ -3061,4 +3067,40 @@ async fn the_canary_sweep_finds_no_token_in_output_trace_or_config() {
     let mut values: Vec<&str> = CANARIES.to_vec();
     values.extend(["canary-sig-0001"]);
     harness.assert_absent(&run, &values);
+}
+
+#[tokio::test]
+async fn account_and_registration_errors_do_not_repeat_the_value() {
+    let harness = Harness::new().await;
+    sign_in_alex(&harness).await;
+    sign_in_sam_too(&harness).await;
+    let canary = "canary-7f3e";
+    let address = format!("{canary}@contoso.example");
+    let guid = "00000000-0000-4000-8000-000000000001";
+    let cases: [&[&str]; 6] = [
+        &["auth", "logout", "--account", &address],
+        &["auth", "refresh", "--account", &address],
+        &["case", "list", "--account", &address],
+        &["auth", "login", "--account", &address],
+        &["auth", "login", "--no-input", "--client-id", canary],
+        &[
+            "auth",
+            "login",
+            "--no-input",
+            "--client-id",
+            guid,
+            "--tenant-id",
+            canary,
+        ],
+    ];
+    for args in cases {
+        for json in [false, true] {
+            let mut full: Vec<&str> = if json { vec!["--json"] } else { vec![] };
+            full.extend_from_slice(args);
+            let run = harness.run(&full).await;
+            assert_eq!(run.outcome.exit_code, 1, "{full:?}");
+            let shown = format!("{}{}", run.stdout(), run.stderr());
+            assert!(!shown.contains(canary), "{full:?}: {shown}");
+        }
+    }
 }

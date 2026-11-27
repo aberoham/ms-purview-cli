@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Errors about `--account`, `--client-id` and `--tenant-id` no longer repeat the value given; they name the option instead.
+
 ## v0.1.0 - 2026-11-27
 
 - Add `purview auth login --browser` using the authorisation code flow with Proof Key for Code Exchange (PKCE) on a loopback redirect (`http://localhost:<port>/callback`), opening the system browser with none of the command's output streams attached.

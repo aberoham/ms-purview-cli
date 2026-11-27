@@ -301,7 +301,9 @@ check whether the other repository needs the same fix.
   navigation property names, replacing any list Graph sent inline, when
   the list reached its last page; otherwise the key is removed.
 - Diagnostics never repeat an argument value (`--select`, `<op>`, a case or
-  search name) or tenant text: a pasted value could be a secret.
+  search name, `--account`, `--client-id`, `--tenant-id`) or tenant text: a
+  pasted value could be a secret. A stored account's own address may be
+  named.
 - Every sink writes through the Redactor: stdout and stderr through `Env`,
   and later trace files and the download manifest. Never write to
   `std::io::stdout()` or `std::io::stderr()`, or use `println!` and

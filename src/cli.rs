@@ -1410,11 +1410,10 @@ async fn auth_login(
     if let Some(wanted) = &wanted {
         if !wanted.is(&record) {
             return Err(PurviewError::message(format!(
-                "the browser signed in as {}, but --account asked for {}; nothing was stored. \
-                 Sign in as {} in the browser, or leave --account out",
-                sanitize(&record.email),
-                sanitize(&wanted.requested),
-                sanitize(&wanted.requested)
+                "the browser signed in as {}, which is not the account --account names; \
+                 nothing was stored. Sign in as that account in the browser, or leave --account \
+                 out",
+                sanitize(&record.email)
             )));
         }
     }
@@ -1528,8 +1527,7 @@ fn matching_accounts<'a>(
     };
     if matches.len() > 1 {
         return Err(PurviewError::message(format!(
-            "{:?} matches several signed-in accounts ({}); pass the account's address",
-            sanitize(requested),
+            "--account matches several signed-in accounts ({}); pass the account's address",
             matches
                 .iter()
                 .map(|account| sanitize(&account.email))
@@ -1895,11 +1893,10 @@ fn saved_registration<'a>(
     };
     if let Some(account) = non_empty(account) {
         return lookup(account).ok_or_else(|| {
-            PurviewError::message(format!(
-                "no app registration is saved for {:?}; pass --client-id <application-client-id> \
-                 and --tenant-id <tenant-id>",
-                sanitize(account)
-            ))
+            PurviewError::message(
+                "no app registration is saved for the --account given; pass --client-id \
+                 <application-client-id> and --tenant-id <tenant-id>",
+            )
         });
     }
     if let Some(found) = non_empty(Some(&stored.default_account)).and_then(lookup) {
@@ -1943,10 +1940,9 @@ fn select_account(
     if let Some(requested) = non_empty(requested) {
         return match matching_accounts(accounts, requested)?.as_slice() {
             [only] => Ok((*only).clone()),
-            _ => Err(PurviewError::message(format!(
-                "no signed-in account matches {:?}; 'purview auth list' shows the accounts",
-                sanitize(requested)
-            ))),
+            _ => Err(PurviewError::message(
+                "no signed-in account matches --account; 'purview auth list' shows the accounts",
+            )),
         };
     }
     accounts

@@ -2517,6 +2517,34 @@ mod tests {
         }
     }
 
+    /// The error printer redacts a secret that JSON escaping would hide
+    /// from byte matching, in both forms. No argument error repeats a value
+    /// any more, so the printer is driven directly.
+    #[test]
+    fn the_error_printer_redacts_escaped_secrets_in_both_forms() {
+        let secret = "canary\"refresh\\0001";
+        for json in [true, false] {
+            let (mut env, captured) = Env::in_memory();
+            env.redactor.register(secret);
+            let error = PurviewError::message(format!("failed near {secret} here"));
+            let outcome = Printer::default().fail(&mut env, json, &error);
+            assert_eq!(outcome.exit_code, 1);
+            env.stdout.finish().unwrap();
+            env.stderr.finish().unwrap();
+            let stdout = captured.stdout.text();
+            let stderr = captured.stderr.text();
+            assert!(!stdout.contains("canary") && !stderr.contains("canary"));
+            if json {
+                let printed: Value = serde_json::from_str(&stdout).unwrap();
+                assert_eq!(Some(&printed), outcome.stdout_value.as_ref());
+                let message = printed["error"]["message"].as_str().unwrap();
+                assert!(message.contains("[redacted]"), "{message}");
+            } else {
+                assert!(stderr.contains("[redacted]"), "{stderr}");
+            }
+        }
+    }
+
     /// A stream that fails on write, on flush, or neither, and records what
     /// reached it.
     #[derive(Clone)]

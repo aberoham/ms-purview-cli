@@ -1898,6 +1898,7 @@ fn download_setup(env: &mut Env) -> Result<(crate::download::Limits, Option<Path
     let dir = configuration_dir(env)?;
     let stored = load_config(env, &dir)?;
     let limits = crate::download::Limits::from_config(&stored.extra)?;
+    // A missing object and `null` both mean unset, as in `download`.
     let defaults = match stored.extra.get("defaults") {
         None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::Object(defaults)) => Some(defaults),

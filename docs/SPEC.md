@@ -1444,6 +1444,9 @@ repository on purpose. Every command that writes a file prints its full path.
 }
 ```
 
+An object or value given as `null` means unset, as if it were missing; any other value of
+the wrong type is an error.
+
 Template variables:
 
 | Variable | Value |

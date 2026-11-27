@@ -134,7 +134,8 @@ impl Limits {
     /// as `64GiB`; an absent key keeps its default.
     pub fn from_config(extra: &BTreeMap<String, Value>) -> Result<Self> {
         let mut limits = Self::default();
-        let Some(download) = extra.get("download") else {
+        // A missing object and `null` both mean unset, as in `defaults`.
+        let Some(download) = extra.get("download").filter(|value| !value.is_null()) else {
             return Ok(limits);
         };
         let Some(object) = download.as_object() else {
@@ -979,6 +980,8 @@ mod tests {
         assert!(Limits::from_config(&extra).is_err());
         extra.insert("download".into(), serde_json::json!("1GiB"));
         assert!(Limits::from_config(&extra).is_err());
+        extra.insert("download".into(), Value::Null);
+        assert_eq!(Limits::from_config(&extra).unwrap(), Limits::default());
     }
 
     #[test]

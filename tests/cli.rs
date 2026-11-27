@@ -492,6 +492,11 @@ fn no_write_refuses_both_create_commands_before_sign_in() {
         "alex@contoso.example",
     ]);
     assert_eq!(refused_before_sign_in(&args), "WriteRefused");
+    // Before the guard, too.
+    let mut args = vec!["--no-write"];
+    args.extend_from_slice(SEARCH_CREATE);
+    args.extend_from_slice(&["--term", "retention"]);
+    assert_eq!(refused_before_sign_in(&args), "WriteRefused");
 }
 
 #[test]
@@ -586,6 +591,9 @@ fn create_argument_errors_need_no_network() {
         assert!(!text.contains(canary), "{args:?}: {text}");
         let value: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value["error"]["code"], "CommandFailed", "{args:?}: {text}");
+        // Refused as an argument, not by the sign-in that would follow.
+        let message = value["error"]["message"].as_str().unwrap_or_default();
+        assert!(!message.contains("auth login"), "{args:?}: {text}");
     }
 }
 

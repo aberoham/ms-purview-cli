@@ -748,3 +748,81 @@ async fn an_unclear_outcome_with_nothing_listed_says_so() {
     );
     assert_eq!(writes(&harness).await.len(), 1);
 }
+
+#[tokio::test]
+async fn an_answer_without_an_id_or_with_another_scope_is_a_warning() {
+    let harness = ready_for_search(json_response(
+        201,
+        json!({
+            "displayName": "orders-api-mail",
+            "contentQuery": QUERY,
+            "dataSourceScopes": "allTenantMailboxes,allTenantSites",
+        }),
+    ))
+    .await;
+    let run = harness.run(&search_create(&["--json", "--yes"])).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
+    let stderr = run.stderr();
+    assert!(
+        stderr.contains("has a dataSourceScopes that differs from the one sent"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("no valid search id"), "{stderr}");
+    assert!(!stderr.contains("contentQuery"), "{stderr}");
+}
+
+#[tokio::test]
+async fn a_case_answer_without_an_id_is_a_warning() {
+    let harness = signed_in().await;
+    mount_get(&harness, CASES, page(vec![])).await;
+    mount_post(
+        &harness,
+        CASES,
+        json_response(201, json!({"displayName": CASE_NAME, "status": "active"})),
+    )
+    .await;
+    let run = harness.run(&case_create(&["--json", "--yes"])).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
+    assert!(
+        run.stderr().contains("no valid case id"),
+        "{}",
+        run.stderr()
+    );
+}
+
+/// A list whose paging link repeats stops before its last page; the name
+/// check cannot rely on it, so nothing is sent.
+#[tokio::test]
+async fn a_list_whose_paging_repeats_refuses_both_creates() {
+    let harness = signed_in().await;
+    let again = format!("{}{CASES}", harness.graph.uri());
+    mount_get(
+        &harness,
+        CASES,
+        json!({"value": [], "@odata.nextLink": again}),
+    )
+    .await;
+    mount_post(&harness, CASES, created_case()).await;
+    let run = harness.run(&case_create(&["--json", "--yes"])).await;
+    assert_eq!(run.outcome.exit_code, 1, "{}", run.stdout());
+    assert!(writes(&harness).await.is_empty());
+
+    let harness = signed_in().await;
+    mount_get(
+        &harness,
+        &format!("{CASES}/{CASE}"),
+        graph_fixture("case-get.json", &harness.graph.uri()),
+    )
+    .await;
+    let again = format!("{}{}", harness.graph.uri(), searches_path());
+    mount_get(
+        &harness,
+        &searches_path(),
+        json!({"value": [], "@odata.nextLink": again}),
+    )
+    .await;
+    mount_post(&harness, &searches_path(), created_search(QUERY)).await;
+    let run = harness.run(&search_create(&["--json", "--yes"])).await;
+    assert_eq!(run.outcome.exit_code, 1, "{}", run.stdout());
+    assert!(writes(&harness).await.is_empty());
+}

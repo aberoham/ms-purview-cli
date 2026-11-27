@@ -57,6 +57,7 @@ error.
 |---|---|
 | `case create` | A new case, visible to eDiscovery administrators. No custodians, data sources or holds. |
 | `search create` | A search over every tenant mailbox in an active case. Nothing runs until an estimate, report or export is started. No custodians, data sources or holds. |
+| `estimate` | Runs a search over every tenant mailbox, adding an estimate operation and its report file to the case. Reads no item content and places no hold. |
 
 ### `case create`
 
@@ -99,12 +100,58 @@ error.
   error. Check the search with `purview search get` before running an
   action on it.
 
+### Actions on a search: `estimate`
+
+Every action runs these checks before its plan, on whatever search it is
+given, whoever created it:
+
+- The search is named by id, or by an exact name that only one search in
+  the case has, and is read by its id.
+- Its `dataSourceScopes` must be exactly `allTenantMailboxes`. Absent, the
+  action is refused with `ScopeUnverified`; any other value with
+  `ScopeNotAllowed`. There is no override.
+- Its custodian, non-custodial and additional source lists must each be
+  empty, read to the last page. An entry refuses with `SearchHasSources`;
+  a list that cannot be read refuses with `ScopeUnverified`.
+- Its current query goes through the guard below. A query outside the
+  grammar is always refused; one that is not narrowed is refused unless
+  `--allow-generic` gives a `--reason`, which the plan shows. An estimate
+  has no description to record it in.
+- An estimate of the case that is `notStarted` or `running` may be a
+  duplicate: the operation list does not say which search an operation
+  runs. The plan names each one, and the estimate is refused with
+  `ConcurrentOperation` unless `--allow-concurrent` is given; `--yes` alone
+  is not enough. A dry run shows the plan either way.
+
+After approval the estimate is sent once. Its 202 answer must name the new
+operation in the `Location` header, on the Graph origin and for the case
+posted to; anything else stops the command with `UnexpectedLocation`,
+and the estimate may still be running (`purview operation list <case>
+--action estimate` shows it). The command then waits for the operation,
+downloads its report zip and reads it:
+
+- `collection` is `complete` when no location failed, `incomplete` when
+  `Locations-*.csv` has a `Status=Failed` row or `Statistics-*.csv` a
+  `StatType=Error` row, and `unchecked` when the zip was not read
+  (`--no-download`, or a file missing).
+- An estimate can succeed while locations failed (Observed); the command
+  warns, and `--strict` makes it exit 4 (`FailedLocations`, or
+  `EvidenceMissing` when the collection is unchecked).
+- At the wait deadline it exits 5, and on Ctrl-C 130, with the commands
+  that resume: `operation get --wait`, then `download`.
+
+`purview operation get <case> <op> --check` runs the same collection
+check on an existing operation, downloading its evidence file into the
+data directory; a later `download` reuses that file.
+
 ### Unclear outcomes
 
 If the POST gets no answer, times out, or gets HTTP 429 or a 5xx, it is not
-sent again. `case create` lists the cases with the planned name, and
-`search create` the case's searches with the planned name, and the command
-fails with `WriteOutcomeUnknown`, naming each by id. Entries on pages read
+sent again. `case create` lists the cases with the planned name,
+`search create` the case's searches with the planned name, and `estimate`
+the estimates of the case created since just before the request by the
+signed-in account (or with no creator recorded), and the command fails
+with `WriteOutcomeUnknown`, naming each by id. Entries on pages read
 before a page failed are still shown, with a note that the list stopped
 early. Names are not unique,
 so a match is only a candidate: check it with `purview case get` or

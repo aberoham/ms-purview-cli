@@ -454,6 +454,26 @@ An operation can report `succeeded` while some locations failed (Observed). The 
 warns about this on stderr, and `--strict` turns it into exit 4 (see the collection check
 above).
 
+Settled in PR 2.3:
+- Further flags: `--allow-generic --reason`, `--allow-concurrent`, `--no-wait`,
+  `--wait-timeout`, `--poll-interval` and `--out`. `--strict` and `--out` conflict with
+  `--no-download` and `--no-wait`; the timing flags conflict with `--no-wait`.
+- A plan whose concurrency check (section 6.7) found an estimate not yet finished is
+  `blocked`: a dry run prints it with a warning per operation, and any other run fails with
+  `ConcurrentOperation` before anyone is asked, unless `--allow-concurrent` is given.
+- `result` is `{"operationId", "operationStatus", "collection", "indexedItemCount",
+  "indexedItemsSize", "unindexedItemCount", "mailboxCount", "locationsSearched",
+  "topLocations", "failedLocations", "files"}`: the 10 locations with most hits (at least
+  one), each failed location with `sources` (`locations`, `statistics` or both), and each
+  file with its path, size, SHA-256 and download status. `--no-wait` gives `operationId`,
+  `collection: unchecked` and `resume`, the commands that carry on.
+- A finished estimate that did not succeed, a file that cannot be downloaded, or `--strict`
+  with `FailedLocations` or `EvidenceMissing`, exits 4 with the write envelope and an
+  `outcome`, whole even under `--results-only`. The wait deadline and Ctrl-C, during the
+  wait or the download, give the operation-wait shapes of section 3.3.
+- The reason of `--allow-generic` is in the plan's warnings only; the download manifest
+  does not record it yet.
+
 #### `purview report <case> <search>` (write: action)
 
 Further flags: `--name NAME`, `--no-teams-context`, `--no-download`, `--strict`, `--profile`.
@@ -533,6 +553,12 @@ not apply here: a wrong id fails at once.
 status is not `succeeded` exits 4, with or without `--wait`. `--wait-timeout` takes whole
 seconds or a duration such as `90s`, `15m`, `2h` or `1h30m`, from 1 second to 24 hours;
 `--wait-timeout` and `--poll-interval` need `--wait`.
+
+Settled in PR 2.3: `--check` downloads every file of an estimate or item report through the
+same code as `download`, into the data directory, and reads the first that is a report zip;
+for an export it downloads only the file whose name starts with `Reports-` (Assumption).
+An operation that is not finished is `unchecked`, with a notice. `--check` changes no exit
+code by itself.
 
 #### `purview download <case> <op>` (read)
 
@@ -1052,10 +1078,23 @@ if PR 4.1 finds it.
   prototype's Python reader needed one raised.
 - Headers are indexed by name. A missing column is a named warning, not a failure.
 
+Settled in PR 2.3: the ratio is checked once an entry has given 1 MiB, so that a small,
+very repetitive file is not refused; the entry cap is `limits.report_zip_entries`; a zip
+that is not a zip, has too many entries or a name that leaves its folder, or passes a
+limit, is `HostileZip`, whose message never names an entry. The column names, read by
+name, are those of the notes: `Locations-*.csv` `DataSourceName`, `DataSourceType`,
+`Location`, `LocationId`, `LocationType`, `LocationSubType`, `Count`, `Size`, `Status`,
+`ErrorWarning`, `Query`; `Statistics-*.csv` `DataSourceName`, `DataSourceType`, `Location`,
+`LocationType`, `LocationSubType`, `StatType`, `StatName`, `OriginalStatName`, `Value`
+(Observed). The collection check is `unchecked` when the file it reads, or its `Location`,
+`Status` or `StatType` column, is missing.
+
 **Summary and Settings.** These are parsed as before:
 
 - `Summary-*.csv` has no header. It is key, value, description rows, with blank lines
-  between groups (Observed). Item-report summaries add a help link, `Export Name`, an item
+  between groups (Observed). It is read whole, up to `limits.csv_max_record_bytes`, and
+  split at blank lines outside quoted fields (settled in PR 2.3: the `csv` crate skips blank
+  lines and its line numbers do not show them). Item-report summaries add a help link, `Export Name`, an item
   count table, an "Informational" table and a "Consumption summary" (Observed). The parser
   returns groups and a map of known keys.
 - `StartTime (UTC)` uses the format `03/14/2026 9:07:41 AM` (an invented example; format Observed). It is parsed with

@@ -519,6 +519,9 @@ pub type PathHook = Arc<dyn Fn(&Path) + Send + Sync>;
 pub struct DownloadFaults {
     /// Called with the final path just before a file is published.
     pub before_publish: Option<PathHook>,
+    /// Called with the final path when a file has been fetched, before its
+    /// zip check.
+    pub before_zip_check: Option<PathHook>,
     /// Makes every manifest write after a publication fail.
     pub manifest_write: bool,
     /// Makes publishing by hard link fail as on a file system without
@@ -531,6 +534,7 @@ impl std::fmt::Debug for DownloadFaults {
         formatter
             .debug_struct("DownloadFaults")
             .field("before_publish", &self.before_publish.is_some())
+            .field("before_zip_check", &self.before_zip_check.is_some())
             .field("manifest_write", &self.manifest_write)
             .field("no_hard_links", &self.no_hard_links)
             .finish()
@@ -588,6 +592,7 @@ pub async fn stage(
     placement: &Placement<'_>,
     limits: Limits,
     interrupted: &mut Interrupted<'_>,
+    faults: &DownloadFaults,
     log: &mut (dyn Write + Send),
 ) -> Result<Option<Staged>> {
     let target = placement.dir.join(placement.name);
@@ -616,6 +621,9 @@ pub async fn stage(
             return Err(error);
         }
     };
+    if let Some(hook) = &faults.before_zip_check {
+        hook(&target);
+    }
     // The zip check reads the file just written, through the handle that
     // wrote it, not a fresh open of its name. The guard goes with it, and
     // the handle is closed before the guard can remove the file.
@@ -631,6 +639,18 @@ pub async fn stage(
     .map_err(|_| PurviewError::message("the zip check stopped unexpectedly"))?;
     let (guard, checked) = checked;
     checked?;
+    // A Ctrl-C during the sync or the zip check ends the run here, before
+    // anything is published or recorded. The listener stays ready once
+    // fired, so this one check sees it.
+    let interrupted_now = tokio::select! {
+        biased;
+        () = interrupted.as_mut() => true,
+        () = std::future::ready(()) => false,
+    };
+    if interrupted_now {
+        drop(guard);
+        return Ok(None);
+    }
     Ok(Some(Staged {
         part: guard,
         target,

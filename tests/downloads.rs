@@ -1426,3 +1426,34 @@ async fn an_expired_download_token_is_refreshed_and_no_token_leaks_into_trace_or
     );
     setup.harness.assert_no_canaries(&run);
 }
+
+#[tokio::test]
+async fn ctrl_c_during_the_zip_check_publishes_nothing() {
+    let setup = Setup::new().await;
+    let first = zip_bytes("kept\n");
+    setup.serve(first.clone()).await;
+    setup
+        .operation("succeeded", json!([file(NAME, 0, &setup.file_url())]))
+        .await;
+    assert_eq!(
+        setup.run(&["download", CASE, OP]).await.outcome.exit_code,
+        0
+    );
+    setup.alpha.reset().await;
+    setup.serve(zip_bytes("replacement\n")).await;
+    let interrupt = Arc::new(ms_purview_cli::env::ManualInterrupt::default());
+    let fired = interrupt.clone();
+    let run = setup
+        .run_with(&["--json", "download", CASE, OP, "--overwrite"], |env| {
+            env.interrupt = interrupt.clone();
+            env.download_faults.before_zip_check = Some(Arc::new(move |_: &Path| fired.fire()));
+        })
+        .await;
+    assert_eq!(run.outcome.exit_code, 130, "{}", run.stdout());
+    assert_eq!(std::fs::read(setup.target_dir().join(NAME)).unwrap(), first);
+    assert_eq!(entries(&setup.target_dir()), [NAME, "manifest.json"]);
+    assert_eq!(
+        manifest(&setup.target_dir())["files"][0]["sha256"],
+        sha256(&first)
+    );
+}

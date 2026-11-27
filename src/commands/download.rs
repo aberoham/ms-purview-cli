@@ -258,6 +258,7 @@ pub async fn run(
             &placement,
             context.limits,
             &mut interrupted,
+            &context.faults,
             &mut session.env.stderr,
         )
         .await

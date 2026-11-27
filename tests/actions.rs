@@ -1162,6 +1162,15 @@ async fn a_source_list_whose_paging_leaves_it_is_unverified() {
         .with_priority(1)
         .mount(&setup.harness.graph)
         .await;
+    // The other collection answers, empty: only the binding refuses it.
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "{CASES}/{CASE}/searches/00000000-0000-4000-8000-000000000052/custodianSources"
+        )))
+        .respond_with(json_response(200, json!({"value": []})))
+        .mount(&setup.harness.graph)
+        .await;
+    setup.accept(&setup.key_form_location()).await;
     setup
         .preflight(
             fixture_value(&setup.harness, "search-get-mailboxes.json"),

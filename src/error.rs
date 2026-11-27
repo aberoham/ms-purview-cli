@@ -168,6 +168,20 @@ pub enum PurviewError {
     )]
     CredentialLockBusy { path: String, seconds: u64 },
 
+    /// A query the guard's parser does not accept (`docs/SPEC.md` section
+    /// 6.3). `column` counts characters from 1. `reason` names the
+    /// construct, and quotes the query's text only when it is one of the
+    /// grammar's fixed symbols, never a word the user or the tenant wrote.
+    /// No override accepts it.
+    #[error("the query is not understood at column {column}: {reason}")]
+    KqlNotUnderstood { column: usize, reason: String },
+
+    /// A query that the guard does not find narrowed: some branch that can
+    /// match a message has neither a specific term nor a `participants:`
+    /// restriction on a full address.
+    #[error("{0}")]
+    GenericQuery(String),
+
     #[error("could not {action} the credential lock file {path}: {source}")]
     CredentialLockFailed {
         action: &'static str,
@@ -304,6 +318,8 @@ impl PurviewError {
             Self::TargetAppeared { .. } => ("TargetAppeared", 0),
             Self::PublishUnsupported { .. } => ("PublishUnsupported", 0),
             Self::ManifestWriteFailed { .. } => ("ManifestWriteFailed", 0),
+            Self::KqlNotUnderstood { .. } => ("KqlNotUnderstood", 0),
+            Self::GenericQuery(_) => ("GenericQuery", 0),
             Self::Message(_)
             | Self::GraphUnreachable { .. }
             | Self::Io(_)

@@ -230,6 +230,16 @@ Builds the Keyword Query Language (KQL) string, parses it with the guard's parse
 query is narrowed, exit 1 with `GenericQuery` or `KqlNotUnderstood` otherwise. `kql` takes no
 override flag: it reports what the guard would decide.
 
+Output (settled in PR 1.6). The table has the columns `COLUMN`, `FIELD`, `VALUE`, `NEGATED`,
+`CLASS` and `RULE`, between a `kql:` line and a `verdict:` line; `--plain` prints the rows
+only. JSON `results` is `{"kql", "narrowed", "unnarrowedAt"?, "leaves": [{"column", "field",
+"value", "quoted", "negated", "class", "rule", "reason", "tokens"?}]}`. A query that is not
+narrowed prints the same report, then fails: in a table the report is on stdout and
+`Error: …` on stderr; under `--json` one document holds `{"analysis": …, "error": …}`,
+whatever `--results-only` says, as exit 3 does for a plan. The error names the column of a
+branch that is not narrowed. `KqlNotUnderstood` has no report. `kql` reads `config.json`
+for `guard` only after the query flags are checked, and never signs in.
+
 Query flags (shared with `search create`):
 
 | Flag | KQL |
@@ -1445,7 +1455,8 @@ repository on purpose. Every command that writes a file prints its full path.
 ```
 
 An object or value given as `null` means unset, as if it were missing; any other value of
-the wrong type is an error.
+the wrong type is an error. `guard.specific_terms` and `guard.generic_terms` are lists of
+non-blank strings.
 
 Template variables:
 
@@ -1567,7 +1578,18 @@ date       = YYYY-MM-DD
   implicit operator is easy to misread.
 - Refused outright: prefix `+` or `-`, `NEAR`, `ONEAR`, `property:(…)`, ranges `..`,
   properties not listed above, `=`, `<`, `>`, wildcards inside a word, and `*` in an address.
-- Property names are case-insensitive. Values keep their case.
+- Property names are case-insensitive. Values keep their case. `kind:` values are compared
+  ignoring case.
+- An address that fails the address check below is refused as a value (`KqlNotUnderstood`),
+  for every address property, so every `participants:` leaf that parses is a full address.
+- Parentheses and `NOT` nest at most 64 deep, so that a hostile query cannot exhaust the
+  stack.
+- A refusal gives the column (characters from 1) and names the construct. It quotes the
+  query only when the construct is ASCII punctuation, never a word, property name or value,
+  following the rule that diagnostics do not repeat argument values or tenant text.
+- The builder refuses a `"` or `*` in `--term`, a `--participant` or `--exclude-from` value
+  that fails the address check, and `--since` later than `--until`, naming the flag and the
+  value's position but not the value.
 - The query builder emits only this subset. Its output goes through the same parser, so the
   flags and `--kql` get the same verdicts; a test runs both forms over one table of cases.
 
@@ -1602,6 +1624,7 @@ First match wins:
 `docs/safety.md` reproduces it; a test asserts the two are identical). These are common words
 that rule 6 would otherwise call specific, in trimmed lower-case form:
 
+<!-- built-in-generic-list:start -->
 ```text
 e-mail e-mails e-commerce e-learning e-signature e.g i.e etc a.m p.m n/a w/c and/or 24/7
 sign-in sign-ins sign-on sign-up sign-out log-in log-on log-off opt-in opt-out
@@ -1612,6 +1635,7 @@ month-end end-of-year end-of-month day-to-day one-to-one 1-to-1 face-to-face rea
 long-term short-term high-level low-level top-level cross-team re-send re-sent re-run
 re-open pre-sales post-sales covid-19 wi-fi
 ```
+<!-- built-in-generic-list:end -->
 
 Changing the list needs a test change and a CHANGELOG entry.
 

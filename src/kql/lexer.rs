@@ -1,0 +1,625 @@
+//! The lexer for the guard's subset of the Keyword Query Language (KQL),
+//! `docs/SPEC.md` section 6.3.
+//!
+//! A restriction (`participants:…`, `subject:…`, `kind:…`, `sent>=…`) is
+//! lexed as one token, value included, because the value's form depends on
+//! the property: an address may hold characters, such as `+` and `'`, that a
+//! word may not. Everything outside the grammar is refused here or in the
+//! parser, with the column of the construct.
+//!
+//! Error reasons name the construct. They quote the query's text only when
+//! it is one of the grammar's fixed symbols, never a word, a value or a
+//! property name, which the user or a tenant user wrote.
+
+use chrono::NaiveDate;
+
+use super::classify::is_full_address;
+
+/// A token and the column of its first character, counted in characters
+/// from 1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Token {
+    pub column: usize,
+    pub kind: TokenKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenKind {
+    LeftParen,
+    RightParen,
+    And,
+    Or,
+    Not,
+    /// A quoted phrase, without its quotes.
+    Phrase(String),
+    /// An unquoted word, with its trailing `*` if it has one.
+    Word(String),
+    Restriction(Restriction),
+}
+
+/// A property restriction, with its value checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Restriction {
+    Address {
+        property: AddressProperty,
+        address: String,
+    },
+    Subject {
+        value: String,
+        quoted: bool,
+    },
+    Kind(KindValue),
+    Sent {
+        comparison: Comparison,
+        date: NaiveDate,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressProperty {
+    Participants,
+    From,
+    To,
+    Cc,
+    Bcc,
+}
+
+impl AddressProperty {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Participants => "participants",
+            Self::From => "from",
+            Self::To => "to",
+            Self::Cc => "cc",
+            Self::Bcc => "bcc",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KindValue {
+    Email,
+    MicrosoftTeams,
+}
+
+impl KindValue {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Email => "email",
+            Self::MicrosoftTeams => "microsoftteams",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Comparison {
+    AtLeast,
+    AtMost,
+}
+
+impl Comparison {
+    pub fn symbol(self) -> &'static str {
+        match self {
+            Self::AtLeast => ">=",
+            Self::AtMost => "<=",
+        }
+    }
+}
+
+/// Why the query was refused, and where.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KqlError {
+    pub column: usize,
+    pub reason: String,
+}
+
+impl KqlError {
+    pub fn new(column: usize, reason: impl Into<String>) -> Self {
+        Self {
+            column,
+            reason: reason.into(),
+        }
+    }
+}
+
+/// The characters a word may hold after its first, which must be a letter
+/// or a digit.
+fn is_word_char(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '-' | '_' | '.' | '/' | '@')
+}
+
+/// Where a value or a word ends: whitespace, a parenthesis or the end.
+fn is_delimiter(character: Option<char>) -> bool {
+    match character {
+        None => true,
+        Some(character) => character.is_whitespace() || character == '(' || character == ')',
+    }
+}
+
+/// The words KQL could read as operators, compared ignoring case.
+const OPERATOR_WORDS: &[&str] = &["and", "or", "not", "near", "onear"];
+
+struct Lexer {
+    chars: Vec<char>,
+    position: usize,
+}
+
+impl Lexer {
+    fn peek(&self) -> Option<char> {
+        self.chars.get(self.position).copied()
+    }
+
+    fn peek_at(&self, offset: usize) -> Option<char> {
+        self.chars.get(self.position + offset).copied()
+    }
+
+    /// The 1-based column of the character at `position`.
+    fn column_of(position: usize) -> usize {
+        position + 1
+    }
+
+    fn column(&self) -> usize {
+        Self::column_of(self.position)
+    }
+
+    fn take_while(&mut self, keep: impl Fn(char) -> bool) -> String {
+        let start = self.position;
+        while self.peek().is_some_and(&keep) {
+            self.position += 1;
+        }
+        self.chars[start..self.position].iter().collect()
+    }
+
+    fn next_token(&mut self) -> Result<Option<Token>, KqlError> {
+        while self.peek().is_some_and(char::is_whitespace) {
+            self.position += 1;
+        }
+        let Some(character) = self.peek() else {
+            return Ok(None);
+        };
+        let column = self.column();
+        let kind = match character {
+            '(' => {
+                self.position += 1;
+                TokenKind::LeftParen
+            }
+            ')' => {
+                self.position += 1;
+                TokenKind::RightParen
+            }
+            '"' => TokenKind::Phrase(self.phrase()?),
+            '+' | '-' => {
+                return Err(KqlError::new(
+                    column,
+                    format!("a prefix {character} is not supported; use NOT to exclude"),
+                ))
+            }
+            character if character.is_alphanumeric() => self.word_or_restriction()?,
+            '*' => return Err(KqlError::new(column, "a * must follow a word")),
+            character if is_symbol(character) => {
+                return Err(KqlError::new(
+                    column,
+                    format!("the character {character} is not supported here"),
+                ))
+            }
+            _ => {
+                return Err(KqlError::new(
+                    column,
+                    "a character that is not supported here; quote the text as a phrase",
+                ))
+            }
+        };
+        Ok(Some(Token { column, kind }))
+    }
+
+    /// A quoted phrase: non-empty, with no wildcard and no control
+    /// character. The opening quote is at `self.position`.
+    fn phrase(&mut self) -> Result<String, KqlError> {
+        let open = self.column();
+        self.position += 1;
+        let start = self.position;
+        loop {
+            match self.peek() {
+                None => {
+                    return Err(KqlError::new(
+                        open,
+                        "unbalanced quotes: this \" has no closing \"",
+                    ))
+                }
+                Some('"') => break,
+                Some('*') => {
+                    return Err(KqlError::new(
+                        self.column(),
+                        "a * inside a quoted phrase is not supported",
+                    ))
+                }
+                Some(character) if character.is_control() => {
+                    return Err(KqlError::new(
+                        self.column(),
+                        "a control character inside a quoted phrase is not supported",
+                    ))
+                }
+                Some(_) => self.position += 1,
+            }
+        }
+        let text: String = self.chars[start..self.position].iter().collect();
+        self.position += 1;
+        if text.trim().is_empty() {
+            return Err(KqlError::new(open, "an empty quoted phrase"));
+        }
+        Ok(text)
+    }
+
+    /// A word, an operator, or a property restriction with its value.
+    fn word_or_restriction(&mut self) -> Result<TokenKind, KqlError> {
+        let start = self.position;
+        let column = self.column();
+        let word = self.take_while(is_word_char);
+        match self.peek() {
+            Some(':') => return self.restriction(&word, column, ':'),
+            Some('>' | '<' | '=') => {
+                let symbol = self.peek().unwrap_or_default();
+                return self.restriction(&word, column, symbol);
+            }
+            _ => {}
+        }
+        let mut text = word.clone();
+        if self.peek() == Some('*') {
+            self.position += 1;
+            text.push('*');
+            if !is_delimiter(self.peek()) && self.peek() != Some('"') {
+                return Err(KqlError::new(
+                    Self::column_of(start),
+                    "a wildcard is supported only once, at the end of a word",
+                ));
+            }
+        }
+        if word.contains("..") {
+            return Err(KqlError::new(column, "a range (..) is not supported"));
+        }
+        if OPERATOR_WORDS.contains(&word.to_lowercase().as_str()) {
+            return match (word.as_str(), text.len() == word.len()) {
+                ("AND", true) => Ok(TokenKind::And),
+                ("OR", true) => Ok(TokenKind::Or),
+                ("NOT", true) => Ok(TokenKind::Not),
+                _ if word.eq_ignore_ascii_case("near") || word.eq_ignore_ascii_case("onear") => {
+                    Err(KqlError::new(
+                        column,
+                        "NEAR and ONEAR are not supported, in any case; quote the word to \
+                         search for it",
+                    ))
+                }
+                _ => Err(KqlError::new(
+                    column,
+                    "an operator word that is not upper case; write AND, OR or NOT, or quote \
+                     the word to search for it",
+                )),
+            };
+        }
+        match self.peek() {
+            None => {}
+            Some(character) if character.is_whitespace() || matches!(character, '(' | ')') => {}
+            // A phrase right after a word is juxtaposition, which the
+            // parser refuses with its own reason.
+            Some('"') => {}
+            Some(character) if is_symbol(character) => {
+                return Err(KqlError::new(
+                    self.column(),
+                    format!("the character {character} is not supported in a word; quote it"),
+                ))
+            }
+            Some(_) => {
+                return Err(KqlError::new(
+                    self.column(),
+                    "a character that is not supported in a word; quote the text as a phrase",
+                ))
+            }
+        }
+        Ok(TokenKind::Word(text))
+    }
+
+    /// A restriction: `property` has been read, and `symbol` (`:`, `>`,
+    /// `<` or `=`) is at `self.position`.
+    fn restriction(
+        &mut self,
+        property: &str,
+        column: usize,
+        symbol: char,
+    ) -> Result<TokenKind, KqlError> {
+        let name = property.to_lowercase();
+        let address_property = match name.as_str() {
+            "participants" => Some(AddressProperty::Participants),
+            "from" => Some(AddressProperty::From),
+            "to" => Some(AddressProperty::To),
+            "cc" => Some(AddressProperty::Cc),
+            "bcc" => Some(AddressProperty::Bcc),
+            _ => None,
+        };
+        let known = address_property.is_some() || matches!(name.as_str(), "subject" | "kind");
+        if !known && name != "sent" {
+            return Err(KqlError::new(
+                column,
+                "a property this tool does not support; the supported properties are \
+                 participants, from, to, cc, bcc, subject, kind and sent",
+            ));
+        }
+        if name == "sent" {
+            let comparison = match (symbol, self.peek_at(1)) {
+                ('>', Some('=')) => Comparison::AtLeast,
+                ('<', Some('=')) => Comparison::AtMost,
+                _ => {
+                    return Err(KqlError::new(
+                        column,
+                        "sent takes only >= or <= and a date in the form YYYY-MM-DD",
+                    ))
+                }
+            };
+            self.position += 2;
+            let value_column = self.column();
+            let value = self.take_while(|character| !is_delimiter(Some(character)));
+            let date = parse_date(&value)
+                .ok_or_else(|| KqlError::new(value_column, "sent needs a date as YYYY-MM-DD"))?;
+            return Ok(TokenKind::Restriction(Restriction::Sent {
+                comparison,
+                date,
+            }));
+        }
+        if symbol != ':' {
+            return Err(KqlError::new(
+                column,
+                "this property takes :, not a comparison such as =, < or >",
+            ));
+        }
+        self.position += 1;
+        let value_column = self.column();
+        if self.peek() == Some('(') {
+            return Err(KqlError::new(
+                value_column,
+                "a property followed by ( is not supported; write each restriction on its own \
+                 and join them with OR",
+            ));
+        }
+        if is_delimiter(self.peek()) {
+            return Err(KqlError::new(value_column, "a property with no value"));
+        }
+        if let Some(property) = address_property {
+            if self.peek() == Some('"') {
+                return Err(KqlError::new(
+                    value_column,
+                    "a quoted address is not supported; write the address without quotes",
+                ));
+            }
+            let address = self.take_while(|character| !is_delimiter(Some(character)));
+            if address.contains('*') {
+                return Err(KqlError::new(
+                    value_column,
+                    "a * in an address is not supported",
+                ));
+            }
+            if !is_full_address(&address) {
+                return Err(KqlError::new(
+                    value_column,
+                    "not a full address: an address needs a local part, @ and a domain, such \
+                     as alex@contoso.example",
+                ));
+            }
+            return Ok(TokenKind::Restriction(Restriction::Address {
+                property,
+                address,
+            }));
+        }
+        if name == "kind" {
+            let value = self.take_while(|character| !is_delimiter(Some(character)));
+            let kind = match value.to_lowercase().as_str() {
+                "email" => KindValue::Email,
+                "microsoftteams" => KindValue::MicrosoftTeams,
+                _ => {
+                    return Err(KqlError::new(
+                        value_column,
+                        "kind takes only email or microsoftteams",
+                    ))
+                }
+            };
+            return Ok(TokenKind::Restriction(Restriction::Kind(kind)));
+        }
+        // subject: a phrase or a word.
+        match self.next_token()? {
+            Some(Token {
+                kind: TokenKind::Phrase(value),
+                ..
+            }) => Ok(TokenKind::Restriction(Restriction::Subject {
+                value,
+                quoted: true,
+            })),
+            Some(Token {
+                kind: TokenKind::Word(value),
+                ..
+            }) => Ok(TokenKind::Restriction(Restriction::Subject {
+                value,
+                quoted: false,
+            })),
+            _ => Err(KqlError::new(
+                value_column,
+                "subject takes a word or a quoted phrase",
+            )),
+        }
+    }
+}
+
+/// ASCII punctuation that error messages may quote: it is one of the
+/// grammar's fixed symbols, or a single character that cannot be a secret.
+fn is_symbol(character: char) -> bool {
+    character.is_ascii_punctuation()
+}
+
+/// A date written exactly as YYYY-MM-DD.
+pub fn parse_date(text: &str) -> Option<NaiveDate> {
+    let bytes = text.as_bytes();
+    let shape = bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit());
+    if !shape {
+        return None;
+    }
+    NaiveDate::parse_from_str(text, "%Y-%m-%d").ok()
+}
+
+/// Every token of `query`, or the first construct the grammar refuses.
+pub fn tokens(query: &str) -> Result<Vec<Token>, KqlError> {
+    let mut lexer = Lexer {
+        chars: query.chars().collect(),
+        position: 0,
+    };
+    let mut tokens = Vec::new();
+    while let Some(token) = lexer.next_token()? {
+        tokens.push(token);
+    }
+    Ok(tokens)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kinds(query: &str) -> Vec<TokenKind> {
+        tokens(query)
+            .unwrap()
+            .into_iter()
+            .map(|token| token.kind)
+            .collect()
+    }
+
+    fn refused(query: &str) -> KqlError {
+        tokens(query).expect_err(query)
+    }
+
+    #[test]
+    fn words_phrases_operators_and_parentheses() {
+        assert_eq!(
+            kinds(r#"("orders-api" OR svc2*) AND NOT e.g"#),
+            [
+                TokenKind::LeftParen,
+                TokenKind::Phrase("orders-api".into()),
+                TokenKind::Or,
+                TokenKind::Word("svc2*".into()),
+                TokenKind::RightParen,
+                TokenKind::And,
+                TokenKind::Not,
+                TokenKind::Word("e.g".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn restrictions_carry_their_checked_values() {
+        assert_eq!(
+            kinds(
+                "Participants:alex+x@contoso.example from:o'neil@fabrikam.example kind:Email \
+                 SENT>=2025-01-31 sent<=2025-12-01 subject:\"stock report\" subject:retention"
+            ),
+            [
+                TokenKind::Restriction(Restriction::Address {
+                    property: AddressProperty::Participants,
+                    address: "alex+x@contoso.example".into()
+                }),
+                TokenKind::Restriction(Restriction::Address {
+                    property: AddressProperty::From,
+                    address: "o'neil@fabrikam.example".into()
+                }),
+                TokenKind::Restriction(Restriction::Kind(KindValue::Email)),
+                TokenKind::Restriction(Restriction::Sent {
+                    comparison: Comparison::AtLeast,
+                    date: NaiveDate::from_ymd_opt(2025, 1, 31).unwrap()
+                }),
+                TokenKind::Restriction(Restriction::Sent {
+                    comparison: Comparison::AtMost,
+                    date: NaiveDate::from_ymd_opt(2025, 12, 1).unwrap()
+                }),
+                TokenKind::Restriction(Restriction::Subject {
+                    value: "stock report".into(),
+                    quoted: true
+                }),
+                TokenKind::Restriction(Restriction::Subject {
+                    value: "retention".into(),
+                    quoted: false
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn columns_count_characters_from_one() {
+        let tokens = tokens("é AND \"x y\"").unwrap();
+        let columns: Vec<usize> = tokens.iter().map(|token| token.column).collect();
+        assert_eq!(columns, [1, 3, 7]);
+    }
+
+    #[test]
+    fn refused_constructs_name_their_column() {
+        for (query, column) in [
+            ("-orders", 1),
+            ("+orders", 1),
+            ("a NEAR b", 3),
+            ("a near b", 3),
+            ("ONEAR", 1),
+            ("a and b", 3),
+            ("a Or b", 3),
+            ("not a", 1),
+            ("NOT*", 1),
+            ("body:\"stock report\"", 1),
+            ("participants:(a@contoso.example)", 14),
+            ("subject:(retention)", 9),
+            ("participants:*@contoso.example", 14),
+            ("participants:alex@contoso.*", 14),
+            ("participants:contoso.example", 14),
+            ("participants:@contoso.example", 14),
+            ("participants:\"alex@contoso.example\"", 14),
+            ("participants:", 14),
+            ("ord*ers", 1),
+            ("orders**", 1),
+            ("*orders", 1),
+            ("\"orders*\"", 8),
+            ("\"orders", 1),
+            ("\"\"", 1),
+            ("\"  \"", 1),
+            ("sent>2025-01-01", 1),
+            ("sent:2025-01-01", 1),
+            ("sent>=2025-1-1", 7),
+            ("sent>=2025-02-30", 7),
+            ("sent>=2025-01-01..2025-02-01", 7),
+            ("size=10", 1),
+            ("subject=x", 1),
+            ("1..5", 1),
+            ("kind:sms", 6),
+            ("a=b", 1),
+            ("café!", 5),
+            ("orders~", 7),
+            ("“orders”", 1),
+            ("subject:", 9),
+        ] {
+            let error = refused(query);
+            assert_eq!(error.column, column, "{query}: {error:?}");
+        }
+    }
+
+    #[test]
+    fn reasons_never_quote_a_word_or_a_value() {
+        for query in [
+            "secretword:x",
+            "a near b",
+            "participants:hunter2",
+            "kind:hunter2",
+            "subject:(hunter2)",
+            "hunter2§",
+        ] {
+            let error = refused(query);
+            for word in ["secretword", "hunter2", "near"] {
+                assert!(!error.reason.contains(word), "{query}: {}", error.reason);
+            }
+        }
+    }
+}

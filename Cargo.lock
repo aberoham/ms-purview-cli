@@ -1048,6 +1048,7 @@ dependencies = [
  "getrandom 0.4.3",
  "keyring",
  "predicates",
+ "regex",
  "reqwest",
  "security-framework 3.7.0",
  "serde",

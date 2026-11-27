@@ -124,10 +124,9 @@ pub fn validate_client_id(value: &str) -> Result<String> {
     Uuid::parse_str(value.trim())
         .map(|id| id.to_string())
         .map_err(|_| {
-            PurviewError::message(format!(
-                "invalid client id {:?}: it must be the application (client) id, a GUID",
-                sanitize(value)
-            ))
+            PurviewError::message(
+                "invalid client id: it must be the application (client) id, a GUID",
+            )
         })
 }
 
@@ -137,10 +136,7 @@ pub fn validate_tenant_id(value: &str) -> Result<String> {
     Uuid::parse_str(value.trim())
         .map(|id| id.to_string())
         .map_err(|_| {
-            PurviewError::message(format!(
-                "invalid tenant id {:?}: it must be the directory (tenant) id, a GUID",
-                sanitize(value)
-            ))
+            PurviewError::message("invalid tenant id: it must be the directory (tenant) id, a GUID")
         })
 }
 

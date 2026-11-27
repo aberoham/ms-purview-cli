@@ -357,7 +357,9 @@ fn a_malformed_client_id_is_refused_before_no_input_or_network() {
         .assert()
         .code(1)
         .stdout(predicate::str::is_empty())
-        .stderr(predicate::str::starts_with("Error: invalid client id"));
+        .stderr(predicate::str::starts_with(
+            "Error: --client-id: invalid client id",
+        ));
 }
 
 #[test]

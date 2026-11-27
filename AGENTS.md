@@ -301,7 +301,12 @@ check whether the other repository needs the same fix.
   navigation property names, replacing any list Graph sent inline, when
   the list reached its last page; otherwise the key is removed.
 - Diagnostics never repeat an argument value (`--select`, `<op>`, a case or
-  search name) or tenant text: a pasted value could be a secret.
+  search name, `--account`, a `--client-id` or `--tenant-id` that is not a
+  GUID, or the `PURVIEW_*` variable behind any of them) or tenant text: a
+  pasted value could be a secret. They name the flag or variable instead. A
+  stored account's own address, and an app registration that has passed the
+  GUID check, may be shown; the sign-in notice prints the registration on
+  purpose.
 - Every sink writes through the Redactor: stdout and stderr through `Env`,
   and later trace files and the download manifest. Never write to
   `std::io::stdout()` or `std::io::stderr()`, or use `println!` and

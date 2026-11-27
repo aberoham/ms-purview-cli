@@ -226,10 +226,9 @@ pub fn account_file_path(config_dir: &Path, email: &str) -> Result<PathBuf> {
             .chars()
             .any(|character| character.is_control() || UNSAFE.contains(character));
     if !safe {
-        return Err(PurviewError::message(format!(
-            "account name {:?} cannot be used as a file name",
-            sanitize(email)
-        )));
+        return Err(PurviewError::message(
+            "the account name cannot be used as a file name",
+        ));
     }
     Ok(accounts_dir(&normalise(config_dir)).join(format!("{lowered}.json")))
 }
@@ -1016,7 +1015,11 @@ mod tests {
             ".hidden",
             "x\ny",
         ] {
-            assert!(account_file_path(dir.path(), name).is_err(), "{name:?}");
+            let error = account_file_path(dir.path(), name).unwrap_err().to_string();
+            assert!(
+                name.is_empty() || !error.contains(name),
+                "{name:?}: {error}"
+            );
         }
         assert!(account_file_path(dir.path(), "o'brien+x@contoso.example").is_ok());
     }

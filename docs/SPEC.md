@@ -536,6 +536,12 @@ Settled in PR 2.4:
   "teamsContext", "estimateId", "locationsWithHits", "failedLocations", "files"}`;
   `locationsWithHits` is the number of Locations rows. `--no-wait` gives `operationId`,
   `collection: unchecked`, `displayName`, `teamsContext` and `resume`.
+- A stopped report (`--no-wait`, the wait deadline, Ctrl-C) resumes with `operation get
+  <case> <op> --wait --check`, never `download`: until the wait ends, the operation the
+  `Location` header named is not known to be an item report, and an export's other files are
+  item content.
+- `collection` and `failedLocations` come from `Locations-*.csv` alone; a Statistics file in
+  a report zip is not read for them.
 - Reconciliation lists operations shown as `exportResult` or `exportReport` created since
   just before the request, and reads each of the first 10 for its true action.
 
@@ -2010,17 +2016,21 @@ the export can be several times larger.
 
 Settled in PR 2.4: `report` refuses a search whose latest estimate passes `max_export_size`
 unless `--allow-large --reason` is given (`TooLarge`; `export create` will do the same). The
-latest estimate is the search's `lastEstimateStatisticsOperation` (Docs; not yet observed).
-With no size to compare, it refuses too (`VolumeUnchecked`): an HTTP error on that read (by
-code and status only; 404 is read as "no estimate", an Assumption), an answer that is not an
+latest estimate is the search's `lastEstimateStatisticsOperation` (Observed: it answers 200
+with the estimate's fields and no `@odata.type`, so the record is read as an estimate by its
+`action`).
+With no size to compare, it refuses too (`VolumeUnchecked`): Graph's HTTP error on that read
+(by code and status only; 404 is read as "no estimate", an Assumption), an answer with no
+operation in it (204 or `null`), an answer that is not an
 `estimateStatistics` operation with estimate detail, one not finished or that did not
 succeed, a partial success within the limit (its size is a lower bound; above the limit it
 is `TooLarge`), an estimate created before the search's `lastModifiedDateTime` (it may count
-another query), either time missing, no readable id, or no `indexedItemsSize`. Whether
-running an estimate changes the search's `lastModifiedDateTime` is not known; if it does,
-this rule refuses every report and must change. `--allow-large --reason` overrides all of
-these, and the plan warns `VOLUME:`. A read that gets no answer from Graph is the command's
-error.
+another query), either time missing, no readable id, or no `indexedItemsSize`. Running an
+estimate does not change the search's `lastModifiedDateTime` (Observed). `--allow-large
+--reason` overrides all of these, and the plan warns `VOLUME:`. A read that gets no answer
+from Graph, or a token that cannot be refreshed, is the command's error, which no flag
+overrides. `report` reads only `volume.max_export_size`, so a bad estimate-only key does not
+stop it.
 
 ---
 

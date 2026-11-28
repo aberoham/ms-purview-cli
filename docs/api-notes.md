@@ -366,3 +366,21 @@ traces and the report zip stayed outside the repository.
   reported `collection: incomplete`. (Observed) This is the case `--strict` exists for.
 - **Counts:** the result's `mailboxCount` (locations with hits) was a few dozen, with a
   few hundred indexed items and no unindexed items. (Observed)
+
+### PR 2.4: `report`
+
+Status: **read part run on 28 November 2026** from a local build of the PR 2.4 branch, on
+the search that the PR 2.2 check created and the PR 2.3 check estimated. The report itself
+has not been sent yet. Outputs and traces stayed outside the repository.
+
+- **Latest estimate:** `GET …/searches/{id}/lastEstimateStatisticsOperation` answered
+  **200** with the search's estimate: `action: estimateStatistics`, `status`,
+  `createdDateTime`, `completedDateTime`, `createdBy`, `id`, `indexedItemCount`,
+  `indexedItemsSize`, `unindexedItemCount`, `unindexedItemsSize`, `mailboxCount`,
+  `siteCount`, `percentProgress`, `statisticsOptions` and `reportFileMetadata`, with an
+  `@odata.context` and **no `@odata.type`**, unlike a single operation `GET`. (Observed)
+  The tool reads the estimate detail of an untyped record by its `action`.
+- **Search after an estimate:** the search's `lastModifiedDateTime` still equalled its
+  `createdDateTime` a day after its estimate ran and finished, so running an estimate does
+  not change it. (Observed) The size limit's rule that an estimate older than the search's
+  last change does not count therefore holds.

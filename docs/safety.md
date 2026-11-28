@@ -173,17 +173,18 @@ then waits for the operation, downloads its report zip and reads it:
 
 `report` also compares the search's latest estimate with
 `volume.max_export_size` in `config.json` (default 10 GiB) before its
-plan, read from the search's `lastEstimateStatisticsOperation` (Docs; not
-yet observed). It refuses with `TooLarge` when the estimate's
+plan, read from the search's `lastEstimateStatisticsOperation` (Observed). It refuses with `TooLarge` when the estimate's
 `indexedItemsSize` is above the limit, and with `VolumeUnchecked` when no
-size can be compared: Graph has no estimate of the search, the latest one
+size can be compared: Graph has no estimate of the search or answers with
+no operation, the latest one
 is not finished or did not succeed, it only partly succeeded and its size
 is within the limit (a partial size is a lower bound), the search was
 changed after it ran, or a time or the size is missing. `--allow-large`
 with `--reason` overrides both, and the plan then warns `VOLUME:`; the
 reason goes into the report's `description` with any `--allow-generic`
 one, since one `--reason` serves both. `--allow-concurrent` does not cover
-the size. A dry run shows the plan either way. The latest estimate is read
+the size, and no flag covers a token that cannot be refreshed. Only
+`volume.max_export_size` is read for a report. A dry run shows the plan either way. The latest estimate is read
 again after approval and must be the one the plan showed
 (`SearchChanged`). The estimate undercounts what a report collects: one
 tenant's reports held about 10 to 37 rows per estimated item with Teams
@@ -195,6 +196,10 @@ A report asks for the messages around each Teams hit
 that body has not been observed, so the flag is experimental and the
 plan warns. Its zip has no Statistics file (Observed), so its
 `collection` comes from `Locations-*.csv` alone.
+
+A stopped report resumes with `operation get <case> <op> --wait --check`,
+never `download`, which would fetch an export's item content if the
+`Location` header had named one.
 
 `purview operation get <case> <op> --check` runs the same collection
 check on an existing operation, downloading its evidence file into the

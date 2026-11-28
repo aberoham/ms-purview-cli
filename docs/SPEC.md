@@ -807,14 +807,16 @@ Settled in the first `.msg` reader PR (PR 5.1 with the body selection of PR 5.2)
   directory.
 - A sender with no SMTP address keeps its Exchange address (Observed: two of 31 items). A
   recipient type has the `MAPI_SUBMITTED` flag of a resend masked off; a missing type is To.
-- Before conversion: the markers of downlevel-revealed conditionals are removed and their
-  content kept, hidden conditionals removed with their content, VML and Office rules removed
-  only when they set `behavior`, `<hr>` kept as `---`, a `colspan` or `rowspan` above 99 cut
-  to 99, and every URL's query and fragment removed, since `html2text` breaks a line longer
-  than its width and a broken query would escape the redaction after. Conversion uses
-  `html2text`'s raw mode, which gives each table cell its own line and draws no borders, so
-  a table is never wider or longer than its text. A converter that fails or panics gives
-  `bodyDecode` unless there is a plain-text body.
+- Before conversion: `<head>`, `<style>` and `<script>` are removed with their content,
+  VML and Office rules only when they set `behavior`, and `<hr>` is kept as `---`. Office's
+  conditional comments need nothing: a hidden one is one HTML comment, which the parser
+  drops, and a downlevel-revealed one's markers are comments around text that is kept.
+  Conversion uses `html2text`'s raw mode, which gives each table cell its own line, draws
+  no borders and ignores spans, so a table is never wider or longer than its text. The
+  width is 10,000 or more than the HTML's length, whichever is larger, so that no word is
+  broken across lines: the URL redaction that runs on the text afterwards then sees every
+  URL whole (Derived from `html2text` 0.17's source and tests). A converter that fails or
+  panics gives `bodyDecode` unless there is a plain-text body.
 - The container is refused as `cfbInvalid`, with a fixed `errorDetail`, when its header's
   FAT, DIFAT or mini FAT sector counts do not fit in the item, before `cfb` reads it; so is
   an item with a property stream that exists and cannot be read in full, and one whose
@@ -830,7 +832,9 @@ Settled in the first `.msg` reader PR (PR 5.1 with the body selection of PR 5.2)
 - The cross-check is `tests/scripts/msg-crosscheck.py`, run by hand. On the maintainer's
   one private export of 31 items it agreed with `extract-msg` 0.55.0 on subject, sent time,
   body and To for every item, on CC for the 18 with CC recipients, and on sender for the 29
-  with an SMTP sender (Observed). An empty field never counts as agreeing with a filled one.
+  with an SMTP sender (Observed). Recipients are compared as sets of address local parts. A
+  field empty in one reader never agrees with a filled one, and a field empty in both is
+  counted apart.
   The `msg-crosscheck` CI job waits for PR 5.3.
 
 #### `purview inventory cases` (read; phase 6)
@@ -1460,13 +1464,12 @@ from the `.msg`. `error` is one of `cfbInvalid`, `noBody`, `bodyDecode`, `entryT
 **Body selection.**
 1. `PidTagHtml`: a binary value is decoded with `PidTagInternetCodepage` through
    `encoding_rs` (default UTF-8); a string value is UTF-16LE. The text is then cleaned:
-   - remove `<head>`, `<style>`, `<script>` and Office conditional comments
-     (`<!--[if …]>…<![endif]-->`);
+   - remove `<head>`, `<style>` and `<script>`; Office conditional comments
+     (`<!--[if …]>…<![endif]-->`) are HTML comments, which the parser drops;
    - remove leftover style text matching `v\:* {behavior:…}`, as the VML (Vector Markup
      Language) text naive tag-stripping leaves behind (Observed). The similar `o\:*`,
      `w\:*` and `.shape` rules are removed too (Assumption: same origin);
-   - convert with `html2text` at a fixed very large width, so nothing wraps. The width is
-     chosen in PR 5.2 after checking how the pinned version treats width;
+   - convert with `html2text` at a width larger than the HTML, so nothing wraps;
    - set `bodySource: "html"`.
 2. Else `PidTagBody`, with `bodySource: "text"`.
 3. Else `PidTagRtfCompressed` only: `error: "noBody"`, `errorDetail: "compressed RTF only"`.

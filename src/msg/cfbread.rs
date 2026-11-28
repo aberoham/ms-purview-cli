@@ -108,9 +108,12 @@ impl<'a> Container<'a> {
 
 /// The checks made on the header (MS-CFB 2.2) before `cfb` reads the
 /// file: the signature, a sector size of 512 or 4,096 bytes, and counts of
-/// FAT, DIFAT and mini FAT sectors that fit in the file. `cfb` builds its
-/// allocation table from the sectors the header lists before checking
-/// them, so the counts bound what it can allocate to the size of the item.
+/// FAT, DIFAT and mini FAT sectors that fit in the file. This refuses a
+/// header that declares more sectors than the item holds; it does not
+/// bound every allocation `cfb` makes, because in its permissive mode
+/// `cfb` builds the FAT from the DIFAT entries it finds and compares their
+/// number with the declared count only in strict mode (Derived from its
+/// source).
 fn check_header(bytes: &[u8]) -> Result<(), MsgError> {
     const SIGNATURE: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
     let invalid = || MsgError::CfbInvalid(NOT_A_CONTAINER.into());
@@ -175,9 +178,16 @@ mod tests {
     fn bytes_that_are_not_a_container_are_cfb_invalid() {
         let error = Container::open(b"not a compound file").err().unwrap();
         assert_eq!(error.code(), "cfbInvalid");
-        // The diagnostic never quotes the item.
+        // The diagnostic never quotes the item: a header that passes
+        // `check_header` and that `cfb` refuses (version 0) gets the fixed
+        // text, not `cfb`'s message.
         let mut bytes = vec![b'Q'; 600];
-        bytes[..8].copy_from_slice(b"SECRETAB");
+        bytes[..8].copy_from_slice(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]);
+        bytes[0x1A..0x1C].copy_from_slice(&0_u16.to_le_bytes());
+        bytes[0x1E..0x20].copy_from_slice(&9_u16.to_le_bytes());
+        for at in [0x2C, 0x40, 0x48] {
+            bytes[at..at + 4].copy_from_slice(&0_u32.to_le_bytes());
+        }
         let error = Container::open(&bytes).err().unwrap();
         assert_eq!(error.detail(), NOT_A_CONTAINER);
     }

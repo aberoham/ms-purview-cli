@@ -8,10 +8,13 @@ use std::sync::LazyLock;
 use encoding_rs::Encoding;
 use regex::Regex;
 
-/// The width the HTML is converted at: wide enough that no line of mail is
-/// wrapped. `html2text` 0.17 lays text out to the width given and pads no
-/// line to it (`pad_block_width` is off), so a large width costs nothing
-/// for short lines (Derived from its source).
+/// The least width the HTML is converted at. The width used is also more
+/// than the HTML's length, so that no word, and so no URL, is ever broken
+/// across lines: the URL redaction that runs on the text afterwards then
+/// sees each URL whole. `html2text` 0.17 lays text out to the width given
+/// and pads no line to it (`pad_block_width` is off, and raw mode draws no
+/// table borders), so a large width costs nothing for short lines (Derived
+/// from its source).
 const TEXT_WIDTH: usize = 10_000;
 
 /// The HTML property as stored.
@@ -171,24 +174,15 @@ fn encoding_for(codepage: u32) -> Option<&'static Encoding> {
     Encoding::for_label(label.as_bytes())
 }
 
-/// The markers of Office's "downlevel-revealed" conditionals, whose content
-/// is shown by every reader and is kept: `<!--[if !mso]><!-->` and
-/// `<!--<![endif]-->`, and the bare `<![if …]>` and `<![endif]>`. They are
-/// removed first, so that the hidden conditionals below cannot reach past
-/// them.
-static REVEALED_MARKERS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)<!--\[if[^\]]*\]><!-->|<!--<!\[endif\]-->|<!\[(?:if[^\]]*|endif)\]>")
-        .expect("a valid pattern")
-});
-
-/// Elements and comments removed before conversion: `<head>`, `<style>`
-/// and `<script>` with their content, and Office's hidden conditional
-/// comments (`<!--[if …]>…<![endif]-->`).
+/// Elements removed with their content before conversion: `<head>`,
+/// `<style>` and `<script>`. Office's conditional comments need nothing:
+/// a hidden one (`<!--[if mso]>…<![endif]-->`) is one HTML comment, which
+/// the parser drops, and the markers of a downlevel-revealed one
+/// (`<!--[if !mso]><!-->`, `<![if …]>`) are comments around text that is
+/// kept.
 static REMOVED_HTML: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?is)<head\b.*?</head\s*>|<style\b.*?</style\s*>|<script\b.*?</script\s*>|<!--\[if.*?<!\[endif\]\s*-->",
-    )
-    .expect("a valid pattern")
+    Regex::new(r"(?is)<head\b.*?</head\s*>|<style\b.*?</style\s*>|<script\b.*?</script\s*>")
+        .expect("a valid pattern")
 });
 
 /// Style rules for VML and Office namespaces that naive tag stripping
@@ -203,30 +197,15 @@ static VML_STYLE: LazyLock<Regex> = LazyLock::new(|| {
 static HR: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)<hr\b[^>]*>").expect("a valid pattern"));
 
-/// A `colspan` or `rowspan` of more than two digits: `html2text` lays out
-/// a cell per spanned slot, so a huge span is memory, not text.
-static SPAN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)\b(colspan|rowspan)\s*=\s*["']?\s*\d{3,}["']?"#).expect("a valid pattern")
-});
-
-/// A URL's query or fragment. It is removed before conversion, because
-/// `html2text` breaks a line longer than its width, and a query broken
-/// across lines would escape the redaction that runs on the text after.
-static URL_QUERY: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(https?://[^\s"'<>?#]*)[?#][^\s"'<>]*"#).expect("a valid pattern")
-});
-
 /// The HTML as plain text: cleaned, converted with no decoration and no
 /// link footnotes, then with VML leftovers and trailing spaces removed.
 /// `None` when it cannot be converted, including a panic in the converter.
 pub fn html_to_text(html: &str) -> Option<String> {
-    let cleaned = REVEALED_MARKERS.replace_all(html, "");
-    let cleaned = REMOVED_HTML.replace_all(&cleaned, "");
+    let cleaned = REMOVED_HTML.replace_all(html, "");
     let cleaned = VML_STYLE.replace_all(&cleaned, "");
     let cleaned = HR.replace_all(&cleaned, "<p>---</p>");
-    let cleaned = SPAN.replace_all(&cleaned, "${1}=\"99\"");
-    let cleaned = URL_QUERY.replace_all(&cleaned, "${1}");
     let cleaned = cleaned.into_owned();
+    let width = TEXT_WIDTH.max(cleaned.len().saturating_add(1));
     let text = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // Raw mode lays a table out as one column with a line per cell, and
         // draws no borders, so a table is never wider or longer than its
@@ -234,7 +213,7 @@ pub fn html_to_text(html: &str) -> Option<String> {
         html2text::config::plain_no_decorate()
             .raw_mode(true)
             .allow_width_overflow()
-            .string_from_read(cleaned.as_bytes(), TEXT_WIDTH)
+            .string_from_read(cleaned.as_bytes(), width)
     }))
     .ok()?
     .ok()?;
@@ -290,11 +269,21 @@ mod tests {
     #[test]
     fn a_downlevel_revealed_conditional_keeps_its_text() {
         let html = "<p>before</p><!--[if !mso]><!--><p>visible to all</p><!--<![endif]-->\
+                    <!--[if !mso]><!-- --><p>spaced opener</p><!--<![endif]-->\
+                    <p>between</p><![if !vml]><p>bare marker</p><![endif]>\
                     <!--[if gte mso 9]><p>hidden</p><![endif]--><p>after</p>";
         let text = html_to_text(html).unwrap();
-        assert!(text.contains("visible to all"), "{text}");
+        for kept in [
+            "before",
+            "visible to all",
+            "spaced opener",
+            "between",
+            "bare marker",
+            "after",
+        ] {
+            assert!(text.contains(kept), "{kept}: {text}");
+        }
         assert!(!text.contains("hidden"), "{text}");
-        assert!(text.contains("before") && text.contains("after"), "{text}");
     }
 
     #[test]
@@ -311,18 +300,34 @@ mod tests {
     }
 
     #[test]
-    fn a_url_query_is_removed_before_conversion() {
+    fn a_url_longer_than_the_least_width_stays_on_one_line() {
+        // A URL broken across lines would escape the redaction that runs on
+        // the text afterwards.
         let url = format!("https://portal.contoso.example/a?{}", "q".repeat(20_000));
-        let text = html_to_text(&format!("<p>{url}</p>")).unwrap();
-        assert!(!text.contains("qqqq"), "{}", text.len());
-        assert!(text.contains("https://portal.contoso.example/a"), "{text}");
+        let text = html_to_text(&format!("<p>See {url} now</p>")).unwrap();
+        assert_eq!(text.lines().count(), 1, "{}", text.len());
+        assert!(text.contains(&url), "{}", text.len());
     }
 
     #[test]
-    fn huge_table_spans_are_capped() {
+    fn text_after_a_link_is_kept() {
+        let text =
+            html_to_text("<p>https://portal.contoso.example/a?x=1&nbsp;before&nbsp;Friday</p>")
+                .unwrap();
+        assert!(text.ends_with("before\u{a0}Friday"), "{text}");
+    }
+
+    #[test]
+    fn huge_table_spans_cost_nothing_in_raw_mode() {
         let html = "<table><tr><td colspan=\"4000000000\" rowspan=99999999>a</td></tr></table>";
         let text = html_to_text(html).unwrap();
-        assert!(text.contains('a'), "{text}");
+        assert_eq!(text, "a");
+    }
+
+    #[test]
+    fn span_attributes_written_as_text_are_kept() {
+        let text = html_to_text("<p>Explain colspan=120 in this note.</p>").unwrap();
+        assert_eq!(text, "Explain colspan=120 in this note.");
     }
 
     #[test]

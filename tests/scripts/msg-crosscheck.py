@@ -7,11 +7,13 @@
     uv run tests/scripts/msg-crosscheck.py <items.zip> <export-read.jsonl>
 
 Reads every .msg in the items zip with extract-msg, from memory, and compares
-subject, sender address, recipient addresses, sent time and body text with the
-records `purview export read` wrote for the same zip. Prints counts only, never
-a value, so it can run on a private export: items compared, agreements and
-differences per field, and items either reader could not read. Exits 1 when a
-field differs on any item both readers read.
+subject, sender address, To and CC addresses (local parts, as sets), sent time
+and body text with the records `purview export read` wrote for the same zip.
+A field empty in both readers is counted apart, not as agreeing. Prints counts
+only, never a value, so it can run on a private export: items compared,
+agreements and differences per field, and items either reader could not read.
+Exits 1 when a field differs on any item both readers read, or a record is
+missing.
 
 The shipped binary never needs this script or Python (AGENTS.md).
 """
@@ -25,6 +27,7 @@ import sys
 import zipfile
 from collections import Counter
 from datetime import UTC
+from email.utils import getaddresses
 
 import extract_msg
 
@@ -43,6 +46,16 @@ def html_text(raw):
 
 def address(mailbox):
     return (mailbox or {}).get("address") or ""
+
+
+def locals_in(listed):
+    """The local parts of the addresses in an extract-msg header string,
+    whose recipients are separated by `;`."""
+    return {
+        addr.split("@")[0].lower()
+        for _, addr in getaddresses((listed or "").split(";"))
+        if "@" in addr
+    }
 
 
 def main(argv):
@@ -87,25 +100,31 @@ def main(argv):
             except Exception:  # noqa: BLE001
                 counts["extract-msg could not read a field"] += 1
                 continue
-            checks = {
-                "subject": (record.get("subject") or "") == theirs["subject"],
-                "sent": (record.get("sent") or "") == theirs["sent"],
-            }
+            checks = {}
+            for field in ("subject", "sent"):
+                if (record.get(field) or "") or theirs[field]:
+                    checks[field] = (record.get(field) or "") == theirs[field]
+                else:
+                    counts[f"{field}: empty in both"] += 1
             ours_from = address(record.get("from")).lower()
-            if ours_from.startswith("/") and "@" not in theirs["from"]:
+            their_from = locals_in(theirs["from"])
+            if ours_from.startswith("/") and not their_from:
                 # No SMTP sender: the Exchange address against a display name.
                 counts["from: no SMTP address in either"] += 1
-            elif theirs["from"]:
-                checks["from"] = bool(ours_from) and ours_from in theirs["from"].lower()
+            elif ours_from or their_from:
+                checks["from"] = {ours_from.split("@")[0]} == their_from
+            else:
+                counts["from: empty in both"] += 1
             # A recipient can be shown under another of its addresses, so the
-            # local part is compared; an empty list never agrees with a
-            # non-empty one.
-            for field, listed in (("to", message.to or ""), ("cc", message.cc or "")):
-                ours_list = [address(m).split("@")[0].lower() for m in record.get(field) or []]
-                if listed.strip() or ours_list:
-                    checks[field] = bool(ours_list) and all(
-                        local and local in listed.lower() for local in ours_list
-                    ) and listed.count("@") in (0, len(ours_list))
+            # local parts are compared, as sets.
+            for field in ("to", "cc"):
+                ours_set = {address(m).split("@")[0].lower() for m in record.get(field) or []}
+                theirs_set = locals_in(theirs[field])
+                if not theirs_set and theirs[field].strip():
+                    # extract-msg shows display names only.
+                    counts[f"{field}: no SMTP addresses from extract-msg"] += 1
+                elif ours_set or theirs_set:
+                    checks[field] = ours_set == theirs_set
             if theirs["body"].strip():
                 ratio = difflib.SequenceMatcher(
                     None, words(record.get("body")), words(theirs["body"]), autojunk=False

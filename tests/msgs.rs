@@ -287,17 +287,30 @@ async fn json_gives_one_document_and_wrap_untrusted_marks_the_message() {
 #[tokio::test]
 async fn a_url_in_a_body_keeps_only_scheme_host_and_path() {
     let harness = Harness::new().await;
-    let html = "<p>See https://portal.contoso.example/orders?token=abc123secret now</p>";
-    let message = Message::note("Link").with(HTML, P::Binary(html.as_bytes().to_vec()));
+    // A plain query; one whose value is split from it by formatting; one
+    // longer than the least conversion width; and words after a link.
+    let long = "q".repeat(20_000);
+    let html = format!(
+        "<p>See https://portal.contoso.example/orders?token=abc123secret now</p>\
+         <p>https://portal.contoso.example/b?ref=<b>boldsecret</b> done</p>\
+         <p>https://portal.contoso.example/c?{long}</p>\
+         <p>https://portal.contoso.example/d?x=1&nbsp;before&nbsp;Friday</p>"
+    );
+    let message = Message::note("Link").with(HTML, P::Binary(html.into_bytes()));
     let path = write_zip(
         &harness,
         "Items.1.001.export.zip",
         items_zip(&[("Exchange/Items/a.msg", message.build())]),
     );
     let run = harness.run(&["export", "read", &path]).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
     let body = lines(&run)[0]["body"].as_str().unwrap().to_owned();
-    assert!(!body.contains("abc123secret"), "{body}");
+    for secret in ["abc123secret", "boldsecret", "qqqq"] {
+        assert!(!body.contains(secret), "{secret}: {body}");
+    }
     assert!(body.contains("portal.contoso.example/orders"), "{body}");
+    assert!(body.contains("now") && body.contains("done"), "{body}");
+    assert!(body.contains("before\u{a0}Friday"), "{body}");
 }
 
 #[tokio::test]

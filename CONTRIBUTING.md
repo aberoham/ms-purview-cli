@@ -17,6 +17,10 @@ This is a public repository. Keep every change free of real tenant or user data:
 - No `PATCH`, `PUT` or `DELETE` requests may be added to the crate. Every Purview write is restricted to the six allowed `POST` routes listed under "Write allow list" in [AGENTS.md](AGENTS.md). Adding a write requires a reviewed design, a change to the allow-list test and an update to the safety documentation, as that rule describes.
 - Label every claim about Microsoft Graph or Purview service behaviour in documentation and comments with its evidence level (`Observed`, `Docs`, `Derived` or `Assumption`), and record live tenant checks in [docs/api-notes.md](docs/api-notes.md).
 
+## Python
+
+The shipped `purview` binary is Rust only and never needs Python. Development may use Python: contributors are expected to have a modern Python environment with `uv`, and development scripts run through `uv run` with their dependencies pinned. No user-facing feature may depend on a Python script.
+
 ## Verification
 
 Run Cargo through rustup so `rust-toolchain.toml` selects Rust 1.100:

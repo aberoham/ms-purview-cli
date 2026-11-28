@@ -59,6 +59,7 @@ error.
 | `search create` | A search over every tenant mailbox in an active case. Nothing runs until an estimate, report or export is started. No custodians, data sources or holds. |
 | `estimate` | Runs a search over every tenant mailbox, adding an estimate operation and its report file to the case. Reads no item content and places no hold. |
 | `report` | Runs a search over every tenant mailbox, adding an item report operation and its zip to the case: one row of metadata (sender, recipients, subject, dates, location) per copy of each item found. Collects no message bodies or attachments and places no hold. |
+| `export create` | Runs a search over every tenant mailbox, adding an export operation to the case that collects a copy of every item found, with its body and attachments, as `.msg` files, and the item report beside them. The command downloads every part into the data directory. Changes no mailbox and places no hold. |
 
 ### `case create`
 
@@ -101,7 +102,7 @@ error.
   error. Check the search with `purview search get` before running an
   action on it.
 
-### Actions on a search: `estimate` and `report`
+### Actions on a search: `estimate`, `report` and `export create`
 
 Every action runs these checks before its plan, on whatever search it is
 given, whoever created it:
@@ -120,7 +121,7 @@ given, whoever created it:
   sends the reason as its `description`; an estimate has no description
   to record it in.
 - An estimate of the case (for `estimate`), or an item report or export
-  (for `report`), that is not known to be finished may be a
+  (for `report` and `export create`), that is not known to be finished may be a
   duplicate: the operation list does not say which search an operation
   runs, and an entry whose action or status cannot be read counts too. The plan names each one, and the action is refused with
   `ConcurrentOperation` unless `--allow-concurrent` is given; `--yes` alone
@@ -137,10 +138,11 @@ that someone else started while the prompt was open is refused as a
 possible duplicate. A change made after these reads is still possible. The action is then sent once.
 Its answer must be a 202 naming the new operation in the `Location`
 header, on the Graph origin and for the case posted to, and the operation
-must be of the action sent (an estimate, or an item report); anything
+must be of the action sent (an estimate, an item report or an export); anything
 else stops the command with `UnexpectedLocation` before any download, and
 the operation may still be running (`purview operation list <case>
---action estimate`, or `--action report --resolve`, shows it). The command
+--action estimate`, or `--action report --resolve` or `--action export
+--resolve`, shows it). The command
 then waits for the operation, downloads its report zip and reads it:
 
 - `collection` is `complete` when no location failed, `incomplete` when
@@ -168,9 +170,10 @@ then waits for the operation, downloads its report zip and reads it:
   times the estimated count (Observed, one run), so it can be several
   times larger than the estimate's size.
 - At the wait deadline it exits 5, and on Ctrl-C (during the wait or the
-  download) 130, with the commands that resume: `operation get --wait`,
-  then `download`. `--wait-timeout` covers the wait; the download has its
-  own timeouts.
+  download) 130, with the command that resumes: `operation get --wait
+  --check`, which fetches only the evidence file of the operation's own
+  action, never `download`. `--wait-timeout` covers the wait; the download
+  has its own timeouts.
 
 `report` also compares the search's latest estimate with
 `volume.max_export_size` in `config.json` (default 10 GiB) before its
@@ -202,6 +205,18 @@ A stopped report resumes with `operation get <case> <op> --wait --check`,
 never `download`, which would fetch an export's item content if the
 `Location` header had named one.
 
+`export create` runs every check of `report`, the size limit included,
+and posts `exportResult` with `exportFormat: msg` and `additionalOptions:
+teamsAndYammerConversations,includeReport` (Observed);
+`--no-teams-context` sends `includeReport` alone, which has not been
+observed. The plan warns that an export can hold several times the items
+the estimate counts (about four times in one run with Teams context on,
+Observed) and that the download is large and holds message content. The
+command downloads every part, into the data directory (mode 0700) unless
+`--out` is given, and reads only the `Reports-…zip` part's Locations file
+for `collection`; it never opens an `Items.*.zip` part and never prints
+item content. Remove the directory when the work is done.
+
 `purview operation get <case> <op> --check` runs the same collection
 check on an existing operation, downloading its evidence file into the
 data directory; a later `download` reuses that file.
@@ -212,7 +227,8 @@ If the POST gets no answer, times out, or gets HTTP 429 or a 5xx, it is not
 sent again. `case create` lists the cases with the planned name,
 `search create` the case's searches with the planned name, `estimate`
 the estimates of the case created since just before the request by the
-signed-in account (or with no creator recorded), and `report` the item
+signed-in account (or with no creator recorded), and `report` and
+`export create` the item
 reports and exports created the same way, each of the first 10 read on its
 own to tell a report from an export (the list shows both as
 `exportResult`), and the command fails

@@ -275,6 +275,7 @@ fn help_is_success_and_lists_exactly_the_shipped_commands() {
             "download",
             "estimate",
             "report",
+            "export",
             "kql",
             "parse",
             "version",

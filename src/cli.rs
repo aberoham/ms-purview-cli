@@ -283,6 +283,14 @@ Examples:
     )]
     Report(ReportArgs),
     #[command(
+        about = "Export a search's items as .msg files, with their item report",
+        after_help = "\
+Examples:
+  purview export create <case> <search> --dry-run
+  purview export create <case> <search> --yes --strict"
+    )]
+    Export(ExportArgs),
+    #[command(
         about = "Check a query against the guard against generic tenant-wide searches",
         long_about = "\
 Build a Keyword Query Language (KQL) query from the query flags, or take one \
@@ -1070,6 +1078,129 @@ minutes, then 60s after 10)"
 }
 
 #[derive(Debug, Clone, Args)]
+struct ExportArgs {
+    #[command(subcommand)]
+    command: ExportCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum ExportCommand {
+    #[command(
+        about = "Export a search's items as .msg files, with their item report",
+        long_about = "\
+Run an export of a search over every tenant mailbox: a copy of every item \
+found, with its message body and attachments, as .msg files in one or more \
+Items.*.zip parts, and the item report in a Reports-…zip part. The search \
+gets the same checks as for report: every tenant mailbox and nothing else, \
+no sources, a query that passes the guard (--allow-generic with --reason \
+overrides a query that is not narrowed), and a latest estimate within \
+volume.max_export_size in config.json (default 10GiB), else --allow-large \
+with --reason. An export holds more than the estimate counts, and its \
+download is large. Teams context is on; --no-teams-context, or \
+defaults.teams_context false, turns it off, and is experimental. An item \
+report or export of the case not yet finished may be a duplicate, and \
+needs --allow-concurrent.
+
+After approval, the export is polled to its end, then every part is \
+downloaded into the data directory (or --out) and the report part's \
+Locations file read: collection is complete when every location was \
+searched, incomplete when one failed, and unchecked when the report was \
+not read. Item content is never printed. --strict makes incomplete or \
+unchecked exit 4. A stopped export resumes with 'operation get --wait \
+--check', which fetches only the report part; 'download' then fetches the \
+items. This command changes Purview: it shows a plan and sends it only \
+when approved, by --yes or by answering y at a terminal.",
+        after_help = "\
+Examples:
+  purview export create <case> <search> --dry-run
+  purview export create <case> <search> --yes --strict
+  purview export create <case> <search> --yes --no-wait --json"
+    )]
+    Create(ExportCreateArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+#[command(group(clap::ArgGroup::new("overrides").multiple(true).args(["allow_generic", "allow_large"])))]
+struct ExportCreateArgs {
+    #[arg(value_name = "CASE", help = CASE_HELP)]
+    case: String,
+    #[arg(value_name = "SEARCH", help = SEARCH_HELP)]
+    search: String,
+    #[arg(
+        long,
+        value_name = "NAME",
+        help = "The export's name in Purview (default: naming.export_name in config.json)"
+    )]
+    name: Option<String>,
+    #[arg(
+        long,
+        help = "Leave out the messages around each Teams hit (experimental: not yet observed)"
+    )]
+    no_teams_context: bool,
+    #[arg(
+        long,
+        requires = "reason",
+        help = "Run even though the guard finds the search's query not narrowed; needs --reason"
+    )]
+    allow_generic: bool,
+    #[arg(
+        long,
+        requires = "reason",
+        help = "Run even though the latest estimate passes volume.max_export_size, or cannot be \
+compared with it; needs --reason"
+    )]
+    allow_large: bool,
+    #[arg(
+        long,
+        value_name = "TEXT",
+        requires = "overrides",
+        help = "Why the override is needed; shown in the plan and sent as the export's description"
+    )]
+    reason: Option<String>,
+    #[arg(
+        long,
+        help = "Run even though an item report or export of the case is not yet finished and may \
+be a duplicate"
+    )]
+    allow_concurrent: bool,
+    #[arg(
+        long,
+        help = "Submit the export and stop, printing the command that carries on"
+    )]
+    no_wait: bool,
+    #[arg(long, help = "Wait for the export, but download none of its files")]
+    no_download: bool,
+    #[arg(
+        long,
+        conflicts_with_all = ["no_download", "no_wait"],
+        help = "Exit 4 when a location failed or the export's report could not be checked"
+    )]
+    strict: bool,
+    #[arg(
+        long,
+        value_name = "DUR",
+        conflicts_with = "no_wait",
+        help = "How long to wait for the export, such as 30m or 2h (default 2h, at most 24h)"
+    )]
+    wait_timeout: Option<String>,
+    #[arg(
+        long,
+        value_name = "DUR",
+        conflicts_with = "no_wait",
+        help = "A fixed interval between reads, at least 5s (default: 10s, then 30s after 2 \
+minutes, then 60s after 10)"
+    )]
+    poll_interval: Option<String>,
+    #[arg(
+        long,
+        value_name = "DIR",
+        conflicts_with_all = ["no_download", "no_wait"],
+        help = "Write the export's files here instead of the data directory"
+    )]
+    out: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
 struct AuthLogin {
     #[arg(
         long,
@@ -1647,6 +1778,7 @@ async fn run(
             write_command(env, output, globals, &mut command).await
         }
         Command::Report(args) => {
+            let collect = commands::report::Collect::Report;
             let reason = args
                 .reason
                 .map(|reason| commands::sent_text("--reason", &reason))
@@ -1656,6 +1788,44 @@ async fn run(
                 .map(|name| commands::sent_text("--name", &name))
                 .transpose()?;
             let mut command = commands::report::Report::new(commands::report::ReportFlags {
+                collect,
+                case: CaseKey::parse(&args.case)?,
+                search: SearchKey::parse(&args.search)?,
+                name,
+                no_teams_context: args.no_teams_context,
+                allow_generic: args.allow_generic,
+                allow_large: args.allow_large,
+                reason,
+                allow_concurrent: args.allow_concurrent,
+                no_wait: args.no_wait,
+                no_download: args.no_download,
+                strict: args.strict,
+                timing: poll::timing(
+                    args.wait_timeout.as_deref(),
+                    args.poll_interval.as_deref(),
+                    poll::DEFAULT_WAIT_TIMEOUT,
+                )?,
+                out: args
+                    .out
+                    .map(|out| not_blank("--out", out).map(PathBuf::from))
+                    .transpose()?,
+            });
+            write_command(env, output, globals, &mut command).await
+        }
+        Command::Export(ExportArgs {
+            command: ExportCommand::Create(args),
+        }) => {
+            let collect = commands::report::Collect::Export;
+            let reason = args
+                .reason
+                .map(|reason| commands::sent_text("--reason", &reason))
+                .transpose()?;
+            let name = args
+                .name
+                .map(|name| commands::sent_text("--name", &name))
+                .transpose()?;
+            let mut command = commands::report::Report::new(commands::report::ReportFlags {
+                collect,
                 case: CaseKey::parse(&args.case)?,
                 search: SearchKey::parse(&args.search)?,
                 name,

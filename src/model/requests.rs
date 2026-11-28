@@ -98,10 +98,88 @@ impl Serialize for TeamsConversations {
     }
 }
 
+/// `POST …/searches/{search}/exportResult` (`docs/SPEC.md` section 7.5):
+/// every hit, from the locations with hits, as `.msg` files with the
+/// item report beside them.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportResultRequest<'a> {
+    pub display_name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<&'a str>,
+    pub export_criteria: SearchHits,
+    pub export_location: ResponsiveLocations,
+    pub additional_options: ExportOptions,
+    pub export_format: MsgFormat,
+}
+
+/// An export's `additionalOptions`: the report always, and the
+/// conversation around each Teams hit unless `--no-teams-context`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportOptions {
+    /// `teamsAndYammerConversations,includeReport` (Observed).
+    TeamsAndReport,
+    /// `includeReport`, not yet observed.
+    ReportOnly,
+}
+
+impl Serialize for ExportOptions {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(match self {
+            Self::TeamsAndReport => "teamsAndYammerConversations,includeReport",
+            Self::ReportOnly => "includeReport",
+        })
+    }
+}
+
+/// Serialises only as `"msg"`: the format `export read` reads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MsgFormat;
+
+impl Serialize for MsgFormat {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str("msg")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn an_export_body_is_the_observed_one_and_always_asks_for_the_report() {
+        let body = serde_json::to_value(ExportResultRequest {
+            display_name: "export 2026-03-14 0930Z",
+            description: None,
+            export_criteria: SearchHits,
+            export_location: ResponsiveLocations,
+            additional_options: ExportOptions::TeamsAndReport,
+            export_format: MsgFormat,
+        })
+        .unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "displayName": "export 2026-03-14 0930Z",
+                "exportCriteria": "searchHits",
+                "exportLocation": "responsiveLocations",
+                "additionalOptions": "teamsAndYammerConversations,includeReport",
+                "exportFormat": "msg",
+            })
+        );
+        let body = serde_json::to_value(ExportResultRequest {
+            display_name: "n",
+            description: Some("why"),
+            export_criteria: SearchHits,
+            export_location: ResponsiveLocations,
+            additional_options: ExportOptions::ReportOnly,
+            export_format: MsgFormat,
+        })
+        .unwrap();
+        assert_eq!(body["additionalOptions"], "includeReport");
+        assert_eq!(body["description"], "why");
+    }
 
     #[test]
     fn a_search_body_always_scopes_every_tenant_mailbox() {

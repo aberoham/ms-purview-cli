@@ -87,13 +87,15 @@ Existing tools leave gaps across the eDiscovery workflow (recorded in [docs/SPEC
 - `purview search create <case> --name NAME [query flags]` (`--description`, `--allow-generic --reason TEXT`): create a search over every tenant mailbox in an active case, after the query guard; a name in use in the case is refused with `SearchNameInUse`.
 - `purview estimate <case> <search>`: run a search's estimate after checking that it covers every tenant mailbox with no sources and that its query passes the guard, wait for it, download its report zip and report `collection` (`complete`, `incomplete` or `unchecked`) with the failed locations; `--strict` exits 4 when a location failed.
 - The write commands show a plan and send one POST only when approved by `--yes` or at an `Apply? [y/N]` prompt; `--dry-run` sends nothing, and `--no-write` refuses them before sign-in.
+- `purview report <case> <search>`: run a search's item report after the same checks and a size limit against its latest estimate, then download the zip and report `collection`.
+- `purview export create <case> <search>`: run a search's export as `.msg` files after the same checks and size limit, download every part into the data directory, and report `collection` from the report part; item content is never printed.
 - `purview operation get --check`, and `purview parse locations`, `parse failures` and `parse summary` on a downloaded estimate or report zip, with no sign-in.
 
 **Planned roadmap (not yet built, no dates):**
 
 - **v0.2:** the rest of the write commands (`report`, and `case close` if its live checks complete) with preflight checks and explicit approval, plus estimate report parsing (`parse locations`, `parse failures`, `parse summary`).
 - **v0.3:** item report parsing (`parse items`, `parse profile`).
-- **v0.4:** `export create` and `export index`.
+- **v0.4:** `export index`.
 - **v0.5:** reading message bodies from export zips (`export read`).
 - **v0.6:** read-only inventory of old cases and holds.
 

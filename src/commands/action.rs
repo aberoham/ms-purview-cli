@@ -326,11 +326,10 @@ pub struct ActionRun {
     pub evidence_of: EvidenceOf,
     /// The command that lists the operation, after the case id.
     pub list_hint: &'static str,
-    /// Whether a stopped run resumes with `operation get --check`, which
-    /// fetches only the evidence file, never `download`: the operation the
-    /// `Location` header names is not checked until the wait ends, and an
-    /// export's other files are item content.
-    pub check_only: bool,
+    /// The start of the one file name read as the evidence, for an export
+    /// whose other files are item content (`Reports-`); `None` reads each
+    /// file in turn until one holds the evidence.
+    pub evidence_file: Option<&'static str>,
     pub no_wait: bool,
     pub no_download: bool,
     pub timing: Timing,
@@ -365,14 +364,13 @@ pub struct Finished {
 }
 
 impl ActionRun {
-    /// How a stopped run resumes; `waiting` while the operation may still
-    /// run.
+    /// How a stopped run resumes, `waiting` while the operation may still
+    /// run: with `operation get --check`, which fetches only the evidence
+    /// file, never `download`. The operation the `Location` header names is
+    /// not checked until the wait ends, and an export's other files are
+    /// item content.
     fn resume_kind(&self, waiting: bool) -> Resume {
-        if self.check_only {
-            Resume::Check { wait: waiting }
-        } else {
-            Resume::WaitThenDownload
-        }
+        Resume::Check { wait: waiting }
     }
 
     fn hint(&self, case: CaseId) -> String {
@@ -535,7 +533,10 @@ impl ActionRun {
                     "sha256": done.sha256,
                     "status": done.status(),
                 }));
-                if evidence.is_none() {
+                let candidate = self
+                    .evidence_file
+                    .is_none_or(|start| done.server_name.starts_with(start));
+                if evidence.is_none() && candidate {
                     match ReportFiles::read_for(&done.path, limits, self.evidence_of) {
                         Ok(read) if read.has_evidence_for(self.evidence_of) => {
                             evidence = Some(read);
@@ -554,7 +555,10 @@ impl ActionRun {
                 }
             }
             if evidence.is_none() && evidence_note.is_none() {
-                evidence_note = Some("no downloaded file is a report zip".into());
+                evidence_note = Some(match self.evidence_file {
+                    Some(start) => format!("no downloaded file named {start}… is a report zip"),
+                    None => "no downloaded file is a report zip".into(),
+                });
             }
         }
         let collection = evidence.as_ref().map_or(Collection::Unchecked, |files| {
@@ -619,17 +623,7 @@ impl Finished {
     }
 }
 
-/// The commands that carry on from a submitted action, as the signed-in
-/// account.
-pub fn resume(after: &After<'_>, case: CaseId, operation: &OperationId) -> Vec<String> {
-    let account = super::operation::shell_word(&after.session.account.email);
-    vec![
-        format!("purview --account={account} operation get {case} {operation} --wait"),
-        format!("purview --account={account} download {case} {operation}"),
-    ]
-}
-
-/// The command that carries on from a submitted report, as the signed-in
+/// The command that carries on from a submitted action, as the signed-in
 /// account: the wait, then the collection check, which fetches only the
 /// evidence file whatever the operation turns out to be.
 pub fn resume_check(after: &After<'_>, case: CaseId, operation: &OperationId) -> Vec<String> {

@@ -133,7 +133,11 @@ def main(argv):
             # A recipient can be shown under another of its addresses, so the
             # local parts are compared, as sets.
             for field in ("to", "cc"):
-                ours_set = {address(m).split("@")[0].lower() for m in record.get(field) or []}
+                ours_set = {
+                    address(m).split("@")[0].lower()
+                    for m in record.get(field) or []
+                    if address(m)
+                }
                 theirs_set = locals_in(theirs[field])
                 if not theirs_set and theirs[field].strip():
                     # extract-msg shows display names only.

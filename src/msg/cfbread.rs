@@ -52,6 +52,10 @@ impl<'a> Container<'a> {
     /// it is absent. A stream that exists and cannot be read is `None` too,
     /// and marks the container unreadable.
     pub fn stream(&mut self, storage: &str, name: &str) -> Option<Vec<u8>> {
+        // The item already fails; reading more would only cost memory.
+        if self.unreadable {
+            return None;
+        }
         let path = path(storage, name);
         if !self.file.is_stream(&path) {
             return None;
@@ -79,6 +83,10 @@ impl<'a> Container<'a> {
     /// The length of the stream `name` inside `storage`, from the
     /// container's directory, without reading it.
     pub fn stream_len(&self, storage: &str, name: &str) -> Option<u64> {
+        // The item already fails; reading more would only cost memory.
+        if self.unreadable {
+            return None;
+        }
         let path = path(storage, name);
         if !self.file.is_stream(&path) {
             return None;

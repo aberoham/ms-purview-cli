@@ -357,6 +357,7 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("two"), "{text}");
+        assert!(!text.contains('─') && !text.contains('│'), "{text}");
     }
 
     #[test]

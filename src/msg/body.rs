@@ -247,6 +247,14 @@ mod tests {
     }
 
     #[test]
+    fn entity_encoded_vml_style_text_is_removed_after_conversion() {
+        // `v\:*` written with an entity only becomes the leftover once the
+        // HTML is decoded.
+        let text = html_to_text("<p>v&#92;:* {behavior:url(#default#VML);} Body text</p>");
+        assert_eq!(text, "Body text");
+    }
+
+    #[test]
     fn a_cp1252_html_body_decodes() {
         // "café – €5" in windows-1252.
         let bytes = b"<p>caf\xe9 \x96 \x805</p>".to_vec();
@@ -256,8 +264,19 @@ mod tests {
 
     #[test]
     fn a_rule_is_drawn_short() {
-        let text = html_to_text("<p>above</p><hr><p>below</p>");
-        assert!(text.lines().all(|line| line.chars().count() < 20), "{text}");
+        // A table's rules are as wide as its widest cell, which at this
+        // width is a whole paragraph.
+        let paragraph = "word ".repeat(400);
+        let text = html_to_text(&format!(
+            "<p>above</p><table><tr><td>{paragraph}</td></tr><tr><td>two</td></tr></table>\
+             <p>below</p>"
+        ));
+        assert!(
+            text.lines()
+                .filter(|line| !line.contains("word"))
+                .all(|line| line.chars().count() < 20),
+            "{text}"
+        );
         assert!(text.contains("above") && text.contains("below"), "{text}");
     }
 

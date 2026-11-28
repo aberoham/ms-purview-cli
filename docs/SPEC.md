@@ -529,8 +529,9 @@ Further flags: `--name NAME`, `--no-teams-context`, `--no-download`, `--strict`,
 Posts `exportReport` with `exportCriteria: searchHits`, `exportLocation: responsiveLocations`,
 `additionalOptions: teamsAndYammerConversations` and `displayName` from `naming.export_name`
 (the body used in the observed runs; Observed). With `--no-teams-context`, or
-`defaults.teams_context: false`, `additionalOptions` is left out. That body has not been
-observed: the flag is marked experimental in help until PR 2.5 observes it.
+`defaults.teams_context: false`, `additionalOptions` is left out. Graph accepted that body,
+the operation read back `additionalOptions: none`, and the report held one row per
+estimated item, with the Teams hits alone (Observed, PR 2.5).
 
 After polling, it downloads the zip (whose `size` is real; Observed) and reports
 `collection` by the report check above. With `--profile` it runs `parse profile` on the zip.
@@ -2078,8 +2079,9 @@ it.
 ### 6.6 Teams context and the row-count warning
 
 `additionalOptions: teamsAndYammerConversations` is on by default for `report` and
-`export create`. It collects the conversation around each Teams hit. Turning it off is
-experimental until observed (section 3.5). The plan always shows the setting.
+`export create`. It collects the conversation around each Teams hit. Turning it off was
+observed for `report` (PR 2.5) and stays experimental for `export create` until observed
+(section 3.5). The plan always shows the setting.
 
 The `report` plan warns that rows can far exceed the estimate. In one observed tenant:
 - a small report held about 10 rows per estimated item;
@@ -3012,6 +3014,8 @@ decompression) follow later.
 - Scope: live check only. Run `exportReport` with no `additionalOptions` and record the
   result. If it works, `--no-teams-context` leaves experimental status for `report`;
   otherwise the flag is removed from `report`.
+- Done on 28 November 2026: it worked, and the flag left experimental status for `report`
+  (`docs/api-notes.md`, PR 2.5).
 
 **PR 2.6: Observation: close and hold reads.**
 - Scope: live check only, on a case created by the tool.
@@ -3148,7 +3152,9 @@ that does not depend on whether the claim is true. The table says which:
    accepted is not tested, because the tool refuses them under a read-only session.
 4. Redirects on download. PR 1.5 saw none for an estimate report; export parts are not
    checked until PR 4.1.
-5. Reports and exports without Teams context (PR 2.5, PR 4.1).
+5. Exports without Teams context (PR 4.1). Observed for an item report (PR 2.5): Graph
+   accepted `exportReport` with no `additionalOptions`, and the report held one row per
+   estimated item.
 6. Case close and hold reads on a case with holds. Observed for a case with no holds or
    custodians (PR 2.6): each hold read answered 200 with an empty `value`,
    `@odata.count: 0` and no `@odata.nextLink`; `POST .../close` with `Content-Length: 0`

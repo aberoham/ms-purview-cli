@@ -222,9 +222,10 @@ context on (Observed), and the plan says so with the estimate's count.
 
 A report asks for the messages around each Teams hit
 (`additionalOptions: teamsAndYammerConversations`, Observed).
-`--no-teams-context`, or `defaults.teams_context: false`, leaves it out;
-that body has not been observed, so the flag is experimental and the
-plan warns. Its zip has no Statistics file (Observed), so its
+`--no-teams-context`, or `defaults.teams_context: false`, leaves it out,
+and Teams hits then come without the messages around them. Graph accepted
+that body, and the report held one row per estimated item (Observed,
+one run). Its zip has no Statistics file (Observed), so its
 `collection` comes from `Locations-*.csv` alone.
 
 A stopped report resumes with `operation get <case> <op> --wait --check`

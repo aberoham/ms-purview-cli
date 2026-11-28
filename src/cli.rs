@@ -264,9 +264,9 @@ no estimate, a failed one or one older than the search's last change is \
 refused: run estimate first, narrow the query, or pass --allow-large with \
 --reason. A report holds more than the estimate counts, often many rows \
 per estimated item. Teams context (the messages around each Teams hit) is \
-on; --no-teams-context, or defaults.teams_context false, turns it off, and \
-is experimental. An item report or export of the case not yet finished may \
-be a duplicate, and needs --allow-concurrent. The reasons of the overrides \
+on; --no-teams-context, or defaults.teams_context false, turns it off, so \
+that Teams hits come without the messages around them. An item report or \
+export of the case not yet finished may be a duplicate, and needs --allow-concurrent. The reasons of the overrides \
 go into the operation's description.
 
 After approval, the report is polled to its end, then its zip is \
@@ -1051,10 +1051,7 @@ struct ReportArgs {
         help = "The report's name in Purview (default: naming.export_name in config.json)"
     )]
     name: Option<String>,
-    #[arg(
-        long,
-        help = "Leave out the messages around each Teams hit (experimental: not yet observed)"
-    )]
+    #[arg(long, help = "Leave out the messages around each Teams hit")]
     no_teams_context: bool,
     #[arg(
         long,

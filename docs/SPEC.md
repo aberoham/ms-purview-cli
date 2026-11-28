@@ -824,8 +824,8 @@ estimate, `Items_N_*.csv` without an `Items.*.zip` sibling means an item report.
     `teamsThread`, `addressLists`, `none`, and `top`: `sender`, `items`, `addresses`),
     `senderDomains` (`distinct`, `top`), `teamsConversations` (`items`, `distinct`,
     `unnamed`, and `top` by `conversationName`), `histogram` (`bucket`, `undated`, and
-    `buckets` of `start` and `items`) and `options`. Lists are by count, most first, then by
-    name.
+    `buckets` of `start` and `items`, by start date) and `options`. The other lists are by
+    count, most first, then by name.
   - `--top` cuts the sender, domain and conversation lists. It defaults to `defaults.top`,
     else 20, and zero is refused; `defaults.top` is read only when `--top` is absent.
   - `--bucket` defaults to `month`. A week is an ISO 8601 week from Monday, in UTC. A bucket

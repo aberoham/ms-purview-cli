@@ -678,3 +678,50 @@ async fn a_long_name_is_cut_in_the_table_and_kept_whole_in_json() {
         name.as_str()
     );
 }
+
+#[tokio::test]
+async fn top_cuts_the_conversation_list_and_keeps_its_distinct_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let teams = |imm: &str, conversation: &str| {
+        row(
+            "",
+            imm,
+            "IPM.SkypeTeams.Message",
+            "2026-07-07 09:00:00Z",
+            "bea@contoso.example",
+            conversation,
+            1,
+        )
+    };
+    let zip = zip_of(
+        dir.path(),
+        &[(
+            "Items_1_2026-08-02.csv",
+            format!(
+                "{HEADER}\n{}{}{}",
+                teams("IMM1", "Billing chat"),
+                teams("IMM2", "Orders chat"),
+                teams("IMM3", "Orders chat")
+            ),
+        )],
+    );
+    let run = run(
+        dir.path(),
+        &[
+            "--json",
+            "parse",
+            "profile",
+            zip.to_str().unwrap(),
+            "--top",
+            "1",
+        ],
+    )
+    .await;
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    let teams = &run.profile()["teamsConversations"];
+    assert_eq!(teams["distinct"], 2);
+    assert_eq!(
+        pairs(&teams["top"], "conversationName"),
+        owned(&[("Orders chat", 2)])
+    );
+}

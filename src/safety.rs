@@ -391,7 +391,7 @@ pub(crate) async fn decide(
         Some(text) => write!(
             prompt,
             "Type the case name to apply ({}): ",
-            sanitize(&redactor.redact(text))
+            sanitize(&crate::redact::shown(text, redactor))
         )?,
         None => write!(prompt, "Apply? [y/N] ")?,
     }

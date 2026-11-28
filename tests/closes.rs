@@ -437,3 +437,131 @@ async fn wait_flags_need_wait() {
     assert_eq!(run.json()["error"]["code"], "CommandFailed");
     assert!(graph_requests(&harness).await.is_empty());
 }
+
+#[tokio::test]
+async fn a_hold_list_paging_link_to_another_case_is_refused() {
+    let harness = signed_in().await;
+    mount_case(&harness, &[case("active", MARKED)]).await;
+    let other = format!(
+        "{}{CASES}/00000000-0000-4000-8000-000000000032/legalHolds",
+        harness.graph.uri()
+    );
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "{CASES}/00000000-0000-4000-8000-000000000032/legalHolds"
+        )))
+        .respond_with(json_response(200, page(vec![])))
+        .mount(&harness.graph)
+        .await;
+    mount_holds(
+        &harness,
+        &[("legalHolds", json!({"value": [], "@odata.nextLink": other}))],
+    )
+    .await;
+    mount_close(&harness, ResponseTemplate::new(204)).await;
+    let run = harness.run(&close(&["--json", "--yes"])).await;
+    assert_eq!(run.outcome.exit_code, 1, "{}", run.stdout());
+    assert_eq!(run.json()["error"]["code"], "ClosePrecheckFailed");
+    assert!(writes(&harness).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_marker_removed_while_the_person_answers_stops_the_close() {
+    let harness = signed_in().await;
+    mount_case(
+        &harness,
+        &[
+            case("active", MARKED),
+            case("active", "Edited in the portal"),
+        ],
+    )
+    .await;
+    mount_holds(&harness, &[]).await;
+    mount_close(&harness, ResponseTemplate::new(204)).await;
+    let run = harness.run(&close(&["--json", "--yes"])).await;
+    assert_eq!(run.outcome.exit_code, 1, "{}", run.stdout());
+    assert_eq!(run.json()["error"]["code"], "ClosePrecheckFailed");
+    assert!(writes(&harness).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_hold_read_never_repeats_graphs_message() {
+    let harness = signed_in().await;
+    mount_case(&harness, &[case("active", MARKED)]).await;
+    Mock::given(method("GET"))
+        .and(path(hold_path("legalHolds")))
+        .respond_with(json_response(
+            403,
+            json!({"error": {"code": "Forbidden", "message": "No access to Kim Example hold"}}),
+        ))
+        .with_priority(1)
+        .mount(&harness.graph)
+        .await;
+    mount_holds(&harness, &[]).await;
+    let run = harness.run(&close(&["--json", "--yes"])).await;
+    assert_eq!(run.outcome.exit_code, 1);
+    let error = &run.json()["error"];
+    assert_eq!(error["code"], "ClosePrecheckFailed");
+    let message = error["message"].as_str().unwrap();
+    assert!(message.contains("HTTP 403"), "{message}");
+    assert!(!message.contains("Kim Example"), "{message}");
+    assert!(writes(&harness).await.is_empty());
+}
+
+#[tokio::test]
+async fn the_prompt_shows_a_url_in_the_case_name_without_its_query() {
+    let name = "Review of https://portal.contoso.example/a?sig=promptsecret";
+    let harness = signed_in().await;
+    let named = |status: &str| {
+        let mut record = case(status, MARKED);
+        record["displayName"] = json!(name);
+        record
+    };
+    mount_case(
+        &harness,
+        &[named("active"), named("active"), named("closed")],
+    )
+    .await;
+    mount_holds(&harness, &[]).await;
+    mount_close(&harness, ResponseTemplate::new(204)).await;
+    let (run, _) = at_a_terminal(&harness, &[name]).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stdout());
+    assert!(!run.stderr().contains("promptsecret"), "{}", run.stderr());
+    assert_eq!(writes(&harness).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_status_the_tool_does_not_know_ends_the_wait_with_exit_4() {
+    let harness = ready(&[case("closedWithError", MARKED)]).await;
+    let run = harness
+        .run(&close(&[
+            "--json",
+            "--yes",
+            "--wait",
+            "--poll-interval",
+            "5s",
+        ]))
+        .await;
+    assert_eq!(run.outcome.exit_code, 4, "{}", run.stdout());
+    let document = run.json();
+    assert_eq!(document["outcome"]["reasons"][0]["code"], "UnknownStatus");
+    assert_eq!(document["results"]["result"]["status"], "closedWithError");
+}
+
+#[tokio::test]
+async fn a_case_read_with_no_status_ends_the_wait() {
+    let mut unreadable = case("active", MARKED);
+    unreadable.as_object_mut().unwrap().remove("status");
+    let harness = ready(&[unreadable]).await;
+    let run = harness
+        .run(&close(&[
+            "--json",
+            "--yes",
+            "--wait",
+            "--poll-interval",
+            "5s",
+        ]))
+        .await;
+    assert_eq!(run.outcome.exit_code, 1, "{}", run.stdout());
+    assert_eq!(writes(&harness).await.len(), 1);
+}

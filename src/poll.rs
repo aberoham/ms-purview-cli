@@ -94,6 +94,14 @@ impl Polled for CaseRecord {
         let record = CaseRecord::from_value(body)
             .ok_or_else(|| PurviewError::message("Graph returned a case that is not an object"))?;
         let case = crate::model::valid::CaseRef::new(record)?;
+        // A read without a status ends the wait (section 4.6): waiting
+        // would only repeat it.
+        if case.record.status == CaseStatus::Missing {
+            return Err(PurviewError::message(format!(
+                "Graph returned case {} with no readable status",
+                case.id
+            )));
+        }
         if let ReadRoute::Case(wanted) = route {
             if case.id != *wanted {
                 return Err(PurviewError::message(format!(

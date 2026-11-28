@@ -554,6 +554,17 @@ fn hold_reads(case: CaseId) -> [(&'static str, ReadRoute); 3] {
     ]
 }
 
+/// The error's code and HTTP status, never its message, which may quote
+/// tenant text: `GraphError, HTTP 403`.
+fn failure_text(error: &PurviewError) -> String {
+    let (code, status) = error.metadata();
+    if status == 0 {
+        code.to_owned()
+    } else {
+        format!("{code}, HTTP {status}")
+    }
+}
+
 /// The precheck's refusal of `what` that failed. A broken sign-in keeps
 /// its own error.
 fn precheck_failed(what: &str, error: PurviewError) -> PurviewError {
@@ -561,8 +572,8 @@ fn precheck_failed(what: &str, error: PurviewError) -> PurviewError {
         return error;
     }
     PurviewError::ClosePrecheckFailed(format!(
-        "{what} failed, so it cannot be shown that the case may be closed; nothing was sent: \
-         {error}"
+        "{what} failed ({}), so it cannot be shown that the case may be closed; nothing was sent",
+        failure_text(&error)
     ))
 }
 
@@ -573,10 +584,12 @@ async fn hold_counts(
 ) -> Result<Vec<(&'static str, usize)>> {
     let mut counts = Vec::new();
     for (name, route) in hold_reads(case) {
-        let what = format!("reading the case's {name}");
+        let what = format!("reading the case's {name} to their end");
+        // A paging link to any other collection is refused: the count must
+        // be this case's.
         let items = preflight
             .graph
-            .list(&route, &Query::new(), preflight.log)
+            .list_bound(&route, &Query::new(), preflight.log)
             .await
             .and_then(crate::graph::Listing::complete)
             .map_err(|error| precheck_failed(&what, error))?;
@@ -599,6 +612,54 @@ fn refuse_holds(case: CaseId, counts: &[(&'static str, usize)]) -> Result<()> {
             .collect::<Vec<_>>()
             .join(", ")
     )))
+}
+
+/// How a case was shown to be one `case close` may close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ownership {
+    Marked,
+    CreatedByAccount,
+    AnyCase,
+}
+
+impl Ownership {
+    fn text(self) -> &'static str {
+        match self {
+            Self::Marked => "the description carries naming.marker",
+            Self::CreatedByAccount => "the signed-in account created it",
+            Self::AnyCase => "--any-case: not shown to be a case this tool made",
+        }
+    }
+}
+
+/// Step 2 of the preflight: the description carries `marker`, or the
+/// signed-in account created the case, or `--any-case`.
+fn ownership(
+    case: &crate::model::valid::CaseRef,
+    marker: &str,
+    account: &AccountRecord,
+    any_case: bool,
+) -> Result<Ownership> {
+    let marked = !marker.is_empty()
+        && case
+            .record
+            .description
+            .as_deref()
+            .is_some_and(|description| description.contains(marker));
+    if marked {
+        Ok(Ownership::Marked)
+    } else if created_by(&case.record, account) {
+        Ok(Ownership::CreatedByAccount)
+    } else if any_case {
+        Ok(Ownership::AnyCase)
+    } else {
+        Err(PurviewError::ClosePrecheckFailed(format!(
+            "case {} has no naming.marker in its description and was not created by the \
+             signed-in account, so it is not shown to be a case this tool made; nothing was \
+             sent. Pass --any-case to close a case made another way",
+            case.id
+        )))
+    }
 }
 
 /// The case, which must be active.
@@ -635,26 +696,7 @@ impl WriteCommand for CaseClose {
             .clone()
             .ok_or_else(|| PurviewError::message("case close ran without its settings"))?;
         let case = active_case(preflight, &self.key).await?;
-        let marked = !marker.is_empty()
-            && case
-                .record
-                .description
-                .as_deref()
-                .is_some_and(|description| description.contains(&marker));
-        let ownership = if marked {
-            "the description carries naming.marker"
-        } else if created_by(&case.record, preflight.account) {
-            "the signed-in account created it"
-        } else if self.any_case {
-            "--any-case: not shown to be a case this tool made"
-        } else {
-            return Err(PurviewError::ClosePrecheckFailed(format!(
-                "case {} has no naming.marker in its description and was not created by the \
-                 signed-in account, so it is not shown to be a case this tool made; nothing was \
-                 sent. Pass --any-case to close a case made another way",
-                case.id
-            )));
-        };
+        let ownership = ownership(&case, &marker, preflight.account, self.any_case)?;
         let counts = hold_counts(preflight, case.id).await?;
         refuse_holds(case.id, &counts)?;
         self.planned = Some(case.id);
@@ -666,7 +708,7 @@ impl WriteCommand for CaseClose {
             .unwrap_or_else(|| case.id.to_string());
         let mut lines = vec![
             Value::String(format!("case {} is active", case.id)),
-            Value::String(format!("ownership: {ownership}")),
+            Value::String(format!("ownership: {}", ownership.text())),
         ];
         lines.extend(
             counts
@@ -688,7 +730,7 @@ impl WriteCommand for CaseClose {
                     ),
                     "Changes no hold, custodian or data source: the case has none.".into(),
                 ],
-                warnings: if self.any_case && !marked {
+                warnings: if ownership == Ownership::AnyCase {
                     vec!["--any-case: the case is not shown to be one this tool made".into()]
                 } else {
                     Vec::new()
@@ -707,6 +749,8 @@ impl WriteCommand for CaseClose {
             return Ok(());
         };
         let case = active_case(preflight, &CaseKey::Id(planned)).await?;
+        let marker = self.marker.clone().unwrap_or_default();
+        ownership(&case, &marker, preflight.account, self.any_case)?;
         let counts = hold_counts(preflight, case.id).await?;
         refuse_holds(case.id, &counts)
     }
@@ -738,7 +782,7 @@ impl WriteCommand for CaseClose {
                         session.env.stderr,
                         "warning: Graph accepted the close, but reading the case after it failed \
                          ({}); 'purview case get {case}' shows its status",
-                        crate::output::sanitize(&error.to_string())
+                        failure_text(&error)
                     );
                     Applied::result(Value::Null)
                 }
@@ -821,7 +865,7 @@ impl WriteCommand for CaseClose {
                 notes: vec![format!(
                     "reading case {case} failed ({}); 'purview case get {case}' shows whether it \
                      closed",
-                    crate::output::sanitize(&error.to_string())
+                    failure_text(&error)
                 )],
             },
         })

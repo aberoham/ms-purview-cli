@@ -355,9 +355,14 @@ Settled in PR 2.7:
 - A case that is not active, or not shown to be the tool's, refuses with
   `ClosePrecheckFailed`; a `<case>` that names no case, or several, keeps `CaseNotFound` or
   `AmbiguousCase`. Case records carried no `createdBy` (Observed, PR 2.6), so step 2 rests
-  on `naming.marker` in practice. `--any-case` puts a warning in the plan.
+  on `naming.marker` in practice. A case allowed only by `--any-case` gets a warning in the
+  plan.
+- Each hold list is read to its last page through paging links to that list alone; a link
+  elsewhere refuses. A failed read is described by its code and HTTP status, never Graph's
+  message.
 - The case and its three lists are read again after approval and before the POST, with
-  the same refusals, since a hold may be added while the person types.
+  the same refusals, ownership included, since a hold may be added or the marker removed
+  while the person types.
 - The POST has no body, and sends `Content-Length: 0` and no `Content-Type`: Graph answered
   411 to a POST without a length (Observed, PR 2.6). The plan shows `body: null`, and its
   digest covers method, path and an empty body.
@@ -366,7 +371,7 @@ Settled in PR 2.7:
   confirmed by its id.
 - `result` is the case as read once after the close, or, with `--wait`, the read that
   found it `closed`. A status the tool does not know ends the wait with exit 4 and
-  `UnknownStatus`. `--wait-timeout` and `--poll-interval` need `--wait`.
+  `UnknownStatus`; a read with no status ends it with exit 1. `--wait-timeout` and `--poll-interval` need `--wait`.
 
 #### `purview search list <case>`, `purview search get <case> <search>` (read)
 

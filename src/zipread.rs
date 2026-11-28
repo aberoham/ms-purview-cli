@@ -218,7 +218,8 @@ pub(crate) fn declared_entries(file: &mut File, len: u64) -> Result<u64> {
 /// counts, as when a comment holds something that also looks like one, and
 /// the largest count is the answer, so none can hide a large directory. A
 /// ZIP64 end record must hold at least 44 bytes after its size field and,
-/// by its own length, end at or before its locator.
+/// by its own length, end where its locator starts; a later locator that
+/// names a record already read (a copy in a comment) reuses its count.
 /// A file with no such record is not a zip.
 pub(crate) fn zip_end(file: &mut File, len: u64) -> Result<(u64, u64)> {
     use std::io::{Seek, SeekFrom};
@@ -258,6 +259,8 @@ pub(crate) fn zip_end(file: &mut File, len: u64) -> Result<(u64, u64)> {
         .collect();
     let end = tail_start + end as u64;
     let mut declared = 0;
+    // ZIP64 end records already read, by offset, with their counts.
+    let mut read: Vec<(u64, u64)> = Vec::new();
     for at in records {
         let classic = u64::from(u16::from_le_bytes([tail[at + 10], tail[at + 11]]));
         // A ZIP64 locator, when there is one, is the 20 bytes before the
@@ -270,30 +273,39 @@ pub(crate) fn zip_end(file: &mut File, len: u64) -> Result<(u64, u64)> {
                 if locator.starts_with(b"PK\x06\x07") {
                     let record_at =
                         u64::from_le_bytes(locator[8..16].try_into().map_err(|_| not_zip())?);
-                    let mut record = [0_u8; 40];
-                    if record_at >= locator_at {
-                        return Err(not_zip());
+                    if let Some((_, total)) = read.iter().find(|(seen, _)| *seen == record_at) {
+                        // A copy of a locator already read, as in a comment
+                        // that repeats the end of the zip.
+                        Some(*total)
+                    } else {
+                        if record_at >= locator_at {
+                            return Err(not_zip());
+                        }
+                        let mut record = [0_u8; 40];
+                        read_at(file, record_at, &mut record)?;
+                        if !record.starts_with(b"PK\x06\x06") {
+                            return Err(not_zip());
+                        }
+                        // The ZIP64 end record holds at least 44 bytes after
+                        // its size field and, by its own length, ends where
+                        // its locator starts, as the format lays them out: a
+                        // record elsewhere could be one the zip crate does
+                        // not read, such as when bytes precede the zip.
+                        let size =
+                            u64::from_le_bytes(record[4..12].try_into().map_err(|_| not_zip())?);
+                        if size < 44
+                            || record_at
+                                .checked_add(12)
+                                .and_then(|at| at.checked_add(size))
+                                != Some(locator_at)
+                        {
+                            return Err(not_zip());
+                        }
+                        let total =
+                            u64::from_le_bytes(record[32..40].try_into().map_err(|_| not_zip())?);
+                        read.push((record_at, total));
+                        Some(total)
                     }
-                    read_at(file, record_at, &mut record)?;
-                    if !record.starts_with(b"PK\x06\x06") {
-                        return Err(not_zip());
-                    }
-                    // The ZIP64 end record holds at least 44 bytes after its
-                    // size field and, by its own length, ends at or before
-                    // the locator that names it. (A copy of the locator in a
-                    // comment names the same record, which ends before it.)
-                    let size = u64::from_le_bytes(record[4..12].try_into().map_err(|_| not_zip())?);
-                    if size < 44
-                        || record_at
-                            .checked_add(12)
-                            .and_then(|at| at.checked_add(size))
-                            .is_none_or(|ends| ends > locator_at)
-                    {
-                        return Err(not_zip());
-                    }
-                    Some(u64::from_le_bytes(
-                        record[32..40].try_into().map_err(|_| not_zip())?,
-                    ))
                 } else {
                     None
                 }
@@ -739,12 +751,11 @@ mod tests {
         let zip64_at = body.len() as u64;
         let mut out = body.to_vec();
         out.extend_from_slice(b"PK\x06\x06");
-        // Declares 28 bytes after the size field, under the minimum of 44.
+        // Declares 28 bytes after the size field, under the minimum of 44,
+        // and ends there, at its locator.
         out.extend_from_slice(&28_u64.to_le_bytes());
         out.extend_from_slice(&[0; 20]);
         out.extend_from_slice(&1_u64.to_le_bytes());
-        out.extend_from_slice(&[0; 16 + 4]);
-        out.extend_from_slice(&[0; 4]);
         out.extend_from_slice(b"PK\x06\x07");
         out.extend_from_slice(&0_u32.to_le_bytes());
         out.extend_from_slice(&zip64_at.to_le_bytes());
@@ -848,6 +859,19 @@ mod tests {
     #[test]
     fn a_zip64_record_longer_than_the_room_before_its_locator_is_hostile() {
         let file = zip64_with(44 + 17, 16);
+        let mut handle = File::open(file.path()).unwrap();
+        let len = handle.metadata().unwrap().len();
+        assert_eq!(
+            zip_end(&mut handle, len).unwrap_err().metadata().0,
+            "HostileZip"
+        );
+    }
+
+    #[test]
+    fn a_zip64_record_that_ends_before_its_locator_is_hostile() {
+        // A gap between the record and its locator, as when bytes precede
+        // the zip and the locator's offset names something else.
+        let file = zip64_with(44, 16);
         let mut handle = File::open(file.path()).unwrap();
         let len = handle.metadata().unwrap().len();
         assert_eq!(

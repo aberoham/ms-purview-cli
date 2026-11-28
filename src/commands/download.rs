@@ -397,6 +397,20 @@ struct Ids {
 /// The files that can be downloaded, with their local names; a reason for
 /// each that cannot. Names are made across every file of the operation,
 /// so `--file` gives a file the same local name a full download does.
+/// Why each file of `files` that `keep` allows could not be downloaded,
+/// without fetching anything: the reasons `fetch` would give, by
+/// position.
+pub fn listing_reasons(
+    rule: &download::DownloadRule,
+    redactor: &crate::redact::Redactor,
+    files: &[FileRecord],
+    keep: Keep,
+) -> Vec<Value> {
+    let mut reasons = Vec::new();
+    downloadable(rule, redactor, files, None, keep, &mut reasons);
+    reasons
+}
+
 fn downloadable(
     rule: &download::DownloadRule,
     redactor: &crate::redact::Redactor,

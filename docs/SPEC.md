@@ -601,9 +601,12 @@ Settled in PR 4.1:
   file that is not an `Items.*.zip` part, each tried in Graph's order until one holds the
   evidence. No items part is ever read as evidence, and only `export create` and `download`
   fetch one: `estimate` and `report` download every file but the items parts.
-- A zip may have up to 4,096 bytes after its end record and comment. Every end record whose
-  comment ends at the end of the file or within those bytes counts toward the entry cap,
-  the largest count deciding, and a Zip64 locator must name a record before it. The one observed items
+- A zip may have up to 4,096 bytes after its end record and comment. The zip ends after the
+  latest-ending end record whose comment ends at the end of the file or within those bytes
+  (the end of the file whenever a record reaches it, as before PR 4.1). Every end record
+  ending exactly there counts toward the entry cap, the largest count deciding, so the end
+  record of a zip stored inside is not taken for the zip's own. A ZIP64 end record must end,
+  by its own length, where its locator starts. The one observed items
   part had 296, most of them zero, after a Zip64 end record (Observed, one export); its
   report part had none. The zip is read as ending at its end record; the downloaded file,
   its size and its SHA-256 are the service's bytes unchanged.

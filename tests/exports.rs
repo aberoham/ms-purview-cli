@@ -1057,3 +1057,26 @@ async fn an_empty_file_name_is_no_candidate() {
         "{stderr}"
     );
 }
+
+#[tokio::test]
+async fn the_check_reports_a_later_file_it_could_not_download_after_an_early_result() {
+    // The report part settles the check; a later candidate without a
+    // download address is still reported.
+    let setup = Setup::new().await;
+    setup.serve().await;
+    let mut record = setup.succeeded();
+    record["action"] = json!("exportReport");
+    record["exportFileMetadata"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"fileName": "second-report.zip", "size": 10}));
+    setup.get(&operation_path(), record).await;
+    let run = setup.check().await;
+    assert_eq!(run.json()["results"]["collection"], "complete");
+    assert!(
+        run.stderr()
+            .contains("file 3 of the operation cannot be downloaded: it has no downloadUrl"),
+        "{}",
+        run.stderr()
+    );
+}

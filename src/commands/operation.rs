@@ -457,20 +457,25 @@ async fn check_collection(
         );
         return Ok(Some(Collection::Unchecked));
     };
-    // An entry with no name cannot be fetched or matched: it is reported,
-    // by position, as `download` reports it.
+    // The whole listing is checked once, as `download` would, so that a
+    // file that cannot be downloaded is reported even when an earlier one
+    // settles the check; nothing is fetched for this.
+    let keep = super::action::evidence_keep(&record.action(Source::Single));
     let listed = record
         .detail()
         .map(|detail| detail.files().to_vec())
         .unwrap_or_default();
-    for (index, file) in listed.iter().enumerate() {
-        if file.file_name.as_deref().is_none_or(str::is_empty) {
-            let _ = writeln!(
-                session.env.stderr,
-                "warning: file {} of the operation cannot be downloaded: it has no fileName",
-                index + 1
-            );
-        }
+    for reason in super::download::listing_reasons(
+        check.download.client.rule(),
+        &session.env.redactor,
+        &listed,
+        keep,
+    ) {
+        let _ = writeln!(
+            session.env.stderr,
+            "warning: {}",
+            sanitize(reason["message"].as_str().unwrap_or_default())
+        );
     }
     if names.is_empty() {
         let _ = writeln!(
@@ -489,19 +494,11 @@ async fn check_collection(
             out: None,
             file: Some(name),
             overwrite: false,
-            keep: super::action::evidence_keep(&record.action(Source::Single)),
+            keep,
         };
+        // Its reasons were reported with the listing above.
         let fetched =
             super::download::fetch(session, case, record, &request, check.download).await?;
-        for reason in &fetched.reasons {
-            if reason["code"] == "FileNotDownloadable" {
-                let _ = writeln!(
-                    session.env.stderr,
-                    "warning: {}",
-                    sanitize(reason["message"].as_str().unwrap_or_default())
-                );
-            }
-        }
         if fetched.interrupted {
             return Ok(None);
         }

@@ -43,7 +43,7 @@ impl Kind {
         if bases.iter().any(|name| name.starts_with("Statistics-")) {
             return Self::Estimate;
         }
-        let items = regex::Regex::new(r"^Items_\d+_.*\.csv$").expect("a valid pattern");
+        let items = regex::Regex::new(r"^Items_\d+_.*\.(?i:csv)$").expect("a valid pattern");
         let package = regex::Regex::new(r"^Items\..*\.zip$").expect("a valid pattern");
         if bases.iter().any(|name| items.is_match(name))
             && !bases.iter().any(|name| package.is_match(name))
@@ -297,6 +297,7 @@ mod tests {
             Kind::of(&names(&["Items_0_2026.csv", "Locations-1.csv"])),
             Kind::ItemReport
         );
+        assert_eq!(Kind::of(&names(&["Items_0_2026.CSV"])), Kind::ItemReport);
         assert_eq!(
             Kind::of(&names(&["Items_0_2026.csv", "Items.1.001.x.zip"])),
             Kind::Other

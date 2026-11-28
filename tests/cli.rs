@@ -764,3 +764,39 @@ fn only_export_create_calls_no_teams_context_experimental() {
     );
     assert!(export.contains("and is experimental"), "{export}");
 }
+
+#[test]
+fn a_closed_stdout_under_parse_items_all_rows_is_reported_as_stdout() {
+    use std::io::Write;
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("report.zip");
+    let mut writer = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+    writer
+        .start_file("Items_0_2026.csv", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    writeln!(writer, "Immutable ID,Item class").unwrap();
+    // Far more than a pipe buffer, so that a write fails mid-pass.
+    for n in 0..20_000 {
+        writeln!(writer, "IMM{n},IPM.Note").unwrap();
+    }
+    writer.finish().unwrap();
+    let (reader, pipe) = std::io::pipe().unwrap();
+    drop(reader);
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("purview"));
+    for name in VARIABLES {
+        command.env_remove(name);
+    }
+    let output = command
+        .env("PURVIEW_CONFIG_DIR", temporary.path().join("config"))
+        .args(["parse", "items", path.to_str().unwrap(), "--all-rows"])
+        .stdout(pipe)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.starts_with("Error: could not write to standard output: "),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("zip"), "{stderr}");
+}

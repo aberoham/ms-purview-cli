@@ -777,7 +777,7 @@ estimate, `Items_N_*.csv` without an `Items.*.zip` sibling means an item report.
   - `locations` is the number of distinct `Location ID` values among the item's copies; the
     ids themselves are not written. An `--all-rows` record has `locationId` in place of
     `copies` and `locations`.
-  - `date` is RFC 3339 in UTC, or `null` when `Date` is empty or cannot be read; `title` is
+  - `date` is RFC 3339 in UTC, with any fraction of a second kept, or `null` when `Date` is empty or cannot be read; `title` is
     `Subject/Title`, else `Conversation name`; `senderDomain` is the part after `@` of the
     address (the text inside `<…>` of `Name <addr>`), lowercased, and `null` for a Teams
     thread id (`19:…`).
@@ -786,8 +786,11 @@ estimate, `Items_N_*.csv` without an `Items.*.zip` sibling means an item report.
   - `--sender` may be repeated (a row must match one), as may `--exclude-sender`; both, and
     `--class` and `--workload`, ignore case. A date filter leaves out rows with no readable
     `Date`.
-  - `--jsonl` writes JSON Lines even under `--json` or `PURVIEW_JSON`; `--force-buffer`
-    without `--json` is refused. `--max-unique` does not apply to `--all-rows`.
+  - `--jsonl` names the default; with `--json` or `PURVIEW_JSON` it is refused, so that a
+    failure is printed in the shape the output mode gives it. `--force-buffer` without
+    `--json` is refused. Without `--force-buffer`, `--json` stops the pass at the 10,001st
+    unique item. `--max-unique` does not apply to `--all-rows`.
+  - `--subject-regex` is compiled as given, spaces included, with a 1 MiB size limit.
   - The stderr summary has counts and column names only: rows, files, rows matched, unique
     items, those keyed by hash, rows with an unreadable `Date`, and missing columns.
   - `--wrap-untrusted` wraps `title`, `key` and `senderDomain` too (with `sender`, `class`
@@ -1366,8 +1369,10 @@ about 37 rows per estimated item, and about 12.6 rows per unique item (Observed,
 report).
 
 - **Key:** `Internet message ID` if it is not empty, else `Immutable ID`, else a SHA-256 of
-  `Item class|Date|Sender|Subject/Title|Conversation name`. Hash keys are counted and
-  reported.
+  `Item class`, `Date`, `Sender`, `Subject/Title` and `Conversation name`. Hash keys are
+  counted and reported. Settled in PR 3.1: the hash is over the five fields, trimmed, as a
+  compact JSON array of strings (an empty field as `""`), so that a `|` or any other text
+  inside a field cannot make two items one; the key is the hash in lowercase hex.
 - **Aggregation:** `HashMap<Box<str>, UniqueAgg>`. Each `UniqueAgg` holds the slim fields of
   the first row, a copy count, and a sorted `Vec<u32>` of interned `Location ID` indexes,
   deduplicated at the end. `parse items` writes its JSONL after the pass. Memory grows with

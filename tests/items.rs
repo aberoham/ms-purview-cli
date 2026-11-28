@@ -346,13 +346,10 @@ async fn bad_flags_are_refused_before_the_zip_is_read_and_never_repeated() {
             "--since is after --until",
         ),
         (vec!["--max-unique", "0"], "--max-unique"),
-        (vec!["--force-buffer"], "--force-buffer"),
+        (vec!["--jsonl"], "--jsonl and --json"),
     ] {
         let mut argv = vec!["--json", "parse", "items", zip];
         argv.extend(args.iter());
-        if needle == "--force-buffer" {
-            argv.push("--jsonl");
-        }
         let run = run(dir.path(), &argv).await;
         assert_eq!(run.code, 1, "{args:?}");
         let message = run.document.as_ref().unwrap()["error"]["message"]
@@ -363,10 +360,157 @@ async fn bad_flags_are_refused_before_the_zip_is_read_and_never_repeated() {
         assert!(!message.contains("secret-pattern"), "{message}");
         assert!(!message.contains("cannot be read"), "{args:?}: {message}");
     }
+    // In JSON Lines mode the refusal goes to stderr, with stdout empty.
+    let run = run(dir.path(), &["parse", "items", zip, "--force-buffer"]).await;
+    assert_eq!(run.code, 1);
+    assert!(run.stdout.is_empty());
+    assert!(
+        run.stderr.contains("--force-buffer goes with --json"),
+        "{}",
+        run.stderr
+    );
 }
 
 #[tokio::test]
-async fn json_is_one_document_and_jsonl_overrides_it() {
+async fn the_subject_pattern_is_used_as_given_with_its_spaces() {
+    let dir = tempfile::tempdir().unwrap();
+    let zip = report(dir.path());
+    let run = run(
+        dir.path(),
+        &[
+            "parse",
+            "items",
+            zip.to_str().unwrap(),
+            "--subject-regex",
+            "^Orders ",
+        ],
+    )
+    .await;
+    let keys: Vec<Value> = run.lines().iter().map(|l| l["key"].clone()).collect();
+    assert_eq!(keys, ["IMM3"]);
+}
+
+#[tokio::test]
+async fn only_the_copies_that_pass_the_filters_are_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = format!(
+        "{HEADER}\n{}{}{}",
+        row(
+            "<m1@contoso.example>",
+            "",
+            "IPM.Note",
+            "2026-07-02 08:00:00Z",
+            "a@contoso.example",
+            "S",
+            "",
+            1
+        ),
+        row(
+            "<m1@contoso.example>",
+            "",
+            "IPM.Note",
+            "2026-07-05 08:00:00Z",
+            "a@contoso.example",
+            "S",
+            "",
+            2
+        ),
+        row(
+            "<m1@contoso.example>",
+            "",
+            "IPM.Note",
+            "2026-07-05 08:00:00Z",
+            "b@contoso.example",
+            "S",
+            "",
+            3
+        ),
+    );
+    let zip = zip_of(dir.path(), &[("Items_0_2026.csv", body)]);
+    let run = run(
+        dir.path(),
+        &[
+            "parse",
+            "items",
+            zip.to_str().unwrap(),
+            "--since",
+            "2026-07-05",
+            "--exclude-sender",
+            "b@contoso.example",
+        ],
+    )
+    .await;
+    let lines = run.lines();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["copies"], 1);
+    assert_eq!(lines[0]["locations"], 1);
+    assert_eq!(lines[0]["date"], "2026-07-05T08:00:00Z");
+}
+
+/// A configuration directory holding `config`, private as the tool keeps
+/// it.
+fn with_config(dir: &Path, config: &str) {
+    let dir = dir.join("config");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("config.json"), config).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            dir.join("config.json"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_failure_while_rows_stream_leaves_only_records_on_stdout() {
+    let dir = tempfile::tempdir().unwrap();
+    with_config(
+        dir.path(),
+        r#"{"limits": {"csv_max_record_bytes": "1KiB"}}"#,
+    );
+    let big = "x".repeat(4096);
+    let body = format!(
+        "{HEADER}\n{}{}",
+        row(
+            "<m1@contoso.example>",
+            "",
+            "IPM.Note",
+            "2026-07-02 08:00:00Z",
+            "a@contoso.example",
+            "S",
+            "",
+            1
+        ),
+        row(
+            "<m2@contoso.example>",
+            "",
+            "IPM.Note",
+            "2026-07-02 08:00:00Z",
+            "a@contoso.example",
+            &big,
+            "",
+            1
+        ),
+    );
+    let zip = zip_of(dir.path(), &[("Items_0_2026.csv", body)]);
+    let run = run(
+        dir.path(),
+        &["parse", "items", zip.to_str().unwrap(), "--all-rows"],
+    )
+    .await;
+    assert_eq!(run.code, 1);
+    assert_eq!(run.lines().len(), 1);
+    assert!(run.document.is_none());
+    assert!(run.stderr.contains("Error: "), "{}", run.stderr);
+    assert!(!run.stderr.contains("xxxx"), "{}", run.stderr);
+}
+
+#[tokio::test]
+async fn json_is_one_document() {
     let dir = tempfile::tempdir().unwrap();
     let zip = report(dir.path());
     let zip = zip.to_str().unwrap();
@@ -375,7 +519,7 @@ async fn json_is_one_document_and_jsonl_overrides_it() {
     let document = run1.document.unwrap();
     assert_eq!(document["count"], 4);
     assert_eq!(document["results"][2]["copies"], 3);
-    let run2 = run(dir.path(), &["--json", "parse", "items", zip, "--jsonl"]).await;
+    let run2 = run(dir.path(), &["parse", "items", zip, "--jsonl"]).await;
     assert!(run2.document.is_none());
     assert_eq!(run2.lines().len(), 4);
 }
@@ -417,6 +561,31 @@ async fn json_above_ten_thousand_records_needs_force_buffer() {
         assert_eq!(forced.code, 0, "{extra:?}: {}", forced.stderr);
         assert_eq!(forced.document.unwrap()["count"], 10_001);
     }
+    // Past the limit the pass stops with the --json refusal, before
+    // --max-unique is reached.
+    let dir = tempfile::tempdir().unwrap();
+    let zip = wide(dir.path(), 10_010);
+    let early = run(
+        dir.path(),
+        &[
+            "--json",
+            "parse",
+            "items",
+            zip.to_str().unwrap(),
+            "--max-unique",
+            "10005",
+        ],
+    )
+    .await;
+    let message = early.document.unwrap()["error"].clone();
+    assert_eq!(message["code"], "CommandFailed", "{message}");
+    assert!(
+        message["message"]
+            .as_str()
+            .unwrap()
+            .contains("--force-buffer"),
+        "{message}"
+    );
     // Exactly at the limit is accepted.
     let dir = tempfile::tempdir().unwrap();
     let zip = wide(dir.path(), 10_000);

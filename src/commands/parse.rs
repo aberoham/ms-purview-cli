@@ -314,7 +314,13 @@ pub fn items(
         let redactor = env.redactor.clone();
         items::read(&request.zip, limits, &request.filters, |row| {
             if !request.all_rows {
-                return dedup.add(row);
+                dedup.add(row)?;
+                // A document past the limit is certain to be refused: stop
+                // now rather than hold the rest.
+                if request.json && !request.force_buffer && dedup.len() > JSON_MAX_RECORDS {
+                    return Err(too_many());
+                }
+                return Ok(());
             }
             if request.json {
                 if buffered.len() == JSON_MAX_RECORDS && !request.force_buffer {
@@ -336,9 +342,10 @@ pub fn items(
             Ok(())
         })
     };
-    // The path is the user's own argument and is not repeated.
+    // The path is the user's own argument and is not repeated. A failed
+    // stdout under --all-rows keeps its own error, for cli to report.
     let tally = read.map_err(|error| match error {
-        PurviewError::Io(io) => {
+        PurviewError::Io(io) if !env.stdout.has_failed() => {
             PurviewError::message(format!("the zip given cannot be read: {}", io.kind()))
         }
         other => other,

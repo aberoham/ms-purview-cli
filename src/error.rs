@@ -300,7 +300,7 @@ pub enum PurviewError {
     NotAReportZip(String),
 
     /// `parse items` met more unique items than `--max-unique` allows.
-    #[error("the report holds more than {0} unique items (--max-unique); raise --max-unique or narrow the filters")]
+    #[error("the report holds more unique items than --max-unique allows; raise --max-unique or narrow the filters")]
     TooManyUnique(usize),
 
     #[error("could not {action} the credential lock file {path}: {source}")]

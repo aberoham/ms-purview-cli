@@ -98,8 +98,8 @@ pub struct SlimItem {
 pub enum KeyKind {
     InternetMessageId,
     ImmutableId,
-    /// A SHA-256 of `Item class|Date|Sender|Subject/Title|Conversation
-    /// name`, for a row with neither id.
+    /// A SHA-256 of `Item class`, `Date`, `Sender`, `Subject/Title` and
+    /// `Conversation name` (`hash_key`), for a row with neither id.
     Hash,
 }
 
@@ -145,11 +145,8 @@ impl ItemRow {
         } else if let Some(id) = &immutable_id {
             (id.clone(), KeyKind::ImmutableId)
         } else {
-            let joined = [&class, &date_text, &sender, &subject, &conversation_name]
-                .map(|field| field.as_deref().unwrap_or_default())
-                .join("|");
             (
-                crate::download::hex(&Sha256::digest(joined.as_bytes())),
+                hash_key(&[&class, &date_text, &sender, &subject, &conversation_name]),
                 KeyKind::Hash,
             )
         };
@@ -190,6 +187,18 @@ impl ItemRow {
         record["locationId"] = json!(self.location);
         record
     }
+}
+
+/// The SHA-256, in hex, of the fields as a compact JSON array of strings,
+/// an empty field as `""`: unlike joined text, no field's content can move
+/// into the next (`docs/SPEC.md` section 4.8).
+fn hash_key(fields: &[&Option<String>]) -> String {
+    let fields: Vec<&str> = fields
+        .iter()
+        .map(|field| field.as_deref().unwrap_or_default())
+        .collect();
+    let bytes = serde_json::to_vec(&fields).expect("strings serialise");
+    crate::download::hex(&Sha256::digest(&bytes))
 }
 
 /// `Date` as written in item reports, `2024-06-03 08:15:00Z` (format
@@ -235,7 +244,7 @@ fn item_record(key: &str, kind: KeyKind, item: &SlimItem) -> Value {
         "key": key,
         "keyKind": kind.as_str(),
         "class": item.class,
-        "date": item.date.map(|date| date.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+        "date": item.date.map(|date| date.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)),
         "sender": item.sender,
         "senderDomain": item.sender.as_deref().and_then(sender_domain),
         "recipientCount": item.recipient_count,
@@ -392,18 +401,23 @@ pub fn read(
 /// name.
 fn item_files(names: &[String]) -> Vec<usize> {
     let pattern = Regex::new(r"^Items_(\d+)_.*\.[cC][sS][vV]$").expect("a valid pattern");
-    let mut files: Vec<(u64, &str, usize)> = names
+    // By the number's digits without leading zeros: shorter is smaller,
+    // and digits of one length compare as text, at any length.
+    let mut files: Vec<(usize, &str, &str, usize)> = names
         .iter()
         .enumerate()
         .filter_map(|(index, name)| {
             let base = name.rsplit('/').next().unwrap_or(name);
-            let number = pattern.captures(base)?.get(1)?.as_str();
-            // A number too long for u64 sorts last.
-            Some((number.parse().unwrap_or(u64::MAX), base, index))
+            let digits = pattern
+                .captures(base)?
+                .get(1)?
+                .as_str()
+                .trim_start_matches('0');
+            Some((digits.len(), digits, base, index))
         })
         .collect();
     files.sort();
-    files.into_iter().map(|(_, _, index)| index).collect()
+    files.into_iter().map(|(_, _, _, index)| index).collect()
 }
 
 /// One unique item: the first row's fields, the rows counted, and the
@@ -412,14 +426,34 @@ fn item_files(names: &[String]) -> Vec<usize> {
 pub struct UniqueAgg {
     pub first: SlimItem,
     pub kind: KeyKind,
-    pub copies: u32,
-    /// Interned `Location ID`s, sorted and distinct.
+    pub copies: u64,
+    /// Interned `Location ID`s; sorted and distinct up to `distinct`, and
+    /// after `finish`.
     locations: Vec<u32>,
+    distinct: usize,
 }
 
 impl UniqueAgg {
+    /// The number of distinct locations; exact after `Dedup::finish`.
     pub fn location_count(&self) -> usize {
         self.locations.len()
+    }
+
+    /// Adds a location, sorting and removing repeats whenever the list has
+    /// doubled since the last time, so that the time spent stays
+    /// proportional to the copies and the memory to twice the distinct
+    /// locations.
+    fn add_location(&mut self, location: u32) {
+        self.locations.push(location);
+        if self.locations.len() >= 2 * self.distinct.max(8) {
+            self.compact();
+        }
+    }
+
+    fn compact(&mut self) {
+        self.locations.sort_unstable();
+        self.locations.dedup();
+        self.distinct = self.locations.len();
     }
 }
 
@@ -475,14 +509,13 @@ impl Dedup {
                         kind: row.kind,
                         copies: 0,
                         locations: Vec::new(),
+                        distinct: 0,
                     })
             }
         };
         agg.copies = agg.copies.saturating_add(1);
         if let Some(location) = location {
-            if let Err(at) = agg.locations.binary_search(&location) {
-                agg.locations.insert(at, location);
-            }
+            agg.add_location(location);
         }
         Ok(())
     }
@@ -498,7 +531,14 @@ impl Dedup {
 
     /// The unique items, by date (items without one last), then key.
     pub fn finish(self) -> Vec<(Box<str>, UniqueAgg)> {
-        let mut items: Vec<(Box<str>, UniqueAgg)> = self.items.into_iter().collect();
+        let mut items: Vec<(Box<str>, UniqueAgg)> = self
+            .items
+            .into_iter()
+            .map(|(key, mut agg)| {
+                agg.compact();
+                (key, agg)
+            })
+            .collect();
         items.sort_by(|(a_key, a), (b_key, b)| {
             (a.first.date.is_none(), a.first.date, a_key).cmp(&(
                 b.first.date.is_none(),
@@ -559,9 +599,13 @@ mod tests {
         let row = one(",,IPM.Note,2026-07-01 08:15:00Z,a@contoso.example,S,C,,1,Exchange,True,L1");
         assert_eq!(row.kind, KeyKind::Hash);
         let expected = crate::download::hex(&Sha256::digest(
-            b"IPM.Note|2026-07-01 08:15:00Z|a@contoso.example|S|C",
+            br#"["IPM.Note","2026-07-01 08:15:00Z","a@contoso.example","S","C"]"#,
         ));
         assert_eq!(row.key, expected);
+        // A separator inside a field cannot make two items one.
+        let a = one(",,IPM.Note,2026-07-01 08:15:00Z,a@contoso.example,A|B,C,,1,Exchange,True,L1");
+        let b = one(",,IPM.Note,2026-07-01 08:15:00Z,a@contoso.example,A,B|C,,1,Exchange,True,L1");
+        assert_ne!(a.key, b.key);
     }
 
     #[test]
@@ -578,6 +622,13 @@ mod tests {
         assert_eq!(record["senderDomain"], "contoso.example");
         assert_eq!(record["date"], "2026-07-02T09:00:00Z");
         assert_eq!(record["locationId"], "L2");
+    }
+
+    #[test]
+    fn fractions_of_a_second_are_kept() {
+        let row =
+            one(",IMM5,IPM.Note,2026-07-02T09:00:00.5Z,a@contoso.example,S,,,1,Exchange,True,L1");
+        assert_eq!(row.record()["date"], "2026-07-02T09:00:00.500Z");
     }
 
     #[test]
@@ -705,6 +756,26 @@ mod tests {
     }
 
     #[test]
+    fn many_locations_in_any_order_are_counted_once_each() {
+        let mut dedup = Dedup::new(10);
+        let mut text = format!("{HEADER}\n");
+        for round in 0..3 {
+            for n in 0..100 {
+                let n = if round == 1 { 99 - n } else { n };
+                text.push_str(&format!(
+                    ",IMM1,IPM.Note,,a@contoso.example,S,,,1,Exchange,True,L{n}\n"
+                ));
+            }
+        }
+        for row in rows(&text) {
+            dedup.add(row).unwrap();
+        }
+        let items = dedup.finish();
+        assert_eq!(items[0].1.copies, 300);
+        assert_eq!(items[0].1.location_count(), 100);
+    }
+
+    #[test]
     fn a_new_item_past_max_unique_is_refused_and_a_copy_is_not() {
         let all = rows(&format!(
             "{HEADER}\n\
@@ -728,10 +799,13 @@ mod tests {
             "Items_2_2026.csv",
             "x/Items_0_2026.CSV",
             "Items_a_2026.csv",
+            "Items_100000000000000000000_2026.csv",
+            "Items_20000000000000000000_2026.csv",
+            "Items_003_2026.csv",
         ]
         .iter()
         .map(|name| (*name).to_owned())
         .collect();
-        assert_eq!(item_files(&names), vec![3, 2, 0]);
+        assert_eq!(item_files(&names), vec![3, 2, 7, 0, 6, 5]);
     }
 }

@@ -460,7 +460,7 @@ struct ParseItemsArgs {
     workload: Option<String>,
     #[arg(
         long,
-        help = "Write JSON Lines (the default), even under --json or PURVIEW_JSON"
+        help = "Write JSON Lines, the default; refused with --json or PURVIEW_JSON"
     )]
     jsonl: bool,
     #[arg(
@@ -2136,7 +2136,11 @@ fn parse_items(env: &mut Env, output: &OutputOptions, args: ParseItemsArgs) -> R
             return Err(PurviewError::message("--since is after --until"));
         }
     }
-    let subject = optional("--subject-regex", args.subject_regex)?
+    // The pattern is compiled as given: its spaces are part of it.
+    let subject = args
+        .subject_regex
+        .map(|pattern| not_blank("--subject-regex", pattern))
+        .transpose()?
         .map(|pattern| {
             regex::RegexBuilder::new(&pattern)
                 .size_limit(1 << 20)
@@ -2162,7 +2166,14 @@ fn parse_items(env: &mut Env, output: &OutputOptions, args: ParseItemsArgs) -> R
     if max_unique == 0 {
         return Err(PurviewError::message("--max-unique must be above zero"));
     }
-    let json = output.format == crate::output::OutputFormat::Json && !args.jsonl;
+    let json = output.format == crate::output::OutputFormat::Json;
+    if args.jsonl && json {
+        // A failure must print where the output mode says, so the two are
+        // never combined.
+        return Err(PurviewError::message(
+            "--jsonl and --json (or PURVIEW_JSON) ask for different output; give one",
+        ));
+    }
     if args.force_buffer && !json {
         return Err(PurviewError::message(
             "--force-buffer goes with --json, which writes one document",

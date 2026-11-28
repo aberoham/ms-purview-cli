@@ -2478,7 +2478,7 @@ pub struct LocationRow { pub location: String, pub location_id: Option<String>, 
 pub struct FailedLocation { pub location: String, pub sub_type: String, pub message: String }
 pub enum Collection { Complete, Incomplete { failed: usize }, Unchecked }
 pub struct SummaryFile { pub groups: Vec<Vec<Vec<String>>>, pub values: BTreeMap<String, String> }
-pub struct SlimItem { pub class: String, pub date: Option<DateTime<Utc>>, pub sender: Option<String>,
+pub struct SlimItem { pub class: Option<String>, pub date: Option<DateTime<Utc>>, pub sender: Option<String>,
                       pub title: Option<String>, pub conversation_type: Option<String>, pub recipient_count: Option<u32>,
                       pub workload: Option<String>, pub has_attachment: Option<bool>,
                       pub internet_message_id: Option<String>, pub immutable_id: Option<String>,

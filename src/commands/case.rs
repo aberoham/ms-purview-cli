@@ -704,7 +704,9 @@ impl WriteCommand for CaseClose {
             .record
             .display_name
             .clone()
-            .filter(|name| !name.trim().is_empty())
+            // A name the terminal would show as nothing is confirmed by the
+            // case id.
+            .filter(|name| !crate::output::sanitize(name).trim().is_empty())
             .unwrap_or_else(|| case.id.to_string());
         let mut lines = vec![
             Value::String(format!("case {} is active", case.id)),
@@ -745,9 +747,9 @@ impl WriteCommand for CaseClose {
     /// The case is read again after approval: still active, and still with
     /// no holds, since the person may have taken a while to answer.
     async fn recheck(&mut self, preflight: &mut Preflight<'_>) -> Result<()> {
-        let Some(planned) = self.planned else {
-            return Ok(());
-        };
+        let planned = self
+            .planned
+            .ok_or_else(|| PurviewError::message("case close ran without a plan"))?;
         let case = active_case(preflight, &CaseKey::Id(planned)).await?;
         let marker = self.marker.clone().unwrap_or_default();
         ownership(&case, &marker, preflight.account, self.any_case)?;
@@ -881,9 +883,13 @@ fn close_stopped(
     waited: Duration,
     interrupted: bool,
 ) -> Produced {
+    // The status is Graph's text: shown as other tenant text is.
     let status = last
         .as_ref()
-        .map(|record| record.status.as_str().to_owned());
+        .map(|record| crate::redact::shown(record.status.as_str(), &session.env.redactor));
+    let closed = last
+        .as_ref()
+        .is_some_and(|record| record.status == CaseStatus::Closed);
     let account = shell_word(&session.account.email);
     let resume = vec![format!("purview --account={account} case get {case}")];
     let (exit_code, code, verb) = if interrupted {
@@ -891,10 +897,14 @@ fn close_stopped(
     } else {
         (5, "WaitTimeout", "stopped waiting")
     };
-    let message = format!(
-        "{verb} after {}; the service carries on closing the case",
-        elapsed_text(waited)
-    );
+    let message = if closed {
+        format!("{verb} after {}", elapsed_text(waited))
+    } else {
+        format!(
+            "{verb} after {}; the service carries on closing the case",
+            elapsed_text(waited)
+        )
+    };
     if session.output.format == OutputFormat::Json {
         return Produced {
             exit_code,

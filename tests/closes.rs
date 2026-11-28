@@ -565,3 +565,71 @@ async fn a_case_read_with_no_status_ends_the_wait() {
     assert_eq!(run.outcome.exit_code, 1, "{}", run.stdout());
     assert_eq!(writes(&harness).await.len(), 1);
 }
+
+#[tokio::test]
+async fn ctrl_c_during_the_wait_gives_the_case_close_shape() {
+    let harness = ready(&[case("closing", MARKED)]).await;
+    let interrupt = Arc::new(ms_purview_cli::env::ManualInterrupt::default());
+    interrupt.fire();
+    let run = harness
+        .run_with(&close(&["--json", "--yes", "--wait"]), |env, _| {
+            env.interrupt = interrupt.clone();
+        })
+        .await;
+    assert_eq!(run.outcome.exit_code, 130, "{}", run.stdout());
+    let document = run.json();
+    assert_eq!(document["error"]["code"], "Interrupted");
+    assert_eq!(document["caseId"], CASE);
+    assert_eq!(
+        document["resume"],
+        json!([format!("purview --account={ALEX} case get {CASE}")])
+    );
+    assert_eq!(writes(&harness).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_name_with_a_hidden_character_is_confirmed_as_shown() {
+    let hidden = "Records\u{200b} research";
+    let harness = signed_in().await;
+    let named = |status: &str| {
+        let mut record = case(status, MARKED);
+        record["displayName"] = json!(hidden);
+        record
+    };
+    mount_case(
+        &harness,
+        &[named("active"), named("active"), named("closed")],
+    )
+    .await;
+    mount_holds(&harness, &[]).await;
+    mount_close(&harness, ResponseTemplate::new(204)).await;
+    let (run, _) = at_a_terminal(&harness, &["Records research"]).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stdout());
+    assert_eq!(writes(&harness).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_name_the_terminal_shows_as_nothing_is_confirmed_by_the_case_id() {
+    let harness = signed_in().await;
+    let named = |status: &str| {
+        let mut record = case(status, MARKED);
+        record["displayName"] = json!("\u{200b}\u{200b}");
+        record
+    };
+    mount_case(
+        &harness,
+        &[named("active"), named("active"), named("closed")],
+    )
+    .await;
+    mount_holds(&harness, &[]).await;
+    mount_close(&harness, ResponseTemplate::new(204)).await;
+    let (run, _) = at_a_terminal(&harness, &[CASE]).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stdout());
+    assert!(
+        run.stderr()
+            .contains(&format!("Type the case name to apply ({CASE}): ")),
+        "{}",
+        run.stderr()
+    );
+    assert_eq!(writes(&harness).await.len(), 1);
+}

@@ -366,8 +366,9 @@ Settled in PR 2.7:
 - The POST has no body, and sends `Content-Length: 0` and no `Content-Type`: Graph answered
   411 to a POST without a length (Observed, PR 2.6). The plan shows `body: null`, and its
   digest covers method, path and an empty body.
-- At a terminal the prompt is `Type the case name to apply (<name>): `; the name typed,
-  with surrounding spaces ignored, is the only answer that approves. A case with no name is
+- At a terminal the prompt is `Type the case name to apply (<name>): `, with the name shown
+  as other tenant text is; the name typed, as Graph gives it or as shown, with surrounding
+  spaces ignored, is the only answer that approves. A case whose name shows as nothing is
   confirmed by its id.
 - `result` is the case as read once after the close, or, with `--wait`, the read that
   found it `closed`. A status the tool does not know ends the wait with exit 4 and

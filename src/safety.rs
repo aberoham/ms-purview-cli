@@ -386,24 +386,27 @@ pub(crate) async fn decide(
         return Ok(Decision::NotApplied(plan, NotApplied::ConfirmationRequired));
     }
     plan.write_text(prompt, redactor)?;
-    match &plan.typed {
-        // The text is tenant text: shown as every printed value is.
-        Some(text) => write!(
-            prompt,
-            "Type the case name to apply ({}): ",
-            sanitize(&crate::redact::shown(text, redactor))
-        )?,
+    // The text is tenant text: shown as every printed value is. Either the
+    // text or the form shown approves, so that a name holding a character
+    // the terminal does not show can still be typed.
+    let shown = plan
+        .typed
+        .as_deref()
+        .map(|text| sanitize(&crate::redact::shown(text, redactor)));
+    match &shown {
+        Some(shown) => write!(prompt, "Type the case name to apply ({shown}): ")?,
         None => write!(prompt, "Apply? [y/N] ")?,
     }
     prompt.flush()?;
     let answer = input.read_line().await?;
-    let yes = answer
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|answer| match &plan.typed {
-            Some(text) => !answer.is_empty() && answer == text.trim(),
-            None => answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"),
-        });
+    let yes = answer.as_deref().map(str::trim).is_some_and(|answer| {
+        match (plan.typed.as_deref(), shown.as_deref()) {
+            (Some(text), Some(shown)) => {
+                !answer.is_empty() && (answer == text.trim() || answer == shown.trim())
+            }
+            _ => answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"),
+        }
+    });
     Ok(if yes {
         Decision::Approved(approve(plan, Approval(Approver::Prompt)))
     } else {

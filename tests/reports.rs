@@ -344,6 +344,11 @@ async fn an_estimate_above_the_size_limit_blocks_the_report_and_allow_large_send
     assert!(message.contains("--allow-large"), "{message}");
     assert!(setup.posts().await.is_empty());
 
+    // The plan itself is blocked: without --yes nobody is asked.
+    let run = setup.run(&["--json"]).await;
+    assert_eq!(run.outcome.exit_code, 1, "{}", run.stdout());
+    assert_eq!(run.json()["error"]["code"], "TooLarge");
+
     // A dry run shows the plan that would be refused.
     let run = setup.run(&["--json", "--dry-run"]).await;
     assert_eq!(run.outcome.exit_code, 0, "{}", run.stdout());
@@ -552,6 +557,17 @@ async fn a_report_or_export_not_yet_finished_needs_allow_concurrent() {
             "{message}"
         );
         assert!(setup.posts().await.is_empty());
+        // The plan itself is blocked, and names the operation.
+        let run = setup.run(&["--json"]).await;
+        assert_eq!(
+            run.json()["error"]["code"],
+            "ConcurrentOperation",
+            "{action}"
+        );
+        let run = setup.run(&["--json", "--dry-run"]).await;
+        assert!(run.json()["results"]["plan"]["warnings"]
+            .to_string()
+            .contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaa0003"));
         let run = setup
             .run(&["--json", "--yes", "--no-download", "--allow-concurrent"])
             .await;
@@ -768,4 +784,25 @@ async fn a_human_run_shows_the_plan_and_the_result() {
     let stdout = run.stdout();
     assert!(stdout.starts_with("Applied: purview report\n"), "{stdout}");
     assert!(stdout.contains("\"collection\": \"complete\""), "{stdout}");
+}
+
+#[tokio::test]
+async fn the_size_limit_is_refused_ahead_of_a_possible_duplicate() {
+    let setup = Setup::new().await;
+    setup
+        .preflight(
+            setup.search(),
+            json!({"value": [
+                {"id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaa0003", "action": "exportResult", "status": "running"},
+            ]}),
+            estimate("succeeded", json!(11 * GIB)),
+        )
+        .await;
+    setup.accept().await;
+    let run = setup.run(&["--json", "--yes"]).await;
+    assert_eq!(run.json()["error"]["code"], "TooLarge");
+    // --allow-concurrent does not cover the size.
+    let run = setup.run(&["--json", "--yes", "--allow-concurrent"]).await;
+    assert_eq!(run.json()["error"]["code"], "TooLarge");
+    assert!(setup.posts().await.is_empty());
 }

@@ -1537,3 +1537,119 @@ async fn a_failed_read_of_an_earlier_file_does_not_explain_a_later_zip() {
         "{reason}"
     );
 }
+
+/// A report zip with a failed location, and a Summary and Settings file
+/// each with a record over a 2 KiB budget.
+fn zip_with_oversized_neighbours() -> Vec<u8> {
+    let locations = format!(
+        "{LOCATIONS_HEADER}Exchange,Mailbox,kim@contoso.example,id-4,Mailbox,PrimaryMailBox,,,Failed,Timed out,q\r\n"
+    );
+    let big = "x".repeat(4096);
+    zip_of(&[
+        (
+            "Items_0_2026-01-05_09-00-00.csv",
+            "\u{feff}Subject\r\nhello\r\n",
+        ),
+        ("Locations-2026-01-05_09-00-00.csv", &locations),
+        (
+            "Summary-2026-01-05_09-00-00.csv",
+            &format!("\u{feff}Job ID,{big},x\r\n"),
+        ),
+        (
+            "Settings-2026-01-05_09-00-00.csv",
+            &format!("\u{feff}\"Setting Name\",\"Value\",\"Description\"\r\na,{big},c\r\n"),
+        ),
+    ])
+}
+
+#[tokio::test]
+async fn files_a_report_does_not_use_cannot_hide_a_failed_location() {
+    let mut setup = Setup::new().await;
+    setup.ready_with(zip_with_oversized_neighbours()).await;
+    set_config(
+        &setup.harness,
+        "limits",
+        json!({"csv_max_record_bytes": "2KiB"}),
+    );
+    let run = setup.run(&["--json", "--yes", "--strict"]).await;
+    assert_eq!(
+        run.outcome.exit_code,
+        4,
+        "{} {}",
+        run.stdout(),
+        run.stderr()
+    );
+    assert_eq!(
+        run.json()["outcome"]["reasons"][0]["code"],
+        "FailedLocations"
+    );
+
+    // operation get --check reads a report's zip the same way.
+    let run = setup
+        .harness
+        .run_with(
+            &["--json", "operation", "get", CASE, OP, "--check"],
+            |env, _| setup.configure(env),
+        )
+        .await;
+    assert_eq!(
+        run.json()["results"]["collection"],
+        "incomplete",
+        "{}",
+        run.stdout()
+    );
+}
+
+#[tokio::test]
+async fn reconciliation_looks_from_after_the_last_read_before_the_send() {
+    let setup = Setup::new().await;
+    setup
+        .preflight(
+            setup.search(),
+            json!({"value": []}),
+            estimate("succeeded", json!(GIB)),
+        )
+        .await;
+    // The operations list read after approval takes ten minutes.
+    Mock::given(method("GET"))
+        .and(path(format!("{CASES}/{CASE}/operations")))
+        .respond_with(AdvanceOn {
+            clock: setup.harness.clock.clone(),
+            seen: AtomicUsize::new(0),
+            nth: 2,
+            by: Duration::from_secs(600),
+            response: json_response(200, json!({"value": []})),
+        })
+        .up_to_n_times(2)
+        .with_priority(1)
+        .mount(&setup.harness.graph)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("{CASES}/{CASE}/operations")))
+        .respond_with(json_response(
+            200,
+            json!({"value": [
+                {"id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaa0006", "action": "exportResult", "status": "succeeded", "createdDateTime": "2026-01-05T08:58:00Z"},
+                {"id": OP, "action": "exportResult", "status": "running", "createdDateTime": "2026-01-05T09:10:10Z"},
+            ]}),
+        ))
+        .with_priority(2)
+        .mount(&setup.harness.graph)
+        .await;
+    setup.get(&operation_path(), setup.succeeded()).await;
+    Mock::given(method("POST"))
+        .and(path(search_path("/exportReport")))
+        .respond_with(json_response(
+            503,
+            json!({"error": {"code": "ServiceUnavailable"}}),
+        ))
+        .mount(&setup.harness.graph)
+        .await;
+    let run = setup.run(&["--json", "--yes"]).await;
+    let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
+    assert!(message.contains(&format!("item report {OP}")), "{message}");
+    assert!(
+        !message.contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaa0006"),
+        "{message}"
+    );
+}

@@ -541,11 +541,12 @@ Settled in PR 2.4:
   `Location` header named is not known to be an item report, and an export's other files are
   item content.
 - `collection` and `failedLocations` come from `Locations-*.csv` alone; a Statistics file in
-  a report zip is not read at all, so it cannot make the zip unreadable, and a zip without
+  a report zip is not read at all, nor are Summary and Settings, so none of them can make
+  the zip unreadable, and a zip without
   Locations is not taken as the evidence. `operation get --check` reads an item report or
   export the same way.
 - Reconciliation, for `report` and for `estimate`, looks for operations created from five
-  minutes before the read after approval, not before the plan, so that a prompt left open
+  minutes before the end of the reads after approval, not before the plan, so that a prompt left open
   does not widen it. A candidate's own read must answer with the candidate's id before its
   action is shown.
 - Reconciliation lists operations shown as `exportResult` or `exportReport` created since

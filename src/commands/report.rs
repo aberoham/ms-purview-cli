@@ -686,10 +686,6 @@ impl WriteCommand for Report {
         if basis != shown.basis {
             return Err(changed("its latest estimate is not the one shown"));
         }
-        // Reconciliation looks for operations from just before the send,
-        // not from when the plan was shown: the prompt may have been open
-        // a long time.
-        self.planned = Some((case, search, preflight.clock.now() - CLOCK_SKEW));
         if !self.flags.allow_concurrent {
             let active = active_operations(preflight.graph, case, &EXPORT_ACTIONS, preflight.log)
                 .await
@@ -712,6 +708,10 @@ impl WriteCommand for Report {
                 )));
             }
         }
+        // Reconciliation looks for operations from just before the send:
+        // after these reads, not when the plan was shown, since the prompt
+        // or a slow read may have taken a long time.
+        self.planned = Some((case, search, preflight.clock.now() - CLOCK_SKEW));
         Ok(())
     }
 

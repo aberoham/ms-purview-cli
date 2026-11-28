@@ -1746,3 +1746,68 @@ async fn an_unknown_status_in_a_candidate_is_not_repeated() {
     );
     assert!(!message.contains("canary-status-0091"), "{message}");
 }
+
+/// Answers with `response`, and moves the clock forward by `by` at the
+/// `nth` request.
+struct AdvanceOn {
+    clock: Arc<ms_purview_cli::env::ManualClock>,
+    seen: std::sync::atomic::AtomicUsize,
+    nth: usize,
+    by: Duration,
+    response: ResponseTemplate,
+}
+
+impl Respond for AdvanceOn {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        if self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == self.nth {
+            self.clock.advance(self.by);
+        }
+        self.response.clone()
+    }
+}
+
+#[tokio::test]
+async fn an_unclear_estimate_looks_from_after_the_last_read_before_the_send() {
+    let setup = Setup::new().await;
+    setup
+        .preflight_search(fixture_value(&setup.harness, "search-get-mailboxes.json"))
+        .await;
+    // The operations list read after approval takes ten minutes.
+    Mock::given(method("GET"))
+        .and(path(format!("{CASES}/{CASE}/operations")))
+        .respond_with(AdvanceOn {
+            clock: setup.harness.clock.clone(),
+            seen: Default::default(),
+            nth: 2,
+            by: Duration::from_secs(600),
+            response: json_response(200, json!({"value": []})),
+        })
+        .up_to_n_times(2)
+        .with_priority(1)
+        .mount(&setup.harness.graph)
+        .await;
+    setup
+        .get(
+            &format!("{CASES}/{CASE}/operations"),
+            json!({"value": [
+                {"id": OTHER_OP, "action": "estimateStatistics", "status": "succeeded", "createdDateTime": "2026-01-05T08:58:00Z"},
+                {"id": OP, "action": "estimateStatistics", "status": "running", "createdDateTime": "2026-01-05T09:10:10Z"},
+            ]}),
+        )
+        .await;
+    Mock::given(method("POST"))
+        .and(path(search_path("/estimateStatistics")))
+        .respond_with(json_response(
+            503,
+            json!({"error": {"code": "ServiceUnavailable"}}),
+        ))
+        .mount(&setup.harness.graph)
+        .await;
+    let run = setup.run(&["--json", "--yes"]).await;
+    let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
+    assert!(
+        message.contains(&format!("estimate {OP} (running")),
+        "{message}"
+    );
+    assert!(!message.contains(OTHER_OP), "{message}");
+}

@@ -605,8 +605,9 @@ Settled in PR 4.1:
   latest-ending end record whose comment ends at the end of the file or within those bytes
   (the end of the file whenever a record reaches it, as before PR 4.1). Every end record
   ending exactly there counts toward the entry cap, the largest count deciding, so the end
-  record of a zip stored inside is not taken for the zip's own. A ZIP64 end record must end,
-  by its own length, where its locator starts. The one observed items
+  record of a zip stored inside is not taken for the zip's own. A ZIP64 end record must hold
+  at least 44 bytes after its size field and, by its own length, end at or before its
+  locator. The one observed items
   part had 296, most of them zero, after a Zip64 end record (Observed, one export); its
   report part had none. The zip is read as ending at its end record; the downloaded file,
   its size and its SHA-256 are the service's bytes unchanged.

@@ -352,6 +352,29 @@ read. If the POST outcome is unclear, the same `GET` on the case is the reconcil
 command reports the status it finds and exits 1 with `WriteOutcomeUnknown`. In the observed tenant some cases were in `closing` status at the time of the
 snapshot (Observed); whether they were stuck there is not known.
 
+Settled in PR 2.7:
+- A case that is not active, or not shown to be the tool's, refuses with
+  `ClosePrecheckFailed`; a `<case>` that names no case, or several, keeps `CaseNotFound` or
+  `AmbiguousCase`. Case records carried no `createdBy` (Observed, PR 2.6), so step 2 rests
+  on `naming.marker` in practice. A case allowed only by `--any-case` gets a warning in the
+  plan.
+- Each hold list is read to its last page through paging links to that list alone; a link
+  elsewhere refuses. A failed read is described by its code and HTTP status, never Graph's
+  message.
+- The case and its three lists are read again after approval and before the POST, with
+  the same refusals, ownership included, since a hold may be added or the marker removed
+  while the person types.
+- The POST has no body, and sends `Content-Length: 0` and no `Content-Type`: Graph answered
+  411 to a POST without a length (Observed, PR 2.6). The plan shows `body: null`, and its
+  digest covers method, path and an empty body.
+- At a terminal the prompt is `Type the case name to apply (<name>): `, with the name shown
+  as other tenant text is; the name typed, as Graph gives it or as shown, with surrounding
+  spaces ignored, is the only answer that approves. A case whose name shows as nothing is
+  confirmed by its id.
+- `result` is the case as read once after the close, or, with `--wait`, the read that
+  found it `closed`. A status the tool does not know ends the wait with exit 4 and
+  `UnknownStatus`; a read with no status ends it with exit 1. `--wait-timeout` and `--poll-interval` need `--wait`.
+
 #### `purview search list <case>`, `purview search get <case> <search>` (read)
 
 Columns: `ID`, `NAME`, `SCOPE`, `CREATED`, `QUERY` (cut to 80 characters in the table; full

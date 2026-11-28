@@ -1,4 +1,5 @@
-//! Waiting for an operation to finish (`docs/SPEC.md` section 4.6).
+//! Waiting for an operation to finish, or a case to close (`docs/SPEC.md`
+//! section 4.6).
 //!
 //! - One deadline covers the whole wait: the reads, the sleeps between
 //!   them and the retries inside each read. A read still in flight when it
@@ -19,7 +20,7 @@ use crate::env::{Clock, Interrupt};
 use crate::error::{PurviewError, Result};
 use crate::graph::GraphClient;
 use crate::model::valid::PollTarget;
-use crate::model::wire::OperationRecord;
+use crate::model::wire::{CaseRecord, CaseStatus, OperationRecord};
 use crate::output::sanitize;
 use crate::routes::{Query, ReadRoute};
 
@@ -53,13 +54,71 @@ pub fn scheduled_interval(elapsed: Duration) -> Duration {
 
 /// How a wait ended. `last` is the newest record read, if any.
 #[derive(Debug, Clone, PartialEq)]
-pub enum PollEnd {
-    /// The operation reached a status that stops polling.
-    Finished(OperationRecord),
+pub enum PollEnd<R = OperationRecord> {
+    /// The record reached a status that stops polling.
+    Finished(R),
     /// The deadline passed first.
-    TimedOut { last: Option<OperationRecord> },
+    TimedOut { last: Option<R> },
     /// Ctrl-C.
-    Interrupted { last: Option<OperationRecord> },
+    Interrupted { last: Option<R> },
+}
+
+/// A record a wait reads again and again: an operation, or a case being
+/// closed.
+pub trait Polled: Sized + Send {
+    /// What the record is, for notices: `operation` or `case`.
+    const NOUN: &'static str;
+    /// The record in one read's answer, checked against the route read.
+    fn read(body: serde_json::Value, route: &ReadRoute) -> Result<Self>;
+    /// Whether the record's status stops the wait.
+    fn finished(&self) -> bool;
+}
+
+impl Polled for OperationRecord {
+    const NOUN: &'static str = "operation";
+
+    fn read(body: serde_json::Value, route: &ReadRoute) -> Result<Self> {
+        checked(body, route)
+    }
+
+    fn finished(&self) -> bool {
+        self.status.is_terminal()
+    }
+}
+
+impl Polled for CaseRecord {
+    const NOUN: &'static str = "case";
+
+    /// The case, which must have a valid id and be the case read.
+    fn read(body: serde_json::Value, route: &ReadRoute) -> Result<Self> {
+        let record = CaseRecord::from_value(body)
+            .ok_or_else(|| PurviewError::message("Graph returned a case that is not an object"))?;
+        let case = crate::model::valid::CaseRef::new(record)?;
+        // A read without a status ends the wait (section 4.6): waiting
+        // would only repeat it.
+        if case.record.status == CaseStatus::Missing {
+            return Err(PurviewError::message(format!(
+                "Graph returned case {} with no readable status",
+                case.id
+            )));
+        }
+        if let ReadRoute::Case(wanted) = route {
+            if case.id != *wanted {
+                return Err(PurviewError::message(format!(
+                    "Graph answered the read of case {wanted} with case {}",
+                    case.id
+                )));
+            }
+        }
+        Ok(case.record)
+    }
+
+    /// `closed`, or a status the tool does not know, which waiting would
+    /// not change; `active` and `closing` keep the wait going. A read with
+    /// no status never gets here: `read` refuses it.
+    fn finished(&self) -> bool {
+        matches!(self.status, CaseStatus::Closed | CaseStatus::Other(_))
+    }
 }
 
 /// What the wait needs besides the route.
@@ -76,18 +135,18 @@ pub struct Poller<'a> {
 }
 
 impl Poller<'_> {
-    /// Reads `route` until the operation stops, the deadline passes or
-    /// Ctrl-C. `progress` is called after each read of a running
-    /// operation, with the time waited so far.
-    pub async fn wait(
+    /// Reads `route` until the record's status stops the wait, the
+    /// deadline passes or Ctrl-C. `progress` is called after each read of
+    /// a record that has not finished, with the time waited so far.
+    pub async fn wait<R: Polled>(
         &self,
         route: &ReadRoute,
         log: &mut (dyn Write + Send),
-        progress: &mut (dyn FnMut(&OperationRecord, Duration, &mut (dyn Write + Send)) + Send),
-    ) -> Result<PollEnd> {
+        progress: &mut (dyn FnMut(&R, Duration, &mut (dyn Write + Send)) + Send),
+    ) -> Result<PollEnd<R>> {
         let started = self.clock.elapsed();
         let deadline = started + self.timing.timeout;
-        let mut last: Option<OperationRecord> = None;
+        let mut last: Option<R> = None;
         let query = Query::new();
         // One listener for the whole wait, so that a Ctrl-C between a read
         // and the sleep after it is not missed.
@@ -109,7 +168,7 @@ impl Poller<'_> {
             let mut asked: Option<Duration> = None;
             let read = match read {
                 Err(_elapsed) => return Ok(PollEnd::TimedOut { last }),
-                Ok(read) => read.and_then(|body| checked(body, route)),
+                Ok(read) => read.and_then(|body| R::read(body, route)),
             };
             // A read that ended after the deadline does not count, whatever
             // it says: the deadline covers the whole wait. A valid record
@@ -122,7 +181,7 @@ impl Poller<'_> {
             }
             match read {
                 Ok(record) => {
-                    if record.status.is_terminal() {
+                    if record.finished() {
                         return Ok(PollEnd::Finished(record));
                     }
                     progress(&record, waited, log);
@@ -134,14 +193,16 @@ impl Poller<'_> {
                 {
                     let _ = writeln!(
                         log,
-                        "notice: the operation is not visible yet; reading it again"
+                        "notice: the {} is not visible yet; reading it again",
+                        R::NOUN
                     );
                 }
                 Err(error) if error.is_transient_graph_failure() => {
                     asked = error.retry_after();
                     let _ = writeln!(
                         log,
-                        "warning: reading the operation failed ({}); still waiting",
+                        "warning: reading the {} failed ({}); still waiting",
+                        R::NOUN,
                         sanitize(&error.to_string())
                     );
                 }

@@ -1135,6 +1135,7 @@ async fn a_fractional_wait_over_the_limit_is_reported_rounded_up() {
 mod polling {
     use super::*;
     use ms_purview_cli::env::ManualInterrupt;
+    use ms_purview_cli::model::wire::OperationRecord;
     use ms_purview_cli::poll::{PollEnd, Poller, Timing};
     use ms_purview_cli::routes::OperationId;
 
@@ -1241,7 +1242,7 @@ mod polling {
             not_found_grace: None,
         };
         let end = poller
-            .wait(&route(), &mut Vec::new(), &mut |_, _, _| interrupt.fire())
+            .wait::<OperationRecord>(&route(), &mut Vec::new(), &mut |_, _, _| interrupt.fire())
             .await
             .unwrap();
         let PollEnd::Interrupted { last: Some(last) } = end else {
@@ -1278,7 +1279,7 @@ mod polling {
         };
         let mut log = Vec::new();
         let end = poller
-            .wait(&route(), &mut log, &mut |_, _, _| {})
+            .wait::<OperationRecord>(&route(), &mut log, &mut |_, _, _| {})
             .await
             .unwrap();
         assert_eq!(end, PollEnd::TimedOut { last: None });

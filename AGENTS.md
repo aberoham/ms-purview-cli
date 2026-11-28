@@ -12,12 +12,12 @@ implements one item of its section 11 and nothing from later items. Today
 the binary has `purview version`, `purview auth login` (device code, or
 `--browser`), `auth refresh`, `auth status`, `auth list` and `auth logout`,
 `case list`, `case get`, `case create`, `search list`, `search get`,
-`search create`, `estimate`, `report`, `export create`, `export read`,
+`case close`, `search create`, `estimate`, `report`, `export create`, `export read`,
 `operation list` and
 `operation get` (with
 `--wait` and `--check`), `download`, `parse locations`, `parse failures`,
 `parse summary`, `kql`, and the global options `--verbose`, `--timeout`,
-`--trace` and `--wrap-untrusted`. `case create`, `search create`,
+`--trace` and `--wrap-untrusted`. `case create`, `case close`, `search create`,
 `estimate`, `report` and `export create` are the write commands so far; they
 run through the safety
 framework (`src/safety.rs`) with `--yes`, `--dry-run` and `--no-write`. Do not add
@@ -88,7 +88,18 @@ run with `python3`.
   character, refused; the query built) and handed to `write_command`.
 - `src/commands/` holds the bodies of the read commands: `case.rs`,
   `search.rs` and `operation.rs`, with key resolution in `mod.rs`.
-  `case.rs` also holds `CaseCreate` and `search.rs` `SearchCreate`, the
+  `case.rs` also holds `CaseClose`, the `WriteCommand` of `case close`:
+  the case must be active and carry `naming.marker` (or have been created
+  by the signed-in account) unless `--any-case`; its `custodians`,
+  `noncustodialDataSources` and `legalHolds` are each read to the last
+  page through paging links to that list alone, any entry refusing with
+  `CaseHasHolds` and a failed read with `ClosePrecheckFailed` (a broken
+  sign-in keeps `TokenUnavailable`), and read again, ownership included,
+  after approval (`recheck`). The
+  POST has no body (`WriteRoute::takes_body`), the plan asks for the case
+  name typed (`WritePlan::with_typed_confirmation`), `--wait` polls the
+  case through `Poller` until `closed`, and an unclear outcome reads the
+  case once. `case.rs` also holds `CaseCreate` and `search.rs` `SearchCreate`, the
   `WriteCommand`s of `case create` and `search create`: each lists the
   cases or the case's searches to the last page and refuses a name in use
   (`CaseNameInUse` in any status, `SearchNameInUse`), lists the same again
@@ -194,7 +205,9 @@ run with `python3`.
   request bodies (`CreateCase`, `CreateSearch`); a search's
   `dataSourceScopes` is `AllTenantMailboxes`, which serialises only as
   `allTenantMailboxes`.
-- `src/poll.rs` is the operation wait of `docs/SPEC.md` section 4.6: one
+- `src/poll.rs` is the wait of `docs/SPEC.md` section 4.6, over any
+  `Polled` record (an operation until it finishes, a case until it is
+  closed): one
   deadline over reads, sleeps and retries (a read in flight is abandoned
   with tokio's timer), the interval schedule, a 404 grace only for a
   fresh submission, and Ctrl-C through `Env`'s `Interrupt`. A read that
@@ -291,10 +304,13 @@ timeout. It carries the Graph base URL (`origin::GRAPH_BASE` in production,
   bytes, its token valid for five minutes, never again: a refused
   connection is `GraphUnreachable` (nothing sent), a 4xx is Graph's error,
   and no answer, a timeout, 429, a 5xx or an unreadable 2xx is
-  `WriteOutcomeUnknown`. The trace records the POST body.
+  `WriteOutcomeUnknown`. A write with no body sends `Content-Length: 0`
+  and no `Content-Type` (Graph answers 411 without the length, Observed).
+  The trace records the POST body.
 - `src/safety.rs` is `WritePlan` (the body serialised once, the SHA-256 of
   method, path and body, effects, warnings, preflight), `decide` (dry run,
-  `--yes`, the `Apply? [y/N]` prompt through `Env`'s `Input`, exit 3 as
+  `--yes`, the `Apply? [y/N]` prompt, or the typed name a plan asks for,
+  through `Env`'s `Input`, exit 3 as
   `ConfirmationRequired` or `Declined`), `ApprovedWrite`, which only
   `approve` builds from an `Approval` only this module makes, and the
   `WriteCommand` trait (`check`, `plan`, `applied`, `reconcile`, which
@@ -354,7 +370,8 @@ timeout. It carries the Graph base URL (`origin::GRAPH_BASE` in production,
   recording every request to the mock Graph and identity platform;
   `tests/creates.rs` runs `case create` and `search create` through
   `execute_with` the same way (flows 1, 2 and 7 of `docs/SPEC.md`
-  section 8.5); `tests/actions.rs` runs `estimate` and `operation get
+  section 8.5); `tests/closes.rs` runs `case close` the same way (flow
+  8); `tests/actions.rs` runs `estimate` and `operation get
   --check` against the mock Graph and a mock download origin (flows 3, 4
   and 5); `tests/reports.rs` runs `report` the same way, and
   `tests/exports.rs` `export create`; `tests/msgs.rs` runs the `.msg`
@@ -499,9 +516,9 @@ Every Purview write is a `WriteRoute` variant, and `WriteRoute::ALL` is the
 six POSTs in `docs/SPEC.md` section 4.3: create case, close case, create
 search, estimate statistics, export report and export result. They are sent
 only by `GraphClient::send_write`, which takes an `ApprovedWrite`;
-`case create`, `search create`, `estimate`, `report` and `export create`
-send create case, create search, estimate statistics, export report and
-export result. No
+`case create`, `case close`, `search create`, `estimate`, `report` and
+`export create` send create case, close case, create search, estimate
+statistics, export report and export result. No
 `PATCH`, `PUT` or `DELETE` may exist in the crate, in code, strings or
 comments, and `tests/write_allow_list.rs` scans the source tree for them
 and for calls that would choose a method at run time. Adding a write needs a

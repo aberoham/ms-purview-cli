@@ -305,6 +305,7 @@ fn command_groups_list_exactly_their_shipped_commands() {
             .collect();
         let expected: &[&str] = match group {
             "operation" => &["list", "get", "help"],
+            "case" => &["list", "get", "create", "close", "help"],
             _ => &["list", "get", "create", "help"],
         };
         assert_eq!(commands, expected, "{group}: {text}");

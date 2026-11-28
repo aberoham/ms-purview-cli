@@ -616,6 +616,50 @@ Examples:
   purview case create --topic \"Orders review\" --reuse-existing --yes --json"
     )]
     Create(CaseCreateArgs),
+    #[command(
+        about = "Close a case this tool made, after checking it holds nothing",
+        long_about = "\
+Close an active case. The case must carry naming.marker in its description \
+or have been created by the signed-in account, unless --any-case is given. \
+Its custodians, non-custodial data sources and legal holds are each read to \
+the last page, and any entry refuses the close (CaseHasHolds); a read that \
+fails refuses it too (ClosePrecheckFailed). This tool never changes a hold \
+and never reopens a case: reopening is done by hand in the Purview portal.
+
+This command changes Purview: it shows a plan and sends it only when \
+approved, by --yes or by typing the case name at a terminal. --dry-run shows \
+the plan and sends nothing. --wait reads the case until it is closed.",
+        after_help = "\
+Examples:
+  purview case close <case> --dry-run
+  purview case close <case> --yes --wait"
+    )]
+    Close(CaseCloseArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct CaseCloseArgs {
+    #[arg(value_name = "CASE", help = CASE_HELP)]
+    case: String,
+    #[arg(long, help = "Close a case that is not shown to be one this tool made")]
+    any_case: bool,
+    #[arg(long, help = "Read the case until it is closed")]
+    wait: bool,
+    #[arg(
+        long,
+        value_name = "DUR",
+        requires = "wait",
+        help = "How long to wait for the case to close, such as 5m (default 15m, at most 24h)"
+    )]
+    wait_timeout: Option<String>,
+    #[arg(
+        long,
+        value_name = "DUR",
+        requires = "wait",
+        help = "A fixed interval between reads, at least 5s (default: 10s, then 30s after 2 \
+minutes, then 60s after 10)"
+    )]
+    poll_interval: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1761,6 +1805,22 @@ async fn run(
             )?;
             write_command(env, output, globals, &mut command).await
         }
+        Command::Case(CaseArgs {
+            command: CaseCommand::Close(args),
+        }) => {
+            let wait = if args.wait {
+                Some(poll::timing(
+                    args.wait_timeout.as_deref(),
+                    args.poll_interval.as_deref(),
+                    commands::case::CLOSE_WAIT_TIMEOUT,
+                )?)
+            } else {
+                None
+            };
+            let mut command =
+                commands::case::CaseClose::new(CaseKey::parse(&args.case)?, args.any_case, wait);
+            write_command(env, output, globals, &mut command).await
+        }
         Command::Case(case) => {
             read_command(env, output, globals, ReadCommand::case(case.command)?).await
         }
@@ -2044,6 +2104,9 @@ impl ReadCommand {
             CaseCommand::Get { case } => Self::CaseGet(CaseKey::parse(&case)?),
             CaseCommand::Create(_) => {
                 return Err(PurviewError::message("case create is a write command"))
+            }
+            CaseCommand::Close(_) => {
+                return Err(PurviewError::message("case close is a write command"))
             }
         })
     }

@@ -30,7 +30,10 @@ Every write runs the same steps, in this order:
    - `--yes` (or `PURVIEW_YES=true`) approves.
    - Otherwise, when standard input and standard error are both terminals
      and `--no-input` is not given, the plan is shown on standard error
-     followed by `Apply? [y/N]`. Only `y` or `yes` approves.
+     followed by `Apply? [y/N]`. Only `y` or `yes` approves. `case close`
+     asks for the case's name instead, and only that name, typed as Graph
+     gives it or as shown, approves; a name that shows as nothing is
+     confirmed by the case id.
    - Otherwise nothing is sent, and the command exits 3 with
      `ConfirmationRequired`; a declined prompt exits 3 with `Declined`.
 6. **Send.** The approved request is sent once, exactly as planned. It is
@@ -56,6 +59,7 @@ error.
 | Command | What it changes |
 |---|---|
 | `case create` | A new case, visible to eDiscovery administrators. No custodians, data sources or holds. |
+| `case close` | The case's status, to `closing` then `closed`. Changes no hold, custodian or data source, since a case with any is refused. The tool never reopens a case; reopening is done by hand in the Purview portal. |
 | `search create` | A search over every tenant mailbox in an active case. Nothing runs until an estimate, report or export is started. No custodians, data sources or holds. |
 | `estimate` | Runs a search over every tenant mailbox, adding an estimate operation and its report file to the case. Reads no item content and places no hold. |
 | `report` | Runs a search over every tenant mailbox, adding an item report operation and its zip to the case: one row of metadata (sender, recipients, subject, dates, location) per copy of each item found. Collects no message bodies or attachments and places no hold. |
@@ -79,6 +83,25 @@ error.
   the command shows it and exits 0 without sending anything
   (`"reused": true`, `"applied": false`). A closed or closing match, or
   several matches, are still refused.
+
+### `case close`
+
+- The case must be active, and must carry `naming.marker` in its
+  description or have been created by the signed-in account, unless
+  `--any-case` is given; a case allowed by `--any-case` alone gets a
+  warning in the plan. Case records in
+  the observed tenant carry no `createdBy`, so the marker is what shows a
+  case is the tool's.
+- Preflight reads the case's custodians, non-custodial data sources and
+  legal holds, each to its last page. Any entry refuses with
+  `CaseHasHolds`, giving the counts but no entry. A read that is denied,
+  malformed or stops before its last page refuses with
+  `ClosePrecheckFailed`, as does a case that is not active.
+- After approval, and before the POST, the case and the three lists are
+  read again, because holds may have been added while the person answered.
+- The POST has no body. `--wait` reads the case until it is `closed`; at
+  the deadline (default 15 minutes) or on Ctrl-C the command prints the
+  last status and `purview case get <case>`, and exits 5 or 130.
 
 ### `search create`
 
@@ -230,7 +253,8 @@ data directory; a later `download` reuses that file.
 
 If the POST gets no answer, times out, or gets HTTP 429 or a 5xx, it is not
 sent again. `case create` lists the cases with the planned name,
-`search create` the case's searches with the planned name, `estimate`
+`search create` the case's searches with the planned name, `case close`
+reads the case once and shows its status, `estimate`
 the estimates of the case created since just before the request by the
 signed-in account (or with no creator recorded), and `report` and
 `export create` the item

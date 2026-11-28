@@ -89,12 +89,12 @@ Existing tools leave gaps across the eDiscovery workflow (recorded in [docs/SPEC
 - The write commands show a plan and send one POST only when approved by `--yes` or at an `Apply? [y/N]` prompt; `--dry-run` sends nothing, and `--no-write` refuses them before sign-in.
 - `purview report <case> <search>`: run a search's item report after the same checks and a size limit against its latest estimate, then download the zip and report `collection`.
 - `purview export read <items.zip>`: read each message in an export's items zip on this computer (from and sender, recipients, subject, dates, attachment names and sizes, and the body, HTML first) as JSON Lines into a file; it refuses to write bodies to a terminal. A body keeps a link's text but not where it points, and web addresses lose everything after `?`; when a link is the evidence, open the `.msg` that the record's `entry` names.
+- `purview case close <case>` (`--any-case`, `--wait`): close an active case the tool made, after checking it has no custodians, data sources or holds; at a terminal you type the case name to approve. The tool never reopens a case.
 - `purview export create <case> <search>`: run a search's export as `.msg` files after the same checks and size limit, download every part into the data directory, and report `collection` from the report part; item content is never printed.
 - `purview operation get --check`, and `purview parse locations`, `parse failures` and `parse summary` on a downloaded estimate or report zip, with no sign-in.
 
 **Planned roadmap (not yet built, no dates):**
 
-- **v0.2:** `case close`, if its live checks complete.
 - **v0.3:** item report parsing (`parse items`, `parse profile`).
 - **v0.4:** `export index`.
 - **v0.5:** the rest of `export read` (the join to the report, quoted-reply cutting and thread de-duplication).

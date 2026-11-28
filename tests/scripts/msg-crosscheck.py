@@ -126,10 +126,10 @@ def main(argv):
             elif "@" in ours_from and their_from and {ours_from} != their_from and {
                 ours_from.split("@")[0]
             } == {a.split("@")[0] for a in their_from}:
-                # PidTagSenderSmtpAddress against extract-msg's sender, the
-                # From header's address, which can be the same mailbox in
-                # another of its domains (Observed). Counted apart: neither
-                # agreement nor a failure.
+                # `from` (PidTagSentRepresentingSmtpAddress) against
+                # extract-msg's sender, the From header's address, which can
+                # be the same mailbox in another of its domains (Observed).
+                # Counted apart: neither agreement nor a failure.
                 counts["from: same local part, other domain"] += 1
             elif ours_from or their_from:
                 checks["from"] = {ours_from} == their_from

@@ -20,7 +20,13 @@ pub struct MsgItem {
     pub subject: Option<String>,
     pub conversation_topic: Option<String>,
     pub internet_message_id: Option<String>,
+    /// The mailbox the message is from, as its recipients see it
+    /// (`PidTagSentRepresenting*`); the sender when the item has none.
     pub from: Option<Mailbox>,
+    /// The mailbox that sent it (`PidTagSender*`), which differs from
+    /// `from` when a delegate sent on another's behalf. Graph's `from` and
+    /// `sender` are the same pair.
+    pub sender: Option<Mailbox>,
     pub to: Vec<Mailbox>,
     pub cc: Vec<Mailbox>,
     pub bcc: Vec<Mailbox>,
@@ -76,6 +82,8 @@ mod id {
     pub const SUBJECT: u16 = 0x0037;
     pub const CLIENT_SUBMIT_TIME: u16 = 0x0039;
     pub const CONVERSATION_TOPIC: u16 = 0x0070;
+    pub const SENT_REPRESENTING_NAME: u16 = 0x0042;
+    pub const SENT_REPRESENTING_EMAIL_ADDRESS: u16 = 0x0065;
     pub const SENDER_NAME: u16 = 0x0C1A;
     pub const SENDER_EMAIL_ADDRESS: u16 = 0x0C1F;
     pub const RECIPIENT_TYPE: u16 = 0x0C15;
@@ -96,6 +104,14 @@ mod id {
     pub const SENT_REPRESENTING_SMTP_ADDRESS: u16 = 0x5D02;
 }
 
+/// The mailbox of a display name and an address property, SMTP first
+/// (MS-OXPROPS), or `None` when the item has neither.
+fn mailbox(message: &mut Props<'_, '_>, name: u16, smtp: u16, address: u16) -> Option<Mailbox> {
+    let name = message.string(name);
+    let address = message.string(smtp).or_else(|| message.string(address));
+    (name.is_some() || address.is_some()).then_some(Mailbox { name, address })
+}
+
 /// Reads one `.msg` from memory.
 pub fn parse_msg(bytes: &[u8]) -> Result<MsgItem, MsgError> {
     let mut container = Container::open(bytes)?;
@@ -105,15 +121,19 @@ pub fn parse_msg(bytes: &[u8]) -> Result<MsgItem, MsgError> {
     let string_codepage = message.long(id::MESSAGE_CODEPAGE);
     message.set_string_codepage(string_codepage);
     let class = message.string(id::MESSAGE_CLASS);
-    let from_name = message.string(id::SENDER_NAME);
-    let from_address = message
-        .string(id::SENDER_SMTP_ADDRESS)
-        .or_else(|| message.string(id::SENDER_EMAIL_ADDRESS))
-        .or_else(|| message.string(id::SENT_REPRESENTING_SMTP_ADDRESS));
-    let from = (from_name.is_some() || from_address.is_some()).then_some(Mailbox {
-        name: from_name,
-        address: from_address,
-    });
+    let sender = mailbox(
+        &mut message,
+        id::SENDER_NAME,
+        id::SENDER_SMTP_ADDRESS,
+        id::SENDER_EMAIL_ADDRESS,
+    );
+    let from = mailbox(
+        &mut message,
+        id::SENT_REPRESENTING_NAME,
+        id::SENT_REPRESENTING_SMTP_ADDRESS,
+        id::SENT_REPRESENTING_EMAIL_ADDRESS,
+    )
+    .or_else(|| sender.clone());
     let html = message.html(id::HTML);
     let text = message.string(id::BODY);
     let rtf = message.exists(id::RTF_COMPRESSED);
@@ -123,6 +143,7 @@ pub fn parse_msg(bytes: &[u8]) -> Result<MsgItem, MsgError> {
         conversation_topic: message.string(id::CONVERSATION_TOPIC),
         internet_message_id: message.string(id::INTERNET_MESSAGE_ID),
         from,
+        sender,
         sent: message.time(id::CLIENT_SUBMIT_TIME),
         received: message.time(id::MESSAGE_DELIVERY_TIME),
         body: body::select(html, text, rtf, internet_codepage, class.as_deref()),

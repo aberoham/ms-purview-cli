@@ -51,6 +51,36 @@ fn an_html_only_note_reads_with_its_headers_and_html_body() {
 }
 
 #[test]
+fn a_message_sent_on_behalf_is_from_the_mailbox_shown_and_sent_by_the_delegate() {
+    // A delegate (`PidTagSender*`) sending for another mailbox
+    // (`PidTagSentRepresenting*`), with only the display address type
+    // for the mailbox shown.
+    let message = html_note()
+        .with(0x0042, P::Unicode("Robin Example".into()))
+        .with(0x5D02, P::Unicode("robin@contoso.example".into()))
+        .with(0x0C1A, P::Unicode("Dana Example".into()))
+        .with(0x5D01, P::Unicode("dana@contoso.example".into()));
+    let item = parse_msg(&message.build()).unwrap();
+    let from = item.from.unwrap();
+    assert_eq!(from.name.as_deref(), Some("Robin Example"));
+    assert_eq!(from.address.as_deref(), Some("robin@contoso.example"));
+    let sender = item.sender.unwrap();
+    assert_eq!(sender.name.as_deref(), Some("Dana Example"));
+    assert_eq!(sender.address.as_deref(), Some("dana@contoso.example"));
+}
+
+#[test]
+fn an_item_with_only_a_sender_is_from_the_sender() {
+    let message = html_note().without(0x0042).without(0x5D02);
+    let item = parse_msg(&message.build()).unwrap();
+    assert_eq!(item.from, item.sender);
+    assert_eq!(
+        item.from.unwrap().address.as_deref(),
+        Some("alex@contoso.example")
+    );
+}
+
+#[test]
 fn a_text_only_note_reads_its_text_body() {
     let message = Message::note("Plain").with(BODY, P::Unicode("Line one\r\nLine two".into()));
     let item = parse_msg(&message.build()).unwrap();
@@ -269,10 +299,15 @@ async fn json_gives_one_document_and_wrap_untrusted_marks_the_message() {
         let text = record[key].as_str().unwrap();
         assert!(text.starts_with("[UNTRUSTED:"), "{key}: {text}");
     }
-    assert!(record["from"]["address"]
-        .as_str()
-        .unwrap()
-        .starts_with("[UNTRUSTED:"));
+    for key in ["from", "sender"] {
+        assert!(
+            record[key]["address"]
+                .as_str()
+                .unwrap()
+                .starts_with("[UNTRUSTED:"),
+            "{key}"
+        );
+    }
     assert!(document["untrustedNotice"].is_string());
 
     // JSON Lines: one marker for the run, the notice on stderr.

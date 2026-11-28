@@ -797,16 +797,21 @@ Settled in the first `.msg` reader PR (PR 5.1 with the body selection of PR 5.2)
   `--body`, `--headers`, the filters and `--force-buffer` wait for later PRs; `--json` is
   refused above 10,000 items.
 - A record has `entry`, `part`, `class`, `subject`, `conversationTopic`,
-  `internetMessageId`, `from`, `to`, `cc`, `bcc` (each `{"name", "address"}`), `sent`,
-  `received`, `attachments` (`{"name", "size"}`), `body`, `bodySource`, `bodyTruncated`,
-  `error` and `errorDetail`; `class` is the `.msg`'s own. A record for an item that could
-  not be parsed (`entryTooLarge`, `entryUnreadable`, `cfbInvalid`) or printed
-  (`redactionFailed`) has only `entry`, `part`, `error` and `errorDetail`. An entry that is
-  not a `.msg` is skipped and counted. An entry over `--max-entry-bytes` is
+  `internetMessageId`, `from`, `sender`, `to`, `cc`, `bcc` (each `{"name", "address"}`),
+  `sent`, `received`, `attachments` (`{"name", "size"}`), `body`, `bodySource`,
+  `bodyTruncated`, `error` and `errorDetail`; `class` is the `.msg`'s own. A record for an
+  item that could not be parsed (`entryTooLarge`, `entryUnreadable`, `cfbInvalid`) or
+  printed (`redactionFailed`) has only `entry`, `part`, `error` and `errorDetail`. An
+  entry that is not a `.msg` is skipped and counted. An entry over `--max-entry-bytes` is
   `entryTooLarge`; one the zip cannot give is `entryUnreadable`.
 - `PidTagAttachSize` is absent from exported attachments (Observed), so an attachment's
   size is the length of its data stream, `__substg1.0_37010102`, read from the container's
   directory.
+- `from` and `sender` are Graph's pair: `from` is the mailbox the message is from as its
+  recipients see it (`PidTagSentRepresenting*`), `sender` the mailbox that sent it
+  (`PidTagSender*`); they differ when a delegate sent on another's behalf (Docs:
+  MS-OXOMSG). An item with no sent-representing properties is from its sender. On the
+  private export the two were the same on every item (Observed).
 - A sender with no SMTP address keeps its Exchange address (Observed: two of 31 items). A
   recipient type has the `MAPI_SUBMITTED` flag of a resend masked off; a missing type is To.
 - Before conversion: `<head>`, `<style>` and `<script>` are removed with their content,
@@ -845,12 +850,13 @@ Settled in the first `.msg` reader PR (PR 5.1 with the body selection of PR 5.2)
 - The cross-check is `tests/scripts/msg-crosscheck.py`, run by hand. On the maintainer's
   one private export of 31 items it agreed with `extract-msg` 0.55.0 on subject, sent time,
   body and To for every item and on CC for the 18 with CC recipients (Observed). Of the 29
-  items with an SMTP sender, 25 agreed on the whole address; on 4, the sender's
-  `PidTagSenderSmtpAddress` had the same local part in another domain than the address
-  `extract-msg` gives from the From header, which shows it only as the display name
-  (Observed): `from` is the mailbox's own SMTP address, not always the address the message
-  was sent as. Senders are compared whole and that case is counted apart; recipients are
-  compared as sets of address local parts. A field empty in one reader never agrees with a
+  items with an SMTP sender, 25 agreed on the whole address; on 4, `from`
+  (`PidTagSentRepresentingSmtpAddress`, the same as `PidTagSenderSmtpAddress` there) had
+  the same local part in another domain than the address `extract-msg` gives from the
+  From header, which shows it only as the display name (Observed): `from` is the
+  mailbox's own SMTP address, not always the address the message was sent as. Senders are
+  compared whole and that case is counted apart; recipients are compared as sets of
+  address local parts. A field empty in one reader never agrees with a
   filled one, and a field empty in both is counted apart.
   The `msg-crosscheck` CI job waits for PR 5.3.
 
@@ -1423,6 +1429,7 @@ An entry over the cap gets
  "conversationName":null,"immutableId":"…","internetMessageId":"<…@contoso.example>",
  "subject":"Orders API cut-over",
  "from":{"name":"Alex Example","address":"alex@contoso.example"},
+ "sender":{"name":"Alex Example","address":"alex@contoso.example"},
  "to":[{"name":"Sam Example","address":"sam@contoso.example"}],"cc":[],
  "sent":"2025-03-02T09:13:58Z","received":"2025-03-02T09:14:00Z",
  "attachments":[{"name":"plan.xlsx","size":48211}],
@@ -1456,9 +1463,11 @@ from the `.msg`. `error` is one of `cfbInvalid`, `noBody`, `bodyDecode`, `entryT
      `PidTagConversationTopic` 0x0070, `PidTagInternetMessageId` 0x1035,
      `PidTagTransportMessageHeaders` 0x007D, `PidTagClientSubmitTime` 0x0039,
      `PidTagMessageDeliveryTime` 0x0E06, `PidTagInternetCodepage` 0x3FDE.
-   - **Sender:** `PidTagSenderName` 0x0C1A, then `PidTagSenderSmtpAddress` 0x5D01,
-     `PidTagSenderEmailAddress` 0x0C1F, `PidTagSentRepresentingSmtpAddress` 0x5D02, in that
-     order of preference.
+   - **From:** `PidTagSentRepresentingName` 0x0042, then
+     `PidTagSentRepresentingSmtpAddress` 0x5D02 or `PidTagSentRepresentingEmailAddress`
+     0x0065; the sender when the item has none of them.
+   - **Sender:** `PidTagSenderName` 0x0C1A, then `PidTagSenderSmtpAddress` 0x5D01 or
+     `PidTagSenderEmailAddress` 0x0C1F.
    - **Body:** `PidTagBody` 0x1000, `PidTagHtml` 0x1013, `PidTagRtfCompressed` 0x1009.
    - **Recipients:** `PidTagRecipientType` 0x0C15, `PidTagDisplayName` 0x3001,
      `PidTagSmtpAddress` 0x39FE, then `PidTagEmailAddress` 0x3003.

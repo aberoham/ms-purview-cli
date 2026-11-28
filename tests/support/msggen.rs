@@ -28,8 +28,16 @@ pub enum Value {
 pub struct Props(pub Vec<(u16, Value)>);
 
 impl Props {
+    /// The properties with `id` set to `value`, replacing any it had.
     pub fn with(mut self, id: u16, value: Value) -> Self {
+        self.0.retain(|(have, _)| *have != id);
         self.0.push((id, value));
+        self
+    }
+
+    /// The properties without `id`.
+    pub fn without(mut self, id: u16) -> Self {
+        self.0.retain(|(have, _)| *have != id);
         self
     }
 }
@@ -66,6 +74,8 @@ impl Message {
             props: Props::default()
                 .with(0x001A, Value::Unicode("IPM.Note".into()))
                 .with(0x0037, Value::Unicode(subject.into()))
+                .with(0x0042, Value::Unicode("Alex Example".into()))
+                .with(0x5D02, Value::Unicode("alex@contoso.example".into()))
                 .with(0x0C1A, Value::Unicode("Alex Example".into()))
                 .with(0x5D01, Value::Unicode("alex@contoso.example".into()))
                 .with(0x0039, Value::Time(1_767_603_600))
@@ -76,7 +86,12 @@ impl Message {
     }
 
     pub fn with(mut self, id: u16, value: Value) -> Self {
-        self.props.0.push((id, value));
+        self.props = std::mem::take(&mut self.props).with(id, value);
+        self
+    }
+
+    pub fn without(mut self, id: u16) -> Self {
+        self.props = std::mem::take(&mut self.props).without(id);
         self
     }
 

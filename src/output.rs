@@ -101,6 +101,7 @@ pub const UNTRUSTED_KEYS: &[&str] = &[
     "conversationTopic",
     "internetMessageId",
     "from",
+    "sender",
     "to",
     "cc",
     "bcc",

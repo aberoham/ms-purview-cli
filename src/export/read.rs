@@ -280,6 +280,7 @@ fn fill(
         ("conversationTopic", json!(item.conversation_topic)),
         ("internetMessageId", json!(item.internet_message_id)),
         ("from", item.from.as_ref().map_or(Value::Null, mailbox)),
+        ("sender", item.sender.as_ref().map_or(Value::Null, mailbox)),
         ("to", Value::Array(item.to.iter().map(mailbox).collect())),
         ("cc", Value::Array(item.cc.iter().map(mailbox).collect())),
         ("bcc", Value::Array(item.bcc.iter().map(mailbox).collect())),

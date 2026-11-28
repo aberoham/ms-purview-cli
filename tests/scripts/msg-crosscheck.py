@@ -123,7 +123,7 @@ def main(argv):
             if ours_from.startswith("/") and not their_from:
                 # No SMTP sender: the Exchange address against a display name.
                 counts["from: no SMTP address in either"] += 1
-            elif ours_from and their_from and {ours_from} != their_from and {
+            elif "@" in ours_from and their_from and {ours_from} != their_from and {
                 ours_from.split("@")[0]
             } == {a.split("@")[0] for a in their_from}:
                 # PidTagSenderSmtpAddress against extract-msg's sender, the

@@ -799,9 +799,11 @@ Settled in the first `.msg` reader PR (PR 5.1 with the body selection of PR 5.2)
 - A record has `entry`, `part`, `class`, `subject`, `conversationTopic`,
   `internetMessageId`, `from`, `to`, `cc`, `bcc` (each `{"name", "address"}`), `sent`,
   `received`, `attachments` (`{"name", "size"}`), `body`, `bodySource`, `bodyTruncated`,
-  `error` and `errorDetail`; `class` is the `.msg`'s own. An entry that is not a `.msg` is
-  skipped and counted. An entry over `--max-entry-bytes` is `entryTooLarge`; one the zip
-  cannot give is `entryUnreadable`.
+  `error` and `errorDetail`; `class` is the `.msg`'s own. A record for an item that could
+  not be parsed (`entryTooLarge`, `entryUnreadable`, `cfbInvalid`) or printed
+  (`redactionFailed`) has only `entry`, `part`, `error` and `errorDetail`. An entry that is
+  not a `.msg` is skipped and counted. An entry over `--max-entry-bytes` is
+  `entryTooLarge`; one the zip cannot give is `entryUnreadable`.
 - `PidTagAttachSize` is absent from exported attachments (Observed), so an attachment's
   size is the length of its data stream, `__substg1.0_37010102`, read from the container's
   directory.
@@ -811,8 +813,12 @@ Settled in the first `.msg` reader PR (PR 5.1 with the body selection of PR 5.2)
   VML and Office rules only when they set `behavior`, and `<hr>` is kept as `---`. Office's
   conditional comments need nothing: a hidden one is one HTML comment, which the parser
   drops, and a downlevel-revealed one's markers are comments around text that is kept.
-  Conversion uses `html2text`'s raw mode, which gives each table cell its own line, draws
-  no borders and ignores spans, so a table is never wider or longer than its text. The
+  A link's `<a>` tags are removed and its text kept: `html2text` would write `[text]`, and a
+  bracket run on to a URL hides its host from the redaction. The link's target is never
+  shown. Conversion uses `html2text`'s raw mode, which gives each table cell its own line
+  and draws no borders, so a table is never wider or longer than its text; a huge span
+  stays cheap, and spans whose sum overflows panic inside `html2text`, which gives
+  `bodyDecode` (Derived from its source). The
   width is 10,000 or more than the HTML's length, whichever is larger, so that no word is
   broken across lines: the URL redaction that runs on the text afterwards then sees every
   URL whole (Derived from `html2text` 0.17's source and tests). A converter that fails or

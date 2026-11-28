@@ -181,7 +181,9 @@ fn encoding_for(codepage: u32) -> Option<&'static Encoding> {
 /// (`<!--[if !mso]><!-->`, `<![if …]>`) are comments around text that is
 /// kept.
 static REMOVED_HTML: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?is)<head\b.*?</head\s*>|<style\b.*?</style\s*>|<script\b.*?</script\s*>")
+    Regex::new(
+        r"(?is)<head(?:\s[^>]*)?>.*?</head\s*>|<style(?:\s[^>]*)?>.*?</style\s*>|<script(?:\s[^>]*)?>.*?</script\s*>",
+    )
         .expect("a valid pattern")
 });
 
@@ -193,6 +195,12 @@ static VML_STYLE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(?:[vowx]\\:\*|\.shape)\s*\{\s*behavior\s*:[^}]*\}").expect("a valid pattern")
 });
 
+/// A link's tags, removed and their text kept: `html2text` writes a link
+/// as `[text]`, and a bracket run on to a URL hides its host from the
+/// redaction after. The link's target is never shown.
+static LINK_TAG: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)<a(?:\s[^>]*)?>|</a\s*>").expect("a valid pattern"));
+
 /// A horizontal rule, which `html2text` 0.17 drops; it is kept as `---`.
 static HR: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)<hr\b[^>]*>").expect("a valid pattern"));
@@ -203,6 +211,7 @@ static HR: LazyLock<Regex> =
 pub fn html_to_text(html: &str) -> Option<String> {
     let cleaned = REMOVED_HTML.replace_all(html, "");
     let cleaned = VML_STYLE.replace_all(&cleaned, "");
+    let cleaned = LINK_TAG.replace_all(&cleaned, "");
     let cleaned = HR.replace_all(&cleaned, "<p>---</p>");
     let cleaned = cleaned.into_owned();
     let width = TEXT_WIDTH.max(cleaned.len().saturating_add(1));
@@ -318,6 +327,29 @@ mod tests {
             html_to_text("<p><s>https://portal.contoso.example/a?x=1</s> <del>gone</del></p>")
                 .unwrap();
         assert_eq!(text, "https://portal.contoso.example/a?x=1 gone");
+    }
+
+    #[test]
+    fn a_link_is_its_text_with_no_brackets() {
+        let text = html_to_text(
+            "<p>See <a href=\"https://portal.contoso.example\">https://portal.contoso.example</a> \
+             and <A HREF='https://portal.contoso.example/a?x=1'>the portal</A>.</p>",
+        )
+        .unwrap();
+        assert_eq!(text, "See https://portal.contoso.example and the portal.");
+    }
+
+    #[test]
+    fn an_element_named_like_head_is_not_removed() {
+        // A forwarded message can hold a second document's `<head>` later.
+        let text = html_to_text(
+            "<p><head-line>kept</head-line></p><p>middle</p><head><title>t</title></head>\
+             <p>after</p>",
+        )
+        .unwrap();
+        for kept in ["kept", "middle", "after"] {
+            assert!(text.contains(kept), "{kept}: {text}");
+        }
     }
 
     #[test]

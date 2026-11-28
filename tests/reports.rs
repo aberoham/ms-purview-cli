@@ -1693,9 +1693,10 @@ async fn locations_with_hits_leaves_out_rows_with_no_hits_and_is_unknown_without
         ]))
         .await;
     let run = setup.run(&["--json", "--yes"]).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stdout());
     assert_eq!(
-        run.json()["results"]["result"]["locationsWithHits"],
-        Value::Null,
+        run.json()["results"]["result"].get("locationsWithHits"),
+        Some(&Value::Null),
         "{}",
         run.stdout()
     );

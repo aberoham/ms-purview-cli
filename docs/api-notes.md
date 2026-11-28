@@ -137,6 +137,19 @@ From the queries sampled in one tenant (Observed):
   `Items.1.001.<export name>.zip\Exchange\Items\<id>.msg`. Items zips hold one flat folder,
   `Exchange/Items/<32 hex>.msg`, plus two directory entries, and every row matched exactly
   one file. (Observed)
+- PR 4.1, one small email-only export (31 items, Teams context on): `export create` with
+  `exportFormat: msg` and `additionalOptions: teamsAndYammerConversations,includeReport`
+  answered 202 with a `Location` header, and the operation listed two files, a
+  `Reports-…StartDirectExport-…zip` of about 14 KB and one `Items.1.001.<export name>.zip`
+  of about 4 MB. The single GET showed `action: exportResult`. Both downloads came from the
+  proxy host with no redirect. (Observed)
+- That items part held 31 entries, all `.msg` and all stored (compression method 0), with no
+  directory entries; each had general-purpose flags 0x0808 (a data descriptor and UTF-8
+  names). It ended with a Zip64 end record and locator, then the classic end record with a
+  zero-length comment, then 296 further bytes, most of them zero. The `zip` crate and the
+  tool's own end-record check refused the file until the zip was read as ending at its end
+  record. The report part held 4 deflated CSV files, each with a Zip64 extra field, and
+  nothing after its end record. No `deflate64` entry was seen. (Observed, one export)
 - Mail bodies in the exported `.msg` files are often only HTML. `extract-msg` read every item
   except Teams system messages (`IPM.SkypeTeams.SystemMessage`). Quoted reply history
   repeats in every message of a thread. (Observed)
@@ -150,7 +163,8 @@ From the queries sampled in one tenant (Observed):
 7. Throttling.
 8. The shapes of `failed`, `partiallySucceeded`, `submissionFailed` and `resultInfo`.
 9. `Range` support, URL expiry and long downloads (PR 4.1).
-10. Zip64 and compression methods in large exports (PR 4.1).
+10. Zip64 and compression methods in large exports: one small export observed (above); a
+    multi-gigabyte one not yet.
 11. Numbering of `Items.1.NNN` parts beyond `.001`.
 12. Teams message bodies in `.msg` form, and compressed-RTF-only items (PR 5.2).
 13. Whether the Summary date format follows locale.

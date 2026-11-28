@@ -44,6 +44,33 @@ pub struct Request {
     /// A server file name, matched exactly.
     pub file: Option<String>,
     pub overwrite: bool,
+    /// Which named files may be fetched at all.
+    pub keep: Keep,
+}
+
+/// Which of an operation's named files a fetch may download. A file with
+/// no name is reported as not downloadable whatever this says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Keep {
+    /// Every file: `download`, and `export create`, whose parts are what
+    /// it collects.
+    Every,
+    /// Every file but an export's items parts (`Items.….zip`): an
+    /// estimate's or item report's evidence.
+    NoItems,
+    /// Only the `Reports-…` files: an export's evidence.
+    Reports,
+}
+
+impl Keep {
+    /// Whether a file named `name` may be fetched.
+    pub fn allows(self, name: &str) -> bool {
+        match self {
+            Self::Every => true,
+            Self::NoItems => !super::action::is_items_part(name),
+            Self::Reports => !super::action::is_items_part(name) && name.starts_with("Reports-"),
+        }
+    }
 }
 
 /// What the command downloads with, beyond the session.
@@ -176,6 +203,7 @@ pub async fn fetch(
         &session.env.redactor,
         &files,
         request.file.as_deref(),
+        request.keep,
         &mut reasons,
     );
     if candidates.is_empty() {
@@ -374,6 +402,7 @@ fn downloadable(
     redactor: &crate::redact::Redactor,
     files: &[FileRecord],
     wanted: Option<&str>,
+    keep: Keep,
     reasons: &mut Vec<Value>,
 ) -> Vec<(DownloadableFile, String)> {
     let named: Vec<&str> = files
@@ -388,6 +417,9 @@ fn downloadable(
         let server_name = file.file_name.as_deref().filter(|name| !name.is_empty());
         let name = server_name.and_then(|_| local.next().and_then(|(_, name)| name));
         if wanted.is_some() && server_name != wanted {
+            continue;
+        }
+        if server_name.is_some_and(|name| !keep.allows(name)) {
             continue;
         }
         let refuse = |reasons: &mut Vec<Value>, why: &str| {

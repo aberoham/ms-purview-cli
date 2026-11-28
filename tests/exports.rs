@@ -653,6 +653,9 @@ async fn an_export_whose_detail_is_not_an_export_is_not_downloaded() {
     setup.ready().await;
     let mut wrong = setup.succeeded();
     wrong["@odata.type"] = json!("#microsoft.graph.security.ediscoveryEstimateOperation");
+    // The parts listed where an estimate lists its files, so that a
+    // download would find them.
+    wrong["reportFileMetadata"] = wrong["exportFileMetadata"].clone();
     Mock::given(method("GET"))
         .and(path(operation_path()))
         .respond_with(json_response(200, wrong))
@@ -826,4 +829,111 @@ async fn only_a_reports_file_is_an_export_s_evidence() {
     assert_eq!(run.json()["results"]["result"]["collection"], "complete");
     let run = setup.check().await;
     assert_eq!(run.json()["results"]["collection"], "complete");
+}
+
+#[tokio::test]
+async fn the_first_usable_report_part_in_graph_s_order_decides_on_both_paths() {
+    // Two usable Reports- files with opposite results: the first listed,
+    // which has no failure, decides.
+    let mut setup = Setup::new().await;
+    setup.parts.push(Part {
+        name: "Reports-second-with-a-failure.zip",
+        key: "report2",
+        bytes: report_part(true),
+    });
+    setup.ready().await;
+    let run = setup.run(&["--json", "--yes"]).await;
+    assert_eq!(run.json()["results"]["result"]["collection"], "complete");
+    let run = setup.check().await;
+    assert_eq!(run.json()["results"]["collection"], "complete");
+}
+
+#[tokio::test]
+async fn a_direct_item_report_never_downloads_an_items_part() {
+    // An item report that lists an export's parts: `report` fetches the
+    // report part and leaves the items part on the service.
+    let setup = Setup::new().await;
+    setup
+        .preflight(json!({"value": []}), estimate(json!(GIB)))
+        .await;
+    let location = format!(
+        "{}/v1.0/security/cases/ediscoverycases('{CASE}')/operations('{OP}')",
+        setup.harness.graph.uri()
+    );
+    Mock::given(method("POST"))
+        .and(path(search_path("/exportReport")))
+        .respond_with(ResponseTemplate::new(202).insert_header("Location", location))
+        .mount(&setup.harness.graph)
+        .await;
+    let mut record = setup.succeeded();
+    record["action"] = json!("exportReport");
+    setup.get(&operation_path(), record).await;
+    setup.serve().await;
+    let run = setup
+        .harness
+        .run_with(&["report", CASE, SEARCH, "--json", "--yes"], |env, _| {
+            setup.configure(env)
+        })
+        .await;
+    assert_eq!(
+        run.outcome.exit_code,
+        0,
+        "{} {}",
+        run.stdout(),
+        run.stderr()
+    );
+    assert_eq!(run.json()["results"]["result"]["collection"], "complete");
+    let downloads = setup.downloads().await;
+    assert_eq!(downloads.len(), 1);
+    assert!(downloads[0].url.query().unwrap().contains("part=report"));
+    assert_eq!(
+        run.json()["results"]["result"]["files"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn no_download_leaves_the_download_out_of_the_plan() {
+    let setup = Setup::new().await;
+    setup.ready().await;
+    let run = setup.run(&["--json", "--dry-run", "--no-download"]).await;
+    let effects = run.json()["results"]["plan"]["effects"].to_string();
+    assert!(!effects.contains("Downloads every part"), "{effects}");
+    let run = setup.run(&["--json", "--dry-run"]).await;
+    let effects = run.json()["results"]["plan"]["effects"].to_string();
+    assert!(effects.contains("Downloads every part"), "{effects}");
+}
+
+#[tokio::test]
+async fn the_check_reports_a_file_entry_with_no_name() {
+    let setup = Setup::new().await;
+    setup.serve().await;
+    let mut record = setup.succeeded();
+    record["action"] = json!("exportReport");
+    record["exportFileMetadata"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"size": 10}));
+    record["exportFileMetadata"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"fileName": "", "size": 10}));
+    setup.get(&operation_path(), record).await;
+    let run = setup.check().await;
+    assert_eq!(run.json()["results"]["collection"], "complete");
+    assert!(
+        run.stderr()
+            .contains("file 4 of the operation cannot be downloaded: it has no fileName"),
+        "{}",
+        run.stderr()
+    );
+    assert!(
+        run.stderr()
+            .contains("file 3 of the operation cannot be downloaded: it has no fileName"),
+        "{}",
+        run.stderr()
+    );
 }

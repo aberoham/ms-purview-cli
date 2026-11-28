@@ -596,10 +596,15 @@ Settled in PR 4.1:
   `collection` is `unchecked`.
 - One rule chooses the evidence files, for every action and for `operation get --check`: the
   operation's action and detail must agree (an estimate with estimate detail, an item report
-  or export with export detail), else nothing is fetched and `collection` is `unchecked`;
-  then, for an export, the files named `Reports-…`, and for an estimate or item report every
+  or export with export detail), else nothing is fetched: an action fails with
+  `UnexpectedLocation`, and `operation get --check` leaves `collection` `unchecked`. Then, for an export, the files named `Reports-…`, and for an estimate or item report every
   file that is not an `Items.*.zip` part, each tried in Graph's order until one holds the
-  evidence. No items part is ever fetched or read as evidence.
+  evidence. No items part is ever read as evidence, and only `export create` and `download`
+  fetch one: `estimate` and `report` download every file but the items parts.
+- A zip may have up to 4,096 bytes after its end record and comment. The one observed items
+  part had 296, most of them zero, after a Zip64 end record (Observed, one export); its
+  report part had none. The zip is read as ending at its end record; the downloaded file,
+  its size and its SHA-256 are the service's bytes unchanged.
 - `result` has the keys of `report`. A stopped export resumes with `operation get <case> <op>
   --wait --check` after `--no-wait`, the wait deadline or Ctrl-C during the wait, and with
   `operation get <case> <op> --check` after Ctrl-C during the download. Either fetches only
@@ -651,9 +656,12 @@ status is not `succeeded` exits 4, with or without `--wait`. `--wait-timeout` ta
 seconds or a duration such as `90s`, `15m`, `2h` or `1h30m`, from 1 second to 24 hours;
 `--wait-timeout` and `--poll-interval` need `--wait`.
 
-Settled in PR 2.3: `--check` downloads every file of an estimate or item report through the
-same code as `download`, into the data directory, and reads the first that is a report zip;
-for an export it downloads only the file whose name starts with `Reports-` (Assumption).
+Settled in PR 2.3, and changed in PR 4.1: `--check` downloads, through the same code as
+`download` and into the data directory, the files that may be the operation's evidence by
+the rule of section 3.5 "Settled in PR 4.1": nothing when the action and detail disagree;
+for an export the files named `Reports-` (Observed); for an estimate or item report every
+file that is not an `Items.*.zip` part. It reads them in Graph's order and stops at the first
+that holds the evidence.
 An operation that is not finished is `unchecked`, with a notice. `--check` changes no exit
 code by itself.
 
@@ -1163,8 +1171,9 @@ are never extracted to disk. Report zips are recognised by `Locations-*.csv`,
 `Statistics-*.csv`, `Summary-*.csv`, `Settings-*.csv` and `Items_(\d+)_.*\.csv`. Items files
 are read in numeric order of N. A large report was split into several items files of about
 200 MB each (Observed). Zip64 and the compression methods used by real exports are recorded
-in PR 4.1; the `zip` crate's `deflate` feature is enabled from PR 1.5, and `deflate64` only
-if PR 4.1 finds it.
+in PR 4.1 (one small export: items stored, report deflated, Zip64 end records, and 296
+bytes after the items part's end record; `docs/api-notes.md`); the `zip` crate's `deflate`
+feature is enabled from PR 1.5, and `deflate64` only if an export needs it.
 
 **CSV.** The tool uses `csv` with `flexible(true)` and reads `ByteRecord`s as a stream.
 
@@ -3035,7 +3044,8 @@ that does not depend on whether the claim is true. The table says which:
 8. Failure-state shapes: `failed`, `partiallySucceeded`, `submissionFailed`, `resultInfo`.
    Synthetic fixtures are marked Assumption.
 9. `Range` support, URL expiry and long downloads (PR 4.1).
-10. Zip64 and compression methods in large exports (PR 4.1).
+10. Zip64 and compression methods in large exports. One small export is observed in
+    `docs/api-notes.md` (PR 4.1); a multi-gigabyte one is not.
 11. Numbering of `Items.1.NNN` parts. Only `.001` has been seen.
 12. Teams message bodies in `.msg` form, HTML or text (PR 5.2), and compressed-RTF-only
     items.

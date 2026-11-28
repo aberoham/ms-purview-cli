@@ -204,8 +204,8 @@ that body has not been observed, so the flag is experimental and the
 plan warns. Its zip has no Statistics file (Observed), so its
 `collection` comes from `Locations-*.csv` alone.
 
-A stopped report resumes with `operation get <case> <op> --wait --check`,
-never `download`, which would fetch an export's item content if the
+A stopped report resumes with `operation get <case> <op> --wait --check`
+(or `--check` alone after Ctrl-C during the download), never `download`, which would fetch an export's item content if the
 `Location` header had named one.
 
 `export create` runs every check of `report`, the size limit included,

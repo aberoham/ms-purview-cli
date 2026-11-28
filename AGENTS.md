@@ -117,10 +117,17 @@ run with `python3`.
   path form, `UnexpectedLocation` otherwise), the wait (`Poller` with a
   30-second not-found grace), the check that the operation is of the
   action sent, the download through `commands::download::fetch` and the
-  collection check (an export's only from its `Reports-` file,
-  `ActionRun::evidence_file`), with `Finished::finish` for `--strict`. A
-  stopped action resumes with `operation get --wait --check`, never
-  `download`.
+  collection check, with `Finished::finish` for `--strict`. An export
+  downloads every part (`download::Keep::Every`); an estimate or item
+  report never an items part (`Keep::NoItems`). `evidence_files` is the
+  one rule for which files may be evidence, shared with `operation get
+  --check`: action and detail must agree, an export's are its `Reports-`
+  files, and no `Items.*.zip` part (`is_items_part`) ever is. A stopped
+  action resumes with `operation get --wait --check`, or `--check` alone
+  after Ctrl-C during the download, never `download`. `zipread::zip_end`
+  reads a zip as ending at its end record, allowing up to
+  `MAX_TRAILING_BYTES` after it (Observed on an items part), through
+  `zipread::Bounded`.
   `commands/estimate.rs` is `estimate`: a plan that a duplicate blocks
   without `--allow-concurrent` (`safety::Blocked::Concurrent`,
   `ConcurrentOperation`), then `after_send` and the volume warning (`report::volume`, the `volume`

@@ -500,6 +500,14 @@ impl ActionRun {
                 out: self.out.clone(),
                 file: None,
                 overwrite: false,
+                // An export collects its parts; an estimate or item report
+                // fetches only what can be its evidence, never an items
+                // part.
+                keep: if self.action == "exportResult" {
+                    super::download::Keep::Every
+                } else {
+                    super::download::Keep::NoItems
+                },
             };
             let fetched = fetch(&mut after.session, case, &record, &request, context).await?;
             // The deadline covers the wait; the download has its own
@@ -657,15 +665,22 @@ pub fn evidence_files(record: &OperationRecord) -> Option<(EvidenceOf, Vec<Strin
         .iter()
         .filter_map(|file| file.file_name.clone())
     {
-        if is_items_part(&name)
-            || (action == Action::ExportResult && !name.starts_with("Reports-"))
-            || names.contains(&name)
-        {
+        if !evidence_keep(&action).allows(&name) || names.contains(&name) {
             continue;
         }
         names.push(name);
     }
     Some((evidence_of, names))
+}
+
+/// The files an action's evidence may come from: an export's `Reports-`
+/// files, else every file but an items part.
+pub fn evidence_keep(action: &Action) -> super::download::Keep {
+    if *action == Action::ExportResult {
+        super::download::Keep::Reports
+    } else {
+        super::download::Keep::NoItems
+    }
 }
 
 /// The command that carries on from a submitted action, as the signed-in

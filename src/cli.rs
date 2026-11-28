@@ -1990,6 +1990,7 @@ impl ReadCommand {
                 .map(|file| not_blank("--file", file))
                 .transpose()?,
             overwrite: args.overwrite,
+            keep: commands::download::Keep::Every,
         }))
     }
 

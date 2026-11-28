@@ -465,30 +465,32 @@ async fn check_collection(
         );
         return Ok(Some(Collection::Unchecked));
     }
-    // Each candidate in turn, until one holds the evidence.
-    for name in names {
-        let request = super::download::Request {
-            case: CaseKey::Id(case),
-            operation: operation.clone(),
-            out: None,
-            file: Some(name),
-            overwrite: false,
-        };
-        let fetched =
-            super::download::fetch(session, case, record, &request, check.download).await?;
-        for reason in &fetched.reasons {
-            if reason["code"] == "FileNotDownloadable" {
-                let _ = writeln!(
-                    session.env.stderr,
-                    "warning: {}",
-                    sanitize(reason["message"].as_str().unwrap_or_default())
-                );
-            }
+    // Every file that may be evidence, in one fetch, so that a file that
+    // cannot be downloaded is reported; then each candidate in Graph's
+    // order until one holds the evidence.
+    let request = super::download::Request {
+        case: CaseKey::Id(case),
+        operation: operation.clone(),
+        out: None,
+        file: None,
+        overwrite: false,
+        keep: super::action::evidence_keep(&record.action(Source::Single)),
+    };
+    let fetched = super::download::fetch(session, case, record, &request, check.download).await?;
+    for reason in &fetched.reasons {
+        if reason["code"] == "FileNotDownloadable" {
+            let _ = writeln!(
+                session.env.stderr,
+                "warning: {}",
+                sanitize(reason["message"].as_str().unwrap_or_default())
+            );
         }
-        if fetched.interrupted {
-            return Ok(None);
-        }
-        for done in &fetched.done {
+    }
+    if fetched.interrupted {
+        return Ok(None);
+    }
+    for name in &names {
+        for done in fetched.done.iter().filter(|done| &done.server_name == name) {
             match crate::report::ReportFiles::read_for(&done.path, check.limits, evidence_of) {
                 Ok(files) if files.has_evidence_for(evidence_of) => {
                     super::parse::warn_missing_columns(&mut session.env.stderr, &files);

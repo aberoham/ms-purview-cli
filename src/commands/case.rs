@@ -903,9 +903,10 @@ fn close_stopped(
     let status = last
         .as_ref()
         .map(|record| crate::redact::shown(record.status.as_str(), &session.env.redactor));
+    // A read at the deadline may already show the close finished.
     let closed = last
         .as_ref()
-        .is_some_and(|record| record.status == CaseStatus::Closed);
+        .is_some_and(<CaseRecord as crate::poll::Polled>::finished);
     let account = shell_word(&session.account.email);
     let resume = vec![format!("purview --account={account} case get {case}")];
     let (exit_code, code, verb) = if interrupted {

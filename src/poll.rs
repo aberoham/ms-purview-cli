@@ -114,7 +114,8 @@ impl Polled for CaseRecord {
     }
 
     /// `closed`, or a status the tool does not know, which waiting would
-    /// not change; `active`, `closing` and no status keep the wait going.
+    /// not change; `active` and `closing` keep the wait going. A read with
+    /// no status never gets here: `read` refuses it.
     fn finished(&self) -> bool {
         matches!(self.status, CaseStatus::Closed | CaseStatus::Other(_))
     }

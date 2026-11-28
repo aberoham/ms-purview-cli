@@ -13,6 +13,11 @@ pub struct Container<'a> {
     /// Whether a stream that exists could not be read, so the item is not
     /// read in full.
     unreadable: bool,
+    /// Bytes every stream read may still take. A valid file stores each
+    /// stream's data once, so the streams read cannot add up to more than
+    /// its size; streams that share sectors could, and are stopped at twice
+    /// the size.
+    budget: u64,
 }
 
 /// The diagnostic of a container that cannot be read. It is fixed: the
@@ -29,6 +34,7 @@ impl<'a> Container<'a> {
             file,
             len: bytes.len() as u64,
             unreadable: false,
+            budget: (bytes.len() as u64).saturating_mul(2),
         })
     }
 
@@ -50,14 +56,20 @@ impl<'a> Container<'a> {
         if !self.file.is_stream(&path) {
             return None;
         }
+        // One byte past what may be read shows the stream is longer.
+        let allowed = self.len.min(self.budget);
         let read = self.file.open_stream(&path).and_then(|stream| {
             let mut bytes = Vec::new();
-            stream.take(self.len).read_to_end(&mut bytes)?;
+            stream.take(allowed + 1).read_to_end(&mut bytes)?;
             Ok(bytes)
         });
         match read {
-            Ok(bytes) => Some(bytes),
-            Err(_) => {
+            Ok(bytes) if bytes.len() as u64 <= allowed => {
+                self.budget -= bytes.len() as u64;
+                Some(bytes)
+            }
+            // Unreadable, longer than the item, or past the budget.
+            _ => {
                 self.unreadable = true;
                 None
             }

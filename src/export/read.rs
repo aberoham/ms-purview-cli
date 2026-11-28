@@ -175,11 +175,21 @@ fn read_item(
     let bytes = match bytes {
         Ok(bytes) => bytes,
         Err(error) => {
-            let (code, detail) = match error {
-                PurviewError::HostileZip(detail) if detail.contains("decompresses to more") => {
-                    ("entryTooLarge", detail)
-                }
-                other => ("entryUnreadable", other.metadata().0.to_owned()),
+            // Too large by the size the zip declares, or stopped by the
+            // per-entry limit; a compression ratio refused, or anything
+            // else, is unreadable.
+            let declared = zip.declared_size(index);
+            let limit = format!("more than {} bytes", request.max_entry_bytes);
+            let too_large = declared.is_some_and(|size| size > request.max_entry_bytes)
+                || matches!(&error, PurviewError::HostileZip(detail) if detail.ends_with(&limit));
+            let code = if too_large {
+                "entryTooLarge"
+            } else {
+                "entryUnreadable"
+            };
+            let detail = match error {
+                PurviewError::HostileZip(detail) => detail,
+                other => other.metadata().0.to_owned(),
             };
             return failed(record, code, &detail);
         }

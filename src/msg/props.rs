@@ -62,7 +62,7 @@ impl<'c, 'a> Props<'c, 'a> {
         if let Some(stream) = container.stream(storage, "__properties_version1.0") {
             // A stream shorter than its header, or with a partial entry, is
             // not read in full.
-            if stream.len() < header.len() || (stream.len() - header.len()) % 16 != 0 {
+            if stream.len() < header.len() || !(stream.len() - header.len()).is_multiple_of(16) {
                 container.mark_unreadable();
             }
             for entry in stream

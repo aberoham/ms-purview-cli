@@ -228,29 +228,19 @@ pub fn html_to_text(html: &str) -> Option<String> {
     let cleaned = URL_QUERY.replace_all(&cleaned, "${1}");
     let cleaned = cleaned.into_owned();
     let text = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Raw mode lays a table out as one column with a line per cell, and
+        // draws no borders, so a table is never wider or longer than its
+        // text (Derived from `html2text` 0.17's source and output).
         html2text::config::plain_no_decorate()
+            .raw_mode(true)
             .allow_width_overflow()
             .string_from_read(cleaned.as_bytes(), TEXT_WIDTH)
     }))
     .ok()?
     .ok()?;
     let text = VML_STYLE.replace_all(&text, "");
-    // A table's rules are drawn as wide as its widest cell, which at this
-    // width can be a whole paragraph: each becomes a short one.
-    let lines: Vec<&str> = text
-        .lines()
-        .map(str::trim_end)
-        .map(|line| if is_rule(line) { "---" } else { line })
-        .collect();
+    let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
     Some(lines.join("\n").trim().to_owned())
-}
-
-/// Whether `line` is only box-drawing or dash characters, and long.
-fn is_rule(line: &str) -> bool {
-    line.chars().count() > 3
-        && line
-            .chars()
-            .all(|c| matches!(c, '─' | '━' | '═' | '-' | '_' | ' ' | '│' | '┼' | '┬' | '┴'))
 }
 
 #[cfg(test)]
@@ -308,6 +298,13 @@ mod tests {
     }
 
     #[test]
+    fn outlook_s_reply_divider_is_kept() {
+        let divider = "_".repeat(32);
+        let text = html_to_text(&format!("<p>reply</p><p>{divider}</p><p>quoted</p>")).unwrap();
+        assert!(text.lines().any(|line| line == divider), "{text}");
+    }
+
+    #[test]
     fn ordinary_css_quoted_in_a_message_is_kept() {
         let text = html_to_text("<p>.shape { color: red; }</p>").unwrap();
         assert_eq!(text, ".shape { color: red; }");
@@ -337,9 +334,9 @@ mod tests {
     }
 
     #[test]
-    fn a_rule_is_drawn_short() {
-        // A table's rules are as wide as its widest cell, which at this
-        // width is a whole paragraph.
+    fn a_table_is_its_cells_and_a_rule_is_short() {
+        // No border is drawn: a rule as wide as a cell, at this width a
+        // whole paragraph, would repeat for every row.
         let paragraph = "word ".repeat(400);
         let text = html_to_text(&format!(
             "<p>above</p><table><tr><td>{paragraph}</td></tr><tr><td>two</td></tr></table>\
@@ -353,11 +350,13 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("above") && text.contains("below"), "{text}");
-        // The table's rules and the <hr> are kept, short.
-        assert!(
-            text.lines().filter(|line| *line == "---").count() >= 3,
+        // The <hr> is kept, short; the table draws no rule.
+        assert_eq!(
+            text.lines().filter(|line| *line == "---").count(),
+            1,
             "{text}"
         );
+        assert!(text.contains("two"), "{text}");
     }
 
     #[test]

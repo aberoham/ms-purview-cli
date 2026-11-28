@@ -180,6 +180,15 @@ impl ZipReader {
             .collect()
     }
 
+    /// The size entry `index` declares, decompressed, from the central
+    /// directory.
+    pub fn declared_size(&mut self, index: usize) -> Option<u64> {
+        self.archive
+            .by_index_raw(index)
+            .ok()
+            .map(|entry| entry.size())
+    }
+
     /// Reads entry `index` to its end through the limits, giving the
     /// reader to `read`.
     pub fn read_entry<T>(

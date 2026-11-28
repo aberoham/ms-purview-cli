@@ -117,7 +117,8 @@ def main(argv):
                 counts[f"{field}: {'agree' if same else 'differ'}"] += 1
     for key in sorted(counts):
         print(f"{key}: {counts[key]}")
-    return 1 if any(key.endswith(": differ") for key in counts) else 0
+    failed = any(key.endswith(": differ") for key in counts) or counts["missing from export read"]
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

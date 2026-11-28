@@ -811,12 +811,16 @@ Settled in the first `.msg` reader PR (PR 5.1 with the body selection of PR 5.2)
   content kept, hidden conditionals removed with their content, VML and Office rules removed
   only when they set `behavior`, `<hr>` kept as `---`, a `colspan` or `rowspan` above 99 cut
   to 99, and every URL's query and fragment removed, since `html2text` breaks a line longer
-  than its width and a broken query would escape the redaction after. After it, a table rule
-  drawn as wide as a cell becomes `---`. A converter that fails or panics gives `bodyDecode`
-  unless there is a plain-text body.
+  than its width and a broken query would escape the redaction after. Conversion uses
+  `html2text`'s raw mode, which gives each table cell its own line and draws no borders, so
+  a table is never wider or longer than its text. A converter that fails or panics gives
+  `bodyDecode` unless there is a plain-text body.
 - The container is refused as `cfbInvalid`, with a fixed `errorDetail`, when its header's
   FAT, DIFAT or mini FAT sector counts do not fit in the item, before `cfb` reads it; so is
-  an item with a property stream that exists and cannot be read in full.
+  an item with a property stream that exists and cannot be read in full, and one whose
+  streams read add up to more than twice its size (streams sharing sectors).
+- An entry is `entryTooLarge` when the size its zip declares, or what was read, passes
+  `--max-entry-bytes`; one refused for its compression ratio is `entryUnreadable`.
 - The stderr summary counts items by class under fixed labels (the classes seen in exports,
   else `other`), so no text from an item reaches stderr; `class` is wrapped by
   `--wrap-untrusted`.

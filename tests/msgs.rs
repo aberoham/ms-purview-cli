@@ -377,3 +377,26 @@ fn a_mac_roman_html_body_decodes() {
     let item = parse_msg(&message.build()).unwrap();
     assert_eq!(item.body, Body::Html("café".into()));
 }
+
+#[tokio::test]
+async fn an_entry_refused_for_its_compression_ratio_is_unreadable_not_too_large() {
+    use std::io::Write;
+    let harness = Harness::new().await;
+    // 3 MiB of zeros deflates far beyond 1,000:1 and stays under the
+    // default 64 MiB entry limit.
+    let mut buffer = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = zip::ZipWriter::new(&mut buffer);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        writer
+            .start_file("Exchange/Items/bomb.msg", options)
+            .unwrap();
+        writer.write_all(&vec![0_u8; 3 << 20]).unwrap();
+        writer.finish().unwrap();
+    }
+    let path = write_zip(&harness, "Items.1.001.export.zip", buffer.into_inner());
+    let run = harness.run(&["export", "read", &path]).await;
+    assert_eq!(run.outcome.exit_code, 4, "{}", run.stderr());
+    assert_eq!(lines(&run)[0]["error"], "entryUnreadable");
+}

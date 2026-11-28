@@ -40,6 +40,9 @@ pub struct WritePlan {
     warnings: Vec<String>,
     preflight: Vec<Value>,
     blocked: Option<Blocked>,
+    /// Text the person must type at the terminal to approve, instead of
+    /// `y`: the case name for `case close`.
+    typed: Option<String>,
 }
 
 /// Why a plan may be shown but not sent. A dry run prints the plan; any
@@ -89,12 +92,20 @@ pub struct PlanInput {
 
 impl WritePlan {
     /// The plan, with the body serialised once: these bytes are the ones
-    /// shown, digested and sent.
+    /// shown, digested and sent. A route that takes no body
+    /// (`WriteRoute::takes_body`) is given `null` and sends no bytes.
     pub fn new(input: PlanInput) -> Result<Self> {
-        if !input.body.is_object() {
-            return Err(PurviewError::message("a write body must be a JSON object"));
-        }
-        let body = serde_json::to_vec(&input.body)?;
+        let body = if input.route.takes_body() {
+            if !input.body.is_object() {
+                return Err(PurviewError::message("a write body must be a JSON object"));
+            }
+            serde_json::to_vec(&input.body)?
+        } else {
+            if !input.body.is_null() {
+                return Err(PurviewError::message("this write takes no body"));
+            }
+            Vec::new()
+        };
         let path = format!("/{}", input.route.segments().join("/"));
         let digest = digest(input.route.method(), &path, &body);
         Ok(Self {
@@ -109,7 +120,16 @@ impl WritePlan {
             warnings: input.warnings,
             preflight: input.preflight,
             blocked: input.blocked,
+            typed: None,
         })
+    }
+
+    /// The plan, approved at a terminal only when the person types `text`
+    /// exactly (ignoring surrounding spaces), rather than `y`. `--yes`
+    /// still approves it.
+    pub fn with_typed_confirmation(mut self, text: String) -> Self {
+        self.typed = Some(text);
+        self
     }
 
     pub fn command(&self) -> &'static str {
@@ -343,7 +363,8 @@ pub enum Decision {
 /// input and standard error are terminals and `--no-input` is not given.
 /// The prompt is `Apply? [y/N]` on `prompt`, after the plan; `y` or `yes`,
 /// in any case, approves, and anything else, end of input included,
-/// declines. Only `cli`'s write runner calls it, with the parsed flags;
+/// declines. A plan with a typed confirmation asks for that text instead,
+/// and only that text approves. Only `cli`'s write runner calls it, with the parsed flags;
 /// `tests/write_allow_list.rs` checks that.
 pub(crate) async fn decide(
     plan: WritePlan,
@@ -365,12 +386,24 @@ pub(crate) async fn decide(
         return Ok(Decision::NotApplied(plan, NotApplied::ConfirmationRequired));
     }
     plan.write_text(prompt, redactor)?;
-    write!(prompt, "Apply? [y/N] ")?;
+    match &plan.typed {
+        // The text is tenant text: shown as every printed value is.
+        Some(text) => write!(
+            prompt,
+            "Type the case name to apply ({}): ",
+            sanitize(&redactor.redact(text))
+        )?,
+        None => write!(prompt, "Apply? [y/N] ")?,
+    }
     prompt.flush()?;
     let answer = input.read_line().await?;
-    let yes = answer.as_deref().map(str::trim).is_some_and(|answer| {
-        answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes")
-    });
+    let yes = answer
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|answer| match &plan.typed {
+            Some(text) => !answer.is_empty() && answer == text.trim(),
+            None => answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"),
+        });
     Ok(if yes {
         Decision::Approved(approve(plan, Approval(Approver::Prompt)))
     } else {

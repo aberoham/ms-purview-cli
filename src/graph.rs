@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use reqwest::header::{HeaderMap, ACCEPT, CONTENT_TYPE, LOCATION, RETRY_AFTER};
+use reqwest::header::{HeaderMap, ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, LOCATION, RETRY_AFTER};
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::Value;
@@ -526,15 +526,21 @@ impl GraphClient {
         let shown = sanitize(&self.redactor.redact(&redact::url(&url, &self.redactor)));
         self.log(log, &format!("{} {shown}", write.method()));
         let started = self.clock.elapsed();
-        let sent = self
+        let mut request = self
             .http
             .post(url.clone())
             .bearer_auth(token.expose())
-            .header(ACCEPT, "application/json")
-            .header(CONTENT_TYPE, "application/json")
-            .body(write.body().to_vec())
-            .send()
-            .await;
+            .header(ACCEPT, "application/json");
+        // A write with no body, such as closing a case, sends none and no
+        // Content-Type, but says its length: Graph refuses a POST without
+        // one with HTTP 411 (Observed), and reqwest omits it for an empty
+        // body.
+        if write.body().is_empty() {
+            request = request.header(CONTENT_LENGTH, "0");
+        } else {
+            request = request.header(CONTENT_TYPE, "application/json");
+        }
+        let sent = request.body(write.body().to_vec()).send().await;
         drop(token);
         let response =
             match sent {

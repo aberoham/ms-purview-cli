@@ -241,6 +241,12 @@ impl WriteRoute {
         matches!(self, Self::CreateCase | Self::CreateSearch(_))
     }
 
+    /// Whether the request carries a body. Closing a case takes none
+    /// (Docs: "Don't supply a request body").
+    pub fn takes_body(&self) -> bool {
+        !matches!(self, Self::CloseCase(_))
+    }
+
     /// The HTTP method: always `POST`.
     pub fn method(&self) -> &'static str {
         "POST"

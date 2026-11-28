@@ -225,6 +225,17 @@ pub enum PurviewError {
     #[error("{0}")]
     CaseNotActive(String),
 
+    /// `case close` preflight could not show that the case may be closed:
+    /// it is not active, not the tool's, or a hold read was denied,
+    /// malformed or did not reach its last page.
+    #[error("{0}")]
+    ClosePrecheckFailed(String),
+
+    /// `case close` found custodians, data sources or holds on the case.
+    /// The message gives the counts, never an entry.
+    #[error("{0}")]
+    CaseHasHolds(String),
+
     /// An action's search whose scope could not be shown to be every
     /// tenant mailbox and nothing else: `dataSourceScopes` absent, or a
     /// source list that could not be read to its end.
@@ -429,6 +440,8 @@ impl PurviewError {
             Self::CaseNameInUse(_) => ("CaseNameInUse", 0),
             Self::SearchNameInUse(_) => ("SearchNameInUse", 0),
             Self::CaseNotActive(_) => ("CaseNotActive", 0),
+            Self::ClosePrecheckFailed(_) => ("ClosePrecheckFailed", 0),
+            Self::CaseHasHolds(_) => ("CaseHasHolds", 0),
             Self::ConcurrentOperation(_) => ("ConcurrentOperation", 0),
             Self::TooLarge(_) => ("TooLarge", 0),
             Self::VolumeUnchecked(_) => ("VolumeUnchecked", 0),

@@ -58,6 +58,7 @@ error.
 | `case create` | A new case, visible to eDiscovery administrators. No custodians, data sources or holds. |
 | `search create` | A search over every tenant mailbox in an active case. Nothing runs until an estimate, report or export is started. No custodians, data sources or holds. |
 | `estimate` | Runs a search over every tenant mailbox, adding an estimate operation and its report file to the case. Reads no item content and places no hold. |
+| `report` | Runs a search over every tenant mailbox, adding an item report operation and its zip to the case: one row of metadata (sender, recipients, subject, dates, location) per copy of each item found. Collects no message bodies or attachments and places no hold. |
 
 ### `case create`
 
@@ -100,7 +101,7 @@ error.
   error. Check the search with `purview search get` before running an
   action on it.
 
-### Actions on a search: `estimate`
+### Actions on a search: `estimate` and `report`
 
 Every action runs these checks before its plan, on whatever search it is
 given, whoever created it:
@@ -115,11 +116,13 @@ given, whoever created it:
   a list that cannot be read refuses with `ScopeUnverified`.
 - Its current query goes through the guard below. A query outside the
   grammar is always refused; one that is not narrowed is refused unless
-  `--allow-generic` gives a `--reason`, which the plan shows. An estimate
-  has no description to record it in.
-- An estimate of the case that is not known to be finished may be a
+  `--allow-generic` gives a `--reason`, which the plan shows. A report
+  sends the reason as its `description`; an estimate has no description
+  to record it in.
+- An estimate of the case (for `estimate`), or an item report or export
+  (for `report`), that is not known to be finished may be a
   duplicate: the operation list does not say which search an operation
-  runs, and an entry whose action or status cannot be read counts too. The plan names each one, and the estimate is refused with
+  runs, and an entry whose action or status cannot be read counts too. The plan names each one, and the action is refused with
   `ConcurrentOperation` unless `--allow-concurrent` is given; `--yes` alone
   is not enough. A dry run shows the plan either way.
 
@@ -129,24 +132,25 @@ with the same checks, and nothing is sent if it no longer passes them
 `SearchHasSources`) or if its query or the guard's verdict differ from the
 plan (`SearchChanged`). Without
 `--allow-concurrent`, the case's operations are listed again too, so an
-estimate someone else started while the prompt was open is refused as a
-possible duplicate. A change made after these reads is still possible. The estimate is then sent once.
+estimate (for `estimate`), or an item report or export (for `report`),
+that someone else started while the prompt was open is refused as a
+possible duplicate. A change made after these reads is still possible. The action is then sent once.
 Its answer must be a 202 naming the new operation in the `Location`
 header, on the Graph origin and for the case posted to, and the operation
-must be an estimate; anything else stops the command with
-`UnexpectedLocation` before any download, and the estimate may still be
-running (`purview operation list <case>
---action estimate` shows it). The command then waits for the operation,
-downloads its report zip and reads it:
+must be of the action sent (an estimate, or an item report); anything
+else stops the command with `UnexpectedLocation` before any download, and
+the operation may still be running (`purview operation list <case>
+--action estimate`, or `--action report --resolve`, shows it). The command
+then waits for the operation, downloads its report zip and reads it:
 
 - `collection` is `complete` when no location failed, `incomplete` when
-  `Locations-*.csv` has a `Status=Failed` row or `Statistics-*.csv` a
-  `StatType=Error` row, and `unchecked` when the zip was not read
+  `Locations-*.csv` has a `Status=Failed` row or, for an estimate,
+  `Statistics-*.csv` a `StatType=Error` row, and `unchecked` when the zip was not read
   (`--no-download`), a file or a column it needs is missing, a row has no
   location, status or `StatType`, or the zip holds two Locations or
   Statistics files. Failures found are listed either way.
-- An estimate can succeed while locations failed (Observed); the command
-  warns, and `--strict` makes it exit 4 (`FailedLocations`, or
+- An estimate can succeed while locations failed (Observed), and a report
+  is taken to do the same (Assumption); the command warns, and `--strict` makes it exit 4 (`FailedLocations`, or
   `EvidenceMissing` when the collection is unchecked).
 - `volume` compares the estimate with the limits under `volume` in
   `config.json`: more than `warn_hits` estimated items (default 5,000), a
@@ -168,6 +172,36 @@ downloads its report zip and reads it:
   then `download`. `--wait-timeout` covers the wait; the download has its
   own timeouts.
 
+`report` also compares the search's latest estimate with
+`volume.max_export_size` in `config.json` (default 10 GiB) before its
+plan, read from the search's `lastEstimateStatisticsOperation` (Observed). It refuses with `TooLarge` when the estimate's
+`indexedItemsSize` is above the limit, and with `VolumeUnchecked` when no
+size can be compared: Graph has no estimate of the search or answers with
+no operation, the latest one
+is not finished or did not succeed, it only partly succeeded and its size
+is within the limit (a partial size is a lower bound), the search was
+changed after it ran, or a time or the size is missing. `--allow-large`
+with `--reason` overrides both, and the plan then warns `VOLUME:`; the
+reason goes into the report's `description` with any `--allow-generic`
+one, since one `--reason` serves both. `--allow-concurrent` does not cover
+the size, and no flag covers a token that cannot be refreshed. Only
+`volume.max_export_size` is read for a report. A dry run shows the plan either way. The latest estimate is read
+again after approval and must be the one the plan showed
+(`SearchChanged`). The estimate undercounts what a report collects: one
+tenant's reports held about 10 to 37 rows per estimated item with Teams
+context on (Observed), and the plan says so with the estimate's count.
+
+A report asks for the messages around each Teams hit
+(`additionalOptions: teamsAndYammerConversations`, Observed).
+`--no-teams-context`, or `defaults.teams_context: false`, leaves it out;
+that body has not been observed, so the flag is experimental and the
+plan warns. Its zip has no Statistics file (Observed), so its
+`collection` comes from `Locations-*.csv` alone.
+
+A stopped report resumes with `operation get <case> <op> --wait --check`,
+never `download`, which would fetch an export's item content if the
+`Location` header had named one.
+
 `purview operation get <case> <op> --check` runs the same collection
 check on an existing operation, downloading its evidence file into the
 data directory; a later `download` reuses that file.
@@ -176,9 +210,12 @@ data directory; a later `download` reuses that file.
 
 If the POST gets no answer, times out, or gets HTTP 429 or a 5xx, it is not
 sent again. `case create` lists the cases with the planned name,
-`search create` the case's searches with the planned name, and `estimate`
+`search create` the case's searches with the planned name, `estimate`
 the estimates of the case created since just before the request by the
-signed-in account (or with no creator recorded), and the command fails
+signed-in account (or with no creator recorded), and `report` the item
+reports and exports created the same way, each of the first 10 read on its
+own to tell a report from an export (the list shows both as
+`exportResult`), and the command fails
 with `WriteOutcomeUnknown`, naming each by id. Entries on pages read
 before a page failed are still shown, with a note that the list stopped
 early. Names are not unique,

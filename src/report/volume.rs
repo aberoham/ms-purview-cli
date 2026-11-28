@@ -51,6 +51,15 @@ impl VolumeLimits {
     /// default; any other value of the wrong type is an error, which names
     /// the key and never repeats the value.
     pub fn from_config(extra: &BTreeMap<String, Value>) -> Result<Self> {
+        Self::read(extra, VolumeUse::All)
+    }
+
+    /// Reads the keys `used` needs, under the rules of `from_config`; the
+    /// others keep their defaults and are not checked.
+    pub fn read(extra: &BTreeMap<String, Value>, used: VolumeUse) -> Result<Self> {
+        if used == VolumeUse::None {
+            return Ok(Self::default());
+        }
         let volume = match extra.get("volume") {
             None | Some(Value::Null) => return Ok(Self::default()),
             Some(Value::Object(volume)) => volume,
@@ -82,6 +91,12 @@ impl VolumeLimits {
                     )
                 })?,
         };
+        if used == VolumeUse::ExportSize {
+            return Ok(Self {
+                max_export_size,
+                ..Self::default()
+            });
+        }
         Ok(Self {
             warn_hits: count("warn_hits", DEFAULT_WARN_HITS)?,
             warn_hits_per_location: count(
@@ -91,6 +106,17 @@ impl VolumeLimits {
             max_export_size,
         })
     }
+}
+
+/// Which `volume` keys a write command reads, so that a bad value stops
+/// only the commands that use it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeUse {
+    None,
+    /// `max_export_size` only: `report`.
+    ExportSize,
+    /// Every key: `estimate`.
+    All,
 }
 
 /// One limit that the estimate passed.
@@ -238,12 +264,7 @@ impl Volume {
                     )
                 }
                 _ => {
-                    let (mut value, mut limit) = (size_text(over.value), size_text(over.limit));
-                    // Rounded alike, they would read as equal.
-                    if value == limit {
-                        value = format!("{} bytes", grouped(over.value));
-                        limit = format!("{} bytes", grouped(over.limit));
-                    }
+                    let (value, limit) = size_texts(over.value, over.limit);
                     format!(
                         "warning: VOLUME: the estimate's indexed size is {value}, more than \
                          volume.max_export_size ({limit}); with Teams context an export can be \
@@ -263,7 +284,7 @@ impl Volume {
 }
 
 /// `12345` as `12,345`.
-fn grouped(value: u64) -> String {
+pub(crate) fn grouped(value: u64) -> String {
     let digits = value.to_string();
     let mut out = String::new();
     for (index, digit) in digits.chars().enumerate() {
@@ -277,7 +298,20 @@ fn grouped(value: u64) -> String {
 
 /// Bytes in the largest binary unit that keeps one or more whole units,
 /// with one decimal place.
-fn size_text(bytes: u64) -> String {
+/// A size and its limit as text, in bytes when rounding would show them
+/// alike.
+pub(crate) fn size_texts(value: u64, limit: u64) -> (String, String) {
+    let (shown, limit_shown) = (size_text(value), size_text(limit));
+    if shown == limit_shown && value != limit {
+        return (
+            format!("{} bytes", grouped(value)),
+            format!("{} bytes", grouped(limit)),
+        );
+    }
+    (shown, limit_shown)
+}
+
+pub(crate) fn size_text(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["KiB", "MiB", "GiB", "TiB"];
     if bytes < 1 << 10 {
         return format!("{bytes} B");

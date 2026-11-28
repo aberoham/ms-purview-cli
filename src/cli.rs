@@ -249,6 +249,40 @@ Examples:
     )]
     Estimate(EstimateArgs),
     #[command(
+        about = "Run a search's item report: one row of metadata per item copy, no content",
+        long_about = "\
+Run an item report of a search over every tenant mailbox: a zip with one \
+row of metadata (sender, recipients, subject, dates, location) per copy of \
+each item found, and no message bodies or attachments. The search gets the \
+same checks as for estimate: every tenant mailbox and nothing else, no \
+sources, and a query that passes the guard (--allow-generic with --reason \
+overrides a query that is not narrowed).
+
+The size of the search's latest estimate must be within \
+volume.max_export_size in config.json (default 10GiB). A larger estimate, \
+no estimate, a failed one or one older than the search's last change is \
+refused: run estimate first, narrow the query, or pass --allow-large with \
+--reason. A report holds more than the estimate counts, often many rows \
+per estimated item. Teams context (the messages around each Teams hit) is \
+on; --no-teams-context, or defaults.teams_context false, turns it off, and \
+is experimental. An item report or export of the case not yet finished may \
+be a duplicate, and needs --allow-concurrent. The reasons of the overrides \
+go into the operation's description.
+
+After approval, the report is polled to its end, then its zip is \
+downloaded and its Locations file read: collection is complete when every \
+location was searched, incomplete when one failed, and unchecked when the \
+zip was not read. --strict makes incomplete or unchecked exit 4. This \
+command changes Purview: it shows a plan and sends it only when approved, \
+by --yes or by answering y at a terminal.",
+        after_help = "\
+Examples:
+  purview report <case> <search> --dry-run
+  purview report <case> <search> --yes --strict
+  purview report <case> <search> --yes --allow-large --reason \"approved by the requester\""
+    )]
+    Report(ReportArgs),
+    #[command(
         about = "Check a query against the guard against generic tenant-wide searches",
         long_about = "\
 Build a Keyword Query Language (KQL) query from the query flags, or take one \
@@ -952,6 +986,90 @@ minutes, then 60s after 10)"
 }
 
 #[derive(Debug, Clone, Args)]
+#[command(group(clap::ArgGroup::new("overrides").multiple(true).args(["allow_generic", "allow_large"])))]
+struct ReportArgs {
+    #[arg(value_name = "CASE", help = CASE_HELP)]
+    case: String,
+    #[arg(value_name = "SEARCH", help = SEARCH_HELP)]
+    search: String,
+    #[arg(
+        long,
+        value_name = "NAME",
+        help = "The report's name in Purview (default: naming.export_name in config.json)"
+    )]
+    name: Option<String>,
+    #[arg(
+        long,
+        help = "Leave out the messages around each Teams hit (experimental: not yet observed)"
+    )]
+    no_teams_context: bool,
+    #[arg(
+        long,
+        requires = "reason",
+        help = "Run even though the guard finds the search's query not narrowed; needs --reason"
+    )]
+    allow_generic: bool,
+    #[arg(
+        long,
+        requires = "reason",
+        help = "Run even though the latest estimate passes volume.max_export_size, or cannot be \
+compared with it; needs --reason"
+    )]
+    allow_large: bool,
+    #[arg(
+        long,
+        value_name = "TEXT",
+        requires = "overrides",
+        help = "Why the override is needed; shown in the plan and sent as the report's description"
+    )]
+    reason: Option<String>,
+    #[arg(
+        long,
+        help = "Run even though an item report or export of the case is not yet finished and may \
+be a duplicate"
+    )]
+    allow_concurrent: bool,
+    #[arg(
+        long,
+        help = "Submit the report and stop, printing the commands that carry on"
+    )]
+    no_wait: bool,
+    #[arg(
+        long,
+        help = "Wait for the report, but do not download or read its zip"
+    )]
+    no_download: bool,
+    #[arg(
+        long,
+        conflicts_with_all = ["no_download", "no_wait"],
+        help = "Exit 4 when a location failed or the report zip could not be checked"
+    )]
+    strict: bool,
+    #[arg(
+        long,
+        value_name = "DUR",
+        conflicts_with = "no_wait",
+        help = "How long to wait for the report, such as 30m or 2h (default 2h, at most 24h)"
+    )]
+    wait_timeout: Option<String>,
+    #[arg(
+        long,
+        value_name = "DUR",
+        conflicts_with = "no_wait",
+        help = "A fixed interval between reads, at least 5s (default: 10s, then 30s after 2 \
+minutes, then 60s after 10)"
+    )]
+    poll_interval: Option<String>,
+    #[arg(
+        long,
+        value_name = "DIR",
+        conflicts_with_all = ["no_download", "no_wait"],
+        help = "Write the report zip here instead of the data directory"
+    )]
+    out: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
 struct AuthLogin {
     #[arg(
         long,
@@ -1528,6 +1646,39 @@ async fn run(
                 });
             write_command(env, output, globals, &mut command).await
         }
+        Command::Report(args) => {
+            let reason = args
+                .reason
+                .map(|reason| commands::sent_text("--reason", &reason))
+                .transpose()?;
+            let name = args
+                .name
+                .map(|name| commands::sent_text("--name", &name))
+                .transpose()?;
+            let mut command = commands::report::Report::new(commands::report::ReportFlags {
+                case: CaseKey::parse(&args.case)?,
+                search: SearchKey::parse(&args.search)?,
+                name,
+                no_teams_context: args.no_teams_context,
+                allow_generic: args.allow_generic,
+                allow_large: args.allow_large,
+                reason,
+                allow_concurrent: args.allow_concurrent,
+                no_wait: args.no_wait,
+                no_download: args.no_download,
+                strict: args.strict,
+                timing: poll::timing(
+                    args.wait_timeout.as_deref(),
+                    args.poll_interval.as_deref(),
+                    poll::DEFAULT_WAIT_TIMEOUT,
+                )?,
+                out: args
+                    .out
+                    .map(|out| not_blank("--out", out).map(PathBuf::from))
+                    .transpose()?,
+            });
+            write_command(env, output, globals, &mut command).await
+        }
         Command::Kql(query) => kql(env, output, query),
         Command::Parse(parse) => parse_zip(env, output, parse.command),
         Command::Version => version(env, output),
@@ -1870,10 +2021,11 @@ async fn write_command(
         } else {
             crate::report::ReportLimits::from_config(&Default::default())?
         },
-        volume: if command.reads_volume() {
-            crate::report::volume::VolumeLimits::from_config(&stored.extra)?
+        volume: crate::report::volume::VolumeLimits::read(&stored.extra, command.volume_use())?,
+        teams_context: if command.reads_teams_context() {
+            commands::report::teams_context_setting(&stored.extra)?
         } else {
-            crate::report::volume::VolumeLimits::default()
+            true
         },
     };
     command.check(&settings)?;
@@ -1999,8 +2151,8 @@ async fn run_write(
     }
     // A blocked plan is shown by a dry run, and refused otherwise, before
     // anyone is asked.
-    if let (Some(reason), false) = (plan.blocked(), settings.dry_run) {
-        return Err(PurviewError::ConcurrentOperation(reason.to_owned()));
+    if let (Some(blocked), false) = (plan.blocked(), settings.dry_run) {
+        return Err(blocked.error());
     }
     let decision =
         safety::decide(plan, settings, input.as_ref(), &mut env.stderr, &redactor).await?;

@@ -12,11 +12,11 @@ implements one item of its section 11 and nothing from later items. Today
 the binary has `purview version`, `purview auth login` (device code, or
 `--browser`), `auth refresh`, `auth status`, `auth list` and `auth logout`,
 `case list`, `case get`, `case create`, `search list`, `search get`,
-`search create`, `estimate`, `operation list` and `operation get` (with
+`search create`, `estimate`, `report`, `operation list` and `operation get` (with
 `--wait` and `--check`), `download`, `parse locations`, `parse failures`,
 `parse summary`, `kql`, and the global options `--verbose`, `--timeout`,
-`--trace` and `--wrap-untrusted`. `case create`, `search create` and
-`estimate` are the write commands so far; they run through the safety
+`--trace` and `--wrap-untrusted`. `case create`, `search create`,
+`estimate` and `report` are the write commands so far; they run through the safety
 framework (`src/safety.rs`) with `--yes`, `--dry-run` and `--no-write`. Do not add
 stubs for commands that a later pull request owns.
 
@@ -97,16 +97,28 @@ that the test files pass their own scan.
   `SearchHasSources` / `ScopeUnverified`, and the guard on its current
   query), `active_operations` (operations of an action not yet finished,
   which may be duplicates: `$expand=search` is refused, Observed) and
-  `started_since` (reconciliation by `createdBy` and creation time).
+  `started_since` (reconciliation by `createdBy` and creation time), each
+  over a list of actions (`EXPORT_ACTIONS` for reports and exports), and
+  `ActionRun::after_send`, the run after an action's one POST: the 202
+  and its `Location` header (`GraphClient::operation_in_location`, key or
+  path form, `UnexpectedLocation` otherwise), the wait (`Poller` with a
+  30-second not-found grace), the check that the operation is of the
+  action sent, the download through `commands::download::fetch` and the
+  collection check, with `Finished::finish` for `--strict`.
   `commands/estimate.rs` is `estimate`: a plan that a duplicate blocks
-  without `--allow-concurrent` (`ConcurrentOperation`), then after the 202
-  the `Location` header (`GraphClient::operation_in_location`, key or path
-  form, `UnexpectedLocation` otherwise), the wait (`Poller` with a 30-second
-  not-found grace), the download through `commands::download::fetch`, the
-  collection check and the volume warning (`report::volume`, the `volume`
-  limits of `config.json`, read only by a command whose `reads_volume()`
+  without `--allow-concurrent` (`safety::Blocked::Concurrent`,
+  `ConcurrentOperation`), then `after_send` and the volume warning (`report::volume`, the `volume`
+  limits of `config.json`, read only as far as a command's `volume_use()`
   is true); `--strict` adds `FailedLocations` or `EvidenceMissing`, never
-  a volume reason. `commands/parse.rs` is `parse locations|failures|
+  a volume reason. `commands/report.rs` is `report`: the same preflight
+  over item reports and exports, then the size limit against the search's
+  latest estimate (`ReadRoute::LastEstimate`, `latest_estimate`,
+  `size_check`), which blocks the plan with `TooLarge` or
+  `VolumeUnchecked` unless `--allow-large`; `defaults.teams_context`, read
+  only by a command whose `reads_teams_context()` is true; the
+  `ExportReportRequest` body; `after_send` with `EvidenceOf::Report`; and
+  reconciliation that reads each candidate for its true action.
+  `commands/parse.rs` is `parse locations|failures|
   summary`, local. `operation get --check` downloads the evidence file and
   sets `collection`.
 - `src/zipread.rs` opens report zips under `ZipLimits` (entries, bytes per
@@ -305,7 +317,7 @@ timeout. It carries the Graph base URL (`origin::GRAPH_BASE` in production,
   `execute_with` the same way (flows 1, 2 and 7 of `docs/SPEC.md`
   section 8.5); `tests/actions.rs` runs `estimate` and `operation get
   --check` against the mock Graph and a mock download origin (flows 3, 4
-  and 5);
+  and 5); `tests/reports.rs` runs `report` the same way;
   `tests/write_allow_list.rs` scans `src/` and `build.rs` for HTTP write
   methods, and allows a POST to be built only in `send_write` and the
   identity client; `tests/fixture_lint.rs` is the public-data lint.
@@ -446,8 +458,8 @@ Every Purview write is a `WriteRoute` variant, and `WriteRoute::ALL` is the
 six POSTs in `docs/SPEC.md` section 4.3: create case, close case, create
 search, estimate statistics, export report and export result. They are sent
 only by `GraphClient::send_write`, which takes an `ApprovedWrite`;
-`case create`, `search create` and `estimate` send create case, create
-search and estimate statistics. No
+`case create`, `search create`, `estimate` and `report` send create case,
+create search, estimate statistics and export report. No
 `PATCH`, `PUT` or `DELETE` may exist in the crate, in code, strings or
 comments, and `tests/write_allow_list.rs` scans the source tree for them
 and for calls that would choose a method at run time. Adding a write needs a

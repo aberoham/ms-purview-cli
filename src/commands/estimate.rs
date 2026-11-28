@@ -8,35 +8,30 @@
 
 use std::io::Write;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 
-use super::action::{active_operations, check_search, started_since, Checked};
-use super::download::{fetch, Request};
-use super::operation::{incomplete_reason, stopped, Resume};
+use super::action::{
+    active_operations, check_search, resume, started_since, ActionRun, Checked, Sent,
+};
 use crate::error::{PurviewError, Result};
 use crate::graph::WriteResponse;
 use crate::kql::GuardConfig;
 use crate::model::requests::{EstimateRequest, IncludeQueryStats};
 use crate::model::valid::{CaseKey, SearchKey};
 use crate::model::wire::{OperationDetail, OperationRecord, OperationStatus};
-use crate::output::sanitize;
-use crate::poll::{elapsed_text, PollEnd, Poller, Timing};
+use crate::poll::Timing;
 use crate::report::estimate::{by_hits, Collection};
-use crate::report::volume::{Volume, VolumeLimits};
+use crate::report::volume::{Volume, VolumeLimits, VolumeUse};
 use crate::report::{EvidenceOf, ReportFiles, ReportLimits};
-use crate::routes::{CaseId, OperationId, ReadRoute, SearchId, WriteRoute};
+use crate::routes::{CaseId, OperationId, SearchId, WriteRoute};
 use crate::safety::{
-    After, Applied, PlanInput, Planned, Preflight, Reconciled, WriteCommand, WritePlan,
+    After, Applied, Blocked, PlanInput, Planned, Preflight, Reconciled, WriteCommand, WritePlan,
     WriteSettings,
 };
 
-/// How long a 404 on a fresh operation counts as "not visible yet"
-/// (`docs/SPEC.md` section 4.6; Assumption).
-pub const NOT_FOUND_GRACE: Duration = Duration::from_secs(30);
 /// The locations with most hits that the result shows.
 pub const TOP_LOCATIONS: usize = 10;
 /// How far before the POST reconciliation looks for new operations, for
@@ -96,8 +91,8 @@ impl WriteCommand for Estimate {
         !self.flags.no_download && !self.flags.no_wait
     }
 
-    fn reads_volume(&self) -> bool {
-        true
+    fn volume_use(&self) -> VolumeUse {
+        VolumeUse::All
     }
 
     async fn plan(&mut self, preflight: &mut Preflight<'_>) -> Result<Planned> {
@@ -119,8 +114,13 @@ impl WriteCommand for Estimate {
             preflight.log,
         )
         .await?;
-        let active =
-            active_operations(preflight.graph, case, "estimateStatistics", preflight.log).await?;
+        let active = active_operations(
+            preflight.graph,
+            case,
+            &["estimateStatistics"],
+            preflight.log,
+        )
+        .await?;
         let mut warnings = Vec::new();
         if !narrowed {
             warnings.push(format!(
@@ -137,7 +137,7 @@ impl WriteCommand for Estimate {
             ));
         }
         let blocked = (!active.is_empty() && !self.flags.allow_concurrent).then(|| {
-            format!(
+            Blocked::Concurrent(format!(
                 "case {case} has {} estimate{} not yet finished that may be a duplicate ({}); \
                  nothing was sent. Wait for {} with 'purview operation get {case} <op> --wait', \
                  or pass --allow-concurrent to start another",
@@ -149,7 +149,7 @@ impl WriteCommand for Estimate {
                     .collect::<Vec<_>>()
                     .join("; "),
                 if active.len() == 1 { "it" } else { "them" },
-            )
+            ))
         });
         let body = serde_json::to_value(EstimateRequest {
             statistics_options: IncludeQueryStats,
@@ -240,15 +240,19 @@ impl WriteCommand for Estimate {
         // An estimate that another person started while the prompt was
         // open may be a duplicate too.
         if !self.flags.allow_concurrent {
-            let active =
-                active_operations(preflight.graph, case, "estimateStatistics", preflight.log)
-                    .await
-                    .map_err(|error| {
-                        error.context(format!(
-                            "listing the operations of case {case} again after approval; \
+            let active = active_operations(
+                preflight.graph,
+                case,
+                &["estimateStatistics"],
+                preflight.log,
+            )
+            .await
+            .map_err(|error| {
+                error.context(format!(
+                    "listing the operations of case {case} again after approval; \
                              nothing was sent"
-                        ))
-                    })?;
+                ))
+            })?;
             if !active.is_empty() {
                 return Err(PurviewError::ConcurrentOperation(format!(
                     "an estimate of case {case} was started after the plan was shown and may be \
@@ -262,6 +266,10 @@ impl WriteCommand for Estimate {
                 )));
             }
         }
+        // Reconciliation looks for operations from just before the send:
+        // after these reads, not when the plan was shown, since the prompt
+        // or a slow read may have taken a long time.
+        self.planned = Some((case, search, preflight.clock.now() - CLOCK_SKEW));
         Ok(())
     }
 
@@ -269,235 +277,52 @@ impl WriteCommand for Estimate {
         let Some((case, _, _)) = self.planned else {
             return Err(PurviewError::message("estimate was applied without a plan"));
         };
-        let reconcile_hint = format!(
-            "the estimate may be running; 'purview operation list {case} --action estimate' \
-             lists it"
-        );
-        if response.status != 202 {
-            return Err(PurviewError::UnexpectedLocation(format!(
-                "Graph answered the estimate with HTTP {}, where 202 and a Location header were \
-                 observed; {reconcile_hint}",
-                response.status
-            )));
-        }
-        let operation = response
-            .location
-            .as_deref()
-            .and_then(|location| after.session.graph.operation_in_location(location, case))
-            .ok_or_else(|| {
-                // The header is Graph's text and is not repeated.
-                PurviewError::UnexpectedLocation(format!(
-                    "Graph accepted the estimate (HTTP {}) but its Location header does not name \
-                     an operation of case {case} in a known form; {reconcile_hint}",
-                    response.status
-                ))
-            })?;
-        if self.flags.no_wait {
-            return Ok(Applied::result(json!({
-                "operationId": operation.to_string(),
-                "operationStatus": Value::Null,
-                "collection": Collection::Unchecked.as_str(),
-                "resume": resume(after, case, &operation),
-            })));
-        }
-        let session = &mut after.session;
-        let started = session.env.clock.elapsed();
-        let clock = session.env.clock.clone();
-        let interrupt = session.env.interrupt.clone();
-        let graph = session.graph.clone();
-        let poller = Poller {
-            graph: &graph,
-            clock: clock.as_ref(),
-            interrupt: interrupt.as_ref(),
+        let run = ActionRun {
+            label: "estimate",
+            noun: "an estimate",
+            action: "estimateStatistics",
+            evidence_of: EvidenceOf::Estimate,
+            list_hint: "--action estimate",
+            check_only: false,
+            no_wait: self.flags.no_wait,
+            no_download: self.flags.no_download,
             timing: self.flags.timing,
-            not_found_grace: Some(NOT_FOUND_GRACE),
+            out: self.flags.out.clone(),
+            limits: self.limits,
         };
-        let show_progress = session.env.stderr_is_terminal && !session.verbose;
-        let shown_id = format!("{}…", &operation.to_string()[..8]);
-        let mut progress =
-            |record: &OperationRecord, waited: Duration, log: &mut (dyn Write + Send)| {
-                if show_progress {
-                    let _ = writeln!(
-                        log,
-                        "estimate {shown_id}: {} · {}",
-                        sanitize(record.status.as_str()),
-                        elapsed_text(waited)
-                    );
-                }
-            };
-        let route = ReadRoute::Operation(case, operation.clone());
-        let end = poller
-            .wait(&route, &mut session.env.stderr, &mut progress)
-            .await?;
-        let waited = clock.elapsed().saturating_sub(started);
-        let record = match end {
-            PollEnd::Finished(record) => record,
-            PollEnd::TimedOut { last } => {
-                return Ok(Applied::Produced(stopped(
-                    session,
-                    case,
-                    &operation,
-                    last,
-                    waited,
-                    false,
-                    Resume::WaitThenDownload,
-                )?))
+        let mut finished = match run.after_send(after, response, case).await? {
+            Sent::Produced(produced) => return Ok(Applied::Produced(produced)),
+            Sent::Submitted(operation) => {
+                return Ok(Applied::result(json!({
+                    "operationId": operation.to_string(),
+                    "operationStatus": Value::Null,
+                    "collection": Collection::Unchecked.as_str(),
+                    "resume": resume(after, case, &operation),
+                })))
             }
-            PollEnd::Interrupted { last } => {
-                return Ok(Applied::Produced(stopped(
-                    session,
-                    case,
-                    &operation,
-                    last,
-                    waited,
-                    true,
-                    Resume::WaitThenDownload,
-                )?))
-            }
+            Sent::Finished(finished) => finished,
         };
-        // The operation the header named must be an estimate: its files are
-        // a report, never item content.
-        if record.action.as_deref() != Some("estimateStatistics")
-            || !matches!(record.detail(), Some(OperationDetail::Estimate(_)))
-        {
-            return Err(PurviewError::UnexpectedLocation(format!(
-                "operation {operation} of case {case}, which the estimate's Location header \
-                 named, is not an estimate; nothing was downloaded. {reconcile_hint}"
-            )));
-        }
-        super::operation::warn_invalid_counts(
-            &after.session.env.redactor.clone(),
-            &mut after.session.env.stderr,
-            std::iter::once(&record),
-        );
-        let mut reasons: Vec<Value> = Vec::new();
-        let mut files: Vec<Value> = Vec::new();
-        let mut evidence: Option<ReportFiles> = None;
-        let mut evidence_note: Option<String> = None;
-        if self.flags.no_download {
-            reasons.extend(incomplete_reason(&record));
-            evidence_note = Some("--no-download: the report zip was not read".into());
-        } else {
-            let context = after
-                .download
-                .ok_or_else(|| PurviewError::message("estimate has no download client"))?;
-            let request = Request {
-                case: CaseKey::Id(case),
-                operation: operation.clone(),
-                out: self.flags.out.clone(),
-                file: None,
-                overwrite: false,
-            };
-            let fetched = fetch(&mut after.session, case, &record, &request, context).await?;
-            // The deadline covers the wait; the download has its own
-            // timeouts (`docs/SPEC.md` section 4.7). Ctrl-C during it
-            // reports the time since the estimate was sent.
-            if fetched.interrupted {
-                let waited = clock.elapsed().saturating_sub(started);
-                return Ok(Applied::Produced(stopped(
-                    &mut after.session,
-                    case,
-                    &operation,
-                    Some(record),
-                    waited,
-                    true,
-                    Resume::WaitThenDownload,
-                )?));
-            }
-            reasons.extend(fetched.reasons);
-            let limits = self.limits.unwrap_or_else(|| {
-                ReportLimits::from_config(&Default::default()).expect("the defaults are valid")
-            });
-            for done in &fetched.done {
-                files.push(json!({
-                    "fileName": done.server_name,
-                    "path": done.path.to_string_lossy(),
-                    "size": done.bytes,
-                    "sha256": done.sha256,
-                    "status": done.status(),
-                }));
-                if evidence.is_none() {
-                    match ReportFiles::read(&done.path, limits) {
-                        Ok(read)
-                            if read.locations.is_some() || read.statistics_errors.is_some() =>
-                        {
-                            evidence = Some(read);
-                        }
-                        Ok(_) => {}
-                        Err(error) => {
-                            let (code, _) = error.metadata();
-                            evidence_note = Some(format!(
-                                "a downloaded file could not be read as a report zip ({code})"
-                            ));
-                        }
-                    }
-                }
-            }
-            if evidence.is_none() && evidence_note.is_none() {
-                evidence_note = Some("no downloaded file is a report zip".into());
-            }
-        }
-        let collection = evidence.as_ref().map_or(Collection::Unchecked, |files| {
-            files.collection(EvidenceOf::Estimate)
-        });
         let log = &mut after.session.env.stderr;
-        if let Some(files) = &evidence {
-            super::parse::warn_missing_columns(log, files);
-        }
-        if let Collection::Incomplete { failed } = collection {
-            if record.status == OperationStatus::Succeeded {
-                let _ = writeln!(
-                    log,
-                    "warning: the estimate succeeded, but {failed} location{} {} not searched in \
-                     full; --strict makes this exit 4",
-                    if failed == 1 { "" } else { "s" },
-                    if failed == 1 { "was" } else { "were" }
-                );
-            }
-        }
         let volume = volume_of(
             self.volume.unwrap_or_default(),
-            &record,
-            evidence.as_ref(),
-            collection,
+            &finished.record,
+            finished.evidence.as_ref(),
+            finished.collection,
         );
         for line in volume.warnings() {
             let _ = writeln!(log, "{line}");
         }
-        if let (Collection::Unchecked, Some(note), false) =
-            (collection, &evidence_note, self.flags.no_download)
-        {
-            let _ = writeln!(log, "warning: collection unchecked: {note}");
-        }
-        if self.flags.strict {
-            match collection {
-                Collection::Incomplete { failed } => reasons.push(json!({
-                    "code": "FailedLocations",
-                    "message": format!("{failed} locations were not searched in full"),
-                })),
-                Collection::Unchecked => reasons.push(json!({
-                    "code": "EvidenceMissing",
-                    "message": format!(
-                        "the collection could not be checked: {}",
-                        evidence_note.as_deref().unwrap_or(
-                            "the report zip lacks a file, column or row value that the check \
-                             needs, or holds two of a file"
-                        )
-                    ),
-                })),
-                Collection::Complete => {}
-            }
-        }
+        finished.finish(log, self.flags.no_download, self.flags.strict);
         Ok(Applied::Result {
             result: result_value(
-                &operation,
-                &record,
-                collection,
-                evidence.as_ref(),
-                files,
+                &finished.operation,
+                &finished.record,
+                finished.collection,
+                finished.evidence.as_ref(),
+                finished.files,
                 &volume,
             ),
-            reasons,
+            reasons: finished.reasons,
         })
     }
 
@@ -508,7 +333,7 @@ impl WriteCommand for Estimate {
         let (found, incomplete, failure) = started_since(
             preflight.graph,
             case,
-            "estimateStatistics",
+            &["estimateStatistics"],
             since,
             preflight.account,
             preflight.log,
@@ -544,16 +369,6 @@ impl WriteCommand for Estimate {
         }
         Ok(Reconciled { candidates, notes })
     }
-}
-
-/// The commands that carry on from a submitted estimate, as the signed-in
-/// account.
-fn resume(after: &After<'_>, case: CaseId, operation: &OperationId) -> Vec<String> {
-    let account = super::operation::shell_word(&after.session.account.email);
-    vec![
-        format!("purview --account={account} operation get {case} {operation} --wait"),
-        format!("purview --account={account} download {case} {operation}"),
-    ]
 }
 
 /// The volume check of a finished estimate (`docs/SPEC.md` section 6.9):

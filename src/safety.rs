@@ -39,7 +39,33 @@ pub struct WritePlan {
     effects: Vec<String>,
     warnings: Vec<String>,
     preflight: Vec<Value>,
-    blocked: Option<String>,
+    blocked: Option<Blocked>,
+}
+
+/// Why a plan may be shown but not sent. A dry run prints the plan; any
+/// other run fails with the reason's own error before anyone is asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Blocked {
+    /// An operation that may be a duplicate, without `--allow-concurrent`
+    /// (`ConcurrentOperation`).
+    Concurrent(String),
+    /// The search's latest estimate passes `volume.max_export_size`,
+    /// without `--allow-large` (`TooLarge`).
+    TooLarge(String),
+    /// The search has no estimate whose size can be compared with
+    /// `volume.max_export_size`, without `--allow-large`
+    /// (`VolumeUnchecked`).
+    VolumeUnchecked(String),
+}
+
+impl Blocked {
+    pub fn error(&self) -> PurviewError {
+        match self {
+            Self::Concurrent(message) => PurviewError::ConcurrentOperation(message.clone()),
+            Self::TooLarge(message) => PurviewError::TooLarge(message.clone()),
+            Self::VolumeUnchecked(message) => PurviewError::VolumeUnchecked(message.clone()),
+        }
+    }
 }
 
 /// What a command gives to build its plan.
@@ -57,9 +83,8 @@ pub struct PlanInput {
     /// What each preflight read found.
     pub preflight: Vec<Value>,
     /// Why the plan may be shown but not sent, such as an operation that
-    /// may be a duplicate without `--allow-concurrent`. A dry run prints
-    /// the plan; any other run fails with `ConcurrentOperation`.
-    pub blocked: Option<String>,
+    /// may be a duplicate without `--allow-concurrent`.
+    pub blocked: Option<Blocked>,
 }
 
 impl WritePlan {
@@ -127,8 +152,8 @@ impl WritePlan {
     }
 
     /// Why the plan may not be sent, when it may not.
-    pub fn blocked(&self) -> Option<&str> {
-        self.blocked.as_deref()
+    pub fn blocked(&self) -> Option<&Blocked> {
+        self.blocked.as_ref()
     }
 
     /// The plan as JSON: `{"command", "account", "tenant", "method",
@@ -363,6 +388,8 @@ pub struct WriteSettings {
     pub report: crate::report::ReportLimits,
     /// The volume warning's limits (`volume` in `config.json`).
     pub volume: crate::report::volume::VolumeLimits,
+    /// `defaults.teams_context`, `true` unless set to `false`.
+    pub teams_context: bool,
 }
 
 /// What preflight decided.
@@ -461,9 +488,15 @@ pub trait WriteCommand: Send {
         false
     }
 
-    /// Whether the command reads `volume` from `config.json`, so that a bad
+    /// Which keys of `volume` in `config.json` the command reads, so that a
+    /// bad setting there stops only the commands that use it.
+    fn volume_use(&self) -> crate::report::volume::VolumeUse {
+        crate::report::volume::VolumeUse::None
+    }
+
+    /// Whether the command reads `defaults.teams_context`, so that a bad
     /// setting there stops only the commands that use it.
-    fn reads_volume(&self) -> bool {
+    fn reads_teams_context(&self) -> bool {
         false
     }
 

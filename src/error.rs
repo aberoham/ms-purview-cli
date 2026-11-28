@@ -257,6 +257,22 @@ pub enum PurviewError {
     #[error("{0}")]
     ConcurrentOperation(String),
 
+    /// A report or export of a search whose latest estimate passes
+    /// `volume.max_export_size`, without `--allow-large` (`docs/SPEC.md`
+    /// section 6.9).
+    #[error("{0}")]
+    TooLarge(String),
+
+    /// A Graph read answered with a success status whose body is not a
+    /// JSON object, such as 204 or `null`.
+    #[error("Microsoft Graph returned a response that is not a JSON object")]
+    GraphBodyNotObject { status: u16 },
+
+    /// A report or export of a search with no estimate whose size can be
+    /// compared with `volume.max_export_size`, without `--allow-large`.
+    #[error("{0}")]
+    VolumeUnchecked(String),
+
     /// A zip that is refused before or while it is read: not a zip, too
     /// many entries, a name that would leave its folder, or more bytes, or
     /// a higher ratio, than the limits allow. Never names an entry.
@@ -414,6 +430,8 @@ impl PurviewError {
             Self::SearchNameInUse(_) => ("SearchNameInUse", 0),
             Self::CaseNotActive(_) => ("CaseNotActive", 0),
             Self::ConcurrentOperation(_) => ("ConcurrentOperation", 0),
+            Self::TooLarge(_) => ("TooLarge", 0),
+            Self::VolumeUnchecked(_) => ("VolumeUnchecked", 0),
             Self::ScopeUnverified(_) => ("ScopeUnverified", 0),
             Self::ScopeNotAllowed(_) => ("ScopeNotAllowed", 0),
             Self::SearchHasSources(_) => ("SearchHasSources", 0),
@@ -426,6 +444,7 @@ impl PurviewError {
             Self::ReadOnlySession(_) => ("ReadOnlySession", 0),
             Self::WriteOutcomeUnknown { .. } => ("WriteOutcomeUnknown", 0),
             Self::Message(_)
+            | Self::GraphBodyNotObject { .. }
             | Self::GraphUnreachable { .. }
             | Self::Io(_)
             | Self::Json(_)
@@ -639,6 +658,20 @@ mod tests {
         assert_eq!(bare.metadata(), ("GraphError", 502));
         assert_eq!(bare.to_string(), "Microsoft Graph returned HTTP 502");
         assert_eq!(PurviewError::message("x").graph_status(), None);
+        // A token the provider could not supply is not Graph's answer,
+        // whatever status the identity platform gave.
+        let refused = PurviewError::TokenUnavailable(Box::new(PurviewError::Graph(Box::new(
+            GraphErrorDetails {
+                status: 400,
+                ..GraphErrorDetails::default()
+            },
+        ))));
+        assert_eq!(refused.graph_status(), None);
+        assert_eq!(
+            refused.context("reading").graph_status(),
+            None,
+            "through context too"
+        );
     }
 
     #[test]

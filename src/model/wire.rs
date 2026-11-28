@@ -391,6 +391,23 @@ impl OperationRecord {
     }
 }
 
+impl OperationRecord {
+    /// The estimate detail of a record that is an estimate by its
+    /// `@odata.type`, or that has no `@odata.type` and the action
+    /// `estimateStatistics`: a search's `lastEstimateStatisticsOperation`
+    /// answers without the type (Observed).
+    pub fn estimate_detail(&self) -> Option<EstimateDetail> {
+        let object = self.raw.as_object()?;
+        match self.odata_type.as_deref() {
+            Some(ESTIMATE_OPERATION) => Some(EstimateDetail::from_object(object)),
+            None if self.action.as_deref() == Some("estimateStatistics") => {
+                Some(EstimateDetail::from_object(object))
+            }
+            _ => None,
+        }
+    }
+}
+
 fn detail_of(odata_type: Option<&str>, object: &Map<String, Value>) -> Option<OperationDetail> {
     match odata_type? {
         ESTIMATE_OPERATION => Some(OperationDetail::Estimate(EstimateDetail::from_object(

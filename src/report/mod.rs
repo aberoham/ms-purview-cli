@@ -99,12 +99,34 @@ pub struct ReportFiles {
 impl ReportFiles {
     /// Reads the files of the zip at `path` that this release parses.
     pub fn read(path: &Path, limits: ReportLimits) -> Result<Self> {
+        Self::read_inner(path, limits, true)
+    }
+
+    /// Reads the files an action's evidence needs: every file for an
+    /// estimate; for a report, `Locations-*.csv` alone, so that no other
+    /// file can make its Locations unreadable.
+    pub fn read_for(path: &Path, limits: ReportLimits, action: EvidenceOf) -> Result<Self> {
+        Self::read_inner(path, limits, action == EvidenceOf::Estimate)
+    }
+
+    /// Whether the zip holds the evidence `action` reads.
+    pub fn has_evidence_for(&self, action: EvidenceOf) -> bool {
+        match action {
+            EvidenceOf::Estimate => self.locations.is_some() || self.statistics_errors.is_some(),
+            EvidenceOf::Report => self.locations.is_some(),
+        }
+    }
+
+    /// `all` reads every file this release parses; otherwise Locations
+    /// alone.
+    fn read_inner(path: &Path, limits: ReportLimits, all: bool) -> Result<Self> {
         let mut zip = ZipReader::open(path, limits.zip)?;
         let kind = Kind::of(zip.names());
         let record = limits.record_bytes;
         let mut missing_columns = Vec::new();
         let duplicates = ["Locations", "Statistics", "Summary", "Settings"]
             .into_iter()
+            .filter(|kind| all || *kind == "Locations")
             .filter(|kind| zip.find_all(&format!("{kind}-")).len() > 1)
             .collect();
         let locations = match zip.find("Locations-") {
@@ -121,7 +143,7 @@ impl ReportFiles {
                 Some(locations)
             }
         };
-        let statistics_errors = match zip.find("Statistics-") {
+        let statistics_errors = match zip.find("Statistics-").filter(|_| all) {
             None => None,
             Some(index) => {
                 let read = zip.read_entry(index, |reader| {
@@ -135,11 +157,11 @@ impl ReportFiles {
                 Some(read)
             }
         };
-        let summary = match zip.find("Summary-") {
+        let summary = match zip.find("Summary-").filter(|_| all) {
             None => None,
             Some(index) => Some(zip.read_entry(index, |reader| SummaryFile::read(reader, record))?),
         };
-        let settings = match zip.find("Settings-") {
+        let settings = match zip.find("Settings-").filter(|_| all) {
             None => None,
             Some(index) => {
                 let (settings, missing) =
@@ -167,6 +189,16 @@ impl ReportFiles {
                 .statistics_errors
                 .as_ref()
                 .map_or(0, |s| s.unusable_rows)
+    }
+
+    /// The failed locations an action's evidence shows: both files for an
+    /// estimate, `Locations` alone for a report, which has no Statistics
+    /// file (Observed).
+    pub fn failed_locations_of(&self, action: EvidenceOf) -> Vec<FailedLocation> {
+        match action {
+            EvidenceOf::Estimate => self.failed_locations(),
+            EvidenceOf::Report => estimate::failed_locations(self.locations.as_ref(), None),
+        }
     }
 
     /// The failed locations of both files.
@@ -202,14 +234,18 @@ impl ReportFiles {
             EvidenceOf::Estimate => locations_usable && statistics_usable,
             EvidenceOf::Report => locations_usable,
         };
-        let ambiguous = self
-            .duplicates
-            .iter()
-            .any(|kind| matches!(*kind, "Locations" | "Statistics"));
-        if !usable || ambiguous || self.unusable_rows() > 0 {
+        let ambiguous = self.duplicates.iter().any(|kind| match action {
+            EvidenceOf::Estimate => matches!(*kind, "Locations" | "Statistics"),
+            EvidenceOf::Report => *kind == "Locations",
+        });
+        let unusable = match action {
+            EvidenceOf::Estimate => self.unusable_rows(),
+            EvidenceOf::Report => self.locations.as_ref().map_or(0, |l| l.unusable_rows),
+        };
+        if !usable || ambiguous || unusable > 0 {
             return Collection::Unchecked;
         }
-        match self.failed_locations().len() {
+        match self.failed_locations_of(action).len() {
             0 => Collection::Complete,
             failed => Collection::Incomplete { failed },
         }

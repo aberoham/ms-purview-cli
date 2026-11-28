@@ -110,6 +110,11 @@ pub const UNTRUSTED_KEYS: &[&str] = &[
     "entry",
     "part",
     "errorDetail",
+    // `parse items` records: the title and key as senders wrote them, and
+    // the domain taken from the sender.
+    "title",
+    "key",
+    "senderDomain",
 ];
 
 /// Wraps every non-empty string under a key in `UNTRUSTED_KEYS`, at any
@@ -380,6 +385,47 @@ pub fn sanitize_multiline(value: &str) -> String {
             value => Some(value),
         })
         .collect()
+}
+
+/// One JSON Lines record, prepared as every JSON document is: URLs
+/// redacted, `--wrap-untrusted` applied under `marker`, secrets redacted as
+/// values. A record whose bytes still match a secret is replaced by its
+/// prepared `keep` fields and an error, so the line count still matches the
+/// records. `false` when that happened.
+pub fn write_json_line(
+    out: &mut dyn Write,
+    redactor: &crate::redact::Redactor,
+    marker: Option<&str>,
+    record: Value,
+    keep: &[&str],
+) -> Result<bool> {
+    let mut value = crate::trace::redact_urls(&record, redactor);
+    if let Some(id) = marker {
+        wrap_untrusted(&mut value, id);
+    }
+    let safe = redactor.redact_value(&value);
+    let mut bytes = serde_json::to_vec(&safe)?;
+    let mut written = true;
+    if redactor.recognises_bytes(&bytes) {
+        written = false;
+        let mut fallback = serde_json::Map::new();
+        for key in keep {
+            fallback.insert((*key).to_owned(), safe[*key].clone());
+        }
+        fallback.insert("error".into(), json!("redactionFailed"));
+        fallback.insert(
+            "errorDetail".into(),
+            json!("the record held a secret that could not be removed, so it is not printed"),
+        );
+        bytes = serde_json::to_vec(&Value::Object(fallback))?;
+        if redactor.recognises_bytes(&bytes) {
+            bytes = serde_json::to_vec(&json!({"error": "redactionFailed"}))?;
+        }
+    }
+    bytes.push(b'\n');
+    // `cli` reports a failed stdout itself, with its own prefix.
+    out.write_all(&bytes)?;
+    Ok(written)
 }
 
 #[cfg(test)]

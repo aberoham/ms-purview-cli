@@ -16,7 +16,7 @@ the binary has `purview version`, `purview auth login` (device code, or
 `operation list` and
 `operation get` (with
 `--wait` and `--check`), `download`, `parse locations`, `parse failures`,
-`parse summary`, `kql`, and the global options `--verbose`, `--timeout`,
+`parse summary`, `parse items`, `kql`, and the global options `--verbose`, `--timeout`,
 `--trace` and `--wrap-untrusted`. `case create`, `case close`, `search create`,
 `estimate`, `report` and `export create` are the write commands so far; they
 run through the safety
@@ -157,7 +157,8 @@ run with `python3`.
   body (`exportFormat: msg`), the plan's export warnings, and every part
   downloaded, with only the `Reports-` part read.
   `commands/parse.rs` is `parse locations|failures|
-  summary`, local. `operation get --check` downloads the evidence file and
+  summary|items`, local; `parse items` writes JSON Lines through
+  `output::write_json_line`, which `export read` shares. `operation get --check` downloads the evidence file and
   sets `collection`.
 - `src/msg/` reads `.msg` items from memory, with no I/O: `cfbread.rs` is
   the Compound File Binary container through `cfb`, `props.rs` the MAPI
@@ -178,9 +179,12 @@ run with `python3`.
   `csvread.rs` (flexible records, the byte-order mark, a per-record byte
   budget, `RecordTooLarge`), `estimate.rs` (Locations, Statistics errors,
   their union as failed locations, `Collection`), `summary.rs` (Summary
-  groups split at blank lines outside quotes, known keys, Settings), and
-  `mod.rs` (`ReportFiles`, the zip's `Kind`, `ReportLimits` from
-  `limits`).
+  groups split at blank lines outside quotes, known keys, Settings),
+  `items.rs` (the `Items_N_*.csv` files in order of `N`, read a byte
+  record at a time; the key by Internet message ID, Immutable ID or a
+  SHA-256 of five fields; `Filters`; `Dedup`, with copies, interned
+  distinct `Location ID`s and `TooManyUnique`), and `mod.rs`
+  (`ReportFiles`, the zip's `Kind`, `ReportLimits` from `limits`).
 - `src/kql/` is the guard of `docs/SPEC.md` section 6.3. `lexer.rs` lexes
   each restriction (`participants:…`, `subject:…`, `kind:…`, `sent>=…`)
   as one token with its value checked; `parser.rs` is the
@@ -364,6 +368,8 @@ timeout. It carries the Graph base URL (`origin::GRAPH_BASE` in production,
   `tests/downloads.rs` runs `download` against mock download origins whose
   host names match the production pattern;
   `tests/kql.rs` runs `purview kql` in-process with no reachable host;
+  `tests/items.rs` runs `parse items` the same way on zips it writes, with
+  the 200,000-row timing test ignored by default;
   `tests/graph.rs` drives `GraphClient`, and `Poller` over it, against
   wiremock with a fake token provider; `tests/writes.rs` runs a write
   command that exists only in the test through `execute_write_with`,

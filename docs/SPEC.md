@@ -772,6 +772,26 @@ estimate, `Items_N_*.csv` without an `Items.*.zip` sibling means an item report.
   `key`, `keyKind`, `class`, `date`, `sender`, `senderDomain`, `recipientCount`, `title`,
   `conversationType`, `workload`, `copies`, `locations`, `hasAttachment`, `immutableId` and
   `internetMessageId`.
+
+  Settled in PR 3.1:
+  - `locations` is the number of distinct `Location ID` values among the item's copies; the
+    ids themselves are not written. An `--all-rows` record has `locationId` in place of
+    `copies` and `locations`.
+  - `date` is RFC 3339 in UTC, or `null` when `Date` is empty or cannot be read; `title` is
+    `Subject/Title`, else `Conversation name`; `senderDomain` is the part after `@` of the
+    address (the text inside `<…>` of `Name <addr>`), lowercased, and `null` for a Teams
+    thread id (`19:…`).
+  - Unique items are written by `date`, items without one last, then by `key`; `--all-rows`
+    keeps file order, the `Items_N` files by `N` as a number.
+  - `--sender` may be repeated (a row must match one), as may `--exclude-sender`; both, and
+    `--class` and `--workload`, ignore case. A date filter leaves out rows with no readable
+    `Date`.
+  - `--jsonl` writes JSON Lines even under `--json` or `PURVIEW_JSON`; `--force-buffer`
+    without `--json` is refused. `--max-unique` does not apply to `--all-rows`.
+  - The stderr summary has counts and column names only: rows, files, rows matched, unique
+    items, those keyed by hash, rows with an unreadable `Date`, and missing columns.
+  - `--wrap-untrusted` wraps `title`, `key` and `senderDomain` too (with `sender`, `class`
+    and `internetMessageId`, already wrapped).
 - `parse profile <zip> [filters] [--top N] [--bucket day|week|month] [--merge-local-part]`
 
 Filters: `--since`, `--until` (on `Date`, both inclusive, UTC), `--subject-regex RE` (on
@@ -3046,8 +3066,10 @@ If PR 2.6 cannot be completed, v0.2.0 ships without `case close`.
 - Scope: `items.rs`, the dedup aggregation, filters, `parse items` with `--all-rows` and
   `--max-unique`.
 - Tests: items units; a 200,000-row generated file in under 10 s (ignored by default).
-- Acceptance: on the maintainer's private large report, unique counts match the earlier
-  Python analysis. Checked locally and reported; nothing is committed.
+- Acceptance: on the item reports of the PR 2.4 and PR 2.5 live checks, unique counts,
+  copies and distinct locations match an independent Python count. Checked locally and
+  reported; nothing is committed. (Changed in PR 3.1: the large report and the earlier
+  Python analysis the plan named were not kept.)
 
 **PR 3.2: Profile.**
 - Scope: `profile.rs`, `parse profile`, `identity` config, `report --profile`,

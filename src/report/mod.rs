@@ -3,6 +3,7 @@
 
 pub mod csvread;
 pub mod estimate;
+pub mod items;
 pub mod summary;
 pub mod volume;
 
@@ -36,7 +37,7 @@ impl Kind {
         }
     }
 
-    fn of(names: &[String]) -> Self {
+    pub(crate) fn of(names: &[String]) -> Self {
         let base = |name: &String| name.rsplit('/').next().unwrap_or(name).to_owned();
         let bases: Vec<String> = names.iter().map(base).collect();
         if bases.iter().any(|name| name.starts_with("Statistics-")) {

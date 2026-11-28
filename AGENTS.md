@@ -127,10 +127,7 @@ run with `python3`.
   after Ctrl-C during the download, never `download`. `zipread::zip_end`
   reads a zip as ending at its end record, allowing up to
   `MAX_TRAILING_BYTES` after it (Observed on an items part), through
-  `zipread::Bounded`, and checks the entry cap against every end record
-  the `zip` crate would try, with its rules for an archive at byte 0
-  (`zipread::zip_config`); a change of the `zip` version needs that
-  mirror checked against the new release's `find_central_directory.rs`.
+  `zipread::Bounded`.
   `commands/estimate.rs` is `estimate`: a plan that a duplicate blocks
   without `--allow-concurrent` (`safety::Blocked::Concurrent`,
   `ConcurrentOperation`), then `after_send` and the volume warning (`report::volume`, the `volume`

@@ -114,10 +114,9 @@ impl ZipReader {
                 limits.entries
             )));
         }
-        let mut archive = zip::ZipArchive::with_config(zip_config(), Bounded::new(file, end))
-            .map_err(|_| {
-                PurviewError::HostileZip("the file is not a zip archive that can be read".into())
-            })?;
+        let mut archive = zip::ZipArchive::new(Bounded::new(file, end)).map_err(|_| {
+            PurviewError::HostileZip("the file is not a zip archive that can be read".into())
+        })?;
         // The index keeps one entry per name, so fewer entries than
         // declared means a name is listed twice.
         if archive.len() as u64 != declared || archive.len() > limits.entries {
@@ -211,26 +210,15 @@ pub(crate) fn declared_entries(file: &mut File, len: u64) -> Result<u64> {
     zip_end(file, len).map(|(declared, _)| declared)
 }
 
-/// The largest number of entries the `zip` crate may index when it opens
-/// the zip, and the offset where the zip ends. The crate is always opened
-/// with its archive starting at byte 0 (`zip_config`), and this mirrors
-/// what the pinned release (9.8.2) then does, so that the cap is checked
-/// before any directory is read:
-///
-/// - The zip ends after the latest-ending end record whose comment ends at
-///   the end of the file or at most `MAX_TRAILING_BYTES` before it; the
-///   crate sees nothing after that (`Bounded`).
-/// - The crate walks the end records in the last 65,572 bytes backwards,
-///   and tries each one its checks accept, reading that record's directory,
-///   until one reads. It never goes past an accepted record whose directory
-///   ends where the record starts.
-/// - So every record from the end back to the first such one is checked
-///   with the crate's own rules, and the largest count among those it would
-///   try is the answer. Records it would not try (a forged one pointing at
-///   no directory, a ZIP64 record not at its locator's offset) are skipped,
-///   as the crate skips them.
-///
-/// A file with no record the crate would try is not a zip.
+/// The number of entries the zip's end of central directory record
+/// declares, or its ZIP64 record when one is there, and the offset where
+/// the zip ends. The zip ends after the comment that ends last among the
+/// end records whose comments end at the end of the file or at most
+/// `MAX_TRAILING_BYTES` before it. Every record that ends exactly there
+/// counts, as when a comment holds something that also looks like one, and
+/// the largest count is the answer, so none can hide a large directory. A
+/// ZIP64 end record must lie before its locator, never in the bytes after
+/// the zip. A file with no such record is not a zip.
 pub(crate) fn zip_end(file: &mut File, len: u64) -> Result<(u64, u64)> {
     use std::io::{Seek, SeekFrom};
     let not_zip =
@@ -239,126 +227,81 @@ pub(crate) fn zip_end(file: &mut File, len: u64) -> Result<(u64, u64)> {
         file.seek(SeekFrom::Start(at)).map_err(|_| not_zip())?;
         file.read_exact(buffer).map_err(|_| not_zip())
     };
-    let u16_at =
-        |bytes: &[u8], at: usize| u64::from(u16::from_le_bytes([bytes[at], bytes[at + 1]]));
-    let u32_at = |bytes: &[u8], at: usize| {
-        u64::from(u32::from_le_bytes(
-            bytes[at..at + 4].try_into().expect("4 bytes"),
-        ))
-    };
-    let u64_at = |bytes: &[u8], at: usize| {
-        u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes"))
-    };
-
-    // Where the zip ends: room for a record, its longest comment and the
-    // trailing bytes.
+    // The record is 22 bytes, followed by a comment of at most 65,535 and
+    // then at most MAX_TRAILING_BYTES.
     let tail_len = len.min((22 + 65_535 + MAX_TRAILING_BYTES) as u64);
     let tail_start = len - tail_len;
     let mut tail = vec![0_u8; tail_len as usize];
     read_at(file, tail_start, &mut tail)?;
-    let record_end = |at: usize| at + 22 + u16_at(&tail, at + 20) as usize;
-    let Some(end) = (0..tail.len().saturating_sub(21))
+    let record_end =
+        |at: usize| at + 22 + usize::from(u16::from_le_bytes([tail[at + 20], tail[at + 21]]));
+    // Every record whose comment ends at the end of the file, or at most
+    // MAX_TRAILING_BYTES before it, counts, and the largest count is the
+    // answer: no record, padded or not, can hide a larger directory.
+    let fitting: Vec<usize> = (0..tail.len().saturating_sub(21))
         .filter(|at| tail[*at..].starts_with(b"PK\x05\x06"))
-        .map(record_end)
-        .filter(|ends| *ends <= tail.len() && tail.len() - ends <= MAX_TRAILING_BYTES)
-        .max()
-    else {
+        .filter(|at| {
+            let ends = record_end(*at);
+            ends <= tail.len() && tail.len() - ends <= MAX_TRAILING_BYTES
+        })
+        .collect();
+    // The zip ends after the comment that ends last: at the end of the
+    // file when a record reaches it. Only the records that end exactly
+    // there count, so an end record of a zip stored inside this one, which
+    // ends before this zip's own directory, is not taken for this zip's.
+    let Some(end) = fitting.iter().map(|at| record_end(*at)).max() else {
         return Err(not_zip());
     };
+    let records: Vec<usize> = fitting
+        .into_iter()
+        .filter(|at| record_end(*at) == end)
+        .collect();
     let end = tail_start + end as u64;
-
-    // The crate's search window, ending at `end`, with a little to spare.
-    let window_start = end.saturating_sub(65_600);
-    let mut window = vec![0_u8; (end - window_start) as usize];
-    read_at(file, window_start, &mut window)?;
-    let mut declared: Option<u64> = None;
-    for at in (0..window.len().saturating_sub(21)).rev() {
-        if !window[at..].starts_with(b"PK\x05\x06") {
-            continue;
-        }
-        let record = &window[at..at + 22];
-        // The comment must end within the zip.
-        if at + 22 + u16_at(record, 20) as usize > window.len() {
-            continue;
-        }
-        let eocd_at = window_start + at as u64;
-        let (disk, cd_disk, on_disk, files) = (
-            u16_at(record, 4),
-            u16_at(record, 6),
-            u16_at(record, 8),
-            u16_at(record, 10),
-        );
-        let (cd_size, cd_offset) = (u32_at(record, 12), u32_at(record, 16));
-        let may_be_zip64 = files == 0xFFFF || cd_size == 0xFFFF_FFFF || cd_offset == 0xFFFF_FFFF;
-        // A ZIP64 locator, read only when the classic fields say so.
-        let locator = match (may_be_zip64, eocd_at.checked_sub(20)) {
-            (true, Some(locator_at)) => {
+    let mut declared = 0;
+    for at in records {
+        let classic = u64::from(u16::from_le_bytes([tail[at + 10], tail[at + 11]]));
+        // A ZIP64 locator, when there is one, is the 20 bytes before the
+        // end record and names the ZIP64 end record.
+        let zip64 = match (tail_start + at as u64).checked_sub(20) {
+            None => None,
+            Some(locator_at) => {
                 let mut locator = [0_u8; 20];
                 read_at(file, locator_at, &mut locator)?;
-                locator
-                    .starts_with(b"PK\x06\x07")
-                    .then_some((locator_at, locator))
-            }
-            _ => None,
-        };
-        // (count, whether its directory ends where its end record starts)
-        let tried: Option<(u64, bool)> = match locator {
-            None => {
-                if disk != 0 || cd_disk != 0 || on_disk != files {
-                    None
-                } else if files == 0 {
-                    (cd_offset <= eocd_at).then_some((0, cd_offset + cd_size == eocd_at))
-                } else if cd_offset >= eocd_at || cd_offset + 4 > eocd_at {
-                    None
+                if locator.starts_with(b"PK\x06\x07") {
+                    let record_at =
+                        u64::from_le_bytes(locator[8..16].try_into().map_err(|_| not_zip())?);
+                    // The ZIP64 end record is at least 56 bytes and comes
+                    // before its locator, never in the bytes after the zip.
+                    if record_at
+                        .checked_add(56)
+                        .is_none_or(|ends| ends > locator_at)
+                    {
+                        return Err(not_zip());
+                    }
+                    let mut record = [0_u8; 40];
+                    read_at(file, record_at, &mut record)?;
+                    if !record.starts_with(b"PK\x06\x06") {
+                        return Err(not_zip());
+                    }
+                    Some(u64::from_le_bytes(
+                        record[32..40].try_into().map_err(|_| not_zip())?,
+                    ))
                 } else {
-                    let mut magic = [0_u8; 4];
-                    read_at(file, cd_offset, &mut magic)?;
-                    (magic == *b"PK\x01\x02").then_some((files, cd_offset + cd_size == eocd_at))
-                }
-            }
-            Some((locator_at, locator)) => {
-                let record_at = u64_at(&locator, 8);
-                let disks = u32_at(&locator, 16);
-                if record_at >= locator_at || disks > 1 || record_at + 56 > locator_at {
                     None
-                } else {
-                    let mut z64 = [0_u8; 56];
-                    read_at(file, record_at, &mut z64)?;
-                    let record_size = u64_at(&z64, 4);
-                    let total = u64_at(&z64, 32);
-                    let accepted = z64.starts_with(b"PK\x06\x06")
-                        && record_size.checked_add(12) == Some(locator_at - record_at)
-                        && u32_at(&z64, 20) == u32_at(&locator, 4)
-                        && u32_at(&z64, 16) == 0
-                        && u64_at(&z64, 24) == total
-                        && total.saturating_mul(46).saturating_add(u64_at(&z64, 48)) <= record_at;
-                    accepted.then(|| {
-                        let abuts =
-                            u64_at(&z64, 48).checked_add(u64_at(&z64, 40)) == Some(record_at);
-                        (total, abuts)
-                    })
                 }
             }
         };
-        let Some((count, abuts)) = tried else {
-            continue;
+        // 0xFFFF in the classic field says "see ZIP64"; otherwise the two
+        // counts must both be honoured.
+        let count = match zip64 {
+            Some(total) if classic == 0xFFFF => total,
+            Some(total) => classic.max(total),
+            None => classic,
         };
-        declared = Some(declared.unwrap_or(0).max(count));
-        if abuts {
-            break;
-        }
+        declared = declared.max(count);
     }
-    let declared = declared.ok_or_else(not_zip)?;
     file.seek(SeekFrom::Start(0)).map_err(|_| not_zip())?;
     Ok((declared, end))
-}
-
-/// How the `zip` crate is told to open a zip: its archive starts at byte
-/// 0, so it never looks for bytes before it, and `zip_end` can follow it.
-pub(crate) fn zip_config() -> zip::read::Config {
-    zip::read::Config {
-        archive_offset: zip::read::ArchiveOffset::Known(0),
-    }
 }
 
 /// A file read as if it ended at `end`: the zip crate never sees the
@@ -624,24 +567,13 @@ mod tests {
             .unwrap();
         writer.write_all(b"1").unwrap();
         // A forged end record declaring 1,000 entries, as the zip's
-        // comment, pointing at the real directory so that the zip crate
-        // would try it: the larger count is the one that counts.
+        // comment: the larger count is the one that counts.
         let mut forged = b"PK\x05\x06".to_vec();
-        forged.extend_from_slice(&[0; 18]);
+        forged.extend_from_slice(&[0; 6]);
+        forged.extend_from_slice(&1000_u16.to_le_bytes());
+        forged.extend_from_slice(&[0; 10]);
         writer.set_raw_comment(forged.into_boxed_slice()).unwrap();
         writer.finish().unwrap();
-        let mut bytes = std::fs::read(file.path()).unwrap();
-        let real = bytes.len() - 44;
-        let (cd_size, cd_offset) = (
-            bytes[real + 12..real + 16].to_vec(),
-            bytes[real + 16..real + 20].to_vec(),
-        );
-        let forged_at = bytes.len() - 22;
-        bytes[forged_at + 8..forged_at + 10].copy_from_slice(&1000_u16.to_le_bytes());
-        bytes[forged_at + 10..forged_at + 12].copy_from_slice(&1000_u16.to_le_bytes());
-        bytes[forged_at + 12..forged_at + 16].copy_from_slice(&cd_size);
-        bytes[forged_at + 16..forged_at + 20].copy_from_slice(&cd_offset);
-        std::fs::write(file.path(), &bytes).unwrap();
         let mut handle = File::open(file.path()).unwrap();
         let len = handle.metadata().unwrap().len();
         assert_eq!(declared_entries(&mut handle, len).unwrap(), 1000);
@@ -790,35 +722,6 @@ mod tests {
     }
 
     #[test]
-    fn a_zip64_record_shorter_than_its_minimum_is_hostile() {
-        let file = zip_with(&[("Locations-a.csv", b"1")], zip::CompressionMethod::Stored);
-        let bytes = std::fs::read(file.path()).unwrap();
-        let (body, end) = bytes.split_at(bytes.len() - 22);
-        let mut end = end.to_vec();
-        end[10..12].copy_from_slice(&0xFFFF_u16.to_le_bytes());
-        let zip64_at = body.len() as u64;
-        let mut out = body.to_vec();
-        out.extend_from_slice(b"PK\x06\x06");
-        // Declares 28 bytes after the size field, under the minimum of 44,
-        // and ends there, at its locator.
-        out.extend_from_slice(&28_u64.to_le_bytes());
-        out.extend_from_slice(&[0; 20]);
-        out.extend_from_slice(&1_u64.to_le_bytes());
-        out.extend_from_slice(b"PK\x06\x07");
-        out.extend_from_slice(&0_u32.to_le_bytes());
-        out.extend_from_slice(&zip64_at.to_le_bytes());
-        out.extend_from_slice(&1_u32.to_le_bytes());
-        out.extend_from_slice(&end);
-        std::fs::write(file.path(), &out).unwrap();
-        let mut handle = File::open(file.path()).unwrap();
-        let len = handle.metadata().unwrap().len();
-        assert_eq!(
-            zip_end(&mut handle, len).unwrap_err().metadata().0,
-            "HostileZip"
-        );
-    }
-
-    #[test]
     fn a_longest_comment_and_trailing_bytes_are_read() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let mut writer = zip::ZipWriter::new(file.reopen().unwrap());
@@ -843,10 +746,6 @@ mod tests {
         let file = zip_with(&[("Locations-a.csv", b"1")], zip::CompressionMethod::Stored);
         let bytes = std::fs::read(file.path()).unwrap();
         let (body, end) = bytes.split_at(bytes.len() - 22);
-        // The ZIP64 sentinel, so that the locator is read at all.
-        let mut end = end.to_vec();
-        end[8..10].copy_from_slice(&0xFFFF_u16.to_le_bytes());
-        end[10..12].copy_from_slice(&0xFFFF_u16.to_le_bytes());
         let mut out = body.to_vec();
         let locator_at = out.len() as u64;
         out.extend_from_slice(b"PK\x06\x07");
@@ -854,7 +753,7 @@ mod tests {
         // Names a record in the bytes after the zip.
         out.extend_from_slice(&(locator_at + 20 + 22 + 8).to_le_bytes());
         out.extend_from_slice(&1_u32.to_le_bytes());
-        out.extend_from_slice(&end);
+        out.extend_from_slice(end);
         out.extend_from_slice(&[0; 8]);
         out.extend_from_slice(b"PK\x06\x06");
         out.extend_from_slice(&[0; 52]);
@@ -865,238 +764,6 @@ mod tests {
             zip_end(&mut handle, len).unwrap_err().metadata().0,
             "HostileZip"
         );
-    }
-
-    /// A one-entry zip with a ZIP64 end record of `extra` bytes of
-    /// extensible data, declaring `size` bytes after its size field.
-    fn zip64_with(size: u64, extra: usize) -> tempfile::NamedTempFile {
-        let file = zip_with(&[("Locations-a.csv", b"1")], zip::CompressionMethod::Stored);
-        let bytes = std::fs::read(file.path()).unwrap();
-        let (body, end) = bytes.split_at(bytes.len() - 22);
-        let mut end = end.to_vec();
-        let cd_size = u32::from_le_bytes(end[12..16].try_into().unwrap()) as u64;
-        let cd_offset = u32::from_le_bytes(end[16..20].try_into().unwrap()) as u64;
-        end[8..10].copy_from_slice(&0xFFFF_u16.to_le_bytes());
-        end[10..12].copy_from_slice(&0xFFFF_u16.to_le_bytes());
-        let zip64_at = body.len() as u64;
-        let mut out = body.to_vec();
-        out.extend_from_slice(b"PK\x06\x06");
-        out.extend_from_slice(&size.to_le_bytes());
-        out.extend_from_slice(&45_u16.to_le_bytes());
-        out.extend_from_slice(&45_u16.to_le_bytes());
-        out.extend_from_slice(&0_u32.to_le_bytes());
-        out.extend_from_slice(&0_u32.to_le_bytes());
-        out.extend_from_slice(&1_u64.to_le_bytes());
-        out.extend_from_slice(&1_u64.to_le_bytes());
-        out.extend_from_slice(&cd_size.to_le_bytes());
-        out.extend_from_slice(&cd_offset.to_le_bytes());
-        out.extend(std::iter::repeat_n(0_u8, extra));
-        out.extend_from_slice(b"PK\x06\x07");
-        out.extend_from_slice(&0_u32.to_le_bytes());
-        out.extend_from_slice(&zip64_at.to_le_bytes());
-        out.extend_from_slice(&1_u32.to_le_bytes());
-        out.extend_from_slice(&end);
-        std::fs::write(file.path(), &out).unwrap();
-        file
-    }
-
-    #[test]
-    fn a_zip64_record_with_extensible_data_is_read() {
-        let file = zip64_with(44 + 16, 16);
-        let mut handle = File::open(file.path()).unwrap();
-        let len = handle.metadata().unwrap().len();
-        assert_eq!(declared_entries(&mut handle, len).unwrap(), 1);
-    }
-
-    #[test]
-    fn a_zip64_record_longer_than_the_room_before_its_locator_is_hostile() {
-        let file = zip64_with(44 + 17, 16);
-        let mut handle = File::open(file.path()).unwrap();
-        let len = handle.metadata().unwrap().len();
-        assert_eq!(
-            zip_end(&mut handle, len).unwrap_err().metadata().0,
-            "HostileZip"
-        );
-    }
-
-    #[test]
-    fn a_zip64_record_that_ends_before_its_locator_is_hostile() {
-        // A gap between the record and its locator, as when bytes precede
-        // the zip and the locator's offset names something else.
-        let file = zip64_with(44, 16);
-        let mut handle = File::open(file.path()).unwrap();
-        let len = handle.metadata().unwrap().len();
-        assert_eq!(
-            zip_end(&mut handle, len).unwrap_err().metadata().0,
-            "HostileZip"
-        );
-    }
-
-    #[test]
-    fn a_copy_of_the_locator_in_a_comment_does_not_refuse_a_zip64_zip() {
-        // The comment repeats the locator and end record; both name the
-        // same ZIP64 record, which ends before either locator.
-        let file = zip64_with(44, 0);
-        let mut bytes = std::fs::read(file.path()).unwrap();
-        let tail = bytes[bytes.len() - 42..].to_vec();
-        let comment_len = (tail.len()) as u16;
-        let at = bytes.len() - 2;
-        bytes[at..].copy_from_slice(&comment_len.to_le_bytes());
-        let mut copy = tail.clone();
-        let copy_len = copy.len();
-        copy[copy_len - 2..].copy_from_slice(&0_u16.to_le_bytes());
-        bytes.extend_from_slice(&copy);
-        std::fs::write(file.path(), &bytes).unwrap();
-        let mut handle = File::open(file.path()).unwrap();
-        let len = handle.metadata().unwrap().len();
-        assert_eq!(declared_entries(&mut handle, len).unwrap(), 1);
-    }
-
-    #[test]
-    fn a_copied_locator_that_names_no_record_is_not_tried() {
-        // As the copy test, but the copy's locator names another offset,
-        // where there is no record: the zip crate does not try that end
-        // record, and the real one reads.
-        let file = zip64_with(44, 0);
-        let mut bytes = std::fs::read(file.path()).unwrap();
-        let tail = bytes[bytes.len() - 42..].to_vec();
-        let at = bytes.len() - 2;
-        bytes[at..].copy_from_slice(&(tail.len() as u16).to_le_bytes());
-        let mut copy = tail.clone();
-        let named = u64::from_le_bytes(copy[8..16].try_into().unwrap()) + 1;
-        copy[8..16].copy_from_slice(&named.to_le_bytes());
-        let copy_len = copy.len();
-        copy[copy_len - 2..].copy_from_slice(&0_u16.to_le_bytes());
-        bytes.extend_from_slice(&copy);
-        std::fs::write(file.path(), &bytes).unwrap();
-        let mut handle = File::open(file.path()).unwrap();
-        let len = handle.metadata().unwrap().len();
-        assert_eq!(declared_entries(&mut handle, len).unwrap(), 1);
-    }
-
-    #[test]
-    fn a_tried_record_that_does_not_abut_its_directory_does_not_stop_the_count() {
-        // The real record, earlier, declares 5 entries; a forged one in its
-        // comment declares 1 and points at the real directory, so the zip
-        // crate would try it first and fall back. Both count.
-        let file = tempfile::NamedTempFile::new().unwrap();
-        let mut writer = zip::ZipWriter::new(file.reopen().unwrap());
-        for index in 0..5 {
-            writer
-                .start_file(
-                    format!("Locations-{index}.csv"),
-                    zip::write::SimpleFileOptions::default(),
-                )
-                .unwrap();
-            writer.write_all(b"1").unwrap();
-        }
-        let mut forged = b"PK\x05\x06".to_vec();
-        forged.extend_from_slice(&[0; 18]);
-        writer.set_raw_comment(forged.into_boxed_slice()).unwrap();
-        writer.finish().unwrap();
-        let mut bytes = std::fs::read(file.path()).unwrap();
-        let real = bytes.len() - 44;
-        let directory = bytes[real + 12..real + 20].to_vec();
-        let forged_at = bytes.len() - 22;
-        bytes[forged_at + 8..forged_at + 10].copy_from_slice(&1_u16.to_le_bytes());
-        bytes[forged_at + 10..forged_at + 12].copy_from_slice(&1_u16.to_le_bytes());
-        bytes[forged_at + 12..forged_at + 20].copy_from_slice(&directory);
-        std::fs::write(file.path(), &bytes).unwrap();
-        let mut handle = File::open(file.path()).unwrap();
-        let len = handle.metadata().unwrap().len();
-        assert_eq!(declared_entries(&mut handle, len).unwrap(), 5);
-    }
-
-    #[test]
-    fn a_forged_record_the_zip_crate_would_not_try_does_not_count() {
-        // A forged end record declaring 1,000 entries, as the comment, that
-        // points at no directory: the crate skips it, so the zip reads with
-        // its one entry.
-        let file = tempfile::NamedTempFile::new().unwrap();
-        let mut writer = zip::ZipWriter::new(file.reopen().unwrap());
-        writer
-            .start_file("Locations-a.csv", zip::write::SimpleFileOptions::default())
-            .unwrap();
-        writer.write_all(b"1").unwrap();
-        let mut forged = b"PK\x05\x06".to_vec();
-        forged.extend_from_slice(&[0; 4]);
-        forged.extend_from_slice(&1000_u16.to_le_bytes());
-        forged.extend_from_slice(&1000_u16.to_le_bytes());
-        forged.extend_from_slice(&[0; 10]);
-        writer.set_raw_comment(forged.into_boxed_slice()).unwrap();
-        writer.finish().unwrap();
-        let mut handle = File::open(file.path()).unwrap();
-        let len = handle.metadata().unwrap().len();
-        assert_eq!(declared_entries(&mut handle, len).unwrap(), 1);
-        assert_eq!(
-            ZipReader::open(file.path(), limits())
-                .unwrap()
-                .names()
-                .len(),
-            1
-        );
-    }
-
-    /// `path` with `prefix` bytes before it.
-    fn with_prefix(path: &Path, prefix: usize) {
-        let mut bytes = vec![b'p'; prefix];
-        bytes.extend(std::fs::read(path).unwrap());
-        std::fs::write(path, bytes).unwrap();
-    }
-
-    #[test]
-    fn a_zip_with_bytes_before_it_is_hostile() {
-        // The zip crate is opened with its archive at byte 0, so neither it
-        // nor the count looks for the real directory past the prefix.
-        let file = zip_with(&[("Locations-a.csv", b"1")], zip::CompressionMethod::Stored);
-        with_prefix(file.path(), 64);
-        assert_eq!(
-            ZipReader::open(file.path(), limits())
-                .err()
-                .unwrap()
-                .metadata()
-                .0,
-            "HostileZip"
-        );
-        assert!(crate::download::check_zip(file.path()).is_err());
-        let file = zip64_with(44, 0);
-        with_prefix(file.path(), 64);
-        let mut handle = File::open(file.path()).unwrap();
-        let len = handle.metadata().unwrap().len();
-        assert_eq!(
-            zip_end(&mut handle, len).unwrap_err().metadata().0,
-            "HostileZip"
-        );
-    }
-
-    #[test]
-    fn the_count_and_the_zip_crate_agree_on_ordinary_zips() {
-        // Stored and deflated, with and without a comment and trailing
-        // bytes, ZIP64 and a stored inner zip: the count is the number of
-        // entries the crate indexes.
-        let mut cases: Vec<tempfile::NamedTempFile> = vec![
-            zip_with(
-                &[("a.csv", b"1"), ("b.csv", b"2")],
-                zip::CompressionMethod::Stored,
-            ),
-            zip_with(&[("a.csv", b"1")], zip::CompressionMethod::Deflated),
-            zip64_with(44, 0),
-            zip64_with(60, 16),
-        ];
-        let padded = zip_with(&[("a.csv", b"1")], zip::CompressionMethod::Deflated);
-        with_trailing(padded.path(), 296);
-        cases.push(padded);
-        for file in &cases {
-            let mut handle = File::open(file.path()).unwrap();
-            let len = handle.metadata().unwrap().len();
-            let (declared, end) = zip_end(&mut handle, len).unwrap();
-            let archive = zip::ZipArchive::with_config(
-                zip_config(),
-                Bounded::new(File::open(file.path()).unwrap(), end),
-            )
-            .unwrap();
-            assert_eq!(archive.len() as u64, declared);
-        }
     }
 
     #[test]

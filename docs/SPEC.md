@@ -604,19 +604,17 @@ Settled in PR 4.1:
 - A zip may have up to 4,096 bytes after its end record and comment. The zip ends after the
   latest-ending end record whose comment ends at the end of the file or within those bytes
   (the end of the file whenever a record reaches it, as before PR 4.1), and the `zip` crate
-  sees nothing after that. The one observed items part had 296 bytes there, most of them
-  zero, after a Zip64 end record (Observed, one export); its report part had none. The
-  downloaded file, its size and its SHA-256 are the service's bytes unchanged.
-- The `zip` crate is opened with its archive starting at byte 0 (`ArchiveOffset::Known(0)`),
-  so a zip with bytes before it is refused. The entry count checked before the crate indexes
-  a directory follows what the pinned release (9.8.2) then does (Derived from its source):
-  it walks the end records of the last 65,572 bytes backwards, tries each that its checks
-  accept (for a ZIP64 record, one at the locator's offset whose length reaches the locator),
-  and does not go past an accepted record whose directory ends where the record starts. The
-  check applies the same rules to the same records and takes the largest count among those
-  the crate would try. A record the crate would skip, such as a forged one pointing at no
-  directory, does not count; one it would try and fall back from does. A change to the
-  crate's search must be matched in `zipread::zip_end` before the pin moves.
+  sees nothing after that. Every end record ending exactly there counts toward the entry
+  cap, the largest count deciding, so the end record of a zip stored inside is not taken for
+  the zip's own; a ZIP64 end record must lie before its locator. The one observed items part
+  had 296 bytes after its end record, most of them zero, after a Zip64 end record (Observed,
+  one export); its report part had none. The downloaded file, its size and its SHA-256 are
+  the service's bytes unchanged.
+- The entry count checked before the `zip` crate indexes a directory is a defence against an
+  oversized directory, not a guarantee: a zip crafted with forged end records, or with bytes
+  before it, can present a smaller count than the crate then reads, as on `main`. The count
+  check after indexing still applies. Zips come only from the Purview download host, so this
+  is left as it is.
 - `result` has the keys of `report`. A stopped export resumes with `operation get <case> <op>
   --wait --check` after `--no-wait`, the wait deadline or Ctrl-C during the wait, and with
   `operation get <case> <op> --check` after Ctrl-C during the download. Either fetches only

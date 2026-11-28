@@ -331,6 +331,8 @@ async fn a_failed_location_is_incomplete_and_strict_exits_4() {
     let run = setup.run(&["--json", "--yes"]).await;
     assert_eq!(run.outcome.exit_code, 0, "{}", run.stdout());
     assert_eq!(run.json()["results"]["result"]["collection"], "incomplete");
+    // The failed location, with no count, has no hits.
+    assert_eq!(run.json()["results"]["result"]["locationsWithHits"], 2);
     assert!(
         run.stderr()
             .contains("the report succeeded, but 1 location was not searched in full"),
@@ -1651,5 +1653,50 @@ async fn reconciliation_looks_from_after_the_last_read_before_the_send() {
     assert!(
         !message.contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaa0006"),
         "{message}"
+    );
+}
+
+#[tokio::test]
+async fn locations_with_hits_leaves_out_rows_with_no_hits_and_is_unknown_without_a_count() {
+    let mut setup = Setup::new().await;
+    let locations = format!(
+        "{LOCATIONS_HEADER}Exchange,Mailbox,alex@contoso.example,id-1,Mailbox,PrimaryMailBox,12,2048,Succeeded,,q\r\nExchange,Mailbox,lee@contoso.example,id-3,Mailbox,ArchiveMailBox,0,0,Succeeded,,q\r\n"
+    );
+    setup
+        .ready_with(zip_of(&[
+            (
+                "Items_0_2026-01-05_09-00-00.csv",
+                "\u{feff}Subject\r\nhello\r\n",
+            ),
+            ("Locations-2026-01-05_09-00-00.csv", &locations),
+        ]))
+        .await;
+    let run = setup.run(&["--json", "--yes"]).await;
+    assert_eq!(
+        run.json()["results"]["result"]["locationsWithHits"],
+        1,
+        "{}",
+        run.stdout()
+    );
+
+    let mut setup = Setup::new().await;
+    setup
+        .ready_with(zip_of(&[
+            (
+                "Items_0_2026-01-05_09-00-00.csv",
+                "\u{feff}Subject\r\nhello\r\n",
+            ),
+            (
+                "Locations-2026-01-05_09-00-00.csv",
+                "\u{feff}Location,Status\r\nalex@contoso.example,Succeeded\r\n",
+            ),
+        ]))
+        .await;
+    let run = setup.run(&["--json", "--yes"]).await;
+    assert_eq!(
+        run.json()["results"]["result"]["locationsWithHits"],
+        Value::Null,
+        "{}",
+        run.stdout()
     );
 }

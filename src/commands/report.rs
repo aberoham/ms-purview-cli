@@ -763,7 +763,16 @@ impl WriteCommand for Report {
                     .evidence
                     .as_ref()
                     .and_then(|files| files.locations.as_ref())
-                    .map(|locations| locations.rows.len()),
+                    // Rows with a count above zero, as estimate and parse
+                    // count them; unknown without a Count column.
+                    .filter(|locations| !locations.missing_columns.contains(&"Count"))
+                    .map(|locations| {
+                        locations
+                            .rows
+                            .iter()
+                            .filter(|row| row.count.is_some_and(|count| count > 0))
+                            .count()
+                    }),
                 "failedLocations": finished
                     .evidence
                     .as_ref()

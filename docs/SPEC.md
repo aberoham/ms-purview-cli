@@ -534,7 +534,8 @@ Settled in PR 2.4:
   `exportReport` operation with export detail before any file is fetched.
 - `result` is `{"operationId", "operationStatus", "collection", "displayName",
   "teamsContext", "estimateId", "locationsWithHits", "failedLocations", "files"}`;
-  `locationsWithHits` is the number of Locations rows. `--no-wait` gives `operationId`,
+  `locationsWithHits` is the number of Locations rows with a `Count` above zero, `null`
+  without a `Count` column. `--no-wait` gives `operationId`,
   `collection: unchecked`, `displayName`, `teamsContext` and `resume`.
 - A stopped report (`--no-wait`, the wait deadline, Ctrl-C) resumes with `operation get
   <case> <op> --wait --check`, never `download`: until the wait ends, the operation the

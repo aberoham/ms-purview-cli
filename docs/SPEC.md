@@ -790,7 +790,14 @@ estimate, `Items_N_*.csv` without an `Items.*.zip` sibling means an item report.
     failure is printed in the shape the output mode gives it. `--force-buffer` without
     `--json` is refused. Without `--force-buffer`, `--json` stops the pass at the 10,001st
     unique item. `--max-unique` does not apply to `--all-rows`.
-  - `--subject-regex` is compiled as given, spaces included, with a 1 MiB size limit.
+  - `--subject-regex` is compiled as given, spaces included, with a 1 MiB size limit, and
+    matched against `Subject/Title` and `Conversation name` trimmed; an empty field is
+    absent, so it matches no pattern.
+  - Items are aggregated by key kind and key, so that an Internet message ID and an
+    Immutable ID with the same text stay two items.
+  - An `Items_N_*.csv` name has ASCII digits for `N` and `.csv` in any ASCII case; `Kind`
+    and the reader share that rule, and a zip is an estimate only with a
+    `Statistics-*.csv`.
   - The stderr summary has counts and column names only: rows, files, rows matched, unique
     items, those keyed by hash, rows with an unreadable `Date`, and missing columns.
   - `--wrap-untrusted` wraps `title`, `key` and `senderDomain` too (with `sender`, `class`
@@ -2475,7 +2482,7 @@ pub struct SlimItem { pub class: String, pub date: Option<DateTime<Utc>>, pub se
                       pub workload: Option<String>, pub has_attachment: Option<bool>,
                       pub internet_message_id: Option<String>, pub immutable_id: Option<String>,
                       pub target_path: Option<String> }
-pub struct UniqueAgg { pub first: SlimItem, pub copies: u32, pub locations: Vec<u32> }
+pub struct UniqueAgg { pub first: SlimItem, pub kind: KeyKind, pub copies: u64, locations: Vec<u32>, distinct: usize }
 pub enum KeyKind { InternetMessageId, ImmutableId, Hash }
 pub struct ExportJoinRow { pub part: String, pub entry: String, pub row: SlimItem }
 pub fn normalise_target_path(p: &str) -> Option<(String /* part */, String /* entry */)>;

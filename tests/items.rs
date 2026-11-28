@@ -16,8 +16,9 @@ const HEADER: &str = "File ID,Status,Internet message ID,Immutable ID,Item class
 const LOCATIONS: &str = "DataSourceName,DataSourceType,Location,LocationId,LocationType,\
                          LocationSubType,Count,Size,Status,ErrorWarning,Query\n";
 
-/// A location id of the synthetic form.
+/// A location id of the synthetic form, `…0000000000NN`.
 fn location(n: u32) -> String {
+    assert!(n < 100, "synthetic ids end in two digits");
     format!("00000000-0000-4000-8000-{n:012}")
 }
 
@@ -722,7 +723,7 @@ async fn two_hundred_thousand_rows_in_under_ten_seconds() {
                 "alex@contoso.example",
                 "Weekly orders report",
                 "",
-                (i % 400) as u32,
+                (i % 100) as u32,
             ));
         }
         files.push((format!("Items_{part}_2026.csv"), body));

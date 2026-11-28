@@ -94,7 +94,7 @@ pub struct SlimItem {
 }
 
 /// What a unique item is keyed by.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum KeyKind {
     InternetMessageId,
     ImmutableId,
@@ -400,7 +400,6 @@ pub fn read(
 /// The indexes of the `Items_N_*.csv` entries, by `N` as a number, then by
 /// name.
 fn item_files(names: &[String]) -> Vec<usize> {
-    let pattern = Regex::new(r"^Items_(\d+)_.*\.[cC][sS][vV]$").expect("a valid pattern");
     // By the number's digits without leading zeros: shorter is smaller,
     // and digits of one length compare as text, at any length.
     let mut files: Vec<(usize, &str, &str, usize)> = names
@@ -408,11 +407,7 @@ fn item_files(names: &[String]) -> Vec<usize> {
         .enumerate()
         .filter_map(|(index, name)| {
             let base = name.rsplit('/').next().unwrap_or(name);
-            let digits = pattern
-                .captures(base)?
-                .get(1)?
-                .as_str()
-                .trim_start_matches('0');
+            let digits = super::items_file_number(base)?.trim_start_matches('0');
             Some((digits.len(), digits, base, index))
         })
         .collect();
@@ -460,7 +455,9 @@ impl UniqueAgg {
 /// The unique items of a pass, keyed as section 4.8 says.
 #[derive(Debug)]
 pub struct Dedup {
-    items: HashMap<Box<str>, UniqueAgg>,
+    /// By kind and key, so that an Internet message ID and an Immutable
+    /// ID with the same text stay two items.
+    items: HashMap<(KeyKind, Box<str>), UniqueAgg>,
     locations: HashMap<Box<str>, u32>,
     max_unique: usize,
     hash_keys: usize,
@@ -492,8 +489,13 @@ impl Dedup {
     /// Counts `row` as a copy of its item. A new item past `max_unique` is
     /// `TooManyUnique`.
     pub fn add(&mut self, row: ItemRow) -> Result<()> {
-        let location = row.location.as_deref().map(|id| self.intern(id));
-        let agg = match self.items.get_mut(row.key.as_str()) {
+        let location = row
+            .location
+            .as_deref()
+            .map(|id| self.intern(id))
+            .transpose()?;
+        let key = (row.kind, row.key.into_boxed_str());
+        let agg = match self.items.get_mut(&key) {
             Some(agg) => agg,
             None => {
                 if self.items.len() >= self.max_unique {
@@ -502,15 +504,13 @@ impl Dedup {
                 if row.kind == KeyKind::Hash {
                     self.hash_keys += 1;
                 }
-                self.items
-                    .entry(row.key.into_boxed_str())
-                    .or_insert(UniqueAgg {
-                        first: row.item,
-                        kind: row.kind,
-                        copies: 0,
-                        locations: Vec::new(),
-                        distinct: 0,
-                    })
+                self.items.entry(key).or_insert(UniqueAgg {
+                    first: row.item,
+                    kind: row.kind,
+                    copies: 0,
+                    locations: Vec::new(),
+                    distinct: 0,
+                })
             }
         };
         agg.copies = agg.copies.saturating_add(1);
@@ -520,13 +520,16 @@ impl Dedup {
         Ok(())
     }
 
-    fn intern(&mut self, id: &str) -> u32 {
+    fn intern(&mut self, id: &str) -> Result<u32> {
         if let Some(index) = self.locations.get(id) {
-            return *index;
+            return Ok(*index);
         }
-        let index = u32::try_from(self.locations.len()).unwrap_or(u32::MAX);
+        // Past the index range, distinct locations would be counted as one.
+        let index = u32::try_from(self.locations.len()).map_err(|_| {
+            PurviewError::message("the report names more distinct locations than can be counted")
+        })?;
         self.locations.insert(id.into(), index);
-        index
+        Ok(index)
     }
 
     /// The unique items, by date (items without one last), then key.
@@ -534,16 +537,17 @@ impl Dedup {
         let mut items: Vec<(Box<str>, UniqueAgg)> = self
             .items
             .into_iter()
-            .map(|(key, mut agg)| {
+            .map(|((_, key), mut agg)| {
                 agg.compact();
                 (key, agg)
             })
             .collect();
         items.sort_by(|(a_key, a), (b_key, b)| {
-            (a.first.date.is_none(), a.first.date, a_key).cmp(&(
+            (a.first.date.is_none(), a.first.date, a_key, a.kind).cmp(&(
                 b.first.date.is_none(),
                 b.first.date,
                 b_key,
+                b.kind,
             ))
         });
         items
@@ -773,6 +777,21 @@ mod tests {
         let items = dedup.finish();
         assert_eq!(items[0].1.copies, 300);
         assert_eq!(items[0].1.location_count(), 100);
+    }
+
+    #[test]
+    fn the_same_text_as_two_kinds_of_key_is_two_items() {
+        let mut dedup = Dedup::new(10);
+        for row in rows(&format!(
+            "{HEADER}\nSAME,,IPM.Note,,a@contoso.example,S,,,1,Exchange,True,L1\n\
+             ,SAME,IPM.Note,,a@contoso.example,T,,,1,Exchange,True,L2\n"
+        )) {
+            dedup.add(row).unwrap();
+        }
+        let items = dedup.finish();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].1.kind, KeyKind::InternetMessageId);
+        assert_eq!(items[1].1.kind, KeyKind::ImmutableId);
     }
 
     #[test]

@@ -204,6 +204,9 @@ async fn an_entry_over_the_limit_is_entry_too_large_and_the_rest_are_read() {
     assert_eq!(run.outcome.exit_code, 4, "{}", run.stderr());
     let records = lines(&run);
     assert_eq!(records[0]["error"], "entryTooLarge");
+    // Refused from the size the zip declares, before it is read.
+    let detail = records[0]["errorDetail"].as_str().unwrap();
+    assert!(detail.contains("declares"), "{detail}");
     assert_eq!(records[1]["error"], Value::Null);
 }
 

@@ -821,8 +821,9 @@ Settled in the first `.msg` reader PR (PR 5.1 with the body selection of PR 5.2)
   FAT, DIFAT or mini FAT sector counts do not fit in the item, before `cfb` reads it; so is
   an item with a property stream that exists and cannot be read in full, and one whose
   streams read add up to more than twice its size (streams sharing sectors).
-- An entry is `entryTooLarge` when the size its zip declares, or what was read, passes
-  `--max-entry-bytes`; one refused for its compression ratio is `entryUnreadable`.
+- An entry is `entryTooLarge`, without being read, when the size its zip declares passes
+  `--max-entry-bytes`, and also when reading it passes the limit; one refused for its
+  compression ratio, or unreadable for any other reason, is `entryUnreadable`.
 - The stderr summary counts items by class under fixed labels (the classes seen in exports,
   else `other`), so no text from an item reaches stderr; `class` is wrapped by
   `--wrap-untrusted`.

@@ -283,11 +283,12 @@ Examples:
     )]
     Report(ReportArgs),
     #[command(
-        about = "Export a search's items as .msg files, with their item report",
+        about = "Export a search's items as .msg files, and read the exported items",
         after_help = "\
 Examples:
   purview export create <case> <search> --dry-run
-  purview export create <case> <search> --yes --strict"
+  purview export create <case> <search> --yes --strict
+  purview export read Items.1.001.export.zip > items.jsonl"
     )]
     Export(ExportArgs),
     #[command(

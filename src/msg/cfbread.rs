@@ -192,6 +192,38 @@ mod tests {
         assert_eq!(error.detail(), NOT_A_CONTAINER);
     }
 
+    /// A header of `len` bytes with the signature, `shift` as the sector
+    /// shift and no FAT, DIFAT or mini FAT sectors.
+    fn header(len: usize, shift: u16) -> Vec<u8> {
+        let mut bytes = vec![0_u8; len];
+        bytes[..8].copy_from_slice(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]);
+        bytes[0x1E..0x20].copy_from_slice(&shift.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn check_header_accepts_both_sector_sizes_and_counts_that_fit() {
+        assert!(check_header(&header(512, 9)).is_ok());
+        assert!(check_header(&header(4_096, 12)).is_ok());
+        // Two FAT sectors, one mini FAT and one DIFAT sector in 2,048 bytes.
+        let mut bytes = header(2_048, 9);
+        bytes[0x2C..0x30].copy_from_slice(&2_u32.to_le_bytes());
+        bytes[0x40..0x44].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[0x48..0x4C].copy_from_slice(&1_u32.to_le_bytes());
+        assert!(check_header(&bytes).is_ok());
+    }
+
+    #[test]
+    fn check_header_refuses_counts_that_do_not_fit_and_other_sector_sizes() {
+        for at in [0x2C, 0x40, 0x48] {
+            let mut bytes = header(1_024, 9);
+            bytes[at..at + 4].copy_from_slice(&3_u32.to_le_bytes());
+            assert!(check_header(&bytes).is_err(), "{at:#x}");
+        }
+        assert!(check_header(&header(1_024, 10)).is_err());
+        assert!(check_header(&header(511, 9)).is_err());
+    }
+
     #[test]
     fn a_header_listing_more_fat_sectors_than_fit_is_refused() {
         let mut bytes = vec![0_u8; 1_024];

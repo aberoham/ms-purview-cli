@@ -167,6 +167,17 @@ fn read_item(
     let mut record = Map::new();
     record.insert("entry".into(), Value::String(name.to_owned()));
     record.insert("part".into(), Value::String(part.to_owned()));
+    // An entry whose zip declares it larger than the limit is not read.
+    if zip
+        .declared_size(index)
+        .is_some_and(|size| size > request.max_entry_bytes)
+    {
+        let detail = format!(
+            "the zip declares the entry larger than {} bytes",
+            request.max_entry_bytes
+        );
+        return failed(record, "entryTooLarge", &detail);
+    }
     let bytes = zip.read_entry(index, |reader| {
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).map_err(read_error)?;
@@ -175,13 +186,12 @@ fn read_item(
     let bytes = match bytes {
         Ok(bytes) => bytes,
         Err(error) => {
-            // Too large by the size the zip declares, or stopped by the
-            // per-entry limit; a compression ratio refused, or anything
-            // else, is unreadable.
-            let declared = zip.declared_size(index);
+            // Stopped by the per-entry limit (the zip understated the
+            // size); a compression ratio refused, or anything else, is
+            // unreadable.
             let limit = format!("more than {} bytes", request.max_entry_bytes);
-            let too_large = declared.is_some_and(|size| size > request.max_entry_bytes)
-                || matches!(&error, PurviewError::HostileZip(detail) if detail.ends_with(&limit));
+            let too_large =
+                matches!(&error, PurviewError::HostileZip(detail) if detail.ends_with(&limit));
             let code = if too_large {
                 "entryTooLarge"
             } else {
@@ -284,9 +294,8 @@ fn write_line(env: &mut Env, marker: Option<&str>, record: Value) -> Result<bool
         }
     }
     bytes.push(b'\n');
-    env.stdout.write_all(&bytes).map_err(|error| {
-        PurviewError::message(format!("could not write to standard output: {error}"))
-    })?;
+    // `cli` reports a failed stdout itself, with its own prefix.
+    env.stdout.write_all(&bytes)?;
     Ok(written)
 }
 

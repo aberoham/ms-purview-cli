@@ -61,13 +61,14 @@ Entries without a date of their own are from 2026-11-25.
   time of a snapshot; whether they were stuck there is not known. (Observed)
 - Creating a case returned 201 with `status: active`. (Observed)
 - Closing a case with no holds or custodians returned 204 with an empty body and no
-  `Location` header. The case listed as `closed` within seconds, without passing through
-  `closing`. (Observed; again on 28 November 2026, below)
+  `Location` header. The case listed as `closed` within seconds, without being seen in
+  `closing`. (Observed; on 28 November 2026 a read of the case showed the same, below)
 - On a case with none, the custodian, non-custodial data source and legal hold lists each
   answered 200 with an empty `value`, `@odata.count: 0` and no `@odata.nextLink`.
   (Observed, 28 November 2026)
-- A `close` POST with no body must still say `Content-Length: 0`: without it Graph answered
-  **411** at once and the case stayed active. (Observed, 28 November 2026)
+- A `close` POST with an empty body and no `Content-Length` got **411** at once, and the
+  case stayed active; the same POST with `Content-Length: 0` got 204. (Observed, 28
+  November 2026) A body-less POST therefore needs the header. (Derived)
 - Creating a search runs nothing until an action is posted. (Observed) The `contentQuery`
   was echoed unchanged. (Observed)
 - Search creation accepted `participants:`, `from:`, `NOT from:`, `sent>=`, `sent<=`,
@@ -431,19 +432,21 @@ same local code-signing identity, against the same tenant and registration, on t
 acceptance case the tool created in PR 2.2. Outputs and traces stayed outside the
 repository.
 
-- **Ownership:** the case record still carried no `createdBy`, so the case was shown to be
-  the tool's by `naming.marker` in its description. (Observed)
+- **Ownership:** the case record still carried no `createdBy`, so the preflight's ownership
+  check was met by `naming.marker` in its description. (Observed) The case is the tool's
+  because PR 2.2 created it.
 - **Hold reads:** `GET …/custodians`, `…/noncustodialDataSources` and `…/legalHolds` each
   answered **200** with the keys `@odata.context`, `@odata.count` and `value`, an empty
   `value`, `@odata.count: 0` and no `@odata.nextLink`. Each took 3 to 8 seconds. (Observed)
 - **First close:** the POST was sent with an empty body and no `Content-Length`. Graph
   answered **411** in milliseconds, with no body, and a read afterwards showed the case
-  still `active`. (Observed) The tool now sends `Content-Length: 0` and no `Content-Type`
-  when a write has no body.
+  still `active`. (Observed) The PR 2.7 build was then changed to send `Content-Length: 0`
+  and no `Content-Type` when a write has no body.
 - **Close:** the same POST with `Content-Length: 0` answered **204** in about 11 seconds,
   with no body and no `Location` header. (Observed)
-- **After the close:** the first read of the case, about 5 seconds later, showed `closed`,
-  with `closedDateTime` and `closedBy` set; `closing` was never seen. `closedBy` and
+- **After the close:** the first read of the case, about 5 seconds later, already showed
+  `closed`, with `closedDateTime` and `closedBy` set, so any time spent in `closing` was
+  shorter than that and was not seen. `closedBy` and
   `lastModifiedBy` named the user by display name only, with no id, and had a null
   `application`. (Observed)
 - **Whole run:** about a minute, most of it the case and hold reads made twice: in

@@ -283,8 +283,8 @@ Flags: `--status active|closing|closed|all` (default `all`), `--name SUBSTR`,
 - The observed tenant's case records carried no `createdBy` at all, in the list or a single
   `GET` (Observed, PR 1.4), so `--mine` matched nothing there; when no case read has
   `createdBy`, the command says so on stderr. Section 3.5's `case close` check on
-  `createdBy` meets the same gap: in PR 2.6 the case record still had no `createdBy`, so
-  `case close` relies on `naming.marker` in the description (Observed).
+  `createdBy` meets the same gap: in PR 2.6 the case record still had no `createdBy`
+  (Observed), so in practice the check is met by `naming.marker` in the description.
 
 Columns: `ID`, `NAME`, `STATUS`, `CREATED`, `AGE (DAYS)`, `CREATED BY`. Rows with a missing
 id or name are shown with `?` and counted in a stderr warning; they are not dropped. `AGE
@@ -3129,9 +3129,9 @@ that does not depend on whether the claim is true. The table says which:
 6. Case close and hold reads on a case with holds. Observed for a case with no holds or
    custodians (PR 2.6): each hold read answered 200 with an empty `value`,
    `@odata.count: 0` and no `@odata.nextLink`; `POST .../close` with `Content-Length: 0`
-   returned 204 with an empty body and no `Location` header, and the case read as `closed`
-   within seconds, without passing through `closing`. Without `Content-Length` the POST got
-   411.
+   returned 204 with an empty body and no `Location` header, and the first read, seconds
+   later, already showed `closed`, so `closing` was not seen. Without `Content-Length` the
+   POST got 411.
 7. Throttling: no 429 seen. POSTs are never retried, so a 429 on a write is reported, not
    repeated.
 8. Failure-state shapes: `failed`, `partiallySucceeded`, `submissionFailed`, `resultInfo`.

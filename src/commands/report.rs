@@ -686,6 +686,10 @@ impl WriteCommand for Report {
         if basis != shown.basis {
             return Err(changed("its latest estimate is not the one shown"));
         }
+        // Reconciliation looks for operations from just before the send,
+        // not from when the plan was shown: the prompt may have been open
+        // a long time.
+        self.planned = Some((case, search, preflight.clock.now() - CLOCK_SKEW));
         if !self.flags.allow_concurrent {
             let active = active_operations(preflight.graph, case, &EXPORT_ACTIONS, preflight.log)
                 .await
@@ -789,17 +793,18 @@ impl WriteCommand for Report {
         let mut unresolved = 0usize;
         for (index, operation) in found.iter().enumerate() {
             let kind = match OperationId::parse(&operation.id) {
-                Some(id) if index < RESOLVE_AT_MOST => preflight
-                    .graph
-                    .get(
-                        &ReadRoute::Operation(case, id),
-                        &Query::new(),
-                        preflight.log,
-                    )
-                    .await
-                    .ok()
-                    .and_then(OperationRecord::from_value)
-                    .map(|record| record.action(Source::Single)),
+                Some(id) if index < RESOLVE_AT_MOST => {
+                    let route = ReadRoute::Operation(case, id);
+                    preflight
+                        .graph
+                        .get(&route, &Query::new(), preflight.log)
+                        .await
+                        .ok()
+                        // Only an answer about the operation asked for
+                        // names its action.
+                        .and_then(|body| crate::poll::checked(body, &route).ok())
+                        .map(|record| record.action(Source::Single))
+                }
                 _ => None,
             };
             let label = match kind {

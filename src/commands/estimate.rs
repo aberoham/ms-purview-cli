@@ -237,6 +237,9 @@ impl WriteCommand for Estimate {
         if again.narrowed != narrowed {
             return Err(changed("the guard's verdict is not the one shown"));
         }
+        // Reconciliation looks for estimates from just before the send,
+        // not from when the plan was shown.
+        self.planned = Some((case, search, preflight.clock.now() - CLOCK_SKEW));
         // An estimate that another person started while the prompt was
         // open may be a duplicate too.
         if !self.flags.allow_concurrent {

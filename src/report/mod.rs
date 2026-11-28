@@ -99,12 +99,32 @@ pub struct ReportFiles {
 impl ReportFiles {
     /// Reads the files of the zip at `path` that this release parses.
     pub fn read(path: &Path, limits: ReportLimits) -> Result<Self> {
+        Self::read_inner(path, limits, true)
+    }
+
+    /// Reads the files an action's evidence needs: every file for an
+    /// estimate; for a report, all but `Statistics-*.csv`, which a report
+    /// has no use for, so that one cannot make its Locations unreadable.
+    pub fn read_for(path: &Path, limits: ReportLimits, action: EvidenceOf) -> Result<Self> {
+        Self::read_inner(path, limits, action == EvidenceOf::Estimate)
+    }
+
+    /// Whether the zip holds the evidence `action` reads.
+    pub fn has_evidence_for(&self, action: EvidenceOf) -> bool {
+        match action {
+            EvidenceOf::Estimate => self.locations.is_some() || self.statistics_errors.is_some(),
+            EvidenceOf::Report => self.locations.is_some(),
+        }
+    }
+
+    fn read_inner(path: &Path, limits: ReportLimits, statistics: bool) -> Result<Self> {
         let mut zip = ZipReader::open(path, limits.zip)?;
         let kind = Kind::of(zip.names());
         let record = limits.record_bytes;
         let mut missing_columns = Vec::new();
         let duplicates = ["Locations", "Statistics", "Summary", "Settings"]
             .into_iter()
+            .filter(|kind| statistics || *kind != "Statistics")
             .filter(|kind| zip.find_all(&format!("{kind}-")).len() > 1)
             .collect();
         let locations = match zip.find("Locations-") {
@@ -121,7 +141,7 @@ impl ReportFiles {
                 Some(locations)
             }
         };
-        let statistics_errors = match zip.find("Statistics-") {
+        let statistics_errors = match zip.find("Statistics-").filter(|_| statistics) {
             None => None,
             Some(index) => {
                 let read = zip.read_entry(index, |reader| {

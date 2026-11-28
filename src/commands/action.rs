@@ -536,11 +536,12 @@ impl ActionRun {
                     "status": done.status(),
                 }));
                 if evidence.is_none() {
-                    match ReportFiles::read(&done.path, limits) {
-                        Ok(read)
-                            if read.locations.is_some() || read.statistics_errors.is_some() =>
-                        {
+                    match ReportFiles::read_for(&done.path, limits, self.evidence_of) {
+                        Ok(read) if read.has_evidence_for(self.evidence_of) => {
                             evidence = Some(read);
+                            // A note about an earlier file no longer
+                            // explains the collection.
+                            evidence_note = None;
                         }
                         Ok(_) => {}
                         Err(error) => {

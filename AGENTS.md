@@ -108,7 +108,7 @@ that the test files pass their own scan.
   `commands/estimate.rs` is `estimate`: a plan that a duplicate blocks
   without `--allow-concurrent` (`safety::Blocked::Concurrent`,
   `ConcurrentOperation`), then `after_send` and the volume warning (`report::volume`, the `volume`
-  limits of `config.json`, read only by a command whose `reads_volume()`
+  limits of `config.json`, read only as far as a command's `volume_use()`
   is true); `--strict` adds `FailedLocations` or `EvidenceMissing`, never
   a volume reason. `commands/report.rs` is `report`: the same preflight
   over item reports and exports, then the size limit against the search's

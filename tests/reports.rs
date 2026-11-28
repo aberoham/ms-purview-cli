@@ -9,13 +9,16 @@ mod support;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use ms_purview_cli::download::DownloadRule;
 use ms_purview_cli::env::Env;
 use serde_json::{json, Value};
 use support::*;
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 const CASES: &str = "/v1.0/security/cases/ediscoveryCases";
 const CASE: &str = "00000000-0000-4000-8000-000000000031";
@@ -1163,5 +1166,374 @@ async fn a_candidate_that_cannot_be_read_is_shown_as_report_or_export() {
     assert!(
         message.contains("could not be read on its own"),
         "{message}"
+    );
+}
+
+/// Fires `interrupt`, then answers with `response`.
+struct FireOn {
+    interrupt: Arc<ms_purview_cli::env::ManualInterrupt>,
+    response: ResponseTemplate,
+}
+
+impl Respond for FireOn {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        self.interrupt.fire();
+        self.response.clone()
+    }
+}
+
+/// Answers with `response`, and moves the clock forward by `by` from the
+/// `nth` request on, once.
+struct AdvanceOn {
+    clock: Arc<ms_purview_cli::env::ManualClock>,
+    seen: AtomicUsize,
+    nth: usize,
+    by: Duration,
+    response: ResponseTemplate,
+}
+
+impl Respond for AdvanceOn {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        if self.seen.fetch_add(1, Ordering::SeqCst) + 1 == self.nth {
+            self.clock.advance(self.by);
+        }
+        self.response.clone()
+    }
+}
+
+#[tokio::test]
+async fn reconciliation_looks_from_the_send_not_from_the_plan() {
+    let setup = Setup::new().await;
+    // The search's second read is the one after approval: an hour passes
+    // there, as if the prompt had been open that long.
+    Mock::given(method("GET"))
+        .and(path(search_path("")))
+        .respond_with(AdvanceOn {
+            clock: setup.harness.clock.clone(),
+            seen: AtomicUsize::new(0),
+            nth: 2,
+            by: Duration::from_secs(3600),
+            response: json_response(200, setup.search()),
+        })
+        .with_priority(1)
+        .mount(&setup.harness.graph)
+        .await;
+    setup
+        .preflight(
+            setup.search(),
+            json!({"value": []}),
+            estimate("succeeded", json!(GIB)),
+        )
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("{CASES}/{CASE}/operations")))
+        .respond_with(json_response(200, json!({"value": []})))
+        .up_to_n_times(2)
+        .with_priority(1)
+        .mount(&setup.harness.graph)
+        .await;
+    // One report finished while the prompt was open; the other is new.
+    Mock::given(method("GET"))
+        .and(path(format!("{CASES}/{CASE}/operations")))
+        .respond_with(json_response(
+            200,
+            json!({"value": [
+                {"id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaa0006", "action": "exportResult", "status": "succeeded", "createdDateTime": "2026-01-05T09:30:00Z"},
+                {"id": OP, "action": "exportResult", "status": "running", "createdDateTime": "2026-01-05T10:00:10Z"},
+            ]}),
+        ))
+        .with_priority(2)
+        .mount(&setup.harness.graph)
+        .await;
+    setup.get(&operation_path(), setup.succeeded()).await;
+    Mock::given(method("POST"))
+        .and(path(search_path("/exportReport")))
+        .respond_with(json_response(
+            503,
+            json!({"error": {"code": "ServiceUnavailable"}}),
+        ))
+        .mount(&setup.harness.graph)
+        .await;
+    let run = setup.run(&["--json", "--yes"]).await;
+    let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
+    assert!(message.contains(&format!("item report {OP}")), "{message}");
+    assert!(
+        !message.contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaa0006"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn a_candidate_read_answered_with_another_operation_is_not_labelled() {
+    let setup = Setup::new().await;
+    setup
+        .preflight(
+            setup.search(),
+            json!({"value": []}),
+            estimate("succeeded", json!(GIB)),
+        )
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("{CASES}/{CASE}/operations")))
+        .respond_with(json_response(200, json!({"value": []})))
+        .up_to_n_times(2)
+        .with_priority(1)
+        .mount(&setup.harness.graph)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("{CASES}/{CASE}/operations")))
+        .respond_with(json_response(
+            200,
+            json!({"value": [
+                {"id": OP, "action": "exportResult", "status": "running", "createdDateTime": "2026-01-05T09:00:30Z"},
+            ]}),
+        ))
+        .with_priority(2)
+        .mount(&setup.harness.graph)
+        .await;
+    let mut other = setup.succeeded();
+    other["id"] = json!("aaaaaaaaaaaaaaaaaaaaaaaaaaaa0007");
+    setup.get(&operation_path(), other).await;
+    Mock::given(method("POST"))
+        .and(path(search_path("/exportReport")))
+        .respond_with(json_response(
+            503,
+            json!({"error": {"code": "ServiceUnavailable"}}),
+        ))
+        .mount(&setup.harness.graph)
+        .await;
+    let run = setup.run(&["--json", "--yes"]).await;
+    let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
+    assert!(
+        message.contains(&format!("report or export {OP}")),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn a_statistics_file_a_report_cannot_read_does_not_hide_its_locations() {
+    let mut setup = Setup::new().await;
+    let locations = format!(
+        "{LOCATIONS_HEADER}Exchange,Mailbox,alex@contoso.example,id-1,Mailbox,PrimaryMailBox,12,2048,Succeeded,,q\r\n"
+    );
+    let huge = format!(
+        "\u{feff}DataSourceName,DataSourceType,Location,LocationType,LocationSubType,StatType,StatName,OriginalStatName,Value\r\nExchange,Mailbox,pat@fabrikam.example,Mailbox,SystemMailbox,Error,{},x,0\r\n",
+        "x".repeat(4096)
+    );
+    setup
+        .ready_with(zip_of(&[
+            (
+                "Items_0_2026-01-05_09-00-00.csv",
+                "\u{feff}Subject\r\nhello\r\n",
+            ),
+            ("Locations-2026-01-05_09-00-00.csv", &locations),
+            ("Statistics-2026-01-05_09-00-00.csv", &huge),
+        ]))
+        .await;
+    set_config(
+        &setup.harness,
+        "limits",
+        json!({"csv_max_record_bytes": "2KiB"}),
+    );
+    let run = setup.run(&["--json", "--yes", "--strict"]).await;
+    assert_eq!(
+        run.outcome.exit_code,
+        0,
+        "{} {}",
+        run.stdout(),
+        run.stderr()
+    );
+    assert_eq!(run.json()["results"]["result"]["collection"], "complete");
+}
+
+#[tokio::test]
+async fn ctrl_c_resumes_a_report_with_the_check_never_download() {
+    // While the report runs: the wait, then the check.
+    let setup = Setup::new().await;
+    setup
+        .preflight(
+            setup.search(),
+            json!({"value": []}),
+            estimate("succeeded", json!(GIB)),
+        )
+        .await;
+    setup.accept().await;
+    let mut running = setup.succeeded();
+    running["status"] = json!("running");
+    setup.get(&operation_path(), running).await;
+    let interrupt = Arc::new(ms_purview_cli::env::ManualInterrupt::default());
+    interrupt.fire();
+    let run = setup
+        .harness
+        .run_with(&["report", CASE, SEARCH, "--json", "--yes"], |env, _| {
+            setup.configure(env);
+            env.interrupt = interrupt.clone();
+        })
+        .await;
+    assert_eq!(run.outcome.exit_code, 130, "{}", run.stdout());
+    let resume = run.json()["resume"].clone();
+    assert_eq!(resume.as_array().unwrap().len(), 1, "{resume}");
+    assert!(
+        resume[0]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("operation get {CASE} {OP} --wait --check")),
+        "{resume}"
+    );
+
+    // During the download: the check alone. The interrupt fires when the
+    // zip is asked for, and the answer is slow enough to be stopped.
+    let setup = Setup::new().await;
+    let interrupt = Arc::new(ms_purview_cli::env::ManualInterrupt::default());
+    let zip = report_zip(false);
+    setup
+        .preflight(
+            setup.search(),
+            json!({"value": []}),
+            estimate("succeeded", json!(GIB)),
+        )
+        .await;
+    setup.accept().await;
+    let mut done = setup.succeeded();
+    done["exportFileMetadata"][0]["size"] = json!(zip.len());
+    setup.get(&operation_path(), done).await;
+    Mock::given(method("GET"))
+        .and(path(FILE_PATH))
+        .respond_with(FireOn {
+            interrupt: interrupt.clone(),
+            response: ResponseTemplate::new(200)
+                .set_body_bytes(zip)
+                .set_delay(Duration::from_millis(500)),
+        })
+        .mount(&setup.alpha)
+        .await;
+    let run = setup
+        .harness
+        .run_with(&["report", CASE, SEARCH, "--json", "--yes"], |env, _| {
+            setup.configure(env);
+            env.interrupt = interrupt.clone();
+        })
+        .await;
+    assert_eq!(run.outcome.exit_code, 130, "{}", run.stdout());
+    let resume = run.json()["resume"].clone();
+    assert_eq!(resume.as_array().unwrap().len(), 1, "{resume}");
+    assert!(
+        resume[0]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("operation get {CASE} {OP} --check")),
+        "{resume}"
+    );
+}
+
+#[tokio::test]
+async fn a_zip_with_only_statistics_is_not_a_report_s_evidence() {
+    let setup = Setup::new().await;
+    let stats = zip_of(&[(
+        "Statistics-2026-01-05_09-00-00.csv",
+        "\u{feff}DataSourceName,DataSourceType,Location,LocationType,LocationSubType,StatType,StatName,OriginalStatName,Value\r\n",
+    )]);
+    let report = report_zip(true);
+    setup
+        .preflight(
+            setup.search(),
+            json!({"value": []}),
+            estimate("succeeded", json!(GIB)),
+        )
+        .await;
+    setup.accept().await;
+    let port = setup.alpha.address().port();
+    let mut done = setup.succeeded();
+    done["exportFileMetadata"] = json!([
+        {"fileName": "a_stats.zip", "size": stats.len(), "downloadUrl": format!("http://{ALPHA}:{port}/stats?downloadType=Report")},
+        {"fileName": "b_report.zip", "size": report.len(), "downloadUrl": setup.file_url()},
+    ]);
+    setup.get(&operation_path(), done).await;
+    for (at, body) in [("/stats", stats), (FILE_PATH, report)] {
+        Mock::given(method("GET"))
+            .and(path(at))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&setup.alpha)
+            .await;
+    }
+    let run = setup.run(&["--json", "--yes"]).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stdout());
+    // The second zip's failed location is found: its Locations were read.
+    assert_eq!(run.json()["results"]["result"]["collection"], "incomplete");
+}
+
+#[tokio::test]
+async fn a_rendered_name_with_a_control_character_is_refused_before_any_post() {
+    let mut setup = Setup::new().await;
+    setup.ready(false).await;
+    set_config(
+        &setup.harness,
+        "naming",
+        json!({"export_name": "report\u{7}{utc_date}"}),
+    );
+    let run = setup.run(&["--json", "--yes"]).await;
+    assert_eq!(run.outcome.exit_code, 1, "{}", run.stdout());
+    let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
+    assert!(message.contains("naming.export_name"), "{message}");
+    assert!(setup.posts().await.is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_read_of_an_earlier_file_does_not_explain_a_later_zip() {
+    let setup = Setup::new().await;
+    // The first zip cannot be read (a record over the budget); the second
+    // can, but has no Status column, so the collection is unchecked for
+    // its own reason.
+    let junk = zip_of(&[(
+        "Locations-2026-01-05_09-00-00.csv",
+        &format!("{LOCATIONS_HEADER}{}\r\n", "x".repeat(4096)),
+    )]);
+    let report = zip_of(&[
+        (
+            "Items_0_2026-01-05_09-00-00.csv",
+            "\u{feff}Subject\r\nhello\r\n",
+        ),
+        (
+            "Locations-2026-01-05_09-00-00.csv",
+            "\u{feff}Location,Count\r\nalex@contoso.example,12\r\n",
+        ),
+    ]);
+    setup
+        .preflight(
+            setup.search(),
+            json!({"value": []}),
+            estimate("succeeded", json!(GIB)),
+        )
+        .await;
+    setup.accept().await;
+    let port = setup.alpha.address().port();
+    let mut done = setup.succeeded();
+    done["exportFileMetadata"] = json!([
+        {"fileName": "a_junk.zip", "size": junk.len(), "downloadUrl": format!("http://{ALPHA}:{port}/junk?downloadType=Report")},
+        {"fileName": "b_report.zip", "size": report.len(), "downloadUrl": setup.file_url()},
+    ]);
+    setup.get(&operation_path(), done).await;
+    for (at, body) in [("/junk", junk), (FILE_PATH, report)] {
+        Mock::given(method("GET"))
+            .and(path(at))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&setup.alpha)
+            .await;
+    }
+    set_config(
+        &setup.harness,
+        "limits",
+        json!({"csv_max_record_bytes": "2KiB"}),
+    );
+    let run = setup.run(&["--json", "--yes", "--strict"]).await;
+    assert_eq!(run.outcome.exit_code, 4, "{}", run.stdout());
+    let reason = run.json()["outcome"]["reasons"][0].clone();
+    assert_eq!(reason["code"], "EvidenceMissing");
+    assert!(
+        !reason["message"]
+            .as_str()
+            .unwrap()
+            .contains("could not be read as a report zip"),
+        "{reason}"
     );
 }

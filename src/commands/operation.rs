@@ -488,8 +488,8 @@ async fn check_collection(
         return Ok(None);
     }
     for done in &fetched.done {
-        match crate::report::ReportFiles::read(&done.path, check.limits) {
-            Ok(files) if files.locations.is_some() || files.statistics_errors.is_some() => {
+        match crate::report::ReportFiles::read_for(&done.path, check.limits, evidence_of) {
+            Ok(files) if files.has_evidence_for(evidence_of) => {
                 super::parse::warn_missing_columns(&mut session.env.stderr, &files);
                 let _ = writeln!(
                     session.env.stderr,

@@ -212,6 +212,9 @@ pub fn html_to_text(html: &str) -> Option<String> {
         // text (Derived from `html2text` 0.17's source and output).
         html2text::config::plain_no_decorate()
             .raw_mode(true)
+            // Struck-through text stays plain: a combining stroke after each
+            // character would hide a URL from the redaction after.
+            .unicode_strikeout(false)
             .allow_width_overflow()
             .string_from_read(cleaned.as_bytes(), width)
     }))
@@ -307,6 +310,14 @@ mod tests {
         let text = html_to_text(&format!("<p>See {url} now</p>")).unwrap();
         assert_eq!(text.lines().count(), 1, "{}", text.len());
         assert!(text.contains(&url), "{}", text.len());
+    }
+
+    #[test]
+    fn struck_through_text_has_no_combining_strokes() {
+        let text =
+            html_to_text("<p><s>https://portal.contoso.example/a?x=1</s> <del>gone</del></p>")
+                .unwrap();
+        assert_eq!(text, "https://portal.contoso.example/a?x=1 gone");
     }
 
     #[test]

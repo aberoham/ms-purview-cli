@@ -503,6 +503,14 @@ pub fn urls_in_text(text: &str, redactor: &Redactor) -> String {
     if let Some(parsed) = single_url(text) {
         return url(&parsed, redactor);
     }
+    urls_in_free_text(text, redactor)
+}
+
+/// `text` with every URL as `urls_in_text` treats a URL in other text,
+/// even when `text` is one URL alone: scheme, host and path kept, any
+/// query or fragment `?REDACTED`. For text written by people, such as a
+/// message body, where no query is an OData option.
+pub fn urls_in_free_text(text: &str, redactor: &Redactor) -> String {
     let lower = text.to_ascii_lowercase();
     let mut output = String::with_capacity(text.len());
     let mut position = 0;

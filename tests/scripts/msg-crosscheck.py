@@ -48,6 +48,13 @@ def address(mailbox):
     return (mailbox or {}).get("address") or ""
 
 
+def addresses_in(listed):
+    """The addresses in an extract-msg header string, lower case."""
+    return {
+        addr.lower() for _, addr in getaddresses((listed or "").split(";")) if "@" in addr
+    }
+
+
 def locals_in(listed):
     """The local parts of the addresses in an extract-msg header string,
     whose recipients are separated by `;`."""
@@ -107,12 +114,20 @@ def main(argv):
                 else:
                     counts[f"{field}: empty in both"] += 1
             ours_from = address(record.get("from")).lower()
-            their_from = locals_in(theirs["from"])
+            their_from = addresses_in(theirs["from"])
             if ours_from.startswith("/") and not their_from:
                 # No SMTP sender: the Exchange address against a display name.
                 counts["from: no SMTP address in either"] += 1
+            elif ours_from and their_from and {ours_from} != their_from and {
+                ours_from.split("@")[0]
+            } == {a.split("@")[0] for a in their_from}:
+                # PidTagSenderSmtpAddress against extract-msg's sender, the
+                # From header's address, which can be the same mailbox in
+                # another of its domains (Observed). Counted apart: neither
+                # agreement nor a failure.
+                counts["from: same local part, other domain"] += 1
             elif ours_from or their_from:
-                checks["from"] = {ours_from.split("@")[0]} == their_from
+                checks["from"] = {ours_from} == their_from
             else:
                 counts["from: empty in both"] += 1
             # A recipient can be shown under another of its addresses, so the
@@ -125,13 +140,19 @@ def main(argv):
                     counts[f"{field}: no SMTP addresses from extract-msg"] += 1
                 elif ours_set or theirs_set:
                     checks[field] = ours_set == theirs_set
+                else:
+                    counts[f"{field}: empty in both"] += 1
+            ours_body = (record.get("body") or "").strip()
             if theirs["body"].strip():
                 ratio = difflib.SequenceMatcher(
-                    None, words(record.get("body")), words(theirs["body"]), autojunk=False
+                    None, words(ours_body), words(theirs["body"]), autojunk=False
                 ).ratio()
-                checks["body"] = bool(record.get("body")) and ratio >= 0.8
+                checks["body"] = bool(ours_body) and ratio >= 0.8
+            elif ours_body:
+                # A body only one reader found is a difference.
+                checks["body"] = False
             else:
-                counts["body: extract-msg has none"] += 1
+                counts["body: empty in both"] += 1
             for field, same in checks.items():
                 counts[f"{field}: {'agree' if same else 'differ'}"] += 1
     for key in sorted(counts):

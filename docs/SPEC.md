@@ -816,7 +816,11 @@ Settled in the first `.msg` reader PR (PR 5.1 with the body selection of PR 5.2)
   width is 10,000 or more than the HTML's length, whichever is larger, so that no word is
   broken across lines: the URL redaction that runs on the text afterwards then sees every
   URL whole (Derived from `html2text` 0.17's source and tests). A converter that fails or
-  panics gives `bodyDecode` unless there is a plain-text body.
+  panics gives `bodyDecode` unless there is a plain-text body. Struck-through text is
+  converted without combining strokes, which would hide a URL from the redaction. Every URL
+  in a body, from HTML or text, keeps only scheme, host and path, as in other free text,
+  before `--max-body-chars` cuts the body, so that a query neither survives as an OData
+  option of a body that is one URL alone nor takes the place of text under the cap.
 - The container is refused as `cfbInvalid`, with a fixed `errorDetail`, when its header's
   FAT, DIFAT or mini FAT sector counts do not fit in the item, before `cfb` reads it; so is
   an item with a property stream that exists and cannot be read in full, and one whose
@@ -832,10 +836,14 @@ Settled in the first `.msg` reader PR (PR 5.1 with the body selection of PR 5.2)
 - `cfb` 0.16.0 (released 2026-10-31) and `html2text` 0.17.4 (released 2026-10-18).
 - The cross-check is `tests/scripts/msg-crosscheck.py`, run by hand. On the maintainer's
   one private export of 31 items it agreed with `extract-msg` 0.55.0 on subject, sent time,
-  body and To for every item, on CC for the 18 with CC recipients, and on sender for the 29
-  with an SMTP sender (Observed). Recipients are compared as sets of address local parts. A
-  field empty in one reader never agrees with a filled one, and a field empty in both is
-  counted apart.
+  body and To for every item and on CC for the 18 with CC recipients (Observed). Of the 29
+  items with an SMTP sender, 25 agreed on the whole address; on 4, the sender's
+  `PidTagSenderSmtpAddress` had the same local part in another domain than the address
+  `extract-msg` gives from the From header, which shows it only as the display name
+  (Observed): `from` is the mailbox's own SMTP address, not always the address the message
+  was sent as. Senders are compared whole and that case is counted apart; recipients are
+  compared as sets of address local parts. A field empty in one reader never agrees with a
+  filled one, and a field empty in both is counted apart.
   The `msg-crosscheck` CI job waits for PR 5.3.
 
 #### `purview inventory cases` (read; phase 6)
@@ -1459,8 +1467,9 @@ from the `.msg`. `error` is one of `cfbInvalid`, `noBody`, `bodyDecode`, `entryT
    it. A contributor is expected to have Python with `uv`. The script is a `uv` script with
    `extract-msg` pinned that reads the same inputs and writes the fields the comparison
    needs. In the observed run, `extract-msg` read every item except the Teams system
-   messages, all from the zip in memory (Observed). CI compares the two readers on synthetic
-   fixtures, and a maintainer compares them on a private export, reporting only counts.
+   messages, all from the zip in memory (Observed). From PR 5.3, CI compares the two readers
+   on synthetic fixtures; until then, and on a private export, a maintainer compares them by
+   hand, reporting only counts.
 
 **Body selection.**
 1. `PidTagHtml`: a binary value is decoded with `PidTagInternetCodepage` through

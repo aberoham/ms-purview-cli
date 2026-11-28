@@ -317,6 +317,52 @@ async fn a_url_in_a_body_keeps_only_scheme_host_and_path() {
 }
 
 #[tokio::test]
+async fn a_body_that_is_one_url_or_struck_through_or_cut_loses_every_query() {
+    let harness = Harness::new().await;
+    let one = Message::note("One").with(
+        HTML,
+        P::Binary(b"<p>https://portal.contoso.example/a?downloadType=onlysecret</p>".to_vec()),
+    );
+    let struck = Message::note("Struck").with(
+        HTML,
+        P::Binary(b"<p><s>https://portal.contoso.example/a?ref=strucksecret</s> done</p>".to_vec()),
+    );
+    let tracking = "t".repeat(180);
+    let cut = Message::note("Cut").with(
+        HTML,
+        P::Binary(
+            format!("<p>See https://portal.contoso.example/a?{tracking} decision Friday</p>")
+                .into_bytes(),
+        ),
+    );
+    let path = write_zip(
+        &harness,
+        "Items.1.001.export.zip",
+        items_zip(&[
+            ("Exchange/Items/a.msg", one.build()),
+            ("Exchange/Items/b.msg", struck.build()),
+            ("Exchange/Items/c.msg", cut.build()),
+        ]),
+    );
+    let run = harness
+        .run(&["export", "read", &path, "--max-body-chars", "100"])
+        .await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
+    let records = lines(&run);
+    for (record, secret) in records.iter().zip(["onlysecret", "strucksecret", "tttt"]) {
+        let body = record["body"].as_str().unwrap();
+        assert!(!body.contains(secret), "{secret}: {body}");
+        assert!(body.contains("portal.contoso.example/a"), "{body}");
+    }
+    // The query is gone before the cap, so the words after it fit.
+    assert!(records[2]["body"]
+        .as_str()
+        .unwrap()
+        .ends_with("decision Friday"));
+    assert_eq!(records[2]["bodyTruncated"], false);
+}
+
+#[tokio::test]
 async fn an_unknown_class_never_reaches_stderr_and_is_wrapped_in_the_record() {
     let harness = Harness::new().await;
     let mut message = html_note();

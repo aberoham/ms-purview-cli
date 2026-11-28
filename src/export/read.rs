@@ -16,6 +16,7 @@ use crate::env::Env;
 use crate::error::{PurviewError, Result};
 use crate::msg::{parse_msg, Mailbox, MsgItem};
 use crate::output::OutputOptions;
+use crate::redact::Redactor;
 use crate::zipread::{read_error, ZipLimits, ZipReader, EXPORT_ZIP_ENTRIES, MAX_RATIO};
 
 /// `--max-entry-bytes` by default: 64 MiB per `.msg`.
@@ -83,7 +84,7 @@ pub fn run(env: &mut Env, output: &OutputOptions, request: &ReadRequest) -> Resu
                 tally.skipped += 1;
                 continue;
             }
-            let record = read_item(&mut zip, index, name, &part, request);
+            let record = read_item(&mut zip, index, name, &part, request, &env.redactor);
             let class = class_label(record["class"].as_str());
             let mut failed = !record["error"].is_null();
             if request.json {
@@ -163,6 +164,7 @@ fn read_item(
     name: &str,
     part: &str,
     request: &ReadRequest,
+    redactor: &Redactor,
 ) -> Value {
     let mut record = Map::new();
     record.insert("entry".into(), Value::String(name.to_owned()));
@@ -208,7 +210,7 @@ fn read_item(
         Ok(item) => item,
         Err(error) => return failed(record, error.code(), error.detail()),
     };
-    fill(&mut record, &item, request.max_body_chars);
+    fill(&mut record, &item, request.max_body_chars, redactor);
     Value::Object(record)
 }
 
@@ -222,11 +224,23 @@ fn mailbox(mailbox: &Mailbox) -> Value {
     json!({"name": mailbox.name, "address": mailbox.address})
 }
 
-fn fill(record: &mut Map<String, Value>, item: &MsgItem, max_body_chars: usize) {
+fn fill(
+    record: &mut Map<String, Value>,
+    item: &MsgItem,
+    max_body_chars: usize,
+    redactor: &Redactor,
+) {
     let time = |time: &Option<chrono::DateTime<chrono::Utc>>| {
         time.map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
     };
-    let (body, truncated) = match item.body.text() {
+    // Every URL in the body loses its query here, before the body is cut,
+    // so that a query neither survives as an OData option of a body that
+    // is one URL alone nor takes the place of text under the cap.
+    let text = item
+        .body
+        .text()
+        .map(|text| crate::redact::urls_in_free_text(text, redactor));
+    let (body, truncated) = match text.as_deref() {
         Some(text) if text.chars().count() > max_body_chars => (
             Some(text.chars().take(max_body_chars).collect::<String>()),
             true,

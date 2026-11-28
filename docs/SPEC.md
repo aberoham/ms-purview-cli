@@ -3155,7 +3155,7 @@ that does not depend on whether the claim is true. The table says which:
    checked until PR 4.1.
 5. Exports without Teams context (PR 4.1). Observed for an item report (PR 2.5): Graph
    accepted `exportReport` with no `additionalOptions`, and the report held one row per
-   estimated item, with fewer Teams rows and the same mail rows.
+   estimated item, with fewer Teams rows and the same number of mail rows.
 6. Case close and hold reads on a case with holds. Observed for a case with no holds or
    custodians (PR 2.6): each hold read answered 200 with an empty `value`,
    `@odata.count: 0` and no `@odata.nextLink`; `POST .../close` with `Content-Length: 0`

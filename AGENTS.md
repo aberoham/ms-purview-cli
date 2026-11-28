@@ -71,8 +71,9 @@ The shipped binary is Rust only and never needs Python; a user of
 Python script at run time. A contributor is expected to have a modern
 Python environment with `uv`: development scripts (such as the `.msg`
 cross-check against `extract-msg`, the fake `az` and the signing-helper
-test) may use Python, run through `uv run` with their dependencies
-pinned.
+test) may use Python. A script that needs a third-party package runs
+through `uv run` with it pinned; one on the standard library alone may
+run with `python3`.
 
 ## Architecture
 

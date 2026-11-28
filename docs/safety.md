@@ -118,7 +118,7 @@ given, whoever created it:
 - Its current query goes through the guard below. A query outside the
   grammar is always refused; one that is not narrowed is refused unless
   `--allow-generic` gives a `--reason`, which the plan shows. A report
-  sends the reason as its `description`; an estimate has no description
+  or export sends the reason as its `description`; an estimate has no description
   to record it in.
 - An estimate of the case (for `estimate`), or an item report or export
   (for `report` and `export create`), that is not known to be finished may be a
@@ -133,7 +133,8 @@ with the same checks, and nothing is sent if it no longer passes them
 `SearchHasSources`) or if its query or the guard's verdict differ from the
 plan (`SearchChanged`). Without
 `--allow-concurrent`, the case's operations are listed again too, so an
-estimate (for `estimate`), or an item report or export (for `report`),
+estimate (for `estimate`), or an item report or export (for `report`
+and `export create`),
 that someone else started while the prompt was open is refused as a
 possible duplicate. A change made after these reads is still possible. The action is then sent once.
 Its answer must be a 202 naming the new operation in the `Location`
@@ -171,8 +172,10 @@ then waits for the operation, downloads its report zip and reads it:
   times larger than the estimate's size.
 - At the wait deadline it exits 5, and on Ctrl-C (during the wait or the
   download) 130, with the command that resumes: `operation get --wait
-  --check`, which fetches only the evidence file of the operation's own
-  action, never `download`. `--wait-timeout` covers the wait; the download
+  --check`, or `operation get --check` when Ctrl-C stopped the download of
+  a finished operation. The check fetches only the evidence file of the
+  operation's own action, and nothing when its detail is not that of its
+  action; it never fetches an `Items.*.zip` part. It is never `download`. `--wait-timeout` covers the wait; the download
   has its own timeouts.
 
 `report` also compares the search's latest estimate with
@@ -212,10 +215,12 @@ teamsAndYammerConversations,includeReport` (Observed);
 observed. The plan warns that an export can hold several times the items
 the estimate counts (about four times in one run with Teams context on,
 Observed) and that the download is large and holds message content. The
-command downloads every part, into the data directory (mode 0700) unless
-`--out` is given, and reads only the `Reports-…zip` part's Locations file
-for `collection`; it never opens an `Items.*.zip` part and never prints
-item content. Remove the directory when the work is done.
+command downloads every part, into the data directory unless `--out` is
+given (a directory it creates is mode 0700; an existing one keeps its
+mode), and reads only the `Reports-…zip` part's Locations file for
+`collection`. The download checks each zip's central directory, but no
+entry of an `Items.*.zip` part is read, and item content is never
+printed. Remove the directory when the work is done.
 
 `purview operation get <case> <op> --check` runs the same collection
 check on an existing operation, downloading its evidence file into the

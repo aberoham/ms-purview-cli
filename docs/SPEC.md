@@ -521,7 +521,7 @@ Settled in PR 2.4:
   and the time preflight ends. `description` is sent only with an override, as
   `--allow-generic: <reason>`, `--allow-large: <reason>` or `--allow-generic and
   --allow-large: <reason>`.
-- `defaults.teams_context` is read before sign-in, only by `report`: `null` or missing is
+- `defaults.teams_context` is read before sign-in, only by `report` and `export create`: `null` or missing is
   `true`; a value that is not a boolean is an error naming the key.
 - The size limit of section 6.9, against the search's latest estimate. A plan it blocks is
   shown by a dry run and refused otherwise with `TooLarge` or `VolumeUnchecked`, ahead of
@@ -588,14 +588,23 @@ Settled in PR 4.1:
 - The answer must be 202, and the operation the `Location` header names must be an
   `exportResult` operation with export detail before any file is fetched; anything else is
   `UnexpectedLocation`.
-- Every file the operation lists is downloaded, into the data directory (mode 0700) unless
-  `--out` is given. Only a file whose server name starts with `Reports-` is read, and only its
-  `Locations-*.csv`; an `Items.*.zip` part is never opened by the command, so item content is
-  never printed. With no `Reports-` file, `collection` is `unchecked`.
-- `result` has the keys of `report`. A stopped export (`--no-wait`, the wait deadline,
-  Ctrl-C) resumes with `operation get <case> <op> --wait --check`, which fetches only the
-  report part; `download <case> <op>` then fetches the items when the operation is known to
-  be the export.
+- Every file the operation lists is downloaded, into the data directory unless `--out` is
+  given (a directory the command creates is 0700; an existing one keeps its mode, section
+  5.4). Only a file whose server name starts with `Reports-` is read, and only its
+  `Locations-*.csv`. The download checks every zip's central directory, but no entry of an
+  `Items.*.zip` part is read, so item content is never printed. With no `Reports-` file,
+  `collection` is `unchecked`.
+- One rule chooses the evidence files, for every action and for `operation get --check`: the
+  operation's action and detail must agree (an estimate with estimate detail, an item report
+  or export with export detail), else nothing is fetched and `collection` is `unchecked`;
+  then, for an export, the files named `Reports-…`, and for an estimate or item report every
+  file that is not an `Items.*.zip` part, each tried in Graph's order until one holds the
+  evidence. No items part is ever fetched or read as evidence.
+- `result` has the keys of `report`. A stopped export resumes with `operation get <case> <op>
+  --wait --check` after `--no-wait`, the wait deadline or Ctrl-C during the wait, and with
+  `operation get <case> <op> --check` after Ctrl-C during the download. Either fetches only
+  the report part; `download <case> <op>` then fetches the items when the operation is known
+  to be the export.
 - From PR 4.1, `estimate` resumes the same way. `operation get --wait --check` reads the
   operation's own action and fetches only that action's evidence file (an estimate's report
   zip; an export's `Reports-` part), where `download` would have fetched every file of
@@ -2049,7 +2058,7 @@ rows per estimated item (section 6.6). So `max_export_size` compares the estimat
 the export can be several times larger.
 
 Settled in PR 2.4: `report` refuses a search whose latest estimate passes `max_export_size`
-unless `--allow-large --reason` is given (`TooLarge`; `export create` will do the same). The
+unless `--allow-large --reason` is given (`TooLarge`; `export create` does the same from PR 4.1). The
 latest estimate is the search's `lastEstimateStatisticsOperation` (Observed: it answers 200
 with the estimate's fields and no `@odata.type`, so the record is read as an estimate by its
 `action`).

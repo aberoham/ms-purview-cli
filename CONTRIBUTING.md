@@ -19,7 +19,7 @@ This is a public repository. Keep every change free of real tenant or user data:
 
 ## Python
 
-The shipped `purview` binary is Rust only and never needs Python. Development may use Python: contributors are expected to have a modern Python environment with `uv`, and development scripts run through `uv run` with their dependencies pinned. No user-facing feature may depend on a Python script.
+The shipped `purview` binary is Rust only and never needs Python. Development may use Python: contributors are expected to have a modern Python environment with `uv`. A development script that needs a third-party package runs through `uv run` with it pinned; scripts on the standard library alone, such as the signing-helper test, may run with `python3`. No user-facing feature may depend on a Python script.
 
 ## Verification
 

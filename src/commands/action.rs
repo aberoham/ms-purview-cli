@@ -16,7 +16,7 @@ use crate::error::{PurviewError, Result};
 use crate::graph::{GraphClient, WriteResponse};
 use crate::kql::{enforce, GuardConfig, Override};
 use crate::model::valid::{CaseKey, SearchKey, SearchRef};
-use crate::model::wire::{OperationDetail, OperationRecord, OperationStatus};
+use crate::model::wire::{Action, OperationDetail, OperationRecord, OperationStatus, Source};
 use crate::output::sanitize;
 use crate::poll::{elapsed_text, PollEnd, Poller, Timing};
 use crate::report::estimate::Collection;
@@ -326,10 +326,6 @@ pub struct ActionRun {
     pub evidence_of: EvidenceOf,
     /// The command that lists the operation, after the case id.
     pub list_hint: &'static str,
-    /// The start of the one file name read as the evidence, for an export
-    /// whose other files are item content (`Reports-`); `None` reads each
-    /// file in turn until one holds the evidence.
-    pub evidence_file: Option<&'static str>,
     pub no_wait: bool,
     pub no_download: bool,
     pub timing: Timing,
@@ -522,6 +518,10 @@ impl ActionRun {
                 )?));
             }
             reasons.extend(fetched.reasons);
+            // The detail matches the action, checked above.
+            let evidence_names = evidence_files(&record)
+                .map(|(_, names)| names)
+                .unwrap_or_default();
             let limits = self.limits.unwrap_or_else(|| {
                 ReportLimits::from_config(&Default::default()).expect("the defaults are valid")
             });
@@ -533,10 +533,7 @@ impl ActionRun {
                     "sha256": done.sha256,
                     "status": done.status(),
                 }));
-                let candidate = self
-                    .evidence_file
-                    .is_none_or(|start| done.server_name.starts_with(start));
-                if evidence.is_none() && candidate {
+                if evidence.is_none() && evidence_names.contains(&done.server_name) {
                     match ReportFiles::read_for(&done.path, limits, self.evidence_of) {
                         Ok(read) if read.has_evidence_for(self.evidence_of) => {
                             evidence = Some(read);
@@ -555,9 +552,10 @@ impl ActionRun {
                 }
             }
             if evidence.is_none() && evidence_note.is_none() {
-                evidence_note = Some(match self.evidence_file {
-                    Some(start) => format!("no downloaded file named {start}… is a report zip"),
-                    None => "no downloaded file is a report zip".into(),
+                evidence_note = Some(if evidence_names.is_empty() {
+                    NO_EVIDENCE_FILE.into()
+                } else {
+                    "no downloaded evidence file is a report zip".into()
                 });
             }
         }
@@ -621,6 +619,53 @@ impl Finished {
             }
         }
     }
+}
+
+/// Why the collection is unchecked when an operation lists no file that
+/// can hold its evidence.
+pub const NO_EVIDENCE_FILE: &str =
+    "the operation lists no file that can hold its evidence (for an export, a Reports- file)";
+
+/// Whether `name` is an export's items part (`Items.….zip`, Observed),
+/// which holds item content and is never fetched or read as evidence.
+pub fn is_items_part(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with("items.") && lower.ends_with(".zip")
+}
+
+/// The one rule for which files of a finished operation may hold the
+/// collection evidence of its own action, used by every action and by
+/// `operation get --check` (`docs/SPEC.md` section 3.5). `None` unless the
+/// operation is an estimate with estimate detail, or an item report or
+/// export with export detail. Otherwise the action's evidence kind and the
+/// server names to try, in Graph's order: for an export, the files named
+/// `Reports-…` (Observed); for an estimate or item report, every file that
+/// is not an items part. No items part is ever a candidate.
+pub fn evidence_files(record: &OperationRecord) -> Option<(EvidenceOf, Vec<String>)> {
+    let action = record.action(Source::Single);
+    let detail = record.detail()?;
+    let evidence_of = match (&action, &detail) {
+        (Action::Estimate, OperationDetail::Estimate(_)) => EvidenceOf::Estimate,
+        (Action::ExportReport | Action::ExportResult, OperationDetail::SearchExport(_)) => {
+            EvidenceOf::Report
+        }
+        _ => return None,
+    };
+    let mut names: Vec<String> = Vec::new();
+    for name in detail
+        .files()
+        .iter()
+        .filter_map(|file| file.file_name.clone())
+    {
+        if is_items_part(&name)
+            || (action == Action::ExportResult && !name.starts_with("Reports-"))
+            || names.contains(&name)
+        {
+            continue;
+        }
+        names.push(name);
+    }
+    Some((evidence_of, names))
 }
 
 /// The command that carries on from a submitted action, as the signed-in

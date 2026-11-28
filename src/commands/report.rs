@@ -672,19 +672,25 @@ impl WriteCommand for Report {
                  hold."
                     .into(),
             ],
-            Collect::Export => vec![
-                format!(
+            Collect::Export => {
+                let mut effects = vec![format!(
                     "Runs search {} over every mailbox in the tenant, and adds an export \
                      operation to case {case} that collects a copy of every item found, with \
                      its message body and attachments, as .msg files, and the item report \
                      beside them.",
                     search.id
-                ),
-                "Downloads every part of the export into the directory the result names: item \
-                 content of colleagues and outside senders, kept on disk until it is removed."
-                    .into(),
-                "Changes no mailbox and places no hold.".into(),
-            ],
+                )];
+                if self.downloads() {
+                    effects.push(
+                        "Downloads every part of the export into the directory the result \
+                         names: item content of colleagues and outside senders, kept on disk \
+                         until it is removed."
+                            .into(),
+                    );
+                }
+                effects.push("Changes no mailbox and places no hold.".into());
+                effects
+            }
         };
         let teams_line = match (collect, teams_context) {
             (Collect::Report, true) => {
@@ -857,12 +863,6 @@ impl WriteCommand for Report {
             list_hint: match collect {
                 Collect::Report => "--action report --resolve",
                 Collect::Export => "--action export --resolve",
-            },
-            // An export's report part (Observed: `Reports-…zip`); its other
-            // files are item content.
-            evidence_file: match collect {
-                Collect::Report => None,
-                Collect::Export => Some("Reports-"),
             },
             no_wait: self.flags.no_wait,
             no_download: self.flags.no_download,

@@ -93,7 +93,7 @@ Existing tools leave gaps across the eDiscovery workflow (recorded in [docs/SPEC
 
 **Planned roadmap (not yet built, no dates):**
 
-- **v0.2:** the rest of the write commands (`report`, and `case close` if its live checks complete) with preflight checks and explicit approval, plus estimate report parsing (`parse locations`, `parse failures`, `parse summary`).
+- **v0.2:** `case close`, if its live checks complete.
 - **v0.3:** item report parsing (`parse items`, `parse profile`).
 - **v0.4:** `export index`.
 - **v0.5:** reading message bodies from export zips (`export read`).

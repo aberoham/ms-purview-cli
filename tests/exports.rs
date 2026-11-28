@@ -160,6 +160,16 @@ impl Setup {
         env.data_dir = Some(self.data_root());
     }
 
+    /// `operation get <case> <op> --check`, as a resume runs it.
+    async fn check(&self) -> Run {
+        self.harness
+            .run_with(
+                &["--json", "operation", "get", CASE, OP, "--check"],
+                |env, _| self.configure(env),
+            )
+            .await
+    }
+
     async fn run(&self, args: &[&str]) -> Run {
         let mut argv = vec!["export", "create", CASE, SEARCH];
         argv.extend_from_slice(args);
@@ -399,7 +409,8 @@ async fn an_export_without_a_report_part_is_unchecked_and_its_items_are_not_read
     assert_eq!(run.outcome.exit_code, 0, "{}", run.stdout());
     assert_eq!(run.json()["results"]["result"]["collection"], "unchecked");
     assert!(
-        run.stderr().contains("no downloaded file named Reports-"),
+        run.stderr()
+            .contains("lists no file that can hold its evidence (for an export, a Reports- file)"),
         "{}",
         run.stderr()
     );
@@ -604,6 +615,7 @@ async fn an_unclear_export_lists_candidates_by_their_true_action() {
         message.contains(&format!("export {OP} (running")),
         "{message}"
     );
+    assert!(!message.contains("report or export"), "{message}");
     assert_eq!(setup.posts().await.len(), 1);
 }
 
@@ -633,4 +645,185 @@ async fn a_dry_run_sends_nothing() {
     assert_eq!(run.json()["results"]["applied"], false);
     assert!(setup.posts().await.is_empty());
     assert!(setup.downloads().await.is_empty());
+}
+
+#[tokio::test]
+async fn an_export_whose_detail_is_not_an_export_is_not_downloaded() {
+    let setup = Setup::new().await;
+    setup.ready().await;
+    let mut wrong = setup.succeeded();
+    wrong["@odata.type"] = json!("#microsoft.graph.security.ediscoveryEstimateOperation");
+    Mock::given(method("GET"))
+        .and(path(operation_path()))
+        .respond_with(json_response(200, wrong))
+        .with_priority(1)
+        .mount(&setup.harness.graph)
+        .await;
+    let run = setup.run(&["--json", "--yes"]).await;
+    assert_eq!(run.json()["error"]["code"], "UnexpectedLocation");
+    assert!(setup.downloads().await.is_empty());
+}
+
+#[tokio::test]
+async fn the_resume_check_never_fetches_an_items_part_whatever_the_action_says() {
+    // An operation that says it is an item report but lists an export's
+    // parts, items first with a failed row: the check fetches only the
+    // file that is not an items part.
+    let mut setup = Setup::new().await;
+    setup.parts.reverse();
+    setup.serve().await;
+    let mut record = setup.succeeded();
+    record["action"] = json!("exportReport");
+    setup.get(&operation_path(), record).await;
+    let run = setup.check().await;
+    assert_eq!(
+        run.outcome.exit_code,
+        0,
+        "{} {}",
+        run.stdout(),
+        run.stderr()
+    );
+    assert_eq!(run.json()["results"]["collection"], "complete");
+    let downloads = setup.downloads().await;
+    assert_eq!(downloads.len(), 1);
+    assert!(downloads[0].url.query().unwrap().contains("part=report"));
+    assert!(!run.stdout().contains(CANARY) && !run.stderr().contains(CANARY));
+}
+
+#[tokio::test]
+async fn the_resume_check_fetches_nothing_when_the_detail_is_not_the_action_s() {
+    let setup = Setup::new().await;
+    setup.serve().await;
+    let mut record = setup.succeeded();
+    record["@odata.type"] = json!("#microsoft.graph.security.ediscoveryEstimateOperation");
+    record["reportFileMetadata"] = record["exportFileMetadata"].clone();
+    setup.get(&operation_path(), record).await;
+    let run = setup.check().await;
+    assert_eq!(
+        run.json()["results"]["collection"],
+        "unchecked",
+        "{}",
+        run.stdout()
+    );
+    assert!(
+        run.stderr().contains("is not that of its action"),
+        "{}",
+        run.stderr()
+    );
+    assert!(setup.downloads().await.is_empty());
+}
+
+#[tokio::test]
+async fn a_direct_export_and_its_resume_check_read_the_same_report_part() {
+    // Two Reports- files: the first has no Locations, the second a failed
+    // location. Both paths go on to the second.
+    let mut setup = Setup::new().await;
+    setup.parts.insert(
+        0,
+        Part {
+            name: "Reports-first-without-locations.zip",
+            key: "report0",
+            bytes: zip_of(&[(
+                "Summary-2026-01-05_09-00-00.csv",
+                b"\xef\xbb\xbfJob ID,j,x\r\n",
+            )]),
+        },
+    );
+    setup.parts[1].bytes = report_part(true);
+    setup.ready().await;
+    let run = setup.run(&["--json", "--yes"]).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stdout());
+    assert_eq!(run.json()["results"]["result"]["collection"], "incomplete");
+    let run = setup.check().await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stdout());
+    assert_eq!(run.json()["results"]["collection"], "incomplete");
+}
+
+#[tokio::test]
+async fn an_unclear_export_labels_an_item_report_candidate_by_its_own_read() {
+    let setup = Setup::new().await;
+    setup
+        .preflight(json!({"value": []}), estimate(json!(GIB)))
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("{CASES}/{CASE}/operations")))
+        .respond_with(json_response(200, json!({"value": []})))
+        .up_to_n_times(2)
+        .with_priority(1)
+        .mount(&setup.harness.graph)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("{CASES}/{CASE}/operations")))
+        .respond_with(json_response(
+            200,
+            json!({"value": [
+                {"id": OP, "action": "exportResult", "status": "running", "createdDateTime": "2026-01-05T09:00:30Z"},
+            ]}),
+        ))
+        .with_priority(2)
+        .mount(&setup.harness.graph)
+        .await;
+    let mut report = setup.succeeded();
+    report["action"] = json!("exportReport");
+    report["status"] = json!("running");
+    setup.get(&operation_path(), report).await;
+    Mock::given(method("POST"))
+        .and(path(search_path("/exportResult")))
+        .respond_with(json_response(
+            503,
+            json!({"error": {"code": "ServiceUnavailable"}}),
+        ))
+        .mount(&setup.harness.graph)
+        .await;
+    let run = setup.run(&["--json", "--yes"]).await;
+    let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
+    assert!(
+        message.contains(&format!("item report {OP} (running")),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn allow_concurrent_sends_the_export_despite_a_possible_duplicate() {
+    let setup = Setup::new().await;
+    setup
+        .preflight(
+            json!({"value": [
+                {"id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaa0005", "action": "exportResult", "status": "running", "createdDateTime": "2026-01-05T08:00:00Z"},
+            ]}),
+            estimate(json!(GIB)),
+        )
+        .await;
+    setup.accept().await;
+    let run = setup
+        .run(&["--json", "--yes", "--no-wait", "--allow-concurrent"])
+        .await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stdout());
+    assert_eq!(setup.posts().await.len(), 1);
+    let warnings = run.json()["results"]["plan"]["warnings"].to_string();
+    assert!(warnings.contains("may be a duplicate"), "{warnings}");
+    // Without a download, the plan does not promise one.
+    let effects = run.json()["results"]["plan"]["effects"].to_string();
+    assert!(!effects.contains("Downloads every part"), "{effects}");
+}
+
+#[tokio::test]
+async fn only_a_reports_file_is_an_export_s_evidence() {
+    // A file of another name, listed first, with a failed location: an
+    // export reads only its Reports- part, so the collection is complete.
+    let mut setup = Setup::new().await;
+    setup.parts.insert(
+        0,
+        Part {
+            name: "Summary-of-the-export.zip",
+            key: "other",
+            bytes: report_part(true),
+        },
+    );
+    setup.ready().await;
+    let run = setup.run(&["--json", "--yes"]).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stdout());
+    assert_eq!(run.json()["results"]["result"]["collection"], "complete");
+    let run = setup.check().await;
+    assert_eq!(run.json()["results"]["collection"], "complete");
 }

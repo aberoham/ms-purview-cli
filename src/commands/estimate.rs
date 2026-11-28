@@ -283,7 +283,6 @@ impl WriteCommand for Estimate {
             action: "estimateStatistics",
             evidence_of: EvidenceOf::Estimate,
             list_hint: "--action estimate",
-            evidence_file: None,
             no_wait: self.flags.no_wait,
             no_download: self.flags.no_download,
             timing: self.flags.timing,

@@ -61,8 +61,8 @@ pub struct ExportReportRequest<'a> {
     pub description: Option<&'a str>,
     pub export_criteria: SearchHits,
     pub export_location: ResponsiveLocations,
-    /// `Some` by default; `None` under `--no-teams-context`, a body not
-    /// yet observed.
+    /// `Some` by default; `None` under `--no-teams-context`, a body Graph
+    /// accepted (Observed, PR 2.5).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub additional_options: Option<TeamsConversations>,
 }

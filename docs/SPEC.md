@@ -531,7 +531,8 @@ Posts `exportReport` with `exportCriteria: searchHits`, `exportLocation: respons
 (the body used in the observed runs; Observed). With `--no-teams-context`, or
 `defaults.teams_context: false`, `additionalOptions` is left out. Graph accepted that body,
 the operation read back `additionalOptions: none`, and the report held one row per
-estimated item, with the Teams hits alone (Observed, PR 2.5).
+estimated item: as many mail rows as with Teams context on, about a fifth of the Teams
+rows, and a Settings file showing contextual conversations off (Observed, PR 2.5).
 
 After polling, it downloads the zip (whose `size` is real; Observed) and reports
 `collection` by the report check above. With `--profile` it runs `parse profile` on the zip.
@@ -3154,7 +3155,7 @@ that does not depend on whether the claim is true. The table says which:
    checked until PR 4.1.
 5. Exports without Teams context (PR 4.1). Observed for an item report (PR 2.5): Graph
    accepted `exportReport` with no `additionalOptions`, and the report held one row per
-   estimated item.
+   estimated item, with fewer Teams rows and the same mail rows.
 6. Case close and hold reads on a case with holds. Observed for a case with no holds or
    custodians (PR 2.6): each hold read answered 200 with an empty `value`,
    `@odata.count: 0` and no `@odata.nextLink`; `POST .../close` with `Content-Length: 0`

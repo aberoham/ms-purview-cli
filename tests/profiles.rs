@@ -16,7 +16,7 @@ const HEADER: &str = "Internet message ID,Immutable ID,Item class,Date,Sender,Su
 /// The aliases and internal domains the tests use: an old domain renamed,
 /// and a second internal domain.
 const IDENTITY: &str = r#"{"identity": {
-    "internal_domains": ["contoso.example", "Fabrikam.example"],
+    "internal_domains": ["contoso.example", "EU.contoso.example"],
     "domain_aliases": {"old.contoso.example": "contoso.example"}
 }}"#;
 
@@ -87,20 +87,20 @@ fn report(dir: &Path) -> PathBuf {
             1,
         ),
         row(
-            "<m3@fabrikam.example>",
+            "<m3@eu.contoso.example>",
             "",
             "IPM.Note",
             "2026-07-13 00:00:00Z",
-            "alex@fabrikam.example",
+            "alex@eu.contoso.example",
             "",
             1,
         ),
         row(
-            "<m4@outside.example>",
+            "<m4@fabrikam.example>",
             "",
             "IPM.Note",
             "2026-08-01 10:00:00Z",
-            "alex@outside.example",
+            "alex@fabrikam.example",
             "",
             1,
         ),
@@ -305,8 +305,8 @@ async fn the_profile_counts_unique_items_by_class_sender_domain_conversation_and
         pairs(&senders["top"], "sender"),
         owned(&[
             ("alex@contoso.example", 2),
+            ("alex@eu.contoso.example", 1),
             ("alex@fabrikam.example", 1),
-            ("alex@outside.example", 1),
             ("bea@contoso.example", 1),
             ("carol@contoso.example", 1),
         ])
@@ -317,8 +317,8 @@ async fn the_profile_counts_unique_items_by_class_sender_domain_conversation_and
         pairs(&profile["senderDomains"]["top"], "senderDomain"),
         owned(&[
             ("contoso.example", 4),
+            ("eu.contoso.example", 1),
             ("fabrikam.example", 1),
-            ("outside.example", 1),
         ])
     );
     // Teams messages only, by class prefix in any case; the Teams file's
@@ -378,7 +378,7 @@ async fn merge_local_part_merges_only_within_internal_domains() {
         pairs(&senders["top"], "sender"),
         owned(&[
             ("alex@contoso.example", 3),
-            ("alex@outside.example", 1),
+            ("alex@fabrikam.example", 1),
             ("bea@contoso.example", 1),
             ("carol@contoso.example", 1),
         ])
@@ -491,16 +491,15 @@ async fn bad_flags_and_settings_are_refused_before_the_zip_is_read_and_never_rep
         (vec!["--top", "0"], "--top must be above zero"),
         (vec!["--sender", " "], "--sender"),
         (vec!["--max-unique", "0"], "--max-unique"),
-        (vec!["--select", "SECRET-COLUMN"], "SECRET"),
+        (vec!["--select", "SECRET-COLUMN"], "--select"),
     ] {
         let mut argv = vec!["--json", "parse", "profile", zip];
         argv.extend(args.iter());
         let run = run(dir.path(), &argv).await;
         assert_eq!(run.code, 1, "{args:?}");
         let message = run.message();
-        if needle != "SECRET" {
-            assert!(message.contains(needle), "{args:?}: {message}");
-        }
+        assert!(message.contains(needle), "{args:?}: {message}");
+        assert!(!message.contains("SECRET"), "{args:?}: {message}");
         assert!(!message.contains("cannot be read"), "{args:?}: {message}");
     }
     for (config, needle) in [

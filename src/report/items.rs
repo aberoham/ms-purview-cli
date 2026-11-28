@@ -218,11 +218,13 @@ fn parse_date(text: &str) -> Option<DateTime<Utc>> {
 }
 
 /// A sender's address, lowercased: the text between `<` and `>` of
-/// `Name <addr>`, else the whole text.
+/// `Name <addr>`, else the whole text. A list of addresses separated by
+/// `;` is kept whole, so that `is_address_list` sees it, whatever form
+/// its last entry has.
 pub fn sender_address(sender: &str) -> String {
     let text = sender.trim();
     let inner = match (text.rfind('<'), text.ends_with('>')) {
-        (Some(start), true) => &text[start + 1..text.len() - 1],
+        (Some(start), true) if !text.contains(';') => &text[start + 1..text.len() - 1],
         _ => text,
     };
     inner.trim().to_lowercase()
@@ -679,6 +681,10 @@ mod tests {
         assert_eq!(sender_domain("Alex Example"), None);
         // A list of addresses, as Teams file items have (Observed).
         assert_eq!(sender_domain("a@contoso.example; b@fabrik"), None);
+        assert_eq!(
+            sender_domain("Alex <alex@contoso.example>; Bea <bea@fabrikam.example>"),
+            None
+        );
     }
 
     fn filtered(filters: &Filters) -> Vec<String> {

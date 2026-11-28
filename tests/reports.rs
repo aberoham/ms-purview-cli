@@ -1765,7 +1765,10 @@ async fn a_profile_that_cannot_be_made_is_null_and_exits_4() {
     assert_eq!(run.outcome.exit_code, 4, "{}", run.stdout());
     let document = run.json();
     assert_eq!(document["results"]["result"]["collection"], "complete");
-    assert_eq!(document["results"]["result"]["profile"], Value::Null);
+    assert_eq!(
+        document["results"]["result"].get("profile"),
+        Some(&Value::Null)
+    );
     assert_eq!(
         document["outcome"]["reasons"][0]["code"],
         "ProfileUnavailable"
@@ -1807,4 +1810,19 @@ async fn profile_needs_the_download_and_good_settings_before_any_request() {
     assert!(message.contains("identity.internal_domains"), "{message}");
     assert!(!message.contains("secret"), "{message}");
     assert!(setup.graph_requests().await.is_empty());
+    // With no account signed in, the setting is still the error.
+    let harness = Harness::new().await;
+    let dir = harness.config_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::to_vec(&json!({"identity": {"domain_aliases": []}})).unwrap(),
+    )
+    .unwrap();
+    let run = harness
+        .run(&["--json", "report", CASE, SEARCH, "--yes", "--profile"])
+        .await;
+    assert_eq!(run.outcome.exit_code, 1, "{}", run.stdout());
+    let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
+    assert!(message.contains("identity.domain_aliases"), "{message}");
 }

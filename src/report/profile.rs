@@ -656,12 +656,12 @@ mod tests {
         // One domain in two cases is refused only when the targets differ.
         let error = Identity::from_config(&config(json!({"identity": {"domain_aliases": {
             "fabrikam.example": "contoso.example",
-            "FABRIKAM.example": "northwind.example",
+            "FABRIKAM.example": "eu.contoso.example",
         }}})))
         .unwrap_err()
         .to_string();
         assert!(error.contains("names one domain twice"), "{error}");
-        assert!(!error.contains("northwind"), "{error}");
+        assert!(!error.contains("eu.contoso"), "{error}");
         let chain = Identity::from_config(&config(json!({"identity": {"domain_aliases": {
             "a.example": "b.example",
             "b.example": "c.example",
@@ -730,6 +730,14 @@ mod tests {
             who(Some("a@contoso.example; b@fabrik"), &identity, true),
             Who::List
         );
+        assert_eq!(
+            who(
+                Some("Alex <alex@contoso.example>; Bea <bea@fabrikam.example>"),
+                &identity,
+                true
+            ),
+            Who::List
+        );
         assert_eq!(who(Some("<>"), &identity, true), Who::Nobody);
         let Who::Person {
             key,
@@ -757,8 +765,8 @@ mod tests {
             SenderKey::Internal("alex".into())
         );
         assert_eq!(
-            key_of("alex@outside.example", true),
-            SenderKey::Address("alex@outside.example".into())
+            key_of("alex@eu.fabrikam.example", true),
+            SenderKey::Address("alex@eu.fabrikam.example".into())
         );
         assert_eq!(
             key_of("alex@fabrikam.example", false),

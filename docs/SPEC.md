@@ -668,8 +668,10 @@ the rule of section 3.5 "Settled in PR 4.1": nothing when the action and detail 
 for an export the files named `Reports-` (Observed); for an estimate or item report every
 file that is not an `Items.*.zip` part. It fetches and reads them one at a time in Graph's
 order and stops at the first that holds the evidence, so a later file that cannot be
-downloaded does not hide an earlier result. A listed file with no name is reported, by
-position, as not downloadable.
+downloaded does not hide an earlier result. The whole listing is checked once before
+anything is fetched, so every candidate that cannot be downloaded (no name, no or a
+refused `downloadUrl`, a name that would collide) is reported by position even when an
+earlier file settles the check.
 An operation that is not finished is `unchecked`, with a notice. `--check` changes no exit
 code by itself.
 

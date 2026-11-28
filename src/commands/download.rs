@@ -394,9 +394,6 @@ struct Ids {
     action: String,
 }
 
-/// The files that can be downloaded, with their local names; a reason for
-/// each that cannot. Names are made across every file of the operation,
-/// so `--file` gives a file the same local name a full download does.
 /// Why each file of `files` that `keep` allows could not be downloaded,
 /// without fetching anything: the reasons `fetch` would give, by
 /// position.
@@ -411,6 +408,9 @@ pub fn listing_reasons(
     reasons
 }
 
+/// The files that can be downloaded, with their local names; a reason for
+/// each that cannot. Names are made across every file of the operation,
+/// so `--file` gives a file the same local name a full download does.
 fn downloadable(
     rule: &download::DownloadRule,
     redactor: &crate::redact::Redactor,

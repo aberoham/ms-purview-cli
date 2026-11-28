@@ -739,6 +739,34 @@ mod tests {
         let len = handle.metadata().unwrap().len();
         assert_eq!(zip_end(&mut handle, len).unwrap(), (1, original));
         ZipReader::open(file.path(), limits()).unwrap();
+        crate::download::check_zip(file.path()).unwrap();
+    }
+
+    #[test]
+    fn a_zip64_record_overlapping_its_locator_is_hostile() {
+        // A ZIP64 record that starts 55 bytes before its locator, so its
+        // 56 bytes would run into it.
+        let file = zip_with(&[("Locations-a.csv", b"1")], zip::CompressionMethod::Stored);
+        let bytes = std::fs::read(file.path()).unwrap();
+        let (body, end) = bytes.split_at(bytes.len() - 22);
+        let mut end = end.to_vec();
+        end[10..12].copy_from_slice(&0xFFFF_u16.to_le_bytes());
+        let mut out = body.to_vec();
+        let record_at = out.len() as u64;
+        out.extend_from_slice(b"PK\x06\x06");
+        out.extend_from_slice(&[0; 51]);
+        out.extend_from_slice(b"PK\x06\x07");
+        out.extend_from_slice(&0_u32.to_le_bytes());
+        out.extend_from_slice(&record_at.to_le_bytes());
+        out.extend_from_slice(&1_u32.to_le_bytes());
+        out.extend_from_slice(&end);
+        std::fs::write(file.path(), &out).unwrap();
+        let mut handle = File::open(file.path()).unwrap();
+        let len = handle.metadata().unwrap().len();
+        assert_eq!(
+            zip_end(&mut handle, len).unwrap_err().metadata().0,
+            "HostileZip"
+        );
     }
 
     #[test]

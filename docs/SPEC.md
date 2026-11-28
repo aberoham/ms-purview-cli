@@ -613,8 +613,8 @@ Settled in PR 4.1:
 - The entry count checked before the `zip` crate indexes a directory is a defence against an
   oversized directory, not a guarantee: a zip crafted with forged end records, or with bytes
   before it, can present a smaller count than the crate then reads, as on `main`. The count
-  check after indexing still applies. Zips come only from the Purview download host, so this
-  is left as it is.
+  check after indexing still applies. Downloaded zips come only from the Purview download
+  host, and the zips `parse` reads are ones the user chose, so this is left as it is.
 - `result` has the keys of `report`. A stopped export resumes with `operation get <case> <op>
   --wait --check` after `--no-wait`, the wait deadline or Ctrl-C during the wait, and with
   `operation get <case> <op> --check` after Ctrl-C during the download. Either fetches only

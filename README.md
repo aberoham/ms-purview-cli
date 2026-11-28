@@ -88,6 +88,7 @@ Existing tools leave gaps across the eDiscovery workflow (recorded in [docs/SPEC
 - `purview estimate <case> <search>`: run a search's estimate after checking that it covers every tenant mailbox with no sources and that its query passes the guard, wait for it, download its report zip and report `collection` (`complete`, `incomplete` or `unchecked`) with the failed locations; `--strict` exits 4 when a location failed.
 - The write commands show a plan and send one POST only when approved by `--yes` or at an `Apply? [y/N]` prompt; `--dry-run` sends nothing, and `--no-write` refuses them before sign-in.
 - `purview report <case> <search>`: run a search's item report after the same checks and a size limit against its latest estimate, then download the zip and report `collection`.
+- `purview export read <items.zip>`: read each message in an export's items zip on this computer (sender, recipients, subject, dates, attachment names and sizes, and the body, HTML first) as JSON Lines into a file; it refuses to write bodies to a terminal.
 - `purview export create <case> <search>`: run a search's export as `.msg` files after the same checks and size limit, download every part into the data directory, and report `collection` from the report part; item content is never printed.
 - `purview operation get --check`, and `purview parse locations`, `parse failures` and `parse summary` on a downloaded estimate or report zip, with no sign-in.
 
@@ -96,7 +97,7 @@ Existing tools leave gaps across the eDiscovery workflow (recorded in [docs/SPEC
 - **v0.2:** `case close`, if its live checks complete.
 - **v0.3:** item report parsing (`parse items`, `parse profile`).
 - **v0.4:** `export index`.
-- **v0.5:** reading message bodies from export zips (`export read`).
+- **v0.5:** the rest of `export read` (the join to the report, quoted-reply cutting and thread de-duplication).
 - **v0.6:** read-only inventory of old cases and holds.
 
 ## Safety

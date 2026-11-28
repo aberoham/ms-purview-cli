@@ -24,7 +24,7 @@ import re
 import sys
 import zipfile
 from collections import Counter
-from datetime import timezone
+from datetime import UTC
 
 import extract_msg
 
@@ -73,7 +73,7 @@ def main(argv):
                 counts["extract-msg could not read"] += 1
                 continue
             try:
-                sent = message.date.astimezone(timezone.utc) if message.date else None
+                sent = message.date.astimezone(UTC) if message.date else None
                 theirs = {
                     # extract-msg keeps a trailing NUL that the format pads with.
                     "subject": (message.subject or "").rstrip("\0"),

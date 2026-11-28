@@ -12,7 +12,8 @@ implements one item of its section 11 and nothing from later items. Today
 the binary has `purview version`, `purview auth login` (device code, or
 `--browser`), `auth refresh`, `auth status`, `auth list` and `auth logout`,
 `case list`, `case get`, `case create`, `search list`, `search get`,
-`search create`, `estimate`, `report`, `export create`, `operation list` and
+`search create`, `estimate`, `report`, `export create`, `export read`,
+`operation list` and
 `operation get` (with
 `--wait` and `--check`), `download`, `parse locations`, `parse failures`,
 `parse summary`, `kql`, and the global options `--verbose`, `--timeout`,
@@ -147,6 +148,18 @@ run with `python3`.
   `commands/parse.rs` is `parse locations|failures|
   summary`, local. `operation get --check` downloads the evidence file and
   sets `collection`.
+- `src/msg/` reads `.msg` items from memory, with no I/O: `cfbread.rs` is
+  the Compound File Binary container through `cfb`, `props.rs` the MAPI
+  properties of MS-OXMSG (`__substg1.0_<id><type>` streams and the fixed
+  `__properties_version1.0`, whose header is 32 bytes for the message and
+  8 for a recipient or attachment), and `body.rs` the body selection of
+  `docs/SPEC.md` section 4.11 (`PidTagHtml` decoded with
+  `PidTagInternetCodepage`, cleaned and converted with `html2text`, then
+  `PidTagBody`, then `noBody`). `msg::parse_msg` is the entry point.
+  `src/export/read.rs` is `export read`: local, a terminal stdout refused,
+  each `.msg` of each items zip read in memory through `ZipReader` and
+  written as one JSON Lines record (or one `--json` document), exit 4 when
+  any item has an error.
 - `src/zipread.rs` opens report zips under `ZipLimits` (entries, bytes per
   entry and in total, and a 1,000:1 ratio checked past 1 MiB, all counted
   on bytes read), refusing a name that fails `enclosed_name()` as
@@ -344,7 +357,8 @@ timeout. It carries the Graph base URL (`origin::GRAPH_BASE` in production,
   section 8.5); `tests/actions.rs` runs `estimate` and `operation get
   --check` against the mock Graph and a mock download origin (flows 3, 4
   and 5); `tests/reports.rs` runs `report` the same way, and
-  `tests/exports.rs` `export create`;
+  `tests/exports.rs` `export create`; `tests/msgs.rs` runs the `.msg`
+  reader and `export read` on items made by `tests/support/msggen.rs`;
   `tests/write_allow_list.rs` scans `src/` and `build.rs` for HTTP write
   methods, and allows a POST to be built only in `send_write` and the
   identity client; `tests/fixture_lint.rs` is the public-data lint.
@@ -559,6 +573,10 @@ cases as arguments to run only those. `TEST_SCRIPT=<path>` runs the cases
 against a copy of the script, which is how to check that a test fails when
 the behaviour it covers is removed without editing the tracked file. For changes to the signing
 helper, run `python3 .github/scripts/test_macos_signing.py`.
+For changes to `src/msg/` or `export read`, run the cross-check against
+`extract-msg` on an export you may read: `uv run
+tests/scripts/msg-crosscheck.py <items.zip> <export-read.jsonl>`. It
+prints counts only, never a value.
 
 A passing suite does not show that the tenant behaves this way. Report live
 checks separately, and update `docs/api-notes.md` with what they observed.

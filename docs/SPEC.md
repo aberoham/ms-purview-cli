@@ -788,6 +788,33 @@ a record with `error` set.
 The command refuses to run when stdout is a terminal, unless `--to-terminal` is given:
 bodies are colleagues' and outsiders' mail. Section 9 explains where the output should go.
 
+Settled in the first `.msg` reader PR (PR 5.1 with the body selection of PR 5.2):
+- The smallest form: `export read <items.zip>...` with `--max-entry-bytes`,
+  `--max-body-chars` and `--json`, local, with no sign-in and no configuration read. There
+  is no `--to-terminal`: a terminal stdout is always refused. The CSV join (`--report`,
+  `joined`, and `class`, `date`, `workload` and `conversationName` from the report), the
+  admission window and reorder buffer, `--jobs`, `--cut-quoted`, `--thread-dedup`,
+  `--body`, `--headers`, the filters and `--force-buffer` wait for later PRs; `--json` is
+  refused above 10,000 items.
+- A record has `entry`, `part`, `class`, `subject`, `conversationTopic`,
+  `internetMessageId`, `from`, `to`, `cc`, `bcc` (each `{"name", "address"}`), `sent`,
+  `received`, `attachments` (`{"name", "size"}`), `body`, `bodySource`, `bodyTruncated`,
+  `error` and `errorDetail`; `class` is the `.msg`'s own. An entry that is not a `.msg` is
+  skipped and counted. An entry over `--max-entry-bytes` is `entryTooLarge`; one the zip
+  cannot give is `entryUnreadable`.
+- `PidTagAttachSize` is absent from exported attachments (Observed), so an attachment's
+  size is the length of its data stream, `__substg1.0_37010102`, read from the container's
+  directory.
+- A sender with no SMTP address keeps its Exchange address (Observed: two of 31 items).
+- A rule drawn across the width (`<hr>`, a table border) becomes `---`.
+- JSON Lines are prepared as every JSON document is: URLs redacted, `--wrap-untrusted` with
+  one marker for the run and the notice on stderr, secrets redacted as values.
+- `cfb` 0.16.0 (released 2026-10-31) and `html2text` 0.17.4 (released 2026-10-18).
+- The cross-check is `tests/scripts/msg-crosscheck.py`, run by hand. On the maintainer's
+  one private export of 31 items it agreed with `extract-msg` 0.55.0 on subject, sent time,
+  body and recipients for every item, and on sender for the 29 with an SMTP sender
+  (Observed). The `msg-crosscheck` CI job waits for PR 5.3.
+
 #### `purview inventory cases` (read; phase 6)
 
 Flags: `--older-than DUR`, `--status S`, `--holds-only`, `--concurrency N` (default 4,

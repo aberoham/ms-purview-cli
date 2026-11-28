@@ -1,11 +1,14 @@
-//! `purview report <case> <search>` (`docs/SPEC.md` section 3.5).
+//! `purview report <case> <search>` and `purview export create <case>
+//! <search>` (`docs/SPEC.md` section 3.5).
 //!
 //! Preflight is the action preflight of section 6.4, the concurrency check
 //! of section 6.7 and the size limit of section 6.9, against the search's
-//! latest estimate. After approval, one `POST …/exportReport`; then, unless
-//! `--no-wait`, the operation is polled to its end, and, unless
-//! `--no-download`, its report zip is downloaded and its `Locations` file
-//! read for the collection check.
+//! latest estimate. After approval, one `POST …/exportReport` or
+//! `…/exportResult`; then, unless `--no-wait`, the operation is polled to
+//! its end, and, unless `--no-download`, its files are downloaded and the
+//! report's `Locations` file read for the collection check. An export's
+//! report is its `Reports-…zip` part; its `Items.*.zip` parts are item
+//! content, downloaded and never read here.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -23,7 +26,8 @@ use crate::error::{PurviewError, Result};
 use crate::graph::{GraphClient, WriteResponse};
 use crate::kql::GuardConfig;
 use crate::model::requests::{
-    ExportReportRequest, ResponsiveLocations, SearchHits, TeamsConversations,
+    ExportOptions, ExportReportRequest, ExportResultRequest, MsgFormat, ResponsiveLocations,
+    SearchHits, TeamsConversations,
 };
 use crate::model::valid::{CaseKey, SearchKey, SearchRef};
 use crate::model::wire::{Action, OperationRecord, OperationStatus, Source};
@@ -48,9 +52,38 @@ const RESOLVE_AT_MOST: usize = 10;
 /// (`docs/SPEC.md` section 6.6; Observed, one tenant).
 const ROWS_PER_ITEM: (u64, u64) = (10, 37);
 
-/// The flags of `report`, checked.
+/// What the command collects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Collect {
+    /// `report`: an item report, metadata only.
+    Report,
+    /// `export create`: the items as `.msg` files, with the item report.
+    Export,
+}
+
+impl Collect {
+    /// The command, for the plan and messages.
+    fn command(self) -> &'static str {
+        match self {
+            Self::Report => "report",
+            Self::Export => "export create",
+        }
+    }
+
+    /// `report` or `export`: the `{action}` of `naming.export_name`, and
+    /// the label in progress lines.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Report => "report",
+            Self::Export => "export",
+        }
+    }
+}
+
+/// The flags of `report` and `export create`, checked.
 #[derive(Debug, Clone)]
 pub struct ReportFlags {
+    pub collect: Collect,
     pub case: CaseKey,
     pub search: SearchKey,
     /// `--name`, else `naming.export_name`.
@@ -443,6 +476,34 @@ fn row_warning(basis: &Basis, teams_context: bool) -> String {
     )
 }
 
+/// The warnings of an export's plan (`docs/SPEC.md` section 3.5): the
+/// estimate undercounts, and the download is large and holds content.
+fn export_warnings(basis: &Basis) -> Vec<String> {
+    let counted = match basis {
+        Basis::Sized {
+            items: Some(items),
+            size,
+            ..
+        } => format!(
+            "; the latest estimate counted {} items ({})",
+            grouped(*items),
+            size_text(*size)
+        ),
+        Basis::Sized { size, .. } => format!("; the latest estimate found {}", size_text(*size)),
+        Basis::Unknown { .. } => String::new(),
+    };
+    vec![
+        format!(
+            "an export can hold several times the items the estimate counts: one export with \
+             Teams context on held about four times the estimated count{counted}"
+        ),
+        "the download is large, on the order of a few hundred kilobytes per item in one run, \
+         and holds message bodies and attachments: keep it in the data directory and remove it \
+         when the work is done"
+            .into(),
+    ]
+}
+
 fn concurrent_message(case: CaseId, active: &[Active]) -> String {
     format!(
         "case {case} has {} item report{} or export{} not yet finished that may be a duplicate \
@@ -485,7 +546,10 @@ impl WriteCommand for Report {
 
     async fn plan(&mut self, preflight: &mut Preflight<'_>) -> Result<Planned> {
         let (Some(guard), Some(naming)) = (self.guard.clone(), self.naming.clone()) else {
-            return Err(PurviewError::message("report ran without its settings"));
+            return Err(PurviewError::message(format!(
+                "{} ran without its settings",
+                self.flags.collect.command()
+            )));
         };
         let generic_reason = self
             .flags
@@ -522,7 +586,7 @@ impl WriteCommand for Report {
                     requester: None,
                     user: &preflight.account.email,
                     query: Some(&query),
-                    action: Some("report"),
+                    action: Some(self.flags.collect.label()),
                     now: Some(preflight.clock.now()),
                 },
             )?,
@@ -542,13 +606,22 @@ impl WriteCommand for Report {
             ));
         }
         warnings.extend(size_warning);
-        warnings.push(row_warning(&basis, teams_context));
+        let collect = self.flags.collect;
+        match collect {
+            Collect::Report => warnings.push(row_warning(&basis, teams_context)),
+            Collect::Export => warnings.extend(export_warnings(&basis)),
+        }
         if !teams_context {
-            warnings.push(
-                "Teams context is off: a report without additionalOptions has not been observed \
-                 (experimental), and Teams hits come without the messages around them"
+            warnings.push(match collect {
+                Collect::Report => "Teams context is off: a report without additionalOptions has \
+                                    not been observed (experimental), and Teams hits come \
+                                    without the messages around them"
                     .into(),
-            );
+                Collect::Export => "Teams context is off: an export with additionalOptions \
+                                    includeReport alone has not been observed (experimental), \
+                                    and Teams hits come without the messages around them"
+                    .into(),
+            });
         }
         for operation in &active {
             warnings.push(format!(
@@ -560,28 +633,35 @@ impl WriteCommand for Report {
         let concurrent = (!active.is_empty() && !self.flags.allow_concurrent)
             .then(|| Blocked::Concurrent(concurrent_message(case, &active)));
         let description = self.description();
-        let body = serde_json::to_value(ExportReportRequest {
-            display_name: &display_name,
-            description: description.as_deref(),
-            export_criteria: SearchHits,
-            export_location: ResponsiveLocations,
-            additional_options: teams_context.then_some(TeamsConversations),
-        })?;
-        self.planned = Some((case, search.id, preflight.clock.now() - CLOCK_SKEW));
-        self.shown = Some(Shown {
-            query: query.clone(),
-            narrowed,
-            basis: basis.clone(),
-            display_name: display_name.clone(),
-            teams_context,
-        });
-        Ok(Planned::Write(WritePlan::new(PlanInput {
-            command: "report",
-            account: preflight.account.email.clone(),
-            tenant: preflight.account.tenant_id.clone(),
-            route: WriteRoute::ExportReport(case, search.id),
-            body,
-            effects: vec![
+        let (body, route) = match collect {
+            Collect::Report => (
+                serde_json::to_value(ExportReportRequest {
+                    display_name: &display_name,
+                    description: description.as_deref(),
+                    export_criteria: SearchHits,
+                    export_location: ResponsiveLocations,
+                    additional_options: teams_context.then_some(TeamsConversations),
+                })?,
+                WriteRoute::ExportReport(case, search.id),
+            ),
+            Collect::Export => (
+                serde_json::to_value(ExportResultRequest {
+                    display_name: &display_name,
+                    description: description.as_deref(),
+                    export_criteria: SearchHits,
+                    export_location: ResponsiveLocations,
+                    additional_options: if teams_context {
+                        ExportOptions::TeamsAndReport
+                    } else {
+                        ExportOptions::ReportOnly
+                    },
+                    export_format: MsgFormat,
+                })?,
+                WriteRoute::ExportResult(case, search.id),
+            ),
+        };
+        let effects = match collect {
+            Collect::Report => vec![
                 format!(
                     "Runs search {} over every mailbox in the tenant, and adds an item report \
                      operation and its report zip to case {case}: one row of metadata (sender, \
@@ -592,6 +672,53 @@ impl WriteCommand for Report {
                  hold."
                     .into(),
             ],
+            Collect::Export => {
+                let mut effects = vec![format!(
+                    "Runs search {} over every mailbox in the tenant, and adds an export \
+                     operation to case {case} that collects a copy of every item found, with \
+                     its message body and attachments, as .msg files, and the item report \
+                     beside them.",
+                    search.id
+                )];
+                if self.downloads() {
+                    effects.push(
+                        "Downloads every part of the export into the directory the result \
+                         names: item content of colleagues and outside senders, kept on disk \
+                         until it is removed."
+                            .into(),
+                    );
+                }
+                effects.push("Changes no mailbox and places no hold.".into());
+                effects
+            }
+        };
+        let teams_line = match (collect, teams_context) {
+            (Collect::Report, true) => {
+                "Teams context: on (additionalOptions teamsAndYammerConversations)"
+            }
+            (Collect::Export, true) => {
+                "Teams context: on (additionalOptions teamsAndYammerConversations,includeReport)"
+            }
+            (Collect::Report, false) => "Teams context: off (experimental)",
+            (Collect::Export, false) => {
+                "Teams context: off (additionalOptions includeReport; experimental)"
+            }
+        };
+        self.planned = Some((case, search.id, preflight.clock.now() - CLOCK_SKEW));
+        self.shown = Some(Shown {
+            query: query.clone(),
+            narrowed,
+            basis: basis.clone(),
+            display_name: display_name.clone(),
+            teams_context,
+        });
+        Ok(Planned::Write(WritePlan::new(PlanInput {
+            command: collect.command(),
+            account: preflight.account.email.clone(),
+            tenant: preflight.account.tenant_id.clone(),
+            route,
+            body,
+            effects,
             warnings,
             preflight: vec![
                 Value::String(format!(
@@ -611,11 +738,7 @@ impl WriteCommand for Report {
                     "guard: the query is not narrowed; overridden with --allow-generic".into()
                 }),
                 Value::String(size_line),
-                Value::String(if teams_context {
-                    "Teams context: on (additionalOptions teamsAndYammerConversations)".into()
-                } else {
-                    "Teams context: off (experimental)".into()
-                }),
+                Value::String(teams_line.into()),
                 Value::String(if active.is_empty() {
                     "item reports or exports not yet finished in the case: none".into()
                 } else {
@@ -636,7 +759,10 @@ impl WriteCommand for Report {
         let (Some((case, search, _)), Some(shown), Some(guard)) =
             (self.planned, self.shown.clone(), self.guard.clone())
         else {
-            return Err(PurviewError::message("report was approved without a plan"));
+            return Err(PurviewError::message(format!(
+                "{} was approved without a plan",
+                self.flags.collect.command()
+            )));
         };
         let changed = |what: &str| {
             PurviewError::SearchChanged(format!(
@@ -717,15 +843,27 @@ impl WriteCommand for Report {
 
     async fn applied(&mut self, after: &mut After<'_>, response: WriteResponse) -> Result<Applied> {
         let (Some((case, _, _)), Some(shown)) = (self.planned, self.shown.clone()) else {
-            return Err(PurviewError::message("report was applied without a plan"));
+            return Err(PurviewError::message(format!(
+                "{} was applied without a plan",
+                self.flags.collect.command()
+            )));
         };
+        let collect = self.flags.collect;
         let run = ActionRun {
-            label: "report",
-            noun: "an item report",
-            action: "exportReport",
+            label: collect.label(),
+            noun: match collect {
+                Collect::Report => "an item report",
+                Collect::Export => "an export",
+            },
+            action: match collect {
+                Collect::Report => "exportReport",
+                Collect::Export => "exportResult",
+            },
             evidence_of: EvidenceOf::Report,
-            list_hint: "--action report --resolve",
-            check_only: true,
+            list_hint: match collect {
+                Collect::Report => "--action report --resolve",
+                Collect::Export => "--action export --resolve",
+            },
             no_wait: self.flags.no_wait,
             no_download: self.flags.no_download,
             timing: self.flags.timing,
@@ -831,7 +969,8 @@ impl WriteCommand for Report {
             notes.push(format!(
                 "No item report or export started since the request was listed; Purview may not \
                  list a new operation at once, so run 'purview operation list {case} --action \
-                 report --resolve' again before running the command again"
+                 {} --resolve' again before running the command again",
+                self.flags.collect.label()
             ));
         }
         if unresolved > 0 {

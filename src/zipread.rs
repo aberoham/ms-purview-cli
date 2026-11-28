@@ -32,6 +32,11 @@ pub const MAX_RATIO: u64 = 1_000;
 /// The ratio is checked only once an entry has given this many bytes, so
 /// that a small, very repetitive file is not refused.
 pub const RATIO_FLOOR: u64 = 1 << 20;
+/// Bytes a zip may carry after its end record and comment. An export's
+/// items part had 296 such bytes, most of them zero (Observed, one
+/// export); the zip is read as ending at its end record, and the bytes
+/// after it are never read.
+pub const MAX_TRAILING_BYTES: usize = 4096;
 
 /// The limits a zip is read under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,7 +89,7 @@ pub fn config_limit<'a>(
 
 /// An open zip whose entry names have been checked.
 pub struct ZipReader {
-    archive: zip::ZipArchive<File>,
+    archive: zip::ZipArchive<Bounded>,
     names: Vec<String>,
     limits: ZipLimits,
     total: Rc<Cell<u64>>,
@@ -101,14 +106,15 @@ impl ZipReader {
         let file_len = file.metadata()?.len();
         // The count the central directory declares, read before the zip
         // crate indexes it, so that a huge directory is refused unread.
-        let declared = declared_entries(&mut file, file_len)?;
+        let (declared, end) = zip_end(&mut file, file_len)?;
+        let file_len = end;
         if declared > limits.entries as u64 {
             return Err(PurviewError::HostileZip(format!(
                 "the zip has {declared} entries, more than the {} allowed",
                 limits.entries
             )));
         }
-        let mut archive = zip::ZipArchive::new(file).map_err(|_| {
+        let mut archive = zip::ZipArchive::new(Bounded::new(file, end)).map_err(|_| {
             PurviewError::HostileZip("the file is not a zip archive that can be read".into())
         })?;
         // The index keeps one entry per name, so fewer entries than
@@ -198,13 +204,22 @@ impl ZipReader {
     }
 }
 
-/// The number of entries the zip's end of central directory record
-/// declares, or its ZIP64 record when one is there. A record counts only
-/// when its comment length reaches the end of the file exactly; when a
-/// comment holds something that also looks like one, every such record is
-/// read and the largest count is the answer, so neither can hide a large
-/// directory. A file with no such record is not a zip.
+/// The number of entries the zip declares; see `zip_end`.
+#[cfg(test)]
 pub(crate) fn declared_entries(file: &mut File, len: u64) -> Result<u64> {
+    zip_end(file, len).map(|(declared, _)| declared)
+}
+
+/// The number of entries the zip's end of central directory record
+/// declares, or its ZIP64 record when one is there, and the offset where
+/// the zip ends. The zip ends after the comment that ends last among the
+/// end records whose comments end at the end of the file or at most
+/// `MAX_TRAILING_BYTES` before it. Every record that ends exactly there
+/// counts, as when a comment holds something that also looks like one, and
+/// the largest count is the answer, so none can hide a large directory. A
+/// ZIP64 end record must lie before its locator, never in the bytes after
+/// the zip. A file with no such record is not a zip.
+pub(crate) fn zip_end(file: &mut File, len: u64) -> Result<(u64, u64)> {
     use std::io::{Seek, SeekFrom};
     let not_zip =
         || PurviewError::HostileZip("the file is not a zip archive that can be read".into());
@@ -212,22 +227,36 @@ pub(crate) fn declared_entries(file: &mut File, len: u64) -> Result<u64> {
         file.seek(SeekFrom::Start(at)).map_err(|_| not_zip())?;
         file.read_exact(buffer).map_err(|_| not_zip())
     };
-    // The record is 22 bytes, followed by a comment of at most 65,535.
-    let tail_len = len.min(22 + 65_535);
+    // The record is 22 bytes, followed by a comment of at most 65,535 and
+    // then at most MAX_TRAILING_BYTES.
+    let tail_len = len.min((22 + 65_535 + MAX_TRAILING_BYTES) as u64);
     let tail_start = len - tail_len;
     let mut tail = vec![0_u8; tail_len as usize];
     read_at(file, tail_start, &mut tail)?;
-    let records: Vec<usize> = (0..tail.len().saturating_sub(21))
+    let record_end =
+        |at: usize| at + 22 + usize::from(u16::from_le_bytes([tail[at + 20], tail[at + 21]]));
+    // Every record whose comment ends at the end of the file, or at most
+    // MAX_TRAILING_BYTES before it, counts, and the largest count is the
+    // answer: no record, padded or not, can hide a larger directory.
+    let fitting: Vec<usize> = (0..tail.len().saturating_sub(21))
+        .filter(|at| tail[*at..].starts_with(b"PK\x05\x06"))
         .filter(|at| {
-            let at = *at;
-            tail[at..].starts_with(b"PK\x05\x06")
-                && at + 22 + usize::from(u16::from_le_bytes([tail[at + 20], tail[at + 21]]))
-                    == tail.len()
+            let ends = record_end(*at);
+            ends <= tail.len() && tail.len() - ends <= MAX_TRAILING_BYTES
         })
         .collect();
-    if records.is_empty() {
+    // The zip ends after the comment that ends last: at the end of the
+    // file when a record reaches it. Only the records that end exactly
+    // there count, so an end record of a zip stored inside this one, which
+    // ends before this zip's own directory, is not taken for this zip's.
+    let Some(end) = fitting.iter().map(|at| record_end(*at)).max() else {
         return Err(not_zip());
-    }
+    };
+    let records: Vec<usize> = fitting
+        .into_iter()
+        .filter(|at| record_end(*at) == end)
+        .collect();
+    let end = tail_start + end as u64;
     let mut declared = 0;
     for at in records {
         let classic = u64::from(u16::from_le_bytes([tail[at + 10], tail[at + 11]]));
@@ -241,6 +270,14 @@ pub(crate) fn declared_entries(file: &mut File, len: u64) -> Result<u64> {
                 if locator.starts_with(b"PK\x06\x07") {
                     let record_at =
                         u64::from_le_bytes(locator[8..16].try_into().map_err(|_| not_zip())?);
+                    // The ZIP64 end record is at least 56 bytes and comes
+                    // before its locator, never in the bytes after the zip.
+                    if record_at
+                        .checked_add(56)
+                        .is_none_or(|ends| ends > locator_at)
+                    {
+                        return Err(not_zip());
+                    }
                     let mut record = [0_u8; 40];
                     read_at(file, record_at, &mut record)?;
                     if !record.starts_with(b"PK\x06\x06") {
@@ -264,7 +301,51 @@ pub(crate) fn declared_entries(file: &mut File, len: u64) -> Result<u64> {
         declared = declared.max(count);
     }
     file.seek(SeekFrom::Start(0)).map_err(|_| not_zip())?;
-    Ok(declared)
+    Ok((declared, end))
+}
+
+/// A file read as if it ended at `end`: the zip crate never sees the
+/// bytes after a zip's end record.
+pub(crate) struct Bounded {
+    inner: File,
+    end: u64,
+}
+
+impl Bounded {
+    pub(crate) fn new(inner: File, end: u64) -> Self {
+        Self { inner, end }
+    }
+}
+
+impl Read for Bounded {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        use std::io::Seek;
+        let at = self.inner.stream_position()?;
+        let left = self.end.saturating_sub(at);
+        let most = buffer
+            .len()
+            .min(usize::try_from(left).unwrap_or(usize::MAX));
+        if most == 0 {
+            return Ok(0);
+        }
+        self.inner.read(&mut buffer[..most])
+    }
+}
+
+impl io::Seek for Bounded {
+    fn seek(&mut self, position: io::SeekFrom) -> io::Result<u64> {
+        let position = match position {
+            io::SeekFrom::End(offset) => {
+                let target = i128::from(self.end) + i128::from(offset);
+                let target = u64::try_from(target).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "seek before the start")
+                })?;
+                io::SeekFrom::Start(target)
+            }
+            other => other,
+        };
+        self.inner.seek(position)
+    }
 }
 
 /// A reader that counts the bytes it gives and fails past the limits.
@@ -541,6 +622,193 @@ mod tests {
         let mut handle = File::open(file.path()).unwrap();
         let len = handle.metadata().unwrap().len();
         assert_eq!(declared_entries(&mut handle, len).unwrap(), 1);
+    }
+
+    /// `body` with `trailing` bytes after it: a few zeros, some others.
+    fn with_trailing(path: &Path, trailing: usize) {
+        let mut bytes = std::fs::read(path).unwrap();
+        bytes.extend((0..trailing).map(|index| if index % 5 == 0 { b'x' } else { 0 }));
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn bytes_after_the_end_record_are_left_out_and_the_zip_is_read() {
+        let file = zip_with(
+            &[("Locations-a.csv", b"hello")],
+            zip::CompressionMethod::Deflated,
+        );
+        let original = std::fs::metadata(file.path()).unwrap().len();
+        with_trailing(file.path(), 296);
+        let mut handle = File::open(file.path()).unwrap();
+        let len = handle.metadata().unwrap().len();
+        assert_eq!(zip_end(&mut handle, len).unwrap(), (1, original));
+        let mut reader = ZipReader::open(file.path(), limits()).unwrap();
+        let index = reader.find("Locations-").unwrap();
+        let text = reader
+            .read_entry(index, |entry| {
+                let mut text = String::new();
+                entry.read_to_string(&mut text)?;
+                Ok(text)
+            })
+            .unwrap();
+        assert_eq!(text, "hello");
+        crate::download::check_zip(file.path()).unwrap();
+    }
+
+    #[test]
+    fn more_bytes_after_the_end_record_than_allowed_is_not_a_zip() {
+        let file = zip_with(&[("Locations-a.csv", b"1")], zip::CompressionMethod::Stored);
+        with_trailing(file.path(), MAX_TRAILING_BYTES + 1);
+        assert_eq!(
+            ZipReader::open(file.path(), limits())
+                .err()
+                .unwrap()
+                .metadata()
+                .0,
+            "HostileZip"
+        );
+        assert!(crate::download::check_zip(file.path()).is_err());
+    }
+
+    #[test]
+    fn a_padded_forged_record_cannot_lower_the_count() {
+        // The real record, earlier, declares 5 entries; a forged one in
+        // its comment, ending at the same place, declares 1; one byte
+        // follows. The larger count is the one that counts.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut writer = zip::ZipWriter::new(file.reopen().unwrap());
+        for index in 0..5 {
+            writer
+                .start_file(
+                    format!("Locations-{index}.csv"),
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .unwrap();
+            writer.write_all(b"1").unwrap();
+        }
+        let mut forged = b"PK\x05\x06".to_vec();
+        forged.extend_from_slice(&[0; 6]);
+        forged.extend_from_slice(&1_u16.to_le_bytes());
+        forged.extend_from_slice(&[0; 10]);
+        writer.set_raw_comment(forged.into_boxed_slice()).unwrap();
+        writer.finish().unwrap();
+        with_trailing(file.path(), 1);
+        let mut handle = File::open(file.path()).unwrap();
+        let len = handle.metadata().unwrap().len();
+        assert_eq!(declared_entries(&mut handle, len).unwrap(), 5);
+    }
+
+    #[test]
+    fn a_zip_stored_inside_near_the_end_is_not_taken_for_this_one() {
+        // An inner zip of three entries, stored as the last entry of an
+        // outer zip of two: the inner end record ends before the outer
+        // directory and is not counted.
+        let inner = zip_with(
+            &[("a.txt", b"a"), ("b.txt", b"b"), ("c.txt", b"c")],
+            zip::CompressionMethod::Stored,
+        );
+        let inner = std::fs::read(inner.path()).unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut writer = zip::ZipWriter::new(file.reopen().unwrap());
+        let stored = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        writer.start_file("Locations-a.csv", stored).unwrap();
+        writer.write_all(b"1").unwrap();
+        writer.start_file("attachment.zip", stored).unwrap();
+        writer.write_all(&inner).unwrap();
+        writer.finish().unwrap();
+        let reader = ZipReader::open(file.path(), limits()).unwrap();
+        assert_eq!(reader.names().len(), 2);
+    }
+
+    #[test]
+    fn a_longest_comment_and_trailing_bytes_are_read() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut writer = zip::ZipWriter::new(file.reopen().unwrap());
+        writer
+            .start_file("Locations-a.csv", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"1").unwrap();
+        writer
+            .set_raw_comment(vec![b'c'; 65_535].into_boxed_slice())
+            .unwrap();
+        writer.finish().unwrap();
+        let original = std::fs::metadata(file.path()).unwrap().len();
+        with_trailing(file.path(), MAX_TRAILING_BYTES);
+        let mut handle = File::open(file.path()).unwrap();
+        let len = handle.metadata().unwrap().len();
+        assert_eq!(zip_end(&mut handle, len).unwrap(), (1, original));
+        ZipReader::open(file.path(), limits()).unwrap();
+        crate::download::check_zip(file.path()).unwrap();
+    }
+
+    #[test]
+    fn a_zip64_record_overlapping_its_locator_is_hostile() {
+        // A ZIP64 record that starts 55 bytes before its locator, so its
+        // 56 bytes would run into it.
+        let file = zip_with(&[("Locations-a.csv", b"1")], zip::CompressionMethod::Stored);
+        let bytes = std::fs::read(file.path()).unwrap();
+        let (body, end) = bytes.split_at(bytes.len() - 22);
+        let mut end = end.to_vec();
+        end[10..12].copy_from_slice(&0xFFFF_u16.to_le_bytes());
+        let mut out = body.to_vec();
+        let record_at = out.len() as u64;
+        out.extend_from_slice(b"PK\x06\x06");
+        out.extend_from_slice(&[0; 51]);
+        out.extend_from_slice(b"PK\x06\x07");
+        out.extend_from_slice(&0_u32.to_le_bytes());
+        out.extend_from_slice(&record_at.to_le_bytes());
+        out.extend_from_slice(&1_u32.to_le_bytes());
+        out.extend_from_slice(&end);
+        std::fs::write(file.path(), &out).unwrap();
+        let mut handle = File::open(file.path()).unwrap();
+        let len = handle.metadata().unwrap().len();
+        assert_eq!(
+            zip_end(&mut handle, len).unwrap_err().metadata().0,
+            "HostileZip"
+        );
+    }
+
+    #[test]
+    fn a_zip64_locator_pointing_after_itself_is_hostile() {
+        let file = zip_with(&[("Locations-a.csv", b"1")], zip::CompressionMethod::Stored);
+        let bytes = std::fs::read(file.path()).unwrap();
+        let (body, end) = bytes.split_at(bytes.len() - 22);
+        let mut out = body.to_vec();
+        let locator_at = out.len() as u64;
+        out.extend_from_slice(b"PK\x06\x07");
+        out.extend_from_slice(&0_u32.to_le_bytes());
+        // Names a record in the bytes after the zip.
+        out.extend_from_slice(&(locator_at + 20 + 22 + 8).to_le_bytes());
+        out.extend_from_slice(&1_u32.to_le_bytes());
+        out.extend_from_slice(end);
+        out.extend_from_slice(&[0; 8]);
+        out.extend_from_slice(b"PK\x06\x06");
+        out.extend_from_slice(&[0; 52]);
+        std::fs::write(file.path(), &out).unwrap();
+        let mut handle = File::open(file.path()).unwrap();
+        let len = handle.metadata().unwrap().len();
+        assert_eq!(
+            zip_end(&mut handle, len).unwrap_err().metadata().0,
+            "HostileZip"
+        );
+    }
+
+    #[test]
+    fn bounded_reads_and_seeks_as_if_the_file_ended_there() {
+        use std::io::{Seek, SeekFrom};
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"0123456789").unwrap();
+        let mut bounded = Bounded::new(File::open(file.path()).unwrap(), 6);
+        assert_eq!(bounded.seek(SeekFrom::End(-2)).unwrap(), 4);
+        let mut text = Vec::new();
+        bounded.read_to_end(&mut text).unwrap();
+        assert_eq!(text, b"45");
+        assert_eq!(bounded.seek(SeekFrom::Start(3)).unwrap(), 3);
+        let mut buffer = [0_u8; 8];
+        assert_eq!(bounded.read(&mut buffer).unwrap(), 3);
+        assert_eq!(&buffer[..3], b"345");
+        assert!(bounded.seek(SeekFrom::End(-7)).is_err());
     }
 
     #[test]

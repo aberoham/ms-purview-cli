@@ -603,10 +603,14 @@ async fn no_wait_submits_and_prints_the_commands_that_carry_on() {
     let result = &run.json()["results"]["result"];
     assert_eq!(result["operationId"], OP);
     assert_eq!(result["collection"], "unchecked");
-    assert!(result["resume"][0]
+    // The operation the header named is not checked yet, so the resume
+    // fetches only the evidence file, never every file with `download`.
+    let resume = result["resume"].as_array().unwrap();
+    assert_eq!(resume.len(), 1, "{resume:?}");
+    assert!(resume[0]
         .as_str()
         .unwrap()
-        .ends_with(&format!("operation get {CASE} {OP} --wait")));
+        .ends_with(&format!("operation get {CASE} {OP} --wait --check")));
     assert!(setup
         .graph_requests()
         .await
@@ -697,10 +701,12 @@ async fn the_wait_deadline_exits_5_with_the_commands_that_resume() {
     let document = run.json();
     assert_eq!(document["error"]["code"], "WaitTimeout");
     assert_eq!(document["operationId"], OP);
-    assert!(document["resume"][1]
+    let resume = document["resume"].as_array().unwrap();
+    assert_eq!(resume.len(), 1, "{resume:?}");
+    assert!(resume[0]
         .as_str()
         .unwrap()
-        .ends_with(&format!("download {CASE} {OP}")));
+        .ends_with(&format!("operation get {CASE} {OP} --wait --check")));
     assert!(setup.downloads().await.is_empty());
 }
 

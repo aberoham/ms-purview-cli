@@ -16,7 +16,7 @@ use crate::error::{PurviewError, Result};
 use crate::graph::{GraphClient, WriteResponse};
 use crate::kql::{enforce, GuardConfig, Override};
 use crate::model::valid::{CaseKey, SearchKey, SearchRef};
-use crate::model::wire::{OperationDetail, OperationRecord, OperationStatus};
+use crate::model::wire::{Action, OperationDetail, OperationRecord, OperationStatus, Source};
 use crate::output::sanitize;
 use crate::poll::{elapsed_text, PollEnd, Poller, Timing};
 use crate::report::estimate::Collection;
@@ -326,11 +326,6 @@ pub struct ActionRun {
     pub evidence_of: EvidenceOf,
     /// The command that lists the operation, after the case id.
     pub list_hint: &'static str,
-    /// Whether a stopped run resumes with `operation get --check`, which
-    /// fetches only the evidence file, never `download`: the operation the
-    /// `Location` header names is not checked until the wait ends, and an
-    /// export's other files are item content.
-    pub check_only: bool,
     pub no_wait: bool,
     pub no_download: bool,
     pub timing: Timing,
@@ -365,14 +360,13 @@ pub struct Finished {
 }
 
 impl ActionRun {
-    /// How a stopped run resumes; `waiting` while the operation may still
-    /// run.
+    /// How a stopped run resumes, `waiting` while the operation may still
+    /// run: with `operation get --check`, which fetches only the evidence
+    /// file, never `download`. The operation the `Location` header names is
+    /// not checked until the wait ends, and an export's other files are
+    /// item content.
     fn resume_kind(&self, waiting: bool) -> Resume {
-        if self.check_only {
-            Resume::Check { wait: waiting }
-        } else {
-            Resume::WaitThenDownload
-        }
+        Resume::Check { wait: waiting }
     }
 
     fn hint(&self, case: CaseId) -> String {
@@ -506,6 +500,14 @@ impl ActionRun {
                 out: self.out.clone(),
                 file: None,
                 overwrite: false,
+                // An export collects its parts; an estimate or item report
+                // fetches only what can be its evidence, never an items
+                // part.
+                keep: if self.action == "exportResult" {
+                    super::download::Keep::Every
+                } else {
+                    super::download::Keep::NoItems
+                },
             };
             let fetched = fetch(&mut after.session, case, &record, &request, context).await?;
             // The deadline covers the wait; the download has its own
@@ -524,6 +526,10 @@ impl ActionRun {
                 )?));
             }
             reasons.extend(fetched.reasons);
+            // The detail matches the action, checked above.
+            let evidence_names = evidence_files(&record)
+                .map(|(_, names)| names)
+                .unwrap_or_default();
             let limits = self.limits.unwrap_or_else(|| {
                 ReportLimits::from_config(&Default::default()).expect("the defaults are valid")
             });
@@ -535,7 +541,7 @@ impl ActionRun {
                     "sha256": done.sha256,
                     "status": done.status(),
                 }));
-                if evidence.is_none() {
+                if evidence.is_none() && evidence_names.contains(&done.server_name) {
                     match ReportFiles::read_for(&done.path, limits, self.evidence_of) {
                         Ok(read) if read.has_evidence_for(self.evidence_of) => {
                             evidence = Some(read);
@@ -554,7 +560,11 @@ impl ActionRun {
                 }
             }
             if evidence.is_none() && evidence_note.is_none() {
-                evidence_note = Some("no downloaded file is a report zip".into());
+                evidence_note = Some(if evidence_names.is_empty() {
+                    NO_EVIDENCE_FILE.into()
+                } else {
+                    "no downloaded evidence file is a report zip".into()
+                });
             }
         }
         let collection = evidence.as_ref().map_or(Collection::Unchecked, |files| {
@@ -619,17 +629,61 @@ impl Finished {
     }
 }
 
-/// The commands that carry on from a submitted action, as the signed-in
-/// account.
-pub fn resume(after: &After<'_>, case: CaseId, operation: &OperationId) -> Vec<String> {
-    let account = super::operation::shell_word(&after.session.account.email);
-    vec![
-        format!("purview --account={account} operation get {case} {operation} --wait"),
-        format!("purview --account={account} download {case} {operation}"),
-    ]
+/// Why the collection is unchecked when an operation lists no file that
+/// can hold its evidence.
+pub const NO_EVIDENCE_FILE: &str =
+    "the operation lists no file that can hold its evidence (for an export, a Reports- file)";
+
+/// Whether `name` is an export's items part (`Items.….zip`, Observed),
+/// which holds item content and is never fetched or read as evidence.
+pub fn is_items_part(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with("items.") && lower.ends_with(".zip")
 }
 
-/// The command that carries on from a submitted report, as the signed-in
+/// The one rule for which files of a finished operation may hold the
+/// collection evidence of its own action, used by every action and by
+/// `operation get --check` (`docs/SPEC.md` section 3.5). `None` unless the
+/// operation is an estimate with estimate detail, or an item report or
+/// export with export detail. Otherwise the action's evidence kind and the
+/// server names to try, in Graph's order: for an export, the files named
+/// `Reports-…` (Observed); for an estimate or item report, every file that
+/// is not an items part. No items part is ever a candidate.
+pub fn evidence_files(record: &OperationRecord) -> Option<(EvidenceOf, Vec<String>)> {
+    let action = record.action(Source::Single);
+    let detail = record.detail()?;
+    let evidence_of = match (&action, &detail) {
+        (Action::Estimate, OperationDetail::Estimate(_)) => EvidenceOf::Estimate,
+        (Action::ExportReport | Action::ExportResult, OperationDetail::SearchExport(_)) => {
+            EvidenceOf::Report
+        }
+        _ => return None,
+    };
+    let mut names: Vec<String> = Vec::new();
+    for name in detail
+        .files()
+        .iter()
+        .filter_map(|file| file.file_name.clone())
+    {
+        if name.is_empty() || !evidence_keep(&action).allows(&name) || names.contains(&name) {
+            continue;
+        }
+        names.push(name);
+    }
+    Some((evidence_of, names))
+}
+
+/// The files an action's evidence may come from: an export's `Reports-`
+/// files, else every file but an items part.
+pub fn evidence_keep(action: &Action) -> super::download::Keep {
+    if *action == Action::ExportResult {
+        super::download::Keep::Reports
+    } else {
+        super::download::Keep::NoItems
+    }
+}
+
+/// The command that carries on from a submitted action, as the signed-in
 /// account: the wait, then the collection check, which fetches only the
 /// evidence file whatever the operation turns out to be.
 pub fn resume_check(after: &After<'_>, case: CaseId, operation: &OperationId) -> Vec<String> {

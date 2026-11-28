@@ -19,7 +19,6 @@ use crate::model::wire::{
 use crate::output::{sanitize, write_fields, write_rows, OutputFormat};
 use crate::poll::{elapsed_text, PollEnd, Poller, Timing};
 use crate::report::estimate::Collection;
-use crate::report::EvidenceOf;
 use crate::routes::{CaseId, OperationId, Query, ReadRoute};
 
 /// Operations read at once by `operation list --resolve`.
@@ -435,12 +434,13 @@ async fn check_collection(
     record: &OperationRecord,
     check: Check<'_>,
 ) -> Result<Option<Collection>> {
-    let action = record.action(Source::Single);
-    let evidence_of = match action {
-        Action::Estimate => EvidenceOf::Estimate,
-        Action::ExportReport | Action::ExportResult => EvidenceOf::Report,
-        _ => return Ok(Some(Collection::Unchecked)),
-    };
+    let collects = matches!(
+        record.action(Source::Single),
+        Action::Estimate | Action::ExportReport | Action::ExportResult
+    );
+    if !collects {
+        return Ok(Some(Collection::Unchecked));
+    }
     if !record.status.is_terminal() {
         let _ = writeln!(
             session.env.stderr,
@@ -448,69 +448,85 @@ async fn check_collection(
         );
         return Ok(Some(Collection::Unchecked));
     }
-    // An export's evidence is its report part (Assumption: named
-    // Reports-…); the other actions have only the report.
-    let file = match action {
-        Action::ExportResult => record.detail().and_then(|detail| {
-            detail
-                .files()
-                .iter()
-                .filter_map(|file| file.file_name.clone())
-                .find(|name| name.starts_with("Reports-"))
-        }),
-        _ => None,
-    };
-    if action == Action::ExportResult && file.is_none() {
+    // The same rule as the actions: no items part is ever fetched.
+    let Some((evidence_of, names)) = super::action::evidence_files(record) else {
         let _ = writeln!(
             session.env.stderr,
-            "warning: collection unchecked: the export lists no Reports- file"
+            "warning: collection unchecked: the operation's detail is not that of its action, so \
+             no file was fetched"
+        );
+        return Ok(Some(Collection::Unchecked));
+    };
+    // The whole listing is checked once, as `download` would, so that a
+    // file that cannot be downloaded is reported even when an earlier one
+    // settles the check; nothing is fetched for this.
+    let keep = super::action::evidence_keep(&record.action(Source::Single));
+    let listed = record
+        .detail()
+        .map(|detail| detail.files().to_vec())
+        .unwrap_or_default();
+    for reason in super::download::listing_reasons(
+        check.download.client.rule(),
+        &session.env.redactor,
+        &listed,
+        keep,
+    ) {
+        let _ = writeln!(
+            session.env.stderr,
+            "warning: {}",
+            sanitize(reason["message"].as_str().unwrap_or_default())
+        );
+    }
+    if names.is_empty() {
+        let _ = writeln!(
+            session.env.stderr,
+            "warning: collection unchecked: {}",
+            super::action::NO_EVIDENCE_FILE
         );
         return Ok(Some(Collection::Unchecked));
     }
-    let request = super::download::Request {
-        case: CaseKey::Id(case),
-        operation: operation.clone(),
-        out: None,
-        file,
-        overwrite: false,
-    };
-    let fetched = super::download::fetch(session, case, record, &request, check.download).await?;
-    for reason in &fetched.reasons {
-        if reason["code"] == "FileNotDownloadable" {
-            let _ = writeln!(
-                session.env.stderr,
-                "warning: {}",
-                sanitize(reason["message"].as_str().unwrap_or_default())
-            );
+    // Each candidate in Graph's order, fetched on its own, until one holds
+    // the evidence: a later file that fails cannot hide an earlier result.
+    for name in names {
+        let request = super::download::Request {
+            case: CaseKey::Id(case),
+            operation: operation.clone(),
+            out: None,
+            file: Some(name),
+            overwrite: false,
+            keep,
+        };
+        // Its reasons were reported with the listing above.
+        let fetched =
+            super::download::fetch(session, case, record, &request, check.download).await?;
+        if fetched.interrupted {
+            return Ok(None);
         }
-    }
-    if fetched.interrupted {
-        return Ok(None);
-    }
-    for done in &fetched.done {
-        match crate::report::ReportFiles::read_for(&done.path, check.limits, evidence_of) {
-            Ok(files) if files.has_evidence_for(evidence_of) => {
-                super::parse::warn_missing_columns(&mut session.env.stderr, &files);
-                let _ = writeln!(
-                    session.env.stderr,
-                    "notice: checked {}",
-                    sanitize(&done.path.display().to_string())
-                );
-                return Ok(Some(files.collection(evidence_of)));
-            }
-            Ok(_) => {}
-            Err(error) => {
-                let _ = writeln!(
-                    session.env.stderr,
-                    "warning: a downloaded file could not be read as a report zip ({})",
-                    error.metadata().0
-                );
+        for done in &fetched.done {
+            match crate::report::ReportFiles::read_for(&done.path, check.limits, evidence_of) {
+                Ok(files) if files.has_evidence_for(evidence_of) => {
+                    super::parse::warn_missing_columns(&mut session.env.stderr, &files);
+                    let _ = writeln!(
+                        session.env.stderr,
+                        "notice: checked {}",
+                        sanitize(&done.path.display().to_string())
+                    );
+                    return Ok(Some(files.collection(evidence_of)));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    let _ = writeln!(
+                        session.env.stderr,
+                        "warning: a downloaded file could not be read as a report zip ({})",
+                        error.metadata().0
+                    );
+                }
             }
         }
     }
     let _ = writeln!(
         session.env.stderr,
-        "warning: collection unchecked: no downloaded file is a report zip"
+        "warning: collection unchecked: no downloaded evidence file is a report zip"
     );
     Ok(Some(Collection::Unchecked))
 }

@@ -14,7 +14,7 @@ use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 
 use super::action::{
-    active_operations, check_search, resume, started_since, ActionRun, Checked, Sent,
+    active_operations, check_search, resume_check, started_since, ActionRun, Checked, Sent,
 };
 use crate::error::{PurviewError, Result};
 use crate::graph::WriteResponse;
@@ -283,7 +283,6 @@ impl WriteCommand for Estimate {
             action: "estimateStatistics",
             evidence_of: EvidenceOf::Estimate,
             list_hint: "--action estimate",
-            check_only: false,
             no_wait: self.flags.no_wait,
             no_download: self.flags.no_download,
             timing: self.flags.timing,
@@ -297,7 +296,7 @@ impl WriteCommand for Estimate {
                     "operationId": operation.to_string(),
                     "operationStatus": Value::Null,
                     "collection": Collection::Unchecked.as_str(),
-                    "resume": resume(after, case, &operation),
+                    "resume": resume_check(after, case, &operation),
                 })))
             }
             Sent::Finished(finished) => finished,

@@ -521,7 +521,7 @@ Settled in PR 2.4:
   and the time preflight ends. `description` is sent only with an override, as
   `--allow-generic: <reason>`, `--allow-large: <reason>` or `--allow-generic and
   --allow-large: <reason>`.
-- `defaults.teams_context` is read before sign-in, only by `report`: `null` or missing is
+- `defaults.teams_context` is read before sign-in, only by `report` and `export create`: `null` or missing is
   `true`; a value that is not a boolean is an error naming the key.
 - The size limit of section 6.9, against the search's latest estimate. A plan it blocks is
   shown by a dry run and refused otherwise with `TooLarge` or `VolumeUnchecked`, ahead of
@@ -579,6 +579,53 @@ In the observed run, posting the export and downloading both files took about te
 the export held roughly four times the estimated count (Observed, one run). And the download
 is large: on the order of a few hundred kilobytes per item (Derived from one run).
 
+Settled in PR 4.1:
+- `export create` runs the preflight, the size limit, the recheck and the reconciliation of
+  `report`, with the same flags (`--name`, `--no-teams-context`, `--allow-generic`,
+  `--allow-large`, `--reason`, `--allow-concurrent`, `--no-wait`, `--no-download`,
+  `--strict`, the timing flags and `--out`). `naming.export_name` is rendered with
+  `{action}` `export`. `defaults.teams_context` applies as for `report`.
+- The answer must be 202, and the operation the `Location` header names must be an
+  `exportResult` operation with export detail before any file is fetched; anything else is
+  `UnexpectedLocation`.
+- Every file the operation lists is downloaded, into the data directory unless `--out` is
+  given (a directory the command creates is 0700; an existing one keeps its mode, section
+  5.4). Only a file whose server name starts with `Reports-` is read, and only its
+  `Locations-*.csv`. The download checks every zip's central directory, but no entry of an
+  `Items.*.zip` part is read, so item content is never printed. With no `Reports-` file,
+  `collection` is `unchecked`.
+- One rule chooses the evidence files, for every action and for `operation get --check`: the
+  operation's action and detail must agree (an estimate with estimate detail, an item report
+  or export with export detail), else nothing is fetched: an action fails with
+  `UnexpectedLocation`, and `operation get --check` leaves `collection` `unchecked`. Then, for an export, the files named `Reports-…`, and for an estimate or item report every
+  file that is not an `Items.*.zip` part, each tried in Graph's order until one holds the
+  evidence. No items part is ever read as evidence, and only `export create` and `download`
+  fetch one: `estimate` and `report` download every file but the items parts.
+- A zip may have up to 4,096 bytes after its end record and comment. The zip ends after the
+  latest-ending end record whose comment ends at the end of the file or within those bytes
+  (the end of the file whenever a record reaches it, as before PR 4.1), and the `zip` crate
+  sees nothing after that. Every end record ending exactly there counts toward the entry
+  cap, the largest count deciding, so the end record of a zip stored inside is not taken for
+  the zip's own; a ZIP64 end record must lie before its locator. The one observed items part
+  had 296 bytes after its end record, most of them zero, after a Zip64 end record (Observed,
+  one export); its report part had none. The downloaded file, its size and its SHA-256 are
+  the service's bytes unchanged.
+- The entry count checked before the `zip` crate indexes a directory is a defence against an
+  oversized directory, not a guarantee: a zip crafted with forged end records, or with bytes
+  before it, can present a smaller count than the crate then reads, as on `main`. The count
+  check after indexing still applies. Downloaded zips come only from the Purview download
+  host, and the zips `parse` reads are ones the user chose, so this is left as it is.
+- `result` has the keys of `report`. A stopped export resumes with `operation get <case> <op>
+  --wait --check` after `--no-wait`, the wait deadline or Ctrl-C during the wait, and with
+  `operation get <case> <op> --check` after Ctrl-C during the download. Either fetches only
+  the report part; `download <case> <op>` then fetches the items when the operation is known
+  to be the export.
+- From PR 4.1, `estimate` resumes the same way. `operation get --wait --check` reads the
+  operation's own action and fetches only that action's evidence file (an estimate's report
+  zip; an export's `Reports-` part), where `download` would have fetched every file of
+  whatever operation the `Location` header named. The volume warning is not repeated by the
+  check.
+
 #### `purview operation list <case>` (read)
 
 Flags: `--action estimate|report|export|any`, `--status S`, `--resolve`.
@@ -619,9 +666,16 @@ status is not `succeeded` exits 4, with or without `--wait`. `--wait-timeout` ta
 seconds or a duration such as `90s`, `15m`, `2h` or `1h30m`, from 1 second to 24 hours;
 `--wait-timeout` and `--poll-interval` need `--wait`.
 
-Settled in PR 2.3: `--check` downloads every file of an estimate or item report through the
-same code as `download`, into the data directory, and reads the first that is a report zip;
-for an export it downloads only the file whose name starts with `Reports-` (Assumption).
+Settled in PR 2.3, and changed in PR 4.1: `--check` downloads, through the same code as
+`download` and into the data directory, the files that may be the operation's evidence by
+the rule of section 3.5 "Settled in PR 4.1": nothing when the action and detail disagree;
+for an export the files named `Reports-` (Observed); for an estimate or item report every
+file that is not an `Items.*.zip` part. It fetches and reads them one at a time in Graph's
+order and stops at the first that holds the evidence, so a later file that cannot be
+downloaded does not hide an earlier result. The whole listing is checked once before
+anything is fetched, so every candidate that cannot be downloaded (no name, no or a
+refused `downloadUrl`, a name that would collide) is reported by position even when an
+earlier file settles the check.
 An operation that is not finished is `unchecked`, with a notice. `--check` changes no exit
 code by itself.
 
@@ -806,8 +860,8 @@ src/
 contrib/
   create-purview-app.sh   app registration; dry run by default, --apply to change (section 5.2)
   install.sh, resign.sh   from entra, identifier com.aberoham.purview
-  msg-bodies.py           phase 5 fallback reader, uv script with extract-msg pinned
 tests/
+  scripts/msg-crosscheck.py  development only: uv script with extract-msg pinned (phase 5)
   cli.rs         assert_cmd: offline process contracts only
   flows.rs       in-process flows through cli::execute_with against wiremock origins
   support/       origins, replay loader, zip and .msg generators, canary scanner
@@ -1131,8 +1185,9 @@ are never extracted to disk. Report zips are recognised by `Locations-*.csv`,
 `Statistics-*.csv`, `Summary-*.csv`, `Settings-*.csv` and `Items_(\d+)_.*\.csv`. Items files
 are read in numeric order of N. A large report was split into several items files of about
 200 MB each (Observed). Zip64 and the compression methods used by real exports are recorded
-in PR 4.1; the `zip` crate's `deflate` feature is enabled from PR 1.5, and `deflate64` only
-if PR 4.1 finds it.
+in PR 4.1 (one small export: items stored, report deflated, Zip64 end records, and 296
+bytes after the items part's end record; `docs/api-notes.md`); the `zip` crate's `deflate`
+feature is enabled from PR 1.5, and `deflate64` only if an export needs it.
 
 **CSV.** The tool uses `csv` with `flexible(true)` and reads `ByteRecord`s as a stream.
 
@@ -1347,12 +1402,14 @@ from the `.msg`. `error` is one of `cfbInvalid`, `noBody`, `bodyDecode`, `entryT
 2. **Not used: `msg_parser`.** We need to read `PidTagHtml` as binary with its code page,
    because mail bodies are often only HTML (Observed). We have not confirmed that
    `msg_parser` exposes this. A wrapper we cannot extend would lose most mail text. It is
-   also not added as a dev-dependency; the cross-check is against the Python fallback.
-3. **Fallback: `contrib/msg-bodies.py`.** It is a `uv` script with `extract-msg` pinned, and
-   it writes the same JSONL schema from the same inputs. In the observed run, `extract-msg`
-   read every item except the Teams system messages, all from the zip in memory (Observed).
-   Users run it when the Rust reader's failure count is too high for their data. CI compares
-   the two readers on synthetic fixtures.
+   also not added as a dev-dependency; the cross-check is against `extract-msg`.
+3. **Cross-check, for development only: `tests/scripts/msg-crosscheck.py`.** The shipped
+   binary is Rust only and never needs Python; a user of `purview` is not expected to have
+   it. A contributor is expected to have Python with `uv`. The script is a `uv` script with
+   `extract-msg` pinned that reads the same inputs and writes the fields the comparison
+   needs. In the observed run, `extract-msg` read every item except the Teams system
+   messages, all from the zip in memory (Observed). CI compares the two readers on synthetic
+   fixtures, and a maintainer compares them on a private export, reporting only counts.
 
 **Body selection.**
 1. `PidTagHtml`: a binary value is decoded with `PidTagInternetCodepage` through
@@ -2024,7 +2081,7 @@ rows per estimated item (section 6.6). So `max_export_size` compares the estimat
 the export can be several times larger.
 
 Settled in PR 2.4: `report` refuses a search whose latest estimate passes `max_export_size`
-unless `--allow-large --reason` is given (`TooLarge`; `export create` will do the same). The
+unless `--allow-large --reason` is given (`TooLarge`; `export create` does the same from PR 4.1). The
 latest estimate is the search's `lastEstimateStatisticsOperation` (Observed: it answers 200
 with the estimate's fields and no `@odata.type`, so the record is read as an estimate by its
 `action`).
@@ -2574,7 +2631,7 @@ Offline contracts only, as in `entra`:
 - A broken container gives `cfbInvalid`, and the run continues with exit 4.
 - **Memory test** (ignored by default): 20,000 generated items of about 300 KB, spread over
   three items zips, read with peak resident memory under 300 MB.
-- **CI cross-check:** `contrib/msg-bodies.py` runs on the generated zip. Subject, sender,
+- **CI cross-check:** `tests/scripts/msg-crosscheck.py` runs on the generated zip. Subject, sender,
   sent date and normalised body text must match the Rust reader, apart from the documented
   `unsupportedClass` cases.
 
@@ -2662,7 +2719,7 @@ runs are never cancelled.
 - **`test`:** a matrix of Ubuntu, macOS and Windows, running
   `cargo test --all-targets --locked` and `cargo build --release --locked`.
 - **`msg-crosscheck`** (from PR 5.3): Ubuntu, `astral-sh/setup-uv` pinned by SHA, runs
-  `contrib/msg-bodies.py` on the generated zips and compares.
+  `tests/scripts/msg-crosscheck.py` on the generated zips and compares.
 
 **`public-data.yml`** (from PR 0.1). It runs on every pull request and every push to `main`,
 with no path filter, so docs-only changes are checked. It runs the public-data lint only
@@ -2738,6 +2795,11 @@ Each PR comes with its tests and documentation, runs the `AGENTS.md` verificatio
 gets an independent review before it opens. A "live check" is run by the maintainer on a test
 tenant. Its results go into `docs/api-notes.md` and synthetic fixtures, never as traces. If a
 live check a feature depends on cannot be done, the feature is left out of that release.
+
+Order changed on 28 November 2026: PR 4.1 comes next, then PR 5.1 with the body selection of
+PR 5.2 and the smallest form of `export read`. PRs 2.5 to 3.2, PR 4.2 and the rest of PR 5.2
+(the admission window and reorder buffer, `--cut-quoted`, `--thread-dedup`, compressed-RTF
+decompression) follow later.
 
 ### Phase 0: scaffold
 
@@ -2930,8 +2992,9 @@ synthetic report zip.
 - Acceptance: on the private export, the failures are no more than `extract-msg`'s and no
   VML text appears, checked locally.
 
-**PR 5.3: Python fallback and CI cross-check.**
-- Scope: `contrib/msg-bodies.py`, the `msg-crosscheck` job, `SKILL.md` guidance on handling
+**PR 5.3: CI cross-check.**
+- Scope: `tests/scripts/msg-crosscheck.py` (development only; no Python fallback ships), the
+  `msg-crosscheck` job, `SKILL.md` guidance on handling
   bodies.
 - Tests and acceptance: the section 8.7 cross-check passes in CI.
 
@@ -2995,7 +3058,8 @@ that does not depend on whether the claim is true. The table says which:
 8. Failure-state shapes: `failed`, `partiallySucceeded`, `submissionFailed`, `resultInfo`.
    Synthetic fixtures are marked Assumption.
 9. `Range` support, URL expiry and long downloads (PR 4.1).
-10. Zip64 and compression methods in large exports (PR 4.1).
+10. Zip64 and compression methods in large exports. One small export is observed in
+    `docs/api-notes.md` (PR 4.1); a multi-gigabyte one is not.
 11. Numbering of `Items.1.NNN` parts. Only `.001` has been seen.
 12. Teams message bodies in `.msg` form, HTML or text (PR 5.2), and compressed-RTF-only
     items.
@@ -3021,7 +3085,8 @@ that does not depend on whether the claim is true. The table says which:
 - **Undocumented quirks may change.** The handling for the list's action label,
   `size: 0`, the placeholder date and report `exportFormat` is tolerant, and keeps raw JSON.
 - **Our own MAPI reader** may miss property variants that `extract-msg` handles. The
-  mitigations are per-item errors, the Python fallback and the CI cross-check.
+  mitigations are per-item errors and the cross-check against `extract-msg` in CI and on a
+  private export.
 - **Test-tenant access.** Every live check needs a tenant where the maintainer may create
   cases. Without one, those checks happen in a production tenant, in cases made for the
   purpose and closed afterwards. That needs the organisation's approval and lies outside

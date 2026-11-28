@@ -164,7 +164,8 @@ From the queries sampled in one tenant (Observed):
 
 1. Whether a missing eDiscovery role gives 403 (not checked in PR 1.4; Assumption).
 2. Non-empty custodian, non-custodial and additional source lists.
-5. Reports and exports without Teams context (PR 2.5, PR 4.1).
+5. Exports without Teams context (PR 4.1). An item report without it was observed in
+   PR 2.5.
 6. Case close and hold reads on a case with holds; PR 2.6 checked a case with none.
 7. Throttling.
 8. The shapes of `failed`, `partiallySucceeded`, `submissionFailed` and `resultInfo`.
@@ -424,6 +425,37 @@ stayed outside the repository.
   file includes locations with no hits. (Observed) `locationsWithHits` counts only rows
   with hits for that reason. The command reported `collection: complete`.
 - **Search after a report:** the search's `lastModifiedDateTime` was unchanged. (Observed)
+
+### PR 2.5: `report` without Teams context
+
+Status: **run on 28 November 2026** from a local build of `main` after PR 2.7, signed with the
+same local code-signing identity, against the same tenant and registration. The check
+created a case and a search with the same query as a search reported with Teams context
+on in the PR 2.4 session, estimated it,
+ran `report --no-teams-context` and closed the case. Outputs, traces and the report zip
+stayed outside the repository.
+
+- **Estimate:** the same item count, indexed size and location count as the PR 2.4
+  session's estimate of the same query. One location failed, and the command reported
+  `collection: incomplete`. (Observed)
+- **POST:** `exportReport` with `displayName`, `exportCriteria: searchHits` and
+  `exportLocation: responsiveLocations`, and no `additionalOptions`, answered **202** with
+  a key-form `Location` header. (Observed)
+- **Wait:** 11 reads of the operation over about two and a half minutes, then
+  `succeeded`. The single `GET` showed `action: exportReport`, `exportFormat: pst` and
+  `additionalOptions: none`. (Observed)
+- **Zip:** the same four files as in PR 2.4. `Items_0` held exactly one row per estimated
+  item. The mail rows (`IPM.Note`) were as many as with Teams context on, and the Teams rows
+  (`IPM.SkypeTeams.Message`) about a fifth as many; the Teams system messages were gone.
+  `Settings` showed `Include contextual Teams and Viva Engage conversations` as `false`
+  where PR 2.4's showed `true`. No location failed, and the command reported
+  `collection: complete`. (Observed)
+- **Rows per item:** with Teams context on, PR 2.4's report of the same query held about
+  1.1 rows per estimated item, far below the 10 to 37 of the reports behind the plan's
+  row-count warning. (Observed) The rows per item depend on the query, not only on the
+  setting. (Derived)
+- **Close:** the hold reads answered 200 with empty lists, `POST …/close` answered **204**,
+  and the first read afterwards showed `closed`, as in PR 2.6. (Observed)
 
 ### PR 2.6: hold reads and case close
 

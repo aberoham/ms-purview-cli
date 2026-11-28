@@ -216,15 +216,17 @@ one, since one `--reason` serves both. `--allow-concurrent` does not cover
 the size, and no flag covers a token that cannot be refreshed. Only
 `volume.max_export_size` is read for a report. A dry run shows the plan either way. The latest estimate is read
 again after approval and must be the one the plan showed
-(`SearchChanged`). The estimate undercounts what a report collects: one
+(`SearchChanged`). The estimate can undercount what a report collects: one
 tenant's reports held about 10 to 37 rows per estimated item with Teams
 context on (Observed), and the plan says so with the estimate's count.
 
 A report asks for the messages around each Teams hit
 (`additionalOptions: teamsAndYammerConversations`, Observed).
-`--no-teams-context`, or `defaults.teams_context: false`, leaves it out;
-that body has not been observed, so the flag is experimental and the
-plan warns. Its zip has no Statistics file (Observed), so its
+`--no-teams-context`, or `defaults.teams_context: false`, leaves it out,
+so that Teams hits come without the messages around them. Graph accepted
+that body; the report held one row per estimated item, as many mail rows
+as with Teams context on and about a fifth of the Teams rows, and its
+Settings file showed contextual conversations off (Observed, one run). Its zip has no Statistics file (Observed), so its
 `collection` comes from `Locations-*.csv` alone.
 
 A stopped report resumes with `operation get <case> <op> --wait --check`

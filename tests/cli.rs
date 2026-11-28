@@ -738,3 +738,29 @@ fn estimate_argument_errors_and_no_write_need_no_network() {
         "WriteRefused"
     );
 }
+
+/// `--no-teams-context` was observed for `report` (PR 2.5), not for
+/// `export create` (PR 4.1): only the second is labelled experimental.
+#[test]
+fn only_export_create_calls_no_teams_context_experimental() {
+    let help = |args: &[&str]| {
+        let output = purview()
+            .args(args)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        String::from_utf8(output).unwrap()
+    };
+    let report = help(&["report", "--help"]);
+    assert!(report.contains("--no-teams-context"), "{report}");
+    assert!(!report.contains("experimental"), "{report}");
+    let export = help(&["export", "create", "--help"]);
+    assert!(export.contains("--no-teams-context"), "{export}");
+    assert!(
+        export.contains("experimental: not yet observed"),
+        "{export}"
+    );
+    assert!(export.contains("and is experimental"), "{export}");
+}

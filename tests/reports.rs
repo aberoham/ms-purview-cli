@@ -525,8 +525,13 @@ async fn teams_context_is_left_out_by_the_flag_or_the_setting() {
     assert_eq!(run.outcome.exit_code, 0, "{}", run.stdout());
     assert!(setup.post_body().await.get("additionalOptions").is_none());
     let plan = &run.json()["results"]["plan"];
-    assert!(plan["warnings"].to_string().contains("experimental"));
-    assert!(plan["preflight"].to_string().contains("Teams context: off"));
+    let warnings = plan["warnings"].to_string();
+    assert!(!warnings.contains("Teams context is off"), "{warnings}");
+    assert!(!warnings.contains("experimental"), "{warnings}");
+    assert!(warnings.contains("rows per estimated item"), "{warnings}");
+    assert!(plan["preflight"]
+        .to_string()
+        .contains("Teams context: off (no additionalOptions)"));
     assert_eq!(run.json()["results"]["result"]["teamsContext"], false);
 
     let mut setup = Setup::new().await;

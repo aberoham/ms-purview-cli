@@ -611,17 +611,13 @@ impl WriteCommand for Report {
             Collect::Report => warnings.push(row_warning(&basis, teams_context)),
             Collect::Export => warnings.extend(export_warnings(&basis)),
         }
-        if !teams_context {
-            warnings.push(match collect {
-                Collect::Report => "Teams context is off: a report without additionalOptions has \
-                                    not been observed (experimental), and Teams hits come \
-                                    without the messages around them"
+        if !teams_context && collect == Collect::Export {
+            warnings.push(
+                "Teams context is off: an export with additionalOptions includeReport alone has \
+                 not been observed (experimental), and Teams hits come without the messages \
+                 around them"
                     .into(),
-                Collect::Export => "Teams context is off: an export with additionalOptions \
-                                    includeReport alone has not been observed (experimental), \
-                                    and Teams hits come without the messages around them"
-                    .into(),
-            });
+            );
         }
         for operation in &active {
             warnings.push(format!(
@@ -699,7 +695,7 @@ impl WriteCommand for Report {
             (Collect::Export, true) => {
                 "Teams context: on (additionalOptions teamsAndYammerConversations,includeReport)"
             }
-            (Collect::Report, false) => "Teams context: off (experimental)",
+            (Collect::Report, false) => "Teams context: off (no additionalOptions)",
             (Collect::Export, false) => {
                 "Teams context: off (additionalOptions includeReport; experimental)"
             }

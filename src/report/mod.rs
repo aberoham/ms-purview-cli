@@ -46,7 +46,7 @@ impl Kind {
         {
             return Self::Estimate;
         }
-        let package = regex::Regex::new(r"^Items\..*\.zip$").expect("a valid pattern");
+        let package = regex::Regex::new(r"^Items\..*\.(?i:zip)$").expect("a valid pattern");
         if bases.iter().any(|name| items_file_number(name).is_some())
             && !bases.iter().any(|name| package.is_match(name))
         {
@@ -324,6 +324,10 @@ mod tests {
         assert_eq!(Kind::of(&names(&["Items_0_x.c\u{17f}v"])), Kind::Other);
         assert_eq!(Kind::of(&names(&["Items_\u{662}_x.csv"])), Kind::Other);
         assert_eq!(items_file_number("Items_007_x.CSV"), Some("007"));
+        assert_eq!(
+            Kind::of(&names(&["Items_0_2026.csv", "Items.1.001.x.ZIP"])),
+            Kind::Other
+        );
         assert_eq!(items_file_number("Items__x.csv"), None);
         assert_eq!(
             Kind::of(&names(&["Items_0_2026.csv", "Items.1.001.x.zip"])),

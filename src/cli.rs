@@ -2157,10 +2157,10 @@ fn parse_items(env: &mut Env, output: &OutputOptions, args: ParseItemsArgs) -> R
         since: args.since,
         until: args.until,
         subject,
-        class_prefix: optional("--class", args.class)?,
+        class_prefix: optional("--class", args.class)?.map(|class| class.to_lowercase()),
         senders: addresses("--sender", args.sender)?,
         exclude_senders: addresses("--exclude-sender", args.exclude_sender)?,
-        workload: optional("--workload", args.workload)?,
+        workload: optional("--workload", args.workload)?.map(|workload| workload.to_lowercase()),
     };
     let max_unique = args.max_unique.unwrap_or(DEFAULT_MAX_UNIQUE);
     if max_unique == 0 {

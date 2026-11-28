@@ -267,13 +267,13 @@ pub struct Filters {
     pub until: Option<NaiveDate>,
     /// On `Subject/Title` or `Conversation name`.
     pub subject: Option<Regex>,
-    /// A prefix of `Item class`, ignoring case.
+    /// A prefix of `Item class`, lowercased; compared ignoring case.
     pub class_prefix: Option<String>,
     /// Sender addresses, lowercased; a row must match one.
     pub senders: Vec<String>,
     /// Sender addresses, lowercased; a row matching one is left out.
     pub exclude_senders: Vec<String>,
-    /// `Workload`, ignoring case.
+    /// `Workload`, lowercased; compared ignoring case.
     pub workload: Option<String>,
 }
 
@@ -299,10 +299,10 @@ impl Filters {
             }
         }
         if let Some(prefix) = &self.class_prefix {
-            let hit = item.class.as_deref().is_some_and(|class| {
-                class.len() >= prefix.len()
-                    && class.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
-            });
+            let hit = item
+                .class
+                .as_deref()
+                .is_some_and(|class| class.to_lowercase().starts_with(prefix.as_str()));
             if !hit {
                 return false;
             }
@@ -325,7 +325,7 @@ impl Filters {
             if !item
                 .workload
                 .as_deref()
-                .is_some_and(|value| value.eq_ignore_ascii_case(workload))
+                .is_some_and(|value| value.to_lowercase() == *workload)
             {
                 return false;
             }
@@ -702,6 +702,17 @@ mod tests {
             filtered(&filters),
             vec!["<m1@contoso.example>", "IMM3", "IMM4"]
         );
+    }
+
+    #[test]
+    fn case_is_ignored_beyond_ascii() {
+        let row = one(",IMM9,IPM.Équipe,,a@contoso.example,S,,,1,Équipe,True,L1");
+        let filters = Filters {
+            class_prefix: Some("ipm.équipe".into()),
+            workload: Some("équipe".into()),
+            ..Filters::default()
+        };
+        assert!(filters.matches(&row));
     }
 
     #[test]

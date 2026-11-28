@@ -1380,7 +1380,8 @@ report).
   counted and reported. Settled in PR 3.1: the hash is over the five fields, trimmed, as a
   compact JSON array of strings (an empty field as `""`), so that a `|` or any other text
   inside a field cannot make two items one; the key is the hash in lowercase hex.
-- **Aggregation:** `HashMap<Box<str>, UniqueAgg>`. Each `UniqueAgg` holds the slim fields of
+- **Aggregation:** `HashMap<(KeyKind, Box<str>), UniqueAgg>` (keyed by kind and key, settled in
+  PR 3.1). Each `UniqueAgg` holds the slim fields of
   the first row, a copy count, and a sorted `Vec<u32>` of interned `Location ID` indexes,
   deduplicated at the end. `parse items` writes its JSONL after the pass. Memory grows with
   the number of unique items, roughly 1 KB each (Assumption). `--max-unique` (default

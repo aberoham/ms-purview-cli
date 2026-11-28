@@ -140,9 +140,13 @@ pub fn parse_msg(bytes: &[u8]) -> Result<MsgItem, MsgError> {
                 .string(id::SMTP_ADDRESS)
                 .or_else(|| recipient.string(id::EMAIL_ADDRESS)),
         };
-        // MAPI_TO 1, MAPI_CC 2, MAPI_BCC 3 (Docs: MS-OXOMSG); anything else
-        // is listed as To.
-        match recipient.long(id::RECIPIENT_TYPE) {
+        // MAPI_TO 1, MAPI_CC 2, MAPI_BCC 3 (Docs: MS-OXOMSG), with the
+        // MAPI_SUBMITTED flag (0x80000000) of a resend masked off; a missing
+        // or other type is listed as To.
+        match recipient
+            .long(id::RECIPIENT_TYPE)
+            .map(|kind| kind & 0x0FFF_FFFF)
+        {
             Some(2) => item.cc.push(mailbox),
             Some(3) => item.bcc.push(mailbox),
             _ => item.to.push(mailbox),
@@ -165,6 +169,11 @@ pub fn parse_msg(bytes: &[u8]) -> Result<MsgItem, MsgError> {
                 last.size = container.stream_len(&storage, "__substg1.0_37010102");
             }
         }
+    }
+    if container.unreadable() {
+        return Err(MsgError::CfbInvalid(
+            "a property stream of the item could not be read in full".into(),
+        ));
     }
     Ok(item)
 }

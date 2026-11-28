@@ -10,31 +10,58 @@ pub struct Container<'a> {
     file: cfb::CompoundFile<Cursor<&'a [u8]>>,
     /// The size of the `.msg`: no stream in it can hold more.
     len: u64,
+    /// Whether a stream that exists could not be read, so the item is not
+    /// read in full.
+    unreadable: bool,
 }
+
+/// The diagnostic of a container that cannot be read. It is fixed: the
+/// `cfb` crate's own messages can quote the item's first bytes or its
+/// directory names.
+const NOT_A_CONTAINER: &str = "not a compound file that can be read";
 
 impl<'a> Container<'a> {
     pub fn open(bytes: &'a [u8]) -> Result<Self, MsgError> {
-        let file = cfb::CompoundFile::open(Cursor::new(bytes)).map_err(|error| {
-            // The crate's message describes the structure, never content.
-            MsgError::CfbInvalid(format!("not a compound file that can be read: {error}"))
-        })?;
+        check_header(bytes)?;
+        let file = cfb::CompoundFile::open(Cursor::new(bytes))
+            .map_err(|_| MsgError::CfbInvalid(NOT_A_CONTAINER.into()))?;
         Ok(Self {
             file,
             len: bytes.len() as u64,
+            unreadable: false,
         })
     }
 
+    /// Whether a stream that exists could not be read.
+    pub fn unreadable(&self) -> bool {
+        self.unreadable
+    }
+
+    /// Records that a stream that exists could not be read in full.
+    pub fn mark_unreadable(&mut self) {
+        self.unreadable = true;
+    }
+
     /// The stream `name` inside `storage` ("" for the root), or `None` when
-    /// it is absent or cannot be read.
+    /// it is absent. A stream that exists and cannot be read is `None` too,
+    /// and marks the container unreadable.
     pub fn stream(&mut self, storage: &str, name: &str) -> Option<Vec<u8>> {
         let path = path(storage, name);
         if !self.file.is_stream(&path) {
             return None;
         }
-        let stream = self.file.open_stream(&path).ok()?;
-        let mut bytes = Vec::new();
-        stream.take(self.len).read_to_end(&mut bytes).ok()?;
-        Some(bytes)
+        let read = self.file.open_stream(&path).and_then(|stream| {
+            let mut bytes = Vec::new();
+            stream.take(self.len).read_to_end(&mut bytes)?;
+            Ok(bytes)
+        });
+        match read {
+            Ok(bytes) => Some(bytes),
+            Err(_) => {
+                self.unreadable = true;
+                None
+            }
+        }
     }
 
     /// The length of the stream `name` inside `storage`, from the
@@ -65,6 +92,40 @@ impl<'a> Container<'a> {
         names.sort();
         names
     }
+}
+
+/// The checks made on the header (MS-CFB 2.2) before `cfb` reads the
+/// file: the signature, a sector size of 512 or 4,096 bytes, and counts of
+/// FAT, DIFAT and mini FAT sectors that fit in the file. `cfb` builds its
+/// allocation table from the sectors the header lists before checking
+/// them, so the counts bound what it can allocate to the size of the item.
+fn check_header(bytes: &[u8]) -> Result<(), MsgError> {
+    const SIGNATURE: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+    let invalid = || MsgError::CfbInvalid(NOT_A_CONTAINER.into());
+    if bytes.len() < 512 || bytes[..8] != SIGNATURE {
+        return Err(invalid());
+    }
+    let u16_at = |at: usize| u64::from(u16::from_le_bytes([bytes[at], bytes[at + 1]]));
+    let u32_at = |at: usize| {
+        u64::from(u32::from_le_bytes([
+            bytes[at],
+            bytes[at + 1],
+            bytes[at + 2],
+            bytes[at + 3],
+        ]))
+    };
+    let sector = match u16_at(0x1E) {
+        9 => 512_u64,
+        12 => 4_096,
+        _ => return Err(invalid()),
+    };
+    let len = bytes.len() as u64;
+    for count in [u32_at(0x2C), u32_at(0x40), u32_at(0x48)] {
+        if count.saturating_mul(sector) > len {
+            return Err(invalid());
+        }
+    }
+    Ok(())
 }
 
 /// `/<storage>/<name>`, with no empty segments.
@@ -101,6 +162,21 @@ mod tests {
     #[test]
     fn bytes_that_are_not_a_container_are_cfb_invalid() {
         let error = Container::open(b"not a compound file").err().unwrap();
+        assert_eq!(error.code(), "cfbInvalid");
+        // The diagnostic never quotes the item.
+        let mut bytes = vec![b'Q'; 600];
+        bytes[..8].copy_from_slice(b"SECRETAB");
+        let error = Container::open(&bytes).err().unwrap();
+        assert_eq!(error.detail(), NOT_A_CONTAINER);
+    }
+
+    #[test]
+    fn a_header_listing_more_fat_sectors_than_fit_is_refused() {
+        let mut bytes = vec![0_u8; 1_024];
+        bytes[..8].copy_from_slice(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]);
+        bytes[0x1E..0x20].copy_from_slice(&9_u16.to_le_bytes());
+        bytes[0x2C..0x30].copy_from_slice(&1_000_000_u32.to_le_bytes());
+        let error = Container::open(&bytes).err().unwrap();
         assert_eq!(error.code(), "cfbInvalid");
     }
 }

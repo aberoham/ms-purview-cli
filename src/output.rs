@@ -97,6 +97,7 @@ pub const UNTRUSTED_KEYS: &[&str] = &[
     // `export read` records: the message as its senders wrote it, and the
     // export's part name, which embeds the export's name.
     "subject",
+    "class",
     "conversationTopic",
     "internetMessageId",
     "from",

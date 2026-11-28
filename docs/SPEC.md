@@ -805,15 +805,29 @@ Settled in the first `.msg` reader PR (PR 5.1 with the body selection of PR 5.2)
 - `PidTagAttachSize` is absent from exported attachments (Observed), so an attachment's
   size is the length of its data stream, `__substg1.0_37010102`, read from the container's
   directory.
-- A sender with no SMTP address keeps its Exchange address (Observed: two of 31 items).
-- A rule drawn across the width (`<hr>`, a table border) becomes `---`.
+- A sender with no SMTP address keeps its Exchange address (Observed: two of 31 items). A
+  recipient type has the `MAPI_SUBMITTED` flag of a resend masked off; a missing type is To.
+- Before conversion: the markers of downlevel-revealed conditionals are removed and their
+  content kept, hidden conditionals removed with their content, VML and Office rules removed
+  only when they set `behavior`, `<hr>` kept as `---`, a `colspan` or `rowspan` above 99 cut
+  to 99, and every URL's query and fragment removed, since `html2text` breaks a line longer
+  than its width and a broken query would escape the redaction after. After it, a table rule
+  drawn as wide as a cell becomes `---`. A converter that fails or panics gives `bodyDecode`
+  unless there is a plain-text body.
+- The container is refused as `cfbInvalid`, with a fixed `errorDetail`, when its header's
+  FAT, DIFAT or mini FAT sector counts do not fit in the item, before `cfb` reads it; so is
+  an item with a property stream that exists and cannot be read in full.
+- The stderr summary counts items by class under fixed labels (the classes seen in exports,
+  else `other`), so no text from an item reaches stderr; `class` is wrapped by
+  `--wrap-untrusted`.
 - JSON Lines are prepared as every JSON document is: URLs redacted, `--wrap-untrusted` with
   one marker for the run and the notice on stderr, secrets redacted as values.
 - `cfb` 0.16.0 (released 2026-10-31) and `html2text` 0.17.4 (released 2026-10-18).
 - The cross-check is `tests/scripts/msg-crosscheck.py`, run by hand. On the maintainer's
   one private export of 31 items it agreed with `extract-msg` 0.55.0 on subject, sent time,
-  body and recipients for every item, and on sender for the 29 with an SMTP sender
-  (Observed). The `msg-crosscheck` CI job waits for PR 5.3.
+  body and To for every item, on CC for the 18 with CC recipients, and on sender for the 29
+  with an SMTP sender (Observed). An empty field never counts as agreeing with a filled one.
+  The `msg-crosscheck` CI job waits for PR 5.3.
 
 #### `purview inventory cases` (read; phase 6)
 

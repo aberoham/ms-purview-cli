@@ -39,7 +39,7 @@ pub struct ReadRequest {
 struct Tally {
     read: usize,
     failed: usize,
-    by_class: BTreeMap<String, (usize, usize)>,
+    by_class: BTreeMap<&'static str, (usize, usize)>,
     skipped: usize,
 }
 
@@ -57,8 +57,9 @@ pub fn run(env: &mut Env, output: &OutputOptions, request: &ReadRequest) -> Resu
         total_bytes: u64::MAX,
         ratio: MAX_RATIO,
     };
-    // One marker id for the whole run; the notice goes to stderr once.
-    let marker = if output.wrap_untrusted {
+    // One marker id for a JSON Lines run, with its notice on stderr once;
+    // a `--json` document carries its own marker and notice.
+    let marker = if output.wrap_untrusted && !request.json {
         let id = crate::output::untrusted_id()?;
         let _ = writeln!(env.stderr, "{}", crate::output::untrusted_notice(&id));
         Some(id)
@@ -83,15 +84,8 @@ pub fn run(env: &mut Env, output: &OutputOptions, request: &ReadRequest) -> Resu
                 continue;
             }
             let record = read_item(&mut zip, index, name, &part, request);
-            let failed = !record["error"].is_null();
-            let class = record["class"].as_str().unwrap_or("(none)").to_owned();
-            let counts = tally.by_class.entry(class).or_default();
-            counts.0 += 1;
-            tally.read += 1;
-            if failed {
-                counts.1 += 1;
-                tally.failed += 1;
-            }
+            let class = class_label(record["class"].as_str());
+            let mut failed = !record["error"].is_null();
             if request.json {
                 if buffered.len() == JSON_MAX_ITEMS {
                     return Err(PurviewError::message(format!(
@@ -100,8 +94,15 @@ pub fn run(env: &mut Env, output: &OutputOptions, request: &ReadRequest) -> Resu
                     )));
                 }
                 buffered.push(record);
-            } else {
-                write_line(env, marker.as_deref(), record)?;
+            } else if !write_line(env, marker.as_deref(), record)? {
+                failed = true;
+            }
+            let counts = tally.by_class.entry(class).or_default();
+            counts.0 += 1;
+            tally.read += 1;
+            if failed {
+                counts.1 += 1;
+                tally.failed += 1;
             }
         }
     }
@@ -119,6 +120,33 @@ pub fn run(env: &mut Env, output: &OutputOptions, request: &ReadRequest) -> Resu
         exit_code,
         document: None,
     })
+}
+
+/// The summary's label for an item class: one of the classes seen in
+/// exports, or `other`, so that no text from an item reaches stderr and the
+/// tally stays small.
+fn class_label(class: Option<&str>) -> &'static str {
+    const KNOWN: &[&str] = &[
+        "IPM.Note",
+        "IPM.Note.SMIME",
+        "IPM.Note.SMIME.MultipartSigned",
+        "IPM.Schedule.Meeting.Request",
+        "IPM.Schedule.Meeting.Resp.Pos",
+        "IPM.Schedule.Meeting.Resp.Neg",
+        "IPM.Schedule.Meeting.Resp.Tent",
+        "IPM.Schedule.Meeting.Canceled",
+        "IPM.Appointment",
+        "IPM.SkypeTeams.Message",
+        "IPM.SkypeTeams.SystemMessage",
+    ];
+    match class {
+        None => "(none)",
+        Some(class) => KNOWN
+            .iter()
+            .find(|known| known.eq_ignore_ascii_case(class))
+            .copied()
+            .unwrap_or("other"),
+    }
 }
 
 /// The zip's own file name, as `export index` matches parts by it.
@@ -222,27 +250,34 @@ fn fill(record: &mut Map<String, Value>, item: &MsgItem, max_body_chars: usize) 
 
 /// One JSON Lines record, prepared as every JSON document is: URLs
 /// redacted, `--wrap-untrusted` applied, secrets redacted as values. A
-/// record whose bytes still match a secret is replaced by its entry name
-/// and an error, so the line count still matches the items.
-fn write_line(env: &mut Env, marker: Option<&str>, record: Value) -> Result<()> {
+/// record whose bytes still match a secret is replaced by its prepared
+/// entry and part names and an error, so the line count still matches the
+/// items. `false` when that happened.
+fn write_line(env: &mut Env, marker: Option<&str>, record: Value) -> Result<bool> {
     let mut value = crate::trace::redact_urls(&record, &env.redactor);
     if let Some(id) = marker {
         crate::output::wrap_untrusted(&mut value, id);
     }
     let safe = env.redactor.redact_value(&value);
     let mut bytes = serde_json::to_vec(&safe)?;
+    let mut written = true;
     if env.redactor.recognises_bytes(&bytes) {
+        written = false;
         bytes = serde_json::to_vec(&json!({
-            "entry": record["entry"],
-            "part": record["part"],
+            "entry": safe["entry"],
+            "part": safe["part"],
             "error": "redactionFailed",
             "errorDetail": "the record held a secret that could not be removed, so it is not printed",
         }))?;
+        if env.redactor.recognises_bytes(&bytes) {
+            bytes = serde_json::to_vec(&json!({"error": "redactionFailed"}))?;
+        }
     }
     bytes.push(b'\n');
     env.stdout.write_all(&bytes).map_err(|error| {
         PurviewError::message(format!("could not write to standard output: {error}"))
-    })
+    })?;
+    Ok(written)
 }
 
 fn summary(log: &mut dyn Write, tally: &Tally) {
@@ -259,10 +294,6 @@ fn summary(log: &mut dyn Write, tally: &Tally) {
         }
     );
     for (class, (read, failed)) in &tally.by_class {
-        let _ = writeln!(
-            log,
-            "  {}: {read} read, {failed} with an error",
-            crate::output::sanitize(class)
-        );
+        let _ = writeln!(log, "  {}: {read} read, {failed} with an error", class);
     }
 }

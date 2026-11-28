@@ -35,6 +35,8 @@ pub enum Body {
     /// A Teams system message with no body (Observed: `extract-msg` fails on
     /// these too).
     UnsupportedClass,
+    /// An HTML body that could not be converted, and no plain-text body.
+    Unconvertible,
     /// No body property at all.
     #[default]
     Missing,
@@ -65,6 +67,7 @@ impl Body {
                 Some(("unsupportedClass", "a Teams system message with no body"))
             }
             Self::Missing => Some(("noBody", "the item has no body property")),
+            Self::Unconvertible => Some(("bodyDecode", "the HTML body could not be converted")),
             Self::Html(_) | Self::Text(_) => None,
         }
     }
@@ -85,9 +88,16 @@ pub fn select(
             Html::Bytes(bytes) => decode_codepage(&bytes, internet_codepage),
             Html::Text(text) => text,
         };
-        let converted = html_to_text(&source);
-        if !converted.trim().is_empty() {
-            return Body::Html(converted);
+        match html_to_text(&source) {
+            Some(converted) if !converted.trim().is_empty() => return Body::Html(converted),
+            Some(_) => {}
+            None => {
+                // The plain-text body, when there is one, still serves.
+                if let Some(text) = text.filter(|text| !text.trim().is_empty()) {
+                    return Body::Text(text.replace("\r\n", "\n"));
+                }
+                return Body::Unconvertible;
+            }
         }
     }
     if let Some(text) = text.filter(|text| !text.trim().is_empty()) {
@@ -122,6 +132,8 @@ pub fn decode_codepage(bytes: &[u8], codepage: Option<u32>) -> String {
 fn encoding_for(codepage: u32) -> Option<&'static Encoding> {
     let label = match codepage {
         65001 => "utf-8",
+        10000 => "macintosh",
+        10007 => "x-mac-cyrillic",
         1200 => "utf-16le",
         1201 => "utf-16be",
         20127 | 1252 | 28591 => "windows-1252",
@@ -159,8 +171,19 @@ fn encoding_for(codepage: u32) -> Option<&'static Encoding> {
     Encoding::for_label(label.as_bytes())
 }
 
+/// The markers of Office's "downlevel-revealed" conditionals, whose content
+/// is shown by every reader and is kept: `<!--[if !mso]><!-->` and
+/// `<!--<![endif]-->`, and the bare `<![if …]>` and `<![endif]>`. They are
+/// removed first, so that the hidden conditionals below cannot reach past
+/// them.
+static REVEALED_MARKERS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)<!--\[if[^\]]*\]><!-->|<!--<!\[endif\]-->|<!\[(?:if[^\]]*|endif)\]>")
+        .expect("a valid pattern")
+});
+
 /// Elements and comments removed before conversion: `<head>`, `<style>`
-/// and `<script>` with their content, and Office conditional comments.
+/// and `<script>` with their content, and Office's hidden conditional
+/// comments (`<!--[if …]>…<![endif]-->`).
 static REMOVED_HTML: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?is)<head\b.*?</head\s*>|<style\b.*?</style\s*>|<script\b.*?</script\s*>|<!--\[if.*?<!\[endif\]\s*-->",
@@ -168,38 +191,58 @@ static REMOVED_HTML: LazyLock<Regex> = LazyLock::new(|| {
     .expect("a valid pattern")
 });
 
-/// The markers of Office's "downlevel-revealed" conditionals, whose content
-/// is kept.
-static REVEALED_MARKERS: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)<!\[(?:if[^\]]*|endif)\]>").expect("a valid pattern"));
-
 /// Style rules for VML and Office namespaces that naive tag stripping
-/// leaves behind as text (Observed for `v\:*`; Assumption for the others,
-/// which share its origin).
+/// leaves behind as text: rules that set `behavior` (Observed for `v\:*`;
+/// Assumption for the others, which share its origin). Ordinary CSS, such
+/// as a `.shape` rule quoted in a message, is kept.
 static VML_STYLE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:[vowx]\\:\*|\.shape)\s*\{[^}]*\}").expect("a valid pattern")
+    Regex::new(r"(?i)(?:[vowx]\\:\*|\.shape)\s*\{\s*behavior\s*:[^}]*\}").expect("a valid pattern")
+});
+
+/// A horizontal rule, which `html2text` 0.17 drops; it is kept as `---`.
+static HR: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)<hr\b[^>]*>").expect("a valid pattern"));
+
+/// A `colspan` or `rowspan` of more than two digits: `html2text` lays out
+/// a cell per spanned slot, so a huge span is memory, not text.
+static SPAN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)\b(colspan|rowspan)\s*=\s*["']?\s*\d{3,}["']?"#).expect("a valid pattern")
+});
+
+/// A URL's query or fragment. It is removed before conversion, because
+/// `html2text` breaks a line longer than its width, and a query broken
+/// across lines would escape the redaction that runs on the text after.
+static URL_QUERY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)(https?://[^\s"'<>?#]*)[?#][^\s"'<>]*"#).expect("a valid pattern")
 });
 
 /// The HTML as plain text: cleaned, converted with no decoration and no
 /// link footnotes, then with VML leftovers and trailing spaces removed.
-pub fn html_to_text(html: &str) -> String {
-    let cleaned = REMOVED_HTML.replace_all(html, "");
-    let cleaned = REVEALED_MARKERS.replace_all(&cleaned, "");
+/// `None` when it cannot be converted, including a panic in the converter.
+pub fn html_to_text(html: &str) -> Option<String> {
+    let cleaned = REVEALED_MARKERS.replace_all(html, "");
+    let cleaned = REMOVED_HTML.replace_all(&cleaned, "");
     let cleaned = VML_STYLE.replace_all(&cleaned, "");
-    let text = html2text::config::plain_no_decorate()
-        .allow_width_overflow()
-        .string_from_read(cleaned.as_bytes(), TEXT_WIDTH)
-        .unwrap_or_default();
+    let cleaned = HR.replace_all(&cleaned, "<p>---</p>");
+    let cleaned = SPAN.replace_all(&cleaned, "${1}=\"99\"");
+    let cleaned = URL_QUERY.replace_all(&cleaned, "${1}");
+    let cleaned = cleaned.into_owned();
+    let text = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        html2text::config::plain_no_decorate()
+            .allow_width_overflow()
+            .string_from_read(cleaned.as_bytes(), TEXT_WIDTH)
+    }))
+    .ok()?
+    .ok()?;
     let text = VML_STYLE.replace_all(&text, "");
-    // A rule (`<hr>`, a table border) is drawn across the whole width, so
-    // at this width it would be thousands of characters: it becomes a
-    // short one.
+    // A table's rules are drawn as wide as its widest cell, which at this
+    // width can be a whole paragraph: each becomes a short one.
     let lines: Vec<&str> = text
         .lines()
         .map(str::trim_end)
         .map(|line| if is_rule(line) { "---" } else { line })
         .collect();
-    lines.join("\n").trim().to_owned()
+    Some(lines.join("\n").trim().to_owned())
 }
 
 /// Whether `line` is only box-drawing or dash characters, and long.
@@ -242,7 +285,7 @@ mod tests {
         let html = "<body><p>v\\:* {behavior:url(#default#VML);} o\\:* \
                     {behavior:url(#default#VML);} .shape {behavior:url(#default#VML);}\
                     Body text</p></body>";
-        let text = html_to_text(html);
+        let text = html_to_text(html).unwrap();
         assert_eq!(text, "Body text");
     }
 
@@ -250,8 +293,39 @@ mod tests {
     fn entity_encoded_vml_style_text_is_removed_after_conversion() {
         // `v\:*` written with an entity only becomes the leftover once the
         // HTML is decoded.
-        let text = html_to_text("<p>v&#92;:* {behavior:url(#default#VML);} Body text</p>");
+        let text = html_to_text("<p>v&#92;:* {behavior:url(#default#VML);} Body text</p>").unwrap();
         assert_eq!(text, "Body text");
+    }
+
+    #[test]
+    fn a_downlevel_revealed_conditional_keeps_its_text() {
+        let html = "<p>before</p><!--[if !mso]><!--><p>visible to all</p><!--<![endif]-->\
+                    <!--[if gte mso 9]><p>hidden</p><![endif]--><p>after</p>";
+        let text = html_to_text(html).unwrap();
+        assert!(text.contains("visible to all"), "{text}");
+        assert!(!text.contains("hidden"), "{text}");
+        assert!(text.contains("before") && text.contains("after"), "{text}");
+    }
+
+    #[test]
+    fn ordinary_css_quoted_in_a_message_is_kept() {
+        let text = html_to_text("<p>.shape { color: red; }</p>").unwrap();
+        assert_eq!(text, ".shape { color: red; }");
+    }
+
+    #[test]
+    fn a_url_query_is_removed_before_conversion() {
+        let url = format!("https://portal.contoso.example/a?{}", "q".repeat(20_000));
+        let text = html_to_text(&format!("<p>{url}</p>")).unwrap();
+        assert!(!text.contains("qqqq"), "{}", text.len());
+        assert!(text.contains("https://portal.contoso.example/a"), "{text}");
+    }
+
+    #[test]
+    fn huge_table_spans_are_capped() {
+        let html = "<table><tr><td colspan=\"4000000000\" rowspan=99999999>a</td></tr></table>";
+        let text = html_to_text(html).unwrap();
+        assert!(text.contains('a'), "{text}");
     }
 
     #[test]
@@ -269,8 +343,9 @@ mod tests {
         let paragraph = "word ".repeat(400);
         let text = html_to_text(&format!(
             "<p>above</p><table><tr><td>{paragraph}</td></tr><tr><td>two</td></tr></table>\
-             <p>below</p>"
-        ));
+             <hr><p>below</p>"
+        ))
+        .unwrap();
         assert!(
             text.lines()
                 .filter(|line| !line.contains("word"))
@@ -278,12 +353,17 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("above") && text.contains("below"), "{text}");
+        // The table's rules and the <hr> are kept, short.
+        assert!(
+            text.lines().filter(|line| *line == "---").count() >= 3,
+            "{text}"
+        );
     }
 
     #[test]
     fn a_long_line_is_not_wrapped() {
         let words = "word ".repeat(1_500);
-        let text = html_to_text(&format!("<p>{words}</p>"));
+        let text = html_to_text(&format!("<p>{words}</p>")).unwrap();
         assert_eq!(text.lines().count(), 1, "{}", text.len());
     }
 

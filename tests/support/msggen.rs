@@ -83,16 +83,26 @@ impl Message {
     /// The `.msg` bytes.
     pub fn build(&self) -> Vec<u8> {
         let mut file = cfb::CompoundFile::create(Cursor::new(Vec::new())).unwrap();
-        write_props(&mut file, "", &self.props, 32);
+        // The message header (MS-OXMSG 2.4.1.1): 8 reserved bytes, the next
+        // recipient and attachment ids, their counts, 8 reserved bytes.
+        let mut header = vec![0_u8; 8];
+        for count in [self.recipients.len(), self.attachments.len()] {
+            header.extend_from_slice(&(count as u32).to_le_bytes());
+        }
+        for count in [self.recipients.len(), self.attachments.len()] {
+            header.extend_from_slice(&(count as u32).to_le_bytes());
+        }
+        header.extend_from_slice(&[0; 8]);
+        write_props(&mut file, "", &self.props, header);
         for (index, props) in self.recipients.iter().enumerate() {
             let storage = format!("__recip_version1.0_#{index:08X}");
             file.create_storage(format!("/{storage}")).unwrap();
-            write_props(&mut file, &storage, props, 8);
+            write_props(&mut file, &storage, props, vec![0; 8]);
         }
         for (index, props) in self.attachments.iter().enumerate() {
             let storage = format!("__attach_version1.0_#{index:08X}");
             file.create_storage(format!("/{storage}")).unwrap();
-            write_props(&mut file, &storage, props, 8);
+            write_props(&mut file, &storage, props, vec![0; 8]);
         }
         file.flush().unwrap();
         file.into_inner().into_inner()
@@ -103,14 +113,14 @@ fn write_props(
     file: &mut cfb::CompoundFile<Cursor<Vec<u8>>>,
     storage: &str,
     props: &Props,
-    header: usize,
+    header: Vec<u8>,
 ) {
     let base = if storage.is_empty() {
         String::new()
     } else {
         format!("/{storage}")
     };
-    let mut fixed = vec![0_u8; header];
+    let mut fixed = header;
     for (id, value) in &props.0 {
         let (kind, stream): (u16, Option<Vec<u8>>) = match value {
             Value::Unicode(text) => (
@@ -139,6 +149,19 @@ fn write_props(
             }
         };
         if let Some(bytes) = stream {
+            // A variable-length value also has an entry in the property
+            // table: its size, with a terminating NUL counted for strings
+            // (MS-OXMSG 2.4.2.2).
+            let size = bytes.len() as u32
+                + match kind {
+                    PT_UNICODE => 2,
+                    PT_STRING8 => 1,
+                    _ => 0,
+                };
+            fixed.extend_from_slice(&((u32::from(*id) << 16) | u32::from(kind)).to_le_bytes());
+            fixed.extend_from_slice(&6_u32.to_le_bytes());
+            fixed.extend_from_slice(&size.to_le_bytes());
+            fixed.extend_from_slice(&[0; 4]);
             let mut stream = file
                 .create_stream(format!("{base}/__substg1.0_{id:04X}{kind:04X}"))
                 .unwrap();

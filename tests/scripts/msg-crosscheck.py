@@ -79,6 +79,7 @@ def main(argv):
                     "subject": (message.subject or "").rstrip("\0"),
                     "from": (message.sender or ""),
                     "to": message.to or "",
+                    "cc": message.cc or "",
                     # The same instant, which extract-msg gives in local time.
                     "sent": sent.strftime("%Y-%m-%dT%H:%M:%SZ") if sent else "",
                     "body": message.body or html_text(message.htmlBody),
@@ -94,20 +95,23 @@ def main(argv):
             if ours_from.startswith("/") and "@" not in theirs["from"]:
                 # No SMTP sender: the Exchange address against a display name.
                 counts["from: no SMTP address in either"] += 1
-            else:
-                checks["from"] = ours_from in theirs["from"].lower()
+            elif theirs["from"]:
+                checks["from"] = bool(ours_from) and ours_from in theirs["from"].lower()
             # A recipient can be shown under another of its addresses, so the
-            # local part is compared.
-            checks["to"] = all(
-                address(m).split("@")[0].lower() in theirs["to"].lower()
-                for m in record.get("to") or []
-            )
-            if record.get("body") and theirs["body"]:
+            # local part is compared; an empty list never agrees with a
+            # non-empty one.
+            for field, listed in (("to", message.to or ""), ("cc", message.cc or "")):
+                ours_list = [address(m).split("@")[0].lower() for m in record.get(field) or []]
+                if listed.strip() or ours_list:
+                    checks[field] = bool(ours_list) and all(
+                        local and local in listed.lower() for local in ours_list
+                    ) and listed.count("@") in (0, len(ours_list))
+            if theirs["body"].strip():
                 ratio = difflib.SequenceMatcher(
-                    None, words(record["body"]), words(theirs["body"]), autojunk=False
+                    None, words(record.get("body")), words(theirs["body"]), autojunk=False
                 ).ratio()
-                checks["body"] = ratio >= 0.8
-            elif not theirs["body"]:
+                checks["body"] = bool(record.get("body")) and ratio >= 0.8
+            else:
                 counts["body: extract-msg has none"] += 1
             for field, same in checks.items():
                 counts[f"{field}: {'agree' if same else 'differ'}"] += 1

@@ -299,3 +299,81 @@ async fn a_url_in_a_body_keeps_only_scheme_host_and_path() {
     assert!(!body.contains("abc123secret"), "{body}");
     assert!(body.contains("portal.contoso.example/orders"), "{body}");
 }
+
+#[tokio::test]
+async fn an_unknown_class_never_reaches_stderr_and_is_wrapped_in_the_record() {
+    let harness = Harness::new().await;
+    let mut message = html_note();
+    message.props.0.retain(|(id, _)| *id != 0x001A);
+    let message = message.with(
+        0x001A,
+        P::Unicode("IPM.Note.Custom-see-portal.contoso.example".into()),
+    );
+    let path = write_zip(
+        &harness,
+        "Items.1.001.export.zip",
+        items_zip(&[("Exchange/Items/a.msg", message.build())]),
+    );
+    let run = harness
+        .run(&["export", "read", &path, "--wrap-untrusted"])
+        .await;
+    assert!(!run.stderr().contains("Custom"), "{}", run.stderr());
+    assert!(run.stderr().contains("other: 1 read"), "{}", run.stderr());
+    let records = lines(&run);
+    assert!(records[0]["class"]
+        .as_str()
+        .unwrap()
+        .starts_with("[UNTRUSTED:"));
+}
+
+#[tokio::test]
+async fn json_with_wrap_untrusted_puts_its_one_notice_in_the_document() {
+    let harness = Harness::new().await;
+    let path = write_zip(
+        &harness,
+        "Items.1.001.export.zip",
+        items_zip(&[("Exchange/Items/a.msg", html_note().build())]),
+    );
+    let run = harness
+        .run(&["export", "read", &path, "--json", "--wrap-untrusted"])
+        .await;
+    assert!(
+        !run.stderr().contains("SECURITY NOTICE"),
+        "{}",
+        run.stderr()
+    );
+    let document = run.json();
+    let notice = document["untrustedNotice"].as_str().unwrap().to_owned();
+    let subject = document["results"][0]["subject"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let id = subject
+        .trim_start_matches("[UNTRUSTED:")
+        .split(']')
+        .next()
+        .unwrap()
+        .to_owned();
+    assert!(notice.contains(&id), "{notice} / {subject}");
+}
+
+#[test]
+fn a_resent_recipient_keeps_its_type() {
+    let mut message = html_note();
+    // MAPI_BCC with MAPI_SUBMITTED set, as on a resend.
+    message
+        .recipients
+        .push(recipient("Lee Example", "lee@contoso.example", 0x8000_0003));
+    let item = parse_msg(&message.build()).unwrap();
+    assert_eq!(item.bcc.len(), 1);
+    assert_eq!(item.to.len(), 1);
+}
+
+#[test]
+fn a_mac_roman_html_body_decodes() {
+    let message = Message::note("Mac")
+        .with(HTML, P::Binary(b"<p>caf\x8e</p>".to_vec()))
+        .with(CODEPAGE, P::Long(10000));
+    let item = parse_msg(&message.build()).unwrap();
+    assert_eq!(item.body, Body::Html("café".into()));
+}

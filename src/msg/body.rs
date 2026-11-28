@@ -141,7 +141,7 @@ fn encoding_for(codepage: u32) -> Option<&'static Encoding> {
         950 => "big5",
         20866 => "koi8-r",
         21866 => "koi8-u",
-        50220 | 50221 | 50222 => "iso-2022-jp",
+        50220..=50222 => "iso-2022-jp",
         51932 => "euc-jp",
         54936 => "gb18030",
         28592 => "iso-8859-2",

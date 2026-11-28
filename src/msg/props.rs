@@ -63,9 +63,10 @@ impl<'c, 'a> Props<'c, 'a> {
             for entry in stream
                 .get(header.len()..)
                 .unwrap_or_default()
-                .chunks_exact(16)
+                .as_chunks::<16>()
+                .0
             {
-                let tag = u32::from_le_bytes(entry[0..4].try_into().expect("4 bytes"));
+                let tag = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
                 let value: [u8; 8] = entry[8..16].try_into().expect("8 bytes");
                 fixed.insert((tag >> 16) as u16, ((tag & 0xFFFF) as u16, value));
             }
@@ -142,8 +143,10 @@ impl<'c, 'a> Props<'c, 'a> {
 /// UTF-16LE, with unpaired surrogates replaced.
 pub fn utf16le(bytes: &[u8]) -> String {
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
         .collect();
     String::from_utf16_lossy(&units)
 }

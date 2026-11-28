@@ -110,7 +110,7 @@ pub fn parse_msg(bytes: &[u8]) -> Result<MsgItem, MsgError> {
         .string(id::SENDER_SMTP_ADDRESS)
         .or_else(|| message.string(id::SENDER_EMAIL_ADDRESS))
         .or_else(|| message.string(id::SENT_REPRESENTING_SMTP_ADDRESS));
-    let from = (from_name.is_some() || from_address.is_some()).then(|| Mailbox {
+    let from = (from_name.is_some() || from_address.is_some()).then_some(Mailbox {
         name: from_name,
         address: from_address,
     });

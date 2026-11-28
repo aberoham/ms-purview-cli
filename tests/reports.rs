@@ -1037,3 +1037,131 @@ async fn a_refresh_the_identity_platform_refuses_is_a_sign_in_error_not_a_size_c
         assert!(setup.posts().await.is_empty(), "{args:?}");
     }
 }
+
+#[tokio::test]
+async fn an_estimate_that_finishes_after_the_plan_is_not_the_plan_approved() {
+    let setup = Setup::new().await;
+    // Same id: running when the plan read it, finished at 500 GiB after
+    // approval. --allow-large covers the size, not a different plan.
+    Mock::given(method("GET"))
+        .and(path(last_estimate_path()))
+        .respond_with(json_response(200, estimate("running", json!(GIB))))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&setup.harness.graph)
+        .await;
+    setup
+        .preflight(
+            setup.search(),
+            json!({"value": []}),
+            estimate("succeeded", json!(500 * GIB)),
+        )
+        .await;
+    setup.accept().await;
+    let run = setup
+        .run(&["--json", "--yes", "--allow-large", "--reason", "needed"])
+        .await;
+    assert_eq!(
+        run.json()["error"]["code"],
+        "SearchChanged",
+        "{}",
+        run.stdout()
+    );
+    assert!(setup.posts().await.is_empty());
+}
+
+#[tokio::test]
+async fn name_sets_the_display_name_and_a_rendered_name_is_checked() {
+    let mut setup = Setup::new().await;
+    setup.ready(false).await;
+    let run = setup
+        .run(&[
+            "--json",
+            "--yes",
+            "--no-download",
+            "--name",
+            "Legal hold check",
+        ])
+        .await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stdout());
+    assert_eq!(setup.post_body().await["displayName"], "Legal hold check");
+    assert_eq!(
+        run.json()["results"]["result"]["displayName"],
+        "Legal hold check"
+    );
+    let run = setup.run(&["--json", "--name", "a\tb"]).await;
+    assert_eq!(run.outcome.exit_code, 1);
+    assert!(!run.stdout().contains("a\\tb"), "{}", run.stdout());
+}
+
+#[tokio::test]
+async fn a_size_just_over_the_limit_is_shown_in_bytes() {
+    let mut setup = Setup::new().await;
+    setup.ready(false).await;
+    Mock::given(method("GET"))
+        .and(path(last_estimate_path()))
+        .respond_with(json_response(
+            200,
+            estimate("succeeded", json!(10 * GIB + 1)),
+        ))
+        .with_priority(1)
+        .mount(&setup.harness.graph)
+        .await;
+    let run = setup.run(&["--json", "--yes"]).await;
+    let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
+    assert!(message.contains("10,737,418,241 bytes"), "{message}");
+    assert!(message.contains("(10,737,418,240 bytes)"), "{message}");
+}
+
+#[tokio::test]
+async fn a_candidate_that_cannot_be_read_is_shown_as_report_or_export() {
+    let setup = Setup::new().await;
+    setup
+        .preflight(
+            setup.search(),
+            json!({"value": []}),
+            estimate("succeeded", json!(GIB)),
+        )
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("{CASES}/{CASE}/operations")))
+        .respond_with(json_response(200, json!({"value": []})))
+        .up_to_n_times(2)
+        .with_priority(1)
+        .mount(&setup.harness.graph)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("{CASES}/{CASE}/operations")))
+        .respond_with(json_response(
+            200,
+            json!({"value": [
+                {"id": OP, "action": "exportResult", "status": "running", "createdDateTime": "2026-01-05T09:00:30Z"},
+            ]}),
+        ))
+        .with_priority(2)
+        .mount(&setup.harness.graph)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(operation_path()))
+        .respond_with(json_response(404, json!({"error": {"code": "NotFound"}})))
+        .mount(&setup.harness.graph)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(search_path("/exportReport")))
+        .respond_with(json_response(
+            503,
+            json!({"error": {"code": "ServiceUnavailable"}}),
+        ))
+        .mount(&setup.harness.graph)
+        .await;
+    let run = setup.run(&["--json", "--yes"]).await;
+    let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
+    assert!(
+        message.contains(&format!("report or export {OP} (running")),
+        "{message}"
+    );
+    assert!(
+        message.contains("could not be read on its own"),
+        "{message}"
+    );
+}

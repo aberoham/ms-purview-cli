@@ -256,6 +256,19 @@ async fn a_bad_volume_setting_does_not_stop_case_create() {
 }
 
 #[tokio::test]
+async fn a_bad_teams_context_setting_does_not_stop_case_create() {
+    let harness = signed_in().await;
+    let file = harness.config_dir().join("config.json");
+    let mut config = harness.config();
+    config["defaults"] = json!({"teams_context": "off"});
+    std::fs::write(&file, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    mount_get(&harness, CASES, page(vec![])).await;
+    let run = harness.run(&case_create(&["--dry-run", "--yes"])).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
+    assert!(writes(&harness).await.is_empty());
+}
+
+#[tokio::test]
 async fn a_name_used_by_a_closed_case_is_refused_with_ids_not_the_name() {
     let harness = signed_in().await;
     mount_get(

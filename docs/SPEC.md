@@ -1989,8 +1989,9 @@ Settled in the volume-warning PR: `estimate` warns loudly when a search finds mo
 person can work with, so that the query is narrowed or the scope confirmed before a report
 or an export collects it. The limits are under `volume` in `config.json` (section 5.5), each
 read as `limits` is: `null` or missing keeps the default, any other value of the wrong type
-is an error before sign-in that names the key and not the value. Only `estimate` reads
-`volume`, so a bad value there stops no other write.
+is an error before sign-in that names the key and not the value. Only `estimate` reads every
+key, and `report` only `max_export_size` (from PR 2.4), so a bad value there stops no other
+write.
 
 | Key | Default | Compared with | Evidence |
 |---|---|---|---|

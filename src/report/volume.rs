@@ -264,12 +264,7 @@ impl Volume {
                     )
                 }
                 _ => {
-                    let (mut value, mut limit) = (size_text(over.value), size_text(over.limit));
-                    // Rounded alike, they would read as equal.
-                    if value == limit {
-                        value = format!("{} bytes", grouped(over.value));
-                        limit = format!("{} bytes", grouped(over.limit));
-                    }
+                    let (value, limit) = size_texts(over.value, over.limit);
                     format!(
                         "warning: VOLUME: the estimate's indexed size is {value}, more than \
                          volume.max_export_size ({limit}); with Teams context an export can be \
@@ -303,6 +298,19 @@ pub(crate) fn grouped(value: u64) -> String {
 
 /// Bytes in the largest binary unit that keeps one or more whole units,
 /// with one decimal place.
+/// A size and its limit as text, in bytes when rounding would show them
+/// alike.
+pub(crate) fn size_texts(value: u64, limit: u64) -> (String, String) {
+    let (shown, limit_shown) = (size_text(value), size_text(limit));
+    if shown == limit_shown && value != limit {
+        return (
+            format!("{} bytes", grouped(value)),
+            format!("{} bytes", grouped(limit)),
+        );
+    }
+    (shown, limit_shown)
+}
+
 pub(crate) fn size_text(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["KiB", "MiB", "GiB", "TiB"];
     if bytes < 1 << 10 {

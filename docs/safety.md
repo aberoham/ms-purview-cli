@@ -132,7 +132,8 @@ with the same checks, and nothing is sent if it no longer passes them
 `SearchHasSources`) or if its query or the guard's verdict differ from the
 plan (`SearchChanged`). Without
 `--allow-concurrent`, the case's operations are listed again too, so an
-estimate someone else started while the prompt was open is refused as a
+estimate (for `estimate`), or an item report or export (for `report`),
+that someone else started while the prompt was open is refused as a
 possible duplicate. A change made after these reads is still possible. The action is then sent once.
 Its answer must be a 202 naming the new operation in the `Location`
 header, on the Graph origin and for the case posted to, and the operation

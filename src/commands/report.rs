@@ -30,7 +30,7 @@ use crate::model::wire::{Action, OperationRecord, OperationStatus, Source};
 use crate::naming::{Naming, Values};
 use crate::poll::Timing;
 use crate::report::estimate::Collection;
-use crate::report::volume::{grouped, size_text, VolumeLimits, VolumeUse};
+use crate::report::volume::{grouped, size_text, size_texts, VolumeLimits, VolumeUse};
 use crate::report::{EvidenceOf, ReportLimits};
 use crate::routes::{CaseId, OperationId, Query, ReadRoute, SearchId, WriteRoute};
 use crate::safety::{
@@ -90,7 +90,8 @@ pub struct Report {
 struct Shown {
     query: String,
     narrowed: bool,
-    estimate: Option<String>,
+    /// The latest estimate as the plan read it.
+    basis: Basis,
     display_name: String,
     teams_context: bool,
 }
@@ -320,19 +321,21 @@ pub(crate) fn size_check(
             partial,
             ..
         } if *size > limit => {
+            // Rounded alike, the two would read as equal.
+            let (size_shown, limit_text) = size_texts(*size, limit);
             let message = format!(
                 "the latest estimate of search {search} ({operation}) found {}{} of items, more \
                  than volume.max_export_size ({limit_text}), and a report or export collects \
                  more than the estimate counts; nothing was sent. Narrow the query, or pass \
                  --allow-large --reason to collect it anyway",
                 if *partial { "at least " } else { "" },
-                size_text(*size)
+                size_shown
             );
             let line = format!(
                 "size: the latest estimate {operation} found {}{}, over volume.max_export_size \
                  ({limit_text})",
                 if *partial { "at least " } else { "" },
-                size_text(*size)
+                size_shown
             );
             if allow_large {
                 (
@@ -341,7 +344,7 @@ pub(crate) fn size_check(
                         "VOLUME: the latest estimate found {}{} of items, over \
                          volume.max_export_size ({limit_text}); --allow-large overrides it",
                         if *partial { "at least " } else { "" },
-                        size_text(*size)
+                        size_shown
                     )),
                     line,
                 )
@@ -568,7 +571,7 @@ impl WriteCommand for Report {
         self.shown = Some(Shown {
             query: query.clone(),
             narrowed,
-            estimate: basis.operation().map(str::to_owned),
+            basis: basis.clone(),
             display_name: display_name.clone(),
             teams_context,
         });
@@ -674,12 +677,14 @@ impl WriteCommand for Report {
                      nothing was sent"
                 ))
             })?;
-        if basis.operation() != shown.estimate.as_deref() {
-            return Err(changed("its latest estimate is not the one shown"));
-        }
         let limit = self.volume.unwrap_or_default().max_export_size;
         if let (Some(blocked), _, _) = size_check(&basis, limit, self.flags.allow_large, search) {
             return Err(blocked.error());
+        }
+        // Another estimate, or the same one with another size, status or
+        // verdict, is not the plan that was approved.
+        if basis != shown.basis {
+            return Err(changed("its latest estimate is not the one shown"));
         }
         if !self.flags.allow_concurrent {
             let active = active_operations(preflight.graph, case, &EXPORT_ACTIONS, preflight.log)
@@ -749,7 +754,7 @@ impl WriteCommand for Report {
                 "collection": finished.collection.as_str(),
                 "displayName": shown.display_name,
                 "teamsContext": shown.teams_context,
-                "estimateId": shown.estimate,
+                "estimateId": shown.basis.operation(),
                 "locationsWithHits": finished
                     .evidence
                     .as_ref()

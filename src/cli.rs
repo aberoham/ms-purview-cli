@@ -1128,6 +1128,11 @@ converted to text when there is one, else the plain-text body; an item with \
 only a compressed RTF body, or none, gets error noBody. Each zip is read in \
 memory through limits on entries and sizes, and nothing is extracted.
 
+A body keeps a link's text but not where it points, and every web address in \
+it keeps only its scheme, host and path, because a query can hold a sign-in \
+code. When a link itself is the evidence, open the .msg that the record's \
+entry names in the zip.
+
 Writes one JSON record per item (JSON Lines), or one document with --json, \
 and a summary to stderr. Bodies are colleagues' and outside senders' mail, \
 so the command refuses to write to a terminal: redirect standard output to \

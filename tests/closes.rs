@@ -633,3 +633,13 @@ async fn a_name_the_terminal_shows_as_nothing_is_confirmed_by_the_case_id() {
     );
     assert_eq!(writes(&harness).await.len(), 1);
 }
+
+#[tokio::test]
+async fn without_wait_a_case_read_with_no_status_is_still_the_result() {
+    let mut unreadable = case("active", MARKED);
+    unreadable.as_object_mut().unwrap().remove("status");
+    let harness = ready(&[unreadable]).await;
+    let run = harness.run(&close(&["--json", "--yes"])).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stdout());
+    assert_eq!(run.json()["results"]["result"]["id"], CASE);
+}

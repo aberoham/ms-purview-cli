@@ -92,8 +92,10 @@ run with `python3`.
   the case must be active and carry `naming.marker` (or have been created
   by the signed-in account) unless `--any-case`; its `custodians`,
   `noncustodialDataSources` and `legalHolds` are each read to the last
-  page, any entry refusing with `CaseHasHolds` and any failed read with
-  `ClosePrecheckFailed`, and read again after approval (`recheck`). The
+  page through paging links to that list alone, any entry refusing with
+  `CaseHasHolds` and a failed read with `ClosePrecheckFailed` (a broken
+  sign-in keeps `TokenUnavailable`), and read again, ownership included,
+  after approval (`recheck`). The
   POST has no body (`WriteRoute::takes_body`), the plan asks for the case
   name typed (`WritePlan::with_typed_confirmation`), `--wait` polls the
   case through `Poller` until `closed`, and an unclear outcome reads the

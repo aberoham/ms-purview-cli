@@ -31,7 +31,9 @@ Every write runs the same steps, in this order:
    - Otherwise, when standard input and standard error are both terminals
      and `--no-input` is not given, the plan is shown on standard error
      followed by `Apply? [y/N]`. Only `y` or `yes` approves. `case close`
-     asks for the case's name instead, and only that name, typed, approves.
+     asks for the case's name instead, and only that name, typed as Graph
+     gives it or as shown, approves; a name that shows as nothing is
+     confirmed by the case id.
    - Otherwise nothing is sent, and the command exits 3 with
      `ConfirmationRequired`; a declined prompt exits 3 with `Declined`.
 6. **Send.** The approved request is sent once, exactly as planned. It is
@@ -86,7 +88,8 @@ error.
 
 - The case must be active, and must carry `naming.marker` in its
   description or have been created by the signed-in account, unless
-  `--any-case` is given; the plan then carries a warning. Case records in
+  `--any-case` is given; a case allowed by `--any-case` alone gets a
+  warning in the plan. Case records in
   the observed tenant carry no `createdBy`, so the marker is what shows a
   case is the tool's.
 - Preflight reads the case's custodians, non-custodial data sources and

@@ -28,7 +28,7 @@ use std::time::Duration;
 use serde_json::json;
 
 use super::operation::shell_word;
-use crate::poll::{elapsed_text, PollEnd, Polled, Poller, Timing};
+use crate::poll::{elapsed_text, PollEnd, Poller, Timing};
 
 /// `--status` of `case list`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -776,7 +776,7 @@ impl WriteCommand for CaseClose {
                 .graph
                 .get(&route, &Query::new(), &mut session.env.stderr)
                 .await
-                .and_then(|body| CaseRecord::read(body, &route));
+                .and_then(|body| case_as_read(body, case));
             return Ok(match read {
                 Ok(record) => Applied::result(record.raw),
                 Err(error) => {
@@ -854,7 +854,7 @@ impl WriteCommand for CaseClose {
             .graph
             .get(&route, &Query::new(), preflight.log)
             .await
-            .and_then(|body| CaseRecord::read(body, &route));
+            .and_then(|body| case_as_read(body, case));
         Ok(match read {
             Ok(record) => Reconciled {
                 candidates: vec![format!("case {case}: {}", case_status(&record.status))],
@@ -872,6 +872,22 @@ impl WriteCommand for CaseClose {
             },
         })
     }
+}
+
+/// One read of the case after the close: it must be case `case`, but
+/// may have no status, which the result then shows as Graph gave it. The
+/// wait, by contrast, ends on a read with no status.
+fn case_as_read(body: Value, case: CaseId) -> Result<CaseRecord> {
+    let record = CaseRecord::from_value(body)
+        .ok_or_else(|| PurviewError::message("Graph returned a case that is not an object"))?;
+    let read = crate::model::valid::CaseRef::new(record)?;
+    if read.id != case {
+        return Err(PurviewError::message(format!(
+            "Graph answered the read of case {case} with case {}",
+            read.id
+        )));
+    }
+    Ok(read.record)
 }
 
 /// The case-close document at the `--wait` deadline (exit 5) or after

@@ -306,6 +306,30 @@ async fn filters_apply_to_rows_before_they_are_counted() {
         keys(&run3),
         ["<m2@contoso.example>", "<m1@contoso.example>"]
     );
+    // A sender as the output shows it, name and all, matches too.
+    let run3b = run(
+        dir.path(),
+        &[
+            "parse",
+            "items",
+            zip,
+            "--exclude-sender",
+            "Alex <ALEX@contoso.example>",
+            "--class",
+            "IPM.Note",
+        ],
+    )
+    .await;
+    let kept = keys(&run3b);
+    assert_eq!(kept.len(), 2, "{kept:?}");
+    assert!(
+        kept.contains(&"<m2@contoso.example>".to_owned()),
+        "{kept:?}"
+    );
+    assert!(
+        !kept.contains(&"<m1@contoso.example>".to_owned()),
+        "{kept:?}"
+    );
     let run4 = run(
         dir.path(),
         &[

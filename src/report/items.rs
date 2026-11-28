@@ -269,9 +269,11 @@ pub struct Filters {
     pub subject: Option<Regex>,
     /// A prefix of `Item class`, lowercased; compared ignoring case.
     pub class_prefix: Option<String>,
-    /// Sender addresses, lowercased; a row must match one.
+    /// Sender addresses as `sender_address` gives them; a row must match
+    /// one.
     pub senders: Vec<String>,
-    /// Sender addresses, lowercased; a row matching one is left out.
+    /// Sender addresses as `sender_address` gives them; a row matching one
+    /// is left out.
     pub exclude_senders: Vec<String>,
     /// `Workload`, lowercased; compared ignoring case.
     pub workload: Option<String>,

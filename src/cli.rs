@@ -2128,7 +2128,10 @@ fn parse_items(env: &mut Env, output: &OutputOptions, args: ParseItemsArgs) -> R
     let addresses = |flag: &str, values: Vec<String>| -> Result<Vec<String>> {
         values
             .into_iter()
-            .map(|value| not_blank(flag, value).map(|value| value.trim().to_lowercase()))
+            .map(|value| {
+                // As the rows' senders are read: `Name <addr>` gives addr.
+                not_blank(flag, value).map(|value| crate::report::items::sender_address(&value))
+            })
             .collect()
     };
     if let (Some(since), Some(until)) = (args.since, args.until) {

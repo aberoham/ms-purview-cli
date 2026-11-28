@@ -784,7 +784,8 @@ estimate, `Items_N_*.csv` without an `Items.*.zip` sibling means an item report.
   - Unique items are written by `date`, items without one last, then by `key`; `--all-rows`
     keeps file order, the `Items_N` files by `N` as a number.
   - `--sender` may be repeated (a row must match one), as may `--exclude-sender`; both, and
-    `--class` and `--workload`, ignore case. A date filter leaves out rows with no readable
+    `--class` and `--workload`, ignore case. A sender flag is read as a row's sender is, so
+    `Name <addr>` as the output shows it matches `addr`. A date filter leaves out rows with no readable
     `Date`.
   - `--jsonl` names the default; with `--json` or `PURVIEW_JSON` it is refused, so that a
     failure is printed in the shape the output mode gives it. `--force-buffer` without

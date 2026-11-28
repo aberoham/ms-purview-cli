@@ -369,9 +369,10 @@ traces and the report zip stayed outside the repository.
 
 ### PR 2.4: `report`
 
-Status: **read part run on 28 November 2026** from a local build of the PR 2.4 branch, on
-the search that the PR 2.2 check created and the PR 2.3 check estimated. The report itself
-has not been sent yet. Outputs and traces stayed outside the repository.
+Status: **run on 28 November 2026** from a local build of the PR 2.4 branch, on the search
+that the PR 2.2 check created and the PR 2.3 check estimated, and on a second, Teams-only
+search (`kind:microsoftteams`) created for the check. Outputs, traces and the report zip
+stayed outside the repository.
 
 - **Latest estimate:** `GET …/searches/{id}/lastEstimateStatisticsOperation` answered
   **200** with the search's estimate: `action: estimateStatistics`, `status`,
@@ -384,3 +385,23 @@ has not been sent yet. Outputs and traces stayed outside the repository.
   `createdDateTime` a day after its estimate ran and finished, so running an estimate does
   not change it. (Observed) The size limit's rule that an estimate older than the search's
   last change does not count therefore holds.
+- **Teams-only estimate:** a search with `kind:microsoftteams` over every tenant mailbox
+  estimated with `succeeded` and no hits, on the order of fourteen thousand locations
+  searched, two of them failed. (Observed)
+- **POST:** `exportReport` with `displayName`, `exportCriteria: searchHits`,
+  `exportLocation: responsiveLocations` and `additionalOptions:
+  teamsAndYammerConversations` answered **202** with a key-form `Location` header.
+  (Observed)
+- **Wait:** 12 reads of the operation over about three minutes, then `succeeded`. The
+  single `GET` was typed `#microsoft.graph.security.ediscoverySearchExportOperation` with
+  `action: exportReport`, `exportFormat: pst`, the `additionalOptions` sent, and
+  `description: null`. (Observed)
+- **Zip:** one file of about fifty kilobytes holding `Items_0_<time>.csv`,
+  `Locations-<time>.csv`, `Settings-<time>.csv` and `Summary-<time>.csv`, and no Statistics
+  file. `Items_0` had 162 columns and a few hundred rows. (Observed)
+- **Locations:** the same header as an estimate's. It listed a few dozen locations, every
+  one `Succeeded`, and fewer than half had a `Count` above zero: an item report's Locations
+  file includes locations with no hits. (Observed) `locationsWithHits` counts only rows
+  with hits for that reason. The command reported `collection: complete`.
+- **Search after a report:** the search's `lastModifiedDateTime` was unchanged. (Observed)
+

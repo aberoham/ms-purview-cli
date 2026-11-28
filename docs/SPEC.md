@@ -818,9 +818,9 @@ Settled in the first `.msg` reader PR (PR 5.1 with the body selection of PR 5.2)
   VML and Office rules only when they set `behavior`, and `<hr>` is kept as `---`. Office's
   conditional comments need nothing: a hidden one is one HTML comment, which the parser
   drops, and a downlevel-revealed one's markers are comments around text that is kept.
-  A link's `<a>` tags are removed and its text kept: `html2text` would write `[text]`, and a
-  bracket run on to a URL hides its host from the redaction. The link's target is never
-  shown. Conversion uses `html2text`'s raw mode, which gives each table cell its own line
+  A link is its text alone: `html2text`'s rich decorator writes nothing around a link,
+  where the plain one writes `[text]` and the bracket runs on to a URL, hiding its host
+  from the redaction. The link's target is never shown. Conversion uses `html2text`'s raw mode, which gives each table cell its own line
   and draws no borders, so a table is never wider or longer than its text; a huge span
   stays cheap, and spans whose sum overflows panic inside `html2text`, which gives
   `bodyDecode` (Derived from its source). The

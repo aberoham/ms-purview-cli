@@ -195,26 +195,16 @@ static VML_STYLE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(?:[vowx]\\:\*|\.shape)\s*\{\s*behavior\s*:[^}]*\}").expect("a valid pattern")
 });
 
-/// A link's tags, removed and their text kept: `html2text` writes a link
-/// as `[text]`, and a bracket run on to a URL hides its host from the
-/// redaction after. The link's target is never shown.
-static LINK_TAG: LazyLock<Regex> =
-    // A quoted attribute value may hold `>`.
-    LazyLock::new(|| {
-        Regex::new(r#"(?i)<a(?:\s(?:[^>"']|"[^"]*"|'[^']*')*)?>|</a\s*>"#).expect("a valid pattern")
-    });
-
 /// A horizontal rule, which `html2text` 0.17 drops; it is kept as `---`.
 static HR: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)<hr\b[^>]*>").expect("a valid pattern"));
 
-/// The HTML as plain text: cleaned, converted with no decoration and no
+/// The HTML as plain text: cleaned, converted with no markers and no
 /// link footnotes, then with VML leftovers and trailing spaces removed.
 /// `None` when it cannot be converted, including a panic in the converter.
 pub fn html_to_text(html: &str) -> Option<String> {
     let cleaned = REMOVED_HTML.replace_all(html, "");
     let cleaned = VML_STYLE.replace_all(&cleaned, "");
-    let cleaned = LINK_TAG.replace_all(&cleaned, "");
     let cleaned = HR.replace_all(&cleaned, "<p>---</p>");
     let cleaned = cleaned.into_owned();
     let width = TEXT_WIDTH.max(cleaned.len().saturating_add(1));
@@ -222,7 +212,12 @@ pub fn html_to_text(html: &str) -> Option<String> {
         // Raw mode lays a table out as one column with a line per cell, and
         // draws no borders, so a table is never wider or longer than its
         // text (Derived from `html2text` 0.17's source and output).
-        html2text::config::plain_no_decorate()
+        // The rich decorator writes nothing around a link, emphasis or
+        // code, where the plain one writes a link as `[text]` and the
+        // bracket runs on to a URL, hiding its host from the redaction.
+        // Its annotations are dropped by `string_from_read`. The link's
+        // target is never shown.
+        html2text::config::rich()
             .raw_mode(true)
             // Struck-through text stays plain: a combining stroke after each
             // character would hide a URL from the redaction after.
@@ -347,6 +342,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(text, "Report Two");
+        // A `/` after the tag name is a separator too.
+        let text = html_to_text(
+            "<p><a/href=\"https://portal.contoso.example\">https://portal.contoso.example</a></p>",
+        )
+        .unwrap();
+        assert_eq!(text, "https://portal.contoso.example");
     }
 
     #[test]

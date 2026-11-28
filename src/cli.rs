@@ -1122,7 +1122,7 @@ Examples:
         about = "Read the messages in an export's items zips on this computer, as JSON Lines",
         long_about = "\
 Read each .msg in one or more Items.*.zip parts that 'purview download' or \
-'export create' wrote, with no sign-in: sender, recipients, subject, dates, \
+'export create' wrote, with no sign-in: from and sender, recipients, subject, dates, \
 class, attachment names and sizes, and the body. The body is the HTML body \
 converted to text when there is one, else the plain-text body; an item with \
 only a compressed RTF body, or none, gets error noBody. Each zip is read in \

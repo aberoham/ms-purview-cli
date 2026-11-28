@@ -4,6 +4,7 @@
 pub mod csvread;
 pub mod estimate;
 pub mod items;
+pub mod profile;
 pub mod summary;
 pub mod volume;
 

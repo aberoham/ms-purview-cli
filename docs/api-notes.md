@@ -136,6 +136,15 @@ From the queries sampled in one tenant (Observed):
 - `Subject/Title` is empty for Teams messages; `Conversation name` labels them. `Sender`
   is sometimes a Teams thread id. The same person was seen under an old and a new domain.
   (Observed)
+- In the three item reports of the PR 2.4 and PR 2.5 live checks, `Workload` was
+  `Exchange` on every row, Teams messages included. Teams messages had `Item class`
+  `IPM.SkypeTeams.Message` or `IPM.SkypeTeams.SystemMessage`; the other classes seen were
+  `IPM.Note`, `IPM.Appointment`, `IPM.Schedule.Meeting.Request`,
+  `IPM.Schedule.Meeting.Resp.Pos`, `IPM.AppointmentSnapshot.SkypeTeams.Meeting` and
+  `IPM.File.TeamsConversation`. (Observed, PR 3.2)
+- The `Sender` of an `IPM.File.TeamsConversation` row can be a list of addresses separated
+  by `; `, cut at 255 characters; each of the three reports had at least one. A few `Sender`
+  values are a display name with no address. (Observed, PR 3.2)
 - With Teams context on, an export held roughly four times the estimated count. (Observed,
   one run)
 - An export's report CSV has one row per exported file, and every row had

@@ -426,6 +426,16 @@ pub struct WriteSettings {
     pub volume: crate::report::volume::VolumeLimits,
     /// `defaults.teams_context`, `true` unless set to `false`.
     pub teams_context: bool,
+    /// What a profile needs, for a command whose `profiles()` is true.
+    pub profile: Option<ProfileSettings>,
+}
+
+/// The settings of a profile (`docs/SPEC.md` section 4.8): `identity` and
+/// `defaults.top` in `config.json`.
+#[derive(Debug, Clone)]
+pub struct ProfileSettings {
+    pub identity: crate::report::profile::Identity,
+    pub top: usize,
 }
 
 /// What preflight decided.
@@ -533,6 +543,13 @@ pub trait WriteCommand: Send {
     /// Whether the command reads `defaults.teams_context`, so that a bad
     /// setting there stops only the commands that use it.
     fn reads_teams_context(&self) -> bool {
+        false
+    }
+
+    /// Whether the command makes a profile of a report, so that it reads
+    /// `identity` and `defaults.top` and a bad setting there stops only the
+    /// commands that use them.
+    fn profiles(&self) -> bool {
         false
     }
 

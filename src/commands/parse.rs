@@ -1,4 +1,4 @@
-//! `purview parse locations|failures|summary|items <zip>` (`docs/SPEC.md`
+//! `purview parse locations|failures|summary|items|profile <zip>` (`docs/SPEC.md`
 //! section 3.5): local, no sign-in. The zip is read through the limits of
 //! `report::ReportLimits`, which `cli` takes from `config.json`.
 
@@ -13,11 +13,15 @@ use crate::error::{PurviewError, Result};
 use crate::output::{sanitize, write_rows, OutputFormat, OutputOptions};
 use crate::report::estimate::{by_hits, FailedLocation, LocationRow};
 use crate::report::items::{self, Dedup, Filters, Tally};
+use crate::report::profile::{self, Identity, Options};
 use crate::report::{ReportFiles, ReportLimits};
 
 pub const LOCATION_COLUMNS: &[&str] = &["LOCATION", "SUBTYPE", "COUNT", "SIZE", "STATUS"];
 pub const FAILURE_COLUMNS: &[&str] = &["LOCATION", "SUBTYPE", "SOURCES", "MESSAGE"];
 pub const SUMMARY_COLUMNS: &[&str] = &["FILE", "KEY", "VALUE"];
+pub const PROFILE_COLUMNS: &[&str] = &["SECTION", "NAME", "COUNT"];
+/// The width `NAME` is cut to in the table; JSON keeps the whole name.
+const PROFILE_NAME_WIDTH: usize = 80;
 
 /// `--subtype` of `parse locations`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -376,6 +380,7 @@ pub fn items(
     }
     items_summary(
         &mut env.stderr,
+        "parse items",
         &tally,
         request.all_rows.then_some(written),
         unique,
@@ -406,11 +411,79 @@ pub fn items(
     })
 }
 
-/// The stderr summary of `parse items`: counts and column names only, never
-/// a field's text. `rows_written` is set under `--all-rows`.
-/// `unique` is the unique items and those keyed by hash.
-fn items_summary(
+/// The checked arguments of `parse profile`.
+#[derive(Debug, Clone)]
+pub struct ProfileRequest {
+    pub zip: PathBuf,
+    pub filters: Filters,
+    pub max_unique: usize,
+    pub identity: Identity,
+    pub options: Options,
+}
+
+/// `parse profile`: one document, or a `SECTION`, `NAME`, `COUNT` table,
+/// and the summary of `parse items` on stderr.
+pub fn profile(
+    env: &mut Env,
+    output: &OutputOptions,
+    request: &ProfileRequest,
+    limits: ReportLimits,
+) -> Result<Produced> {
+    let read = profile::read(
+        &request.zip,
+        limits,
+        &request.filters,
+        request.max_unique,
+        &request.identity,
+        request.options,
+    )
+    // The path is the user's own argument and is not repeated.
+    .map_err(|error| match error {
+        PurviewError::Io(io) => {
+            PurviewError::message(format!("the zip given cannot be read: {}", io.kind()))
+        }
+        other => other,
+    })?;
+    items_summary(
+        &mut env.stderr,
+        "parse profile",
+        &read.tally,
+        None,
+        read.unique,
+    );
+    if output.format == OutputFormat::Json {
+        return Ok(Produced::success(Some(output.untrusted_json_value(
+            read.profile.to_value(),
+            1,
+            &env.redactor,
+        )?)));
+    }
+    let table: Vec<Vec<String>> = read
+        .profile
+        .rows()
+        .into_iter()
+        .map(|[section, name, count]| {
+            vec![
+                section,
+                super::cut(
+                    &sanitize(&crate::redact::shown(&name, &env.redactor)),
+                    PROFILE_NAME_WIDTH,
+                ),
+                count,
+            ]
+        })
+        .collect();
+    write_rows(&mut env.stdout, output, PROFILE_COLUMNS, &table)?;
+    Ok(Produced::success(None))
+}
+
+/// The stderr summary of `parse items` and `parse profile` (`command`):
+/// counts and column names only, never a field's text. `rows_written` is
+/// set under `--all-rows`. `unique` is the unique items and those keyed by
+/// hash.
+pub fn items_summary(
     log: &mut dyn Write,
+    command: &str,
     tally: &Tally,
     rows_written: Option<usize>,
     unique: (usize, usize),
@@ -427,7 +500,7 @@ fn items_summary(
     };
     let _ = writeln!(
         log,
-        "parse items: {} read from {}, {} matched the filters; {what}",
+        "{command}: {} read from {}, {} matched the filters; {what}",
         plural(tally.rows, "row"),
         plural(tally.files as u64, "Items file"),
         tally.matched,

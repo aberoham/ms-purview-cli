@@ -321,7 +321,8 @@ Examples:
   purview parse locations <zip> --top 10 --with-hits
   purview parse failures <zip> --json
   purview parse summary <zip>
-  purview parse items <zip> > items.jsonl"
+  purview parse items <zip> > items.jsonl
+  purview parse profile <zip> --top 10"
     )]
     Parse(ParseArgs),
     #[command(
@@ -408,12 +409,30 @@ Examples:
   purview --json parse items <zip> --subject-regex '(?i)invoice'"
     )]
     Items(ParseItemsArgs),
+    #[command(
+        about = "Count an item report's unique items by class, sender, conversation and date",
+        long_about = "\
+Read the Items_N_*.csv files of an item report zip, count rows as copies of \
+unique items as parse items does, and count the unique items: by Item class \
+and Workload; by sender, with the forms addr and Name <addr> read as addr, \
+lowercased, and Teams thread ids (19:...) counted apart, never as a person; \
+by sender domain; by Conversation name for Teams messages (Item class \
+IPM.SkypeTeams.*); and by UTC day, ISO week or month. Domains are mapped \
+through identity.domain_aliases in config.json. The filters apply to rows \
+before they are counted. A summary goes to standard error.",
+        after_help = "\
+Examples:
+  purview parse profile <zip>
+  purview parse profile <zip> --top 10 --bucket week
+  purview parse profile <zip> --class IPM.SkypeTeams --merge-local-part --json"
+    )]
+    Profile(ParseProfileArgs),
 }
 
+/// The filters of `parse items` and `parse profile` (`docs/SPEC.md`
+/// section 3.5).
 #[derive(Debug, Clone, Args)]
-struct ParseItemsArgs {
-    #[arg(value_name = "ZIP", help = "An item report zip")]
-    zip: PathBuf,
+struct ItemFilterArgs {
     #[arg(
         long,
         value_name = "DATE",
@@ -458,6 +477,14 @@ struct ParseItemsArgs {
         help = "Keep rows whose Workload is W, ignoring case, such as Exchange"
     )]
     workload: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ParseItemsArgs {
+    #[arg(value_name = "ZIP", help = "An item report zip")]
+    zip: PathBuf,
+    #[command(flatten)]
+    filters: ItemFilterArgs,
     #[arg(
         long,
         help = "Write JSON Lines, the default; refused with --json or PURVIEW_JSON"
@@ -479,6 +506,56 @@ struct ParseItemsArgs {
         help = "Stop with TooManyUnique past N unique items (default 2000000)"
     )]
     max_unique: Option<usize>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ParseProfileArgs {
+    #[arg(value_name = "ZIP", help = "An item report zip")]
+    zip: PathBuf,
+    #[command(flatten)]
+    filters: ItemFilterArgs,
+    #[arg(
+        long,
+        value_name = "N",
+        help = "List the N senders, domains and Teams conversations with most items (default: \
+defaults.top in config.json, else 20)"
+    )]
+    top: Option<usize>,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = BucketArg::Month,
+        help = "Count items by UTC day, ISO week (from Monday) or month"
+    )]
+    bucket: BucketArg,
+    #[arg(
+        long,
+        help = "Count senders in identity.internal_domains with one local part as one sender"
+    )]
+    merge_local_part: bool,
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Stop with TooManyUnique past N unique items (default 2000000)"
+    )]
+    max_unique: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum BucketArg {
+    Day,
+    Week,
+    Month,
+}
+
+impl From<BucketArg> for crate::report::profile::Bucket {
+    fn from(bucket: BucketArg) -> Self {
+        match bucket {
+            BucketArg::Day => Self::Day,
+            BucketArg::Week => Self::Week,
+            BucketArg::Month => Self::Month,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -1211,6 +1288,13 @@ minutes, then 60s after 10)"
         help = "Write the report zip here instead of the data directory"
     )]
     out: Option<String>,
+    #[arg(
+        long,
+        conflicts_with_all = ["no_download", "no_wait"],
+        help = "Add the report's profile to the result, as parse profile gives it with its \
+defaults; exit 4 when it cannot be made"
+    )]
+    profile: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -2000,6 +2084,7 @@ async fn run(
                 no_wait: args.no_wait,
                 no_download: args.no_download,
                 strict: args.strict,
+                profile: args.profile,
                 timing: poll::timing(
                     args.wait_timeout.as_deref(),
                     args.poll_interval.as_deref(),
@@ -2037,6 +2122,7 @@ async fn run(
                 no_wait: args.no_wait,
                 no_download: args.no_download,
                 strict: args.strict,
+                profile: false,
                 timing: poll::timing(
                     args.wait_timeout.as_deref(),
                     args.poll_interval.as_deref(),
@@ -2079,6 +2165,7 @@ fn parse_zip(env: &mut Env, output: &OutputOptions, command: ParseCommand) -> Re
     use commands::parse::{LocationFilters, SubType, What};
     let (zip, what) = match command {
         ParseCommand::Items(args) => return parse_items(env, output, args),
+        ParseCommand::Profile(args) => return parse_profile(env, output, args),
         ParseCommand::Locations {
             zip,
             top,
@@ -2113,62 +2200,77 @@ fn parse_zip(env: &mut Env, output: &OutputOptions, command: ParseCommand) -> Re
     })
 }
 
-/// `purview parse items`: local. The flags are checked, then config.json's
-/// limits, then the zip is read.
-fn parse_items(env: &mut Env, output: &OutputOptions, args: ParseItemsArgs) -> Result<Outcome> {
-    use crate::report::items::{Filters, DEFAULT_MAX_UNIQUE};
-    if args.zip.as_os_str().is_empty() {
-        return Err(PurviewError::message("<ZIP> was given an empty value"));
-    }
-    let optional = |flag: &str, value: Option<String>| -> Result<Option<String>> {
-        value
-            .map(|value| not_blank(flag, value).map(|value| value.trim().to_owned()))
-            .transpose()
-    };
-    let addresses = |flag: &str, values: Vec<String>| -> Result<Vec<String>> {
-        values
-            .into_iter()
-            .map(|value| {
-                // As the rows' senders are read: `Name <addr>` gives addr.
-                not_blank(flag, value).map(|value| crate::report::items::sender_address(&value))
-            })
-            .collect()
-    };
-    if let (Some(since), Some(until)) = (args.since, args.until) {
-        if since > until {
-            return Err(PurviewError::message("--since is after --until"));
-        }
-    }
-    // The pattern is compiled as given: its spaces are part of it.
-    let subject = args
-        .subject_regex
-        .map(|pattern| not_blank("--subject-regex", pattern))
-        .transpose()?
-        .map(|pattern| {
-            regex::RegexBuilder::new(&pattern)
-                .size_limit(1 << 20)
-                .build()
-                // The pattern is not repeated.
-                .map_err(|_| {
-                    PurviewError::message(
-                        "--subject-regex is not a regular expression this tool can use",
-                    )
+impl ItemFilterArgs {
+    /// The filters, checked: a blank value is refused, a sender is read as
+    /// the rows' senders are, and the pattern is compiled.
+    fn filters(self) -> Result<crate::report::items::Filters> {
+        use crate::report::items::Filters;
+        let optional = |flag: &str, value: Option<String>| -> Result<Option<String>> {
+            value
+                .map(|value| not_blank(flag, value).map(|value| value.trim().to_owned()))
+                .transpose()
+        };
+        let addresses = |flag: &str, values: Vec<String>| -> Result<Vec<String>> {
+            values
+                .into_iter()
+                .map(|value| {
+                    // As the rows' senders are read: `Name <addr>` gives addr.
+                    not_blank(flag, value).map(|value| crate::report::items::sender_address(&value))
                 })
+                .collect()
+        };
+        if let (Some(since), Some(until)) = (self.since, self.until) {
+            if since > until {
+                return Err(PurviewError::message("--since is after --until"));
+            }
+        }
+        // The pattern is compiled as given: its spaces are part of it.
+        let subject = self
+            .subject_regex
+            .map(|pattern| not_blank("--subject-regex", pattern))
+            .transpose()?
+            .map(|pattern| {
+                regex::RegexBuilder::new(&pattern)
+                    .size_limit(1 << 20)
+                    .build()
+                    // The pattern is not repeated.
+                    .map_err(|_| {
+                        PurviewError::message(
+                            "--subject-regex is not a regular expression this tool can use",
+                        )
+                    })
+            })
+            .transpose()?;
+        Ok(Filters {
+            since: self.since,
+            until: self.until,
+            subject,
+            class_prefix: optional("--class", self.class)?.map(|class| class.to_lowercase()),
+            senders: addresses("--sender", self.sender)?,
+            exclude_senders: addresses("--exclude-sender", self.exclude_sender)?,
+            workload: optional("--workload", self.workload)?
+                .map(|workload| workload.to_lowercase()),
         })
-        .transpose()?;
-    let filters = Filters {
-        since: args.since,
-        until: args.until,
-        subject,
-        class_prefix: optional("--class", args.class)?.map(|class| class.to_lowercase()),
-        senders: addresses("--sender", args.sender)?,
-        exclude_senders: addresses("--exclude-sender", args.exclude_sender)?,
-        workload: optional("--workload", args.workload)?.map(|workload| workload.to_lowercase()),
-    };
-    let max_unique = args.max_unique.unwrap_or(DEFAULT_MAX_UNIQUE);
+    }
+}
+
+/// `--max-unique`, or its default; zero is refused.
+fn max_unique(value: Option<usize>) -> Result<usize> {
+    let max_unique = value.unwrap_or(crate::report::items::DEFAULT_MAX_UNIQUE);
     if max_unique == 0 {
         return Err(PurviewError::message("--max-unique must be above zero"));
     }
+    Ok(max_unique)
+}
+
+/// `purview parse items`: local. The flags are checked, then config.json's
+/// limits, then the zip is read.
+fn parse_items(env: &mut Env, output: &OutputOptions, args: ParseItemsArgs) -> Result<Outcome> {
+    if args.zip.as_os_str().is_empty() {
+        return Err(PurviewError::message("<ZIP> was given an empty value"));
+    }
+    let filters = args.filters.filters()?;
+    let max_unique = max_unique(args.max_unique)?;
     let json = output.format == crate::output::OutputFormat::Json;
     if args.jsonl && json {
         // A failure must print where the output mode says, so the two are
@@ -2194,6 +2296,52 @@ fn parse_items(env: &mut Env, output: &OutputOptions, args: ParseItemsArgs) -> R
         force_buffer: args.force_buffer,
     };
     let produced = commands::parse::items(env, output, &request, limits)?;
+    Ok(Outcome {
+        exit_code: produced.exit_code,
+        stdout_value: produced.document,
+    })
+}
+
+/// `purview parse profile`: local. The flags and `--select` are checked,
+/// then config.json's limits, `identity` and, without `--top`,
+/// `defaults.top`, then the zip is read.
+fn parse_profile(env: &mut Env, output: &OutputOptions, args: ParseProfileArgs) -> Result<Outcome> {
+    use crate::report::profile::{self, Identity, Options};
+    if args.zip.as_os_str().is_empty() {
+        return Err(PurviewError::message("<ZIP> was given an empty value"));
+    }
+    let filters = args.filters.filters()?;
+    let max_unique = max_unique(args.max_unique)?;
+    if args.top == Some(0) {
+        return Err(PurviewError::message("--top must be above zero"));
+    }
+    crate::output::selected_indices(&output.select, commands::parse::PROFILE_COLUMNS)?;
+    let dir = configuration_dir(env)?;
+    let stored = load_config(env, &dir)?;
+    let limits = crate::report::ReportLimits::from_config(&stored.extra)?;
+    let identity = Identity::from_config(&stored.extra)?;
+    if args.merge_local_part && !identity.has_internal_domains() {
+        return Err(PurviewError::message(
+            "--merge-local-part merges senders only within identity.internal_domains, which \
+             config.json does not set",
+        ));
+    }
+    let top = match args.top {
+        Some(top) => top,
+        None => profile::top_setting(&stored.extra)?,
+    };
+    let request = commands::parse::ProfileRequest {
+        zip: args.zip,
+        filters,
+        max_unique,
+        identity,
+        options: Options {
+            top,
+            bucket: args.bucket.into(),
+            merge_local_part: args.merge_local_part,
+        },
+    };
+    let produced = commands::parse::profile(env, output, &request, limits)?;
     Ok(Outcome {
         exit_code: produced.exit_code,
         stdout_value: produced.document,
@@ -2524,6 +2672,15 @@ async fn write_command(
             commands::report::teams_context_setting(&stored.extra)?
         } else {
             true
+        },
+        // Read only by a command that makes a profile, as for the others.
+        profile: if command.profiles() {
+            Some(safety::ProfileSettings {
+                identity: crate::report::profile::Identity::from_config(&stored.extra)?,
+                top: crate::report::profile::top_setting(&stored.extra)?,
+            })
+        } else {
+            None
         },
     };
     command.check(&settings)?;

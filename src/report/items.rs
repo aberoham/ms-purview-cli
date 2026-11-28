@@ -85,6 +85,8 @@ pub struct SlimItem {
     /// `Subject/Title`, or `Conversation name` when that is empty, as for
     /// Teams messages (Observed).
     pub title: Option<String>,
+    /// `Conversation name`, which names a Teams chat or channel (Observed).
+    pub conversation_name: Option<String>,
     pub conversation_type: Option<String>,
     pub recipient_count: Option<u32>,
     pub workload: Option<String>,
@@ -155,6 +157,7 @@ impl ItemRow {
             date,
             sender,
             title: subject.clone().or_else(|| conversation_name.clone()),
+            conversation_name: conversation_name.clone(),
             conversation_type: get(columns.conversation_type),
             recipient_count: get(columns.recipient_count).and_then(|text| text.parse().ok()),
             workload: get(columns.workload),
@@ -225,11 +228,26 @@ pub fn sender_address(sender: &str) -> String {
     inner.trim().to_lowercase()
 }
 
-/// The domain of a sender's address, or `None` when it has none or is a
-/// Teams thread id (`19:…@thread.v2`), which names no person (Observed).
+/// Whether a sender's address, as `sender_address` gives it, is a Teams
+/// thread id (`19:…@thread.v2`), which names a chat, not a person
+/// (Observed).
+pub fn is_thread_id(address: &str) -> bool {
+    address.starts_with("19:")
+}
+
+/// Whether a sender's address, as `sender_address` gives it, is a list of
+/// addresses separated by `;`, as Teams file items have, cut at 255
+/// characters (Observed), which names no one sender.
+pub fn is_address_list(address: &str) -> bool {
+    address.contains(';')
+}
+
+/// The domain of a sender's address, or `None` when it has none, is a
+/// Teams thread id (`19:…@thread.v2`) or is a list of addresses, which
+/// name no person (Observed).
 pub fn sender_domain(sender: &str) -> Option<String> {
     let address = sender_address(sender);
-    if address.starts_with("19:") {
+    if is_thread_id(&address) || is_address_list(&address) {
         return None;
     }
     address
@@ -659,6 +677,8 @@ mod tests {
         );
         assert_eq!(sender_domain("19:abc@thread.v2"), None);
         assert_eq!(sender_domain("Alex Example"), None);
+        // A list of addresses, as Teams file items have (Observed).
+        assert_eq!(sender_domain("a@contoso.example; b@fabrik"), None);
     }
 
     fn filtered(filters: &Filters) -> Vec<String> {

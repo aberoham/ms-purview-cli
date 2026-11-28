@@ -16,7 +16,7 @@ the binary has `purview version`, `purview auth login` (device code, or
 `operation list` and
 `operation get` (with
 `--wait` and `--check`), `download`, `parse locations`, `parse failures`,
-`parse summary`, `parse items`, `kql`, and the global options `--verbose`, `--timeout`,
+`parse summary`, `parse items`, `parse profile`, `kql`, and the global options `--verbose`, `--timeout`,
 `--trace` and `--wrap-untrusted`. `case create`, `case close`, `search create`,
 `estimate`, `report` and `export create` are the write commands so far; they
 run through the safety
@@ -152,13 +152,19 @@ run with `python3`.
   `VolumeUnchecked` unless `--allow-large`; `defaults.teams_context`, read
   only by a command whose `reads_teams_context()` is true; the
   `ExportReportRequest` body; `after_send` with `EvidenceOf::Report`; and
-  reconciliation that reads each candidate for its true action. The same
+  reconciliation that reads each candidate for its true action; and
+  `--profile`, which reads `identity` and `defaults.top` before sign-in
+  (`WriteCommand::profiles`, `safety::ProfileSettings`) and profiles the
+  zip read as evidence (`Finished::evidence_path`), or exits 4 with
+  `ProfileUnavailable`. The same
   file is `export create` (`Collect::Export`): the `ExportResultRequest`
   body (`exportFormat: msg`), the plan's export warnings, and every part
   downloaded, with only the `Reports-` part read.
   `commands/parse.rs` is `parse locations|failures|
-  summary|items`, local; `parse items` writes JSON Lines through
-  `output::write_json_line`, which `export read` shares. `operation get --check` downloads the evidence file and
+  summary|items|profile`, local; `parse items` writes JSON Lines through
+  `output::write_json_line`, which `export read` shares, and `parse
+  profile` prints one document or a `SECTION`, `NAME`, `COUNT` table.
+  `cli`'s `ItemFilterArgs` holds the filter flags both share. `operation get --check` downloads the evidence file and
   sets `collection`.
 - `src/msg/` reads `.msg` items from memory, with no I/O: `cfbread.rs` is
   the Compound File Binary container through `cfb`, `props.rs` the MAPI
@@ -183,7 +189,13 @@ run with `python3`.
   `items.rs` (the `Items_N_*.csv` files in order of `N`, read a byte
   record at a time; the key by Internet message ID, Immutable ID or a
   SHA-256 of five fields; `Filters`; `Dedup`, with copies, interned
-  distinct `Location ID`s and `TooManyUnique`), and `mod.rs`
+  distinct `Location ID`s and `TooManyUnique`; `is_thread_id` and
+  `is_address_list`, the senders that name no person), `profile.rs` (the
+  profile of section 4.8 over `Dedup`'s unique items: `Identity`, the
+  `identity` section of `config.json` with one-step domain aliases,
+  `top_setting` for `defaults.top`, sender normalisation, Teams items by
+  the `IPM.SkypeTeams.` class prefix, and UTC buckets with ISO weeks), and
+  `mod.rs`
   (`ReportFiles`, the zip's `Kind`, `ReportLimits` from `limits`).
 - `src/kql/` is the guard of `docs/SPEC.md` section 6.3. `lexer.rs` lexes
   each restriction (`participants:…`, `subject:…`, `kind:…`, `sent>=…`)
@@ -369,7 +381,8 @@ timeout. It carries the Graph base URL (`origin::GRAPH_BASE` in production,
   host names match the production pattern;
   `tests/kql.rs` runs `purview kql` in-process with no reachable host;
   `tests/items.rs` runs `parse items` the same way on zips it writes, with
-  the 200,000-row timing test ignored by default;
+  the 200,000-row timing test ignored by default; `tests/profiles.rs` runs
+  `parse profile` the same way;
   `tests/graph.rs` drives `GraphClient`, and `Poller` over it, against
   wiremock with a fake token provider; `tests/writes.rs` runs a write
   command that exists only in the test through `execute_write_with`,

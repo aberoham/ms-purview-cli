@@ -93,10 +93,10 @@ Existing tools leave gaps across the eDiscovery workflow (recorded in [docs/SPEC
 - `purview export create <case> <search>`: run a search's export as `.msg` files after the same checks and size limit, download every part into the data directory, and report `collection` from the report part; item content is never printed.
 - `purview operation get --check`, and `purview parse locations`, `parse failures` and `parse summary` on a downloaded estimate or report zip, with no sign-in.
 - `purview parse items <zip>`: an item report's unique items as JSON Lines, with the copies of each and the number of mailboxes holding them, filtered by date, subject, class, sender or workload; `--all-rows` writes every row instead.
+- `purview parse profile <zip>` (`--top`, `--bucket day|week|month`, `--merge-local-part`, and the filters of `parse items`): count an item report's unique items by class, workload, sender, sender domain, Teams conversation and date, with the copies per item. Senders are normalised through `identity` in `config.json`. `purview report --profile` adds the same profile to the report's result.
 
 **Planned roadmap (not yet built, no dates):**
 
-- **v0.3:** item report profiles (`parse profile`).
 - **v0.4:** `export index`.
 - **v0.5:** the rest of `export read` (the join to the report, quoted-reply cutting and thread de-duplication).
 - **v0.6:** read-only inventory of old cases and holds.

@@ -8,7 +8,8 @@
 //! its end, and, unless `--no-download`, its files are downloaded and the
 //! report's `Locations` file read for the collection check. An export's
 //! report is its `Reports-…zip` part; its `Items.*.zip` parts are item
-//! content, downloaded and never read here.
+//! content, downloaded and never read here. `report --profile` then reads
+//! the report's items for `report::profile`.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -19,8 +20,8 @@ use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 
 use super::action::{
-    active_operations, check_search, resume_check, started_since, ActionRun, Active, Checked, Sent,
-    EXPORT_ACTIONS,
+    active_operations, check_search, resume_check, started_since, ActionRun, Active, Checked,
+    Finished, Sent, EXPORT_ACTIONS,
 };
 use crate::error::{PurviewError, Result};
 use crate::graph::{GraphClient, WriteResponse};
@@ -38,8 +39,8 @@ use crate::report::volume::{grouped, size_text, size_texts, VolumeLimits, Volume
 use crate::report::{EvidenceOf, ReportLimits};
 use crate::routes::{CaseId, OperationId, Query, ReadRoute, SearchId, WriteRoute};
 use crate::safety::{
-    After, Applied, Blocked, PlanInput, Planned, Preflight, Reconciled, WriteCommand, WritePlan,
-    WriteSettings,
+    After, Applied, Blocked, PlanInput, Planned, Preflight, ProfileSettings, Reconciled,
+    WriteCommand, WritePlan, WriteSettings,
 };
 
 /// How far before the POST reconciliation looks for new operations, for
@@ -100,6 +101,8 @@ pub struct ReportFlags {
     pub no_wait: bool,
     pub no_download: bool,
     pub strict: bool,
+    /// `--profile`, which `report` alone has.
+    pub profile: bool,
     pub timing: Timing,
     pub out: Option<PathBuf>,
 }
@@ -112,6 +115,8 @@ pub struct Report {
     volume: Option<VolumeLimits>,
     /// `defaults.teams_context`, read before sign-in.
     teams_context_default: bool,
+    /// `identity` and `defaults.top`, read before sign-in under `--profile`.
+    profile_settings: Option<ProfileSettings>,
     /// What the plan sends to, and when preflight ended, for
     /// reconciliation.
     planned: Option<(CaseId, SearchId, DateTime<Utc>)>,
@@ -152,6 +157,59 @@ pub fn teams_context_setting(extra: &BTreeMap<String, Value>) -> Result<bool> {
 }
 
 impl Report {
+    /// `--profile`: the profile of the report zip read for the collection
+    /// check, with the defaults of `parse profile` and no filter, or `null`
+    /// and the exit-4 reason `ProfileUnavailable`.
+    fn profile_of(
+        &self,
+        finished: &Finished,
+        log: &mut (dyn Write + Send),
+    ) -> (Value, Option<Value>) {
+        use crate::report::items::{Filters, DEFAULT_MAX_UNIQUE};
+        use crate::report::profile::{self, Bucket, Options};
+        let unavailable = |why: &str| {
+            (
+                Value::Null,
+                Some(json!({
+                    "code": "ProfileUnavailable",
+                    "message": format!("the report's profile could not be made: {why}"),
+                })),
+            )
+        };
+        let Some(settings) = &self.profile_settings else {
+            return unavailable("its settings were not read");
+        };
+        let Some(path) = &finished.evidence_path else {
+            return unavailable("no downloaded file was read as the report zip");
+        };
+        let limits = self.limits.unwrap_or_else(|| {
+            ReportLimits::from_config(&Default::default()).expect("the defaults are valid")
+        });
+        let options = Options {
+            top: settings.top,
+            bucket: Bucket::Month,
+            merge_local_part: false,
+        };
+        match profile::read(
+            path,
+            limits,
+            &Filters::default(),
+            DEFAULT_MAX_UNIQUE,
+            &settings.identity,
+            options,
+        ) {
+            Ok(read) => {
+                super::parse::items_summary(log, "profile", &read.tally, None, read.unique);
+                (read.profile.to_value(), None)
+            }
+            Err(error) => {
+                // The code only: a message could name the path.
+                let (code, _) = error.metadata();
+                unavailable(&format!("the report zip could not be read for it ({code})"))
+            }
+        }
+    }
+
     pub fn new(flags: ReportFlags) -> Self {
         Self {
             flags,
@@ -160,6 +218,7 @@ impl Report {
             limits: None,
             volume: None,
             teams_context_default: true,
+            profile_settings: None,
             planned: None,
             shown: None,
         }
@@ -529,6 +588,7 @@ impl WriteCommand for Report {
         self.limits = Some(settings.report);
         self.volume = Some(settings.volume);
         self.teams_context_default = settings.teams_context;
+        self.profile_settings = settings.profile.clone();
         Ok(())
     }
 
@@ -542,6 +602,10 @@ impl WriteCommand for Report {
 
     fn reads_teams_context(&self) -> bool {
         true
+    }
+
+    fn profiles(&self) -> bool {
+        self.flags.profile
     }
 
     async fn plan(&mut self, preflight: &mut Preflight<'_>) -> Result<Planned> {
@@ -885,8 +949,7 @@ impl WriteCommand for Report {
             self.flags.no_download,
             self.flags.strict,
         );
-        Ok(Applied::Result {
-            result: json!({
+        let mut result = json!({
                 "operationId": finished.operation.to_string(),
                 "operationStatus": finished.record.status.as_str(),
                 "collection": finished.collection.as_str(),
@@ -912,9 +975,14 @@ impl WriteCommand for Report {
                     .as_ref()
                     .map(|files| files.failed_locations_of(EvidenceOf::Report)),
                 "files": finished.files,
-            }),
-            reasons: finished.reasons,
-        })
+        });
+        let mut reasons = std::mem::take(&mut finished.reasons);
+        if self.flags.profile {
+            let (profile, reason) = self.profile_of(&finished, &mut after.session.env.stderr);
+            result["profile"] = profile;
+            reasons.extend(reason);
+        }
+        Ok(Applied::Result { result, reasons })
     }
 
     async fn reconcile(&mut self, preflight: &mut Preflight<'_>) -> Result<Reconciled> {

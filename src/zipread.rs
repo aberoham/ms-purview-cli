@@ -212,13 +212,12 @@ pub(crate) fn declared_entries(file: &mut File, len: u64) -> Result<u64> {
 
 /// The number of entries the zip's end of central directory record
 /// declares, or its ZIP64 record when one is there, and the offset where
-/// the zip ends. A record counts when its comment length reaches the end
-/// of the file exactly; when a comment holds something that also looks
-/// like one, every such record is read and the largest count is the
-/// answer, so neither can hide a large directory. With no such record,
-/// the last record whose comment ends at most `MAX_TRAILING_BYTES` before
-/// the end of the file counts, and the zip ends after its comment. A file
-/// with neither is not a zip.
+/// the zip ends. A record counts when its comment ends at the end of the
+/// file or at most `MAX_TRAILING_BYTES` before it; when there are several,
+/// as when a comment holds something that also looks like one, every one
+/// is read and the largest count is the answer, so none can hide a large
+/// directory. The zip ends after the comment that ends last. A file with
+/// no such record is not a zip.
 pub(crate) fn zip_end(file: &mut File, len: u64) -> Result<(u64, u64)> {
     use std::io::{Seek, SeekFrom};
     let not_zip =
@@ -227,33 +226,29 @@ pub(crate) fn zip_end(file: &mut File, len: u64) -> Result<(u64, u64)> {
         file.seek(SeekFrom::Start(at)).map_err(|_| not_zip())?;
         file.read_exact(buffer).map_err(|_| not_zip())
     };
-    // The record is 22 bytes, followed by a comment of at most 65,535.
-    let tail_len = len.min(22 + 65_535);
+    // The record is 22 bytes, followed by a comment of at most 65,535 and
+    // then at most MAX_TRAILING_BYTES.
+    let tail_len = len.min((22 + 65_535 + MAX_TRAILING_BYTES) as u64);
     let tail_start = len - tail_len;
     let mut tail = vec![0_u8; tail_len as usize];
     read_at(file, tail_start, &mut tail)?;
     let record_end =
         |at: usize| at + 22 + usize::from(u16::from_le_bytes([tail[at + 20], tail[at + 21]]));
-    let signatures: Vec<usize> = (0..tail.len().saturating_sub(21))
+    // Every record whose comment ends at the end of the file, or at most
+    // MAX_TRAILING_BYTES before it, counts, and the largest count is the
+    // answer: no record, padded or not, can hide a larger directory.
+    let records: Vec<usize> = (0..tail.len().saturating_sub(21))
         .filter(|at| tail[*at..].starts_with(b"PK\x05\x06"))
-        .collect();
-    let mut records: Vec<usize> = signatures
-        .iter()
-        .copied()
-        .filter(|at| record_end(*at) == tail.len())
-        .collect();
-    let mut end = len;
-    if records.is_empty() {
-        // Bytes after the record: the last record whose comment fits.
-        let Some(at) = signatures.iter().copied().rev().find(|at| {
+        .filter(|at| {
             let ends = record_end(*at);
             ends <= tail.len() && tail.len() - ends <= MAX_TRAILING_BYTES
-        }) else {
-            return Err(not_zip());
-        };
-        records.push(at);
-        end = tail_start + record_end(at) as u64;
-    }
+        })
+        .collect();
+    // The zip ends after the comment that ends last.
+    let Some(end) = records.iter().map(|at| record_end(*at)).max() else {
+        return Err(not_zip());
+    };
+    let end = tail_start + end as u64;
     let mut declared = 0;
     for at in records {
         let classic = u64::from(u16::from_le_bytes([tail[at + 10], tail[at + 11]]));
@@ -267,6 +262,14 @@ pub(crate) fn zip_end(file: &mut File, len: u64) -> Result<(u64, u64)> {
                 if locator.starts_with(b"PK\x06\x07") {
                     let record_at =
                         u64::from_le_bytes(locator[8..16].try_into().map_err(|_| not_zip())?);
+                    // The ZIP64 end record is at least 56 bytes and comes
+                    // before its locator, never in the bytes after the zip.
+                    if record_at
+                        .checked_add(56)
+                        .is_none_or(|ends| ends > locator_at)
+                    {
+                        return Err(not_zip());
+                    }
                     let mut record = [0_u8; 40];
                     read_at(file, record_at, &mut record)?;
                     if !record.starts_with(b"PK\x06\x06") {
@@ -657,6 +660,90 @@ mod tests {
             "HostileZip"
         );
         assert!(crate::download::check_zip(file.path()).is_err());
+    }
+
+    #[test]
+    fn a_padded_forged_record_cannot_lower_the_count() {
+        // As `an_end_record_inside_a_comment_cannot_lower_the_count`, with
+        // one byte after the zip.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut writer = zip::ZipWriter::new(file.reopen().unwrap());
+        writer
+            .start_file("Locations-a.csv", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"1").unwrap();
+        let mut forged = b"PK\x05\x06".to_vec();
+        forged.extend_from_slice(&[0; 6]);
+        forged.extend_from_slice(&1000_u16.to_le_bytes());
+        forged.extend_from_slice(&[0; 10]);
+        writer.set_raw_comment(forged.into_boxed_slice()).unwrap();
+        writer.finish().unwrap();
+        with_trailing(file.path(), 1);
+        let mut handle = File::open(file.path()).unwrap();
+        let len = handle.metadata().unwrap().len();
+        assert_eq!(declared_entries(&mut handle, len).unwrap(), 1000);
+    }
+
+    #[test]
+    fn a_longest_comment_and_trailing_bytes_are_read() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut writer = zip::ZipWriter::new(file.reopen().unwrap());
+        writer
+            .start_file("Locations-a.csv", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"1").unwrap();
+        writer
+            .set_raw_comment(vec![b'c'; 65_535].into_boxed_slice())
+            .unwrap();
+        writer.finish().unwrap();
+        let original = std::fs::metadata(file.path()).unwrap().len();
+        with_trailing(file.path(), MAX_TRAILING_BYTES);
+        let mut handle = File::open(file.path()).unwrap();
+        let len = handle.metadata().unwrap().len();
+        assert_eq!(zip_end(&mut handle, len).unwrap(), (1, original));
+        ZipReader::open(file.path(), limits()).unwrap();
+    }
+
+    #[test]
+    fn a_zip64_locator_pointing_after_itself_is_hostile() {
+        let file = zip_with(&[("Locations-a.csv", b"1")], zip::CompressionMethod::Stored);
+        let bytes = std::fs::read(file.path()).unwrap();
+        let (body, end) = bytes.split_at(bytes.len() - 22);
+        let mut out = body.to_vec();
+        let locator_at = out.len() as u64;
+        out.extend_from_slice(b"PK\x06\x07");
+        out.extend_from_slice(&0_u32.to_le_bytes());
+        // Names a record in the bytes after the zip.
+        out.extend_from_slice(&(locator_at + 20 + 22 + 8).to_le_bytes());
+        out.extend_from_slice(&1_u32.to_le_bytes());
+        out.extend_from_slice(end);
+        out.extend_from_slice(&[0; 8]);
+        out.extend_from_slice(b"PK\x06\x06");
+        out.extend_from_slice(&[0; 52]);
+        std::fs::write(file.path(), &out).unwrap();
+        let mut handle = File::open(file.path()).unwrap();
+        let len = handle.metadata().unwrap().len();
+        assert_eq!(
+            zip_end(&mut handle, len).unwrap_err().metadata().0,
+            "HostileZip"
+        );
+    }
+
+    #[test]
+    fn bounded_reads_and_seeks_as_if_the_file_ended_there() {
+        use std::io::{Seek, SeekFrom};
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"0123456789").unwrap();
+        let mut bounded = Bounded::new(File::open(file.path()).unwrap(), 6);
+        assert_eq!(bounded.seek(SeekFrom::End(-2)).unwrap(), 4);
+        let mut text = Vec::new();
+        bounded.read_to_end(&mut text).unwrap();
+        assert_eq!(text, b"45");
+        assert_eq!(bounded.seek(SeekFrom::Start(3)).unwrap(), 3);
+        let mut buffer = [0_u8; 8];
+        assert_eq!(bounded.read(&mut buffer).unwrap(), 3);
+        assert_eq!(&buffer[..3], b"345");
+        assert!(bounded.seek(SeekFrom::End(-7)).is_err());
     }
 
     #[test]

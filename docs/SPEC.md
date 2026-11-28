@@ -601,7 +601,9 @@ Settled in PR 4.1:
   file that is not an `Items.*.zip` part, each tried in Graph's order until one holds the
   evidence. No items part is ever read as evidence, and only `export create` and `download`
   fetch one: `estimate` and `report` download every file but the items parts.
-- A zip may have up to 4,096 bytes after its end record and comment. The one observed items
+- A zip may have up to 4,096 bytes after its end record and comment. Every end record whose
+  comment ends at the end of the file or within those bytes counts toward the entry cap,
+  the largest count deciding, and a Zip64 locator must name a record before it. The one observed items
   part had 296, most of them zero, after a Zip64 end record (Observed, one export); its
   report part had none. The zip is read as ending at its end record; the downloaded file,
   its size and its SHA-256 are the service's bytes unchanged.
@@ -660,8 +662,10 @@ Settled in PR 2.3, and changed in PR 4.1: `--check` downloads, through the same 
 `download` and into the data directory, the files that may be the operation's evidence by
 the rule of section 3.5 "Settled in PR 4.1": nothing when the action and detail disagree;
 for an export the files named `Reports-` (Observed); for an estimate or item report every
-file that is not an `Items.*.zip` part. It reads them in Graph's order and stops at the first
-that holds the evidence.
+file that is not an `Items.*.zip` part. It fetches and reads them one at a time in Graph's
+order and stops at the first that holds the evidence, so a later file that cannot be
+downloaded does not hide an earlier result. A listed file with no name is reported, by
+position, as not downloadable.
 An operation that is not finished is `unchecked`, with a notice. `--check` changes no exit
 code by itself.
 

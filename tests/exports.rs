@@ -837,7 +837,8 @@ async fn the_first_usable_report_part_in_graph_s_order_decides_on_both_paths() {
     // which has no failure, decides.
     let mut setup = Setup::new().await;
     setup.parts.push(Part {
-        name: "Reports-second-with-a-failure.zip",
+        // Sorted by name it would come first.
+        name: "Reports-AA-second-with-a-failure.zip",
         key: "report2",
         bytes: report_part(true),
     });
@@ -936,4 +937,101 @@ async fn the_check_reports_a_file_entry_with_no_name() {
         "{}",
         run.stderr()
     );
+}
+
+#[tokio::test]
+async fn a_later_report_part_that_fails_does_not_hide_an_earlier_result() {
+    // The second Reports- file is listed but not served (HTTP 404): the
+    // check stops at the first, which holds the evidence.
+    let mut setup = Setup::new().await;
+    setup.parts.push(Part {
+        name: "Reports-second-not-served.zip",
+        key: "missing",
+        bytes: Vec::new(),
+    });
+    let served = setup.parts.remove(2);
+    setup.serve().await;
+    setup.parts.push(served);
+    setup.get(&operation_path(), setup.succeeded()).await;
+    let run = setup.check().await;
+    assert_eq!(
+        run.outcome.exit_code,
+        0,
+        "{} {}",
+        run.stdout(),
+        run.stderr()
+    );
+    assert_eq!(run.json()["results"]["collection"], "complete");
+}
+
+#[tokio::test]
+async fn a_nameless_entry_is_reported_even_with_no_candidate() {
+    let mut setup = Setup::new().await;
+    setup.parts.remove(0);
+    setup.serve().await;
+    let mut record = setup.succeeded();
+    record["exportFileMetadata"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"size": 10}));
+    setup.get(&operation_path(), record).await;
+    let run = setup.check().await;
+    assert_eq!(run.json()["results"]["collection"], "unchecked");
+    assert!(
+        run.stderr()
+            .contains("file 2 of the operation cannot be downloaded: it has no fileName"),
+        "{}",
+        run.stderr()
+    );
+    assert!(setup.downloads().await.is_empty());
+}
+
+#[tokio::test]
+async fn a_direct_estimate_never_downloads_an_items_part() {
+    let setup = Setup::new().await;
+    setup
+        .preflight(json!({"value": []}), estimate(json!(GIB)))
+        .await;
+    let location = format!(
+        "{}/v1.0/security/cases/ediscoverycases('{CASE}')/operations('{OP}')",
+        setup.harness.graph.uri()
+    );
+    Mock::given(method("POST"))
+        .and(path(search_path("/estimateStatistics")))
+        .respond_with(ResponseTemplate::new(202).insert_header("Location", location))
+        .mount(&setup.harness.graph)
+        .await;
+    let files = setup.succeeded()["exportFileMetadata"].clone();
+    setup
+        .get(
+            &operation_path(),
+            json!({
+                "@odata.type": "#microsoft.graph.security.ediscoveryEstimateOperation",
+                "id": OP,
+                "action": "estimateStatistics",
+                "status": "succeeded",
+                "createdDateTime": "2026-01-05T09:00:00Z",
+                "indexedItemCount": 15,
+                "indexedItemsSize": 2148,
+                "reportFileMetadata": files,
+            }),
+        )
+        .await;
+    setup.serve().await;
+    let run = setup
+        .harness
+        .run_with(&["estimate", CASE, SEARCH, "--json", "--yes"], |env, _| {
+            setup.configure(env)
+        })
+        .await;
+    assert_eq!(
+        run.outcome.exit_code,
+        0,
+        "{} {}",
+        run.stdout(),
+        run.stderr()
+    );
+    let downloads = setup.downloads().await;
+    assert_eq!(downloads.len(), 1);
+    assert!(downloads[0].url.query().unwrap().contains("part=report"));
 }

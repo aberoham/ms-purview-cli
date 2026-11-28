@@ -404,4 +404,3 @@ stayed outside the repository.
   file includes locations with no hits. (Observed) `locationsWithHits` counts only rows
   with hits for that reason. The command reported `collection: complete`.
 - **Search after a report:** the search's `lastModifiedDateTime` was unchanged. (Observed)
-

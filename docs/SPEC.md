@@ -603,19 +603,20 @@ Settled in PR 4.1:
   fetch one: `estimate` and `report` download every file but the items parts.
 - A zip may have up to 4,096 bytes after its end record and comment. The zip ends after the
   latest-ending end record whose comment ends at the end of the file or within those bytes
-  (the end of the file whenever a record reaches it, as before PR 4.1). Every end record
-  ending exactly there counts toward the entry cap, the largest count deciding, so the end
-  record of a zip stored inside is not taken for the zip's own. A ZIP64 end record must hold
-  at least 44 bytes after its size field and, by its own length, end where its locator
-  starts; a copy of the locator, as in a comment that repeats the end of the zip, reuses
-  the count of the record it names. An ordinary ZIP64 zip with bytes before it is refused,
-  since its locator's offset does not name its record. The count read before the zip crate
-  indexes the directory is a defence, not a guarantee: a zip crafted with bytes before it,
-  or with forged records the crate does not settle on, can still present a smaller count, as
-  on `main`, and is then caught only by the count check after indexing. The one observed items
-  part had 296, most of them zero, after a Zip64 end record (Observed, one export); its
-  report part had none. The zip is read as ending at its end record; the downloaded file,
-  its size and its SHA-256 are the service's bytes unchanged.
+  (the end of the file whenever a record reaches it, as before PR 4.1), and the `zip` crate
+  sees nothing after that. The one observed items part had 296 bytes there, most of them
+  zero, after a Zip64 end record (Observed, one export); its report part had none. The
+  downloaded file, its size and its SHA-256 are the service's bytes unchanged.
+- The `zip` crate is opened with its archive starting at byte 0 (`ArchiveOffset::Known(0)`),
+  so a zip with bytes before it is refused. The entry count checked before the crate indexes
+  a directory follows what the pinned release (9.8.2) then does (Derived from its source):
+  it walks the end records of the last 65,572 bytes backwards, tries each that its checks
+  accept (for a ZIP64 record, one at the locator's offset whose length reaches the locator),
+  and does not go past an accepted record whose directory ends where the record starts. The
+  check applies the same rules to the same records and takes the largest count among those
+  the crate would try. A record the crate would skip, such as a forged one pointing at no
+  directory, does not count; one it would try and fall back from does. A change to the
+  crate's search must be matched in `zipread::zip_end` before the pin moves.
 - `result` has the keys of `report`. A stopped export resumes with `operation get <case> <op>
   --wait --check` after `--no-wait`, the wait deadline or Ctrl-C during the wait, and with
   `operation get <case> <op> --check` after Ctrl-C during the download. Either fetches only

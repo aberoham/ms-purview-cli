@@ -63,6 +63,9 @@ pub struct CsvFile<R> {
 /// A record's fields as text.
 pub type Row = Vec<String>;
 
+/// The UTF-8 byte-order mark.
+const BOM: &[u8] = b"\xef\xbb\xbf";
+
 impl<R: Read> CsvFile<R> {
     /// A file with no header row: every record is data.
     pub fn new(input: R, what: &'static str, limit: u64) -> Self {
@@ -91,13 +94,28 @@ impl<R: Read> CsvFile<R> {
     /// removed from the first field of the first record.
     pub fn next_row(&mut self) -> Result<Option<Row>> {
         let mut record = csv::ByteRecord::new();
+        if !self.next_record(&mut record)? {
+            return Ok(None);
+        }
+        Ok(Some(
+            record
+                .iter()
+                .map(|field| String::from_utf8_lossy(field).into_owned())
+                .collect(),
+        ))
+    }
+
+    /// The next record into `record`, as bytes, with the same budget and
+    /// byte-order mark handling as `next_row`; `false` at the end. For a
+    /// reader that needs a few fields of a wide file.
+    pub fn next_record(&mut self, record: &mut csv::ByteRecord) -> Result<bool> {
         let more = self
             .reader
-            .read_byte_record(&mut record)
+            .read_byte_record(record)
             .map_err(|error| self.error(error))?;
         self.since_reset.set(0);
         if !more {
-            return Ok(None);
+            return Ok(false);
         }
         // The record's own bytes: its fields and the separators between
         // them.
@@ -108,18 +126,14 @@ impl<R: Read> CsvFile<R> {
                 limit: self.limit,
             });
         }
-        let mut row: Row = record
-            .iter()
-            .map(|field| String::from_utf8_lossy(field).into_owned())
-            .collect();
         if std::mem::take(&mut self.first) {
-            if let Some(first) = row.first_mut() {
-                if let Some(rest) = first.strip_prefix('\u{feff}') {
-                    *first = rest.to_owned();
-                }
+            if let Some(rest) = record.get(0).and_then(|first| first.strip_prefix(BOM)) {
+                let mut fields: Vec<Vec<u8>> = record.iter().map(<[u8]>::to_vec).collect();
+                fields[0] = rest.to_vec();
+                *record = csv::ByteRecord::from(fields);
             }
         }
-        Ok(Some(row))
+        Ok(true)
     }
 
     fn error(&self, error: csv::Error) -> PurviewError {
@@ -190,6 +204,21 @@ impl<R: Read> Table<R> {
     pub fn next_row(&mut self) -> Result<Option<Row>> {
         self.file.next_row()
     }
+
+    /// The next record as bytes (`CsvFile::next_record`).
+    pub fn next_record(&mut self, record: &mut csv::ByteRecord) -> Result<bool> {
+        self.file.next_record(record)
+    }
+}
+
+/// `record[index]` as text, trimmed, invalid UTF-8 replaced, or `None` when
+/// the column is missing or the field is empty.
+pub fn byte_field(record: &csv::ByteRecord, index: Option<usize>) -> Option<String> {
+    index
+        .and_then(|index| record.get(index))
+        .map(String::from_utf8_lossy)
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty())
 }
 
 /// `row[index]`, trimmed, or `None` when the column is missing or the field

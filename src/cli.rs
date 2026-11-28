@@ -314,13 +314,14 @@ Examples:
         long_about = "\
 Read an estimate or item report zip that 'purview download' wrote, with no \
 sign-in: the locations searched with their hits, the locations that failed, \
-or the summary and settings. The zip is read in memory through limits on \
+the summary and settings, or an item report's unique items. The zip is read in memory through limits on \
 its entries and sizes (config.json limits), and nothing is extracted.",
         after_help = "\
 Examples:
   purview parse locations <zip> --top 10 --with-hits
   purview parse failures <zip> --json
-  purview parse summary <zip>"
+  purview parse summary <zip>
+  purview parse items <zip> > items.jsonl"
     )]
     Parse(ParseArgs),
     #[command(
@@ -385,6 +386,99 @@ Examples:
         #[arg(value_name = "ZIP", help = "An estimate or report zip")]
         zip: PathBuf,
     },
+    #[command(
+        about = "List the unique items of an item report",
+        long_about = "\
+Read the Items_N_*.csv files of an item report zip and write one JSON Lines \
+record per unique item, after the whole report is read. An item report has \
+one row per copy of an item in each mailbox; rows are counted as copies of \
+one item by Internet message ID, else Immutable ID, else a SHA-256 of Item \
+class, Date, Sender, Subject/Title and Conversation name (keyKind hash). \
+Each record has key, keyKind, class, date, sender, senderDomain, \
+recipientCount, title, conversationType, workload, copies, locations (the \
+number of distinct mailboxes), hasAttachment, immutableId and \
+internetMessageId. --all-rows writes one record per row instead, as it is \
+read, with locationId in place of copies and locations. The filters apply to \
+rows before they are counted. A summary goes to standard error.",
+        after_help = "\
+Examples:
+  purview parse items <zip> > items.jsonl
+  purview parse items <zip> --since 2026-07-01 --until 2026-07-31 --class IPM.Note
+  purview parse items <zip> --all-rows --sender alex@contoso.example > rows.jsonl
+  purview --json parse items <zip> --subject-regex '(?i)invoice'"
+    )]
+    Items(ParseItemsArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct ParseItemsArgs {
+    #[arg(value_name = "ZIP", help = "An item report zip")]
+    zip: PathBuf,
+    #[arg(
+        long,
+        value_name = "DATE",
+        value_parser = parse_date,
+        help = "Keep rows dated on or after DATE (YYYY-MM-DD, UTC); rows with no Date are left out"
+    )]
+    since: Option<chrono::NaiveDate>,
+    #[arg(
+        long,
+        value_name = "DATE",
+        value_parser = parse_date,
+        help = "Keep rows dated on or before DATE (YYYY-MM-DD, UTC); rows with no Date are left out"
+    )]
+    until: Option<chrono::NaiveDate>,
+    #[arg(
+        long,
+        value_name = "RE",
+        help = "Keep rows whose Subject/Title or Conversation name matches the regular expression RE"
+    )]
+    subject_regex: Option<String>,
+    #[arg(
+        long = "class",
+        value_name = "PREFIX",
+        help = "Keep rows whose Item class starts with PREFIX, ignoring case, such as IPM.Note"
+    )]
+    class: Option<String>,
+    #[arg(
+        long,
+        value_name = "ADDR",
+        help = "Keep rows sent by ADDR, ignoring case; repeat for any of several"
+    )]
+    sender: Vec<String>,
+    #[arg(
+        long,
+        value_name = "ADDR",
+        help = "Leave out rows sent by ADDR, ignoring case; may be repeated"
+    )]
+    exclude_sender: Vec<String>,
+    #[arg(
+        long,
+        value_name = "W",
+        help = "Keep rows whose Workload is W, ignoring case, such as Exchange"
+    )]
+    workload: Option<String>,
+    #[arg(
+        long,
+        help = "Write JSON Lines, the default; refused with --json or PURVIEW_JSON"
+    )]
+    jsonl: bool,
+    #[arg(
+        long,
+        help = "With --json, write a document of more than 10000 records, all held in memory"
+    )]
+    force_buffer: bool,
+    #[arg(
+        long,
+        help = "One record per row, written as it is read, with no deduplication"
+    )]
+    all_rows: bool,
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Stop with TooManyUnique past N unique items (default 2000000)"
+    )]
+    max_unique: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -1984,6 +2078,7 @@ fn kql(env: &mut Env, output: &OutputOptions, query: QueryArgs) -> Result<Outcom
 fn parse_zip(env: &mut Env, output: &OutputOptions, command: ParseCommand) -> Result<Outcome> {
     use commands::parse::{LocationFilters, SubType, What};
     let (zip, what) = match command {
+        ParseCommand::Items(args) => return parse_items(env, output, args),
         ParseCommand::Locations {
             zip,
             top,
@@ -2012,6 +2107,93 @@ fn parse_zip(env: &mut Env, output: &OutputOptions, command: ParseCommand) -> Re
     let stored = load_config(env, &dir)?;
     let limits = crate::report::ReportLimits::from_config(&stored.extra)?;
     let produced = commands::parse::run(env, output, &zip, limits, what)?;
+    Ok(Outcome {
+        exit_code: produced.exit_code,
+        stdout_value: produced.document,
+    })
+}
+
+/// `purview parse items`: local. The flags are checked, then config.json's
+/// limits, then the zip is read.
+fn parse_items(env: &mut Env, output: &OutputOptions, args: ParseItemsArgs) -> Result<Outcome> {
+    use crate::report::items::{Filters, DEFAULT_MAX_UNIQUE};
+    if args.zip.as_os_str().is_empty() {
+        return Err(PurviewError::message("<ZIP> was given an empty value"));
+    }
+    let optional = |flag: &str, value: Option<String>| -> Result<Option<String>> {
+        value
+            .map(|value| not_blank(flag, value).map(|value| value.trim().to_owned()))
+            .transpose()
+    };
+    let addresses = |flag: &str, values: Vec<String>| -> Result<Vec<String>> {
+        values
+            .into_iter()
+            .map(|value| {
+                // As the rows' senders are read: `Name <addr>` gives addr.
+                not_blank(flag, value).map(|value| crate::report::items::sender_address(&value))
+            })
+            .collect()
+    };
+    if let (Some(since), Some(until)) = (args.since, args.until) {
+        if since > until {
+            return Err(PurviewError::message("--since is after --until"));
+        }
+    }
+    // The pattern is compiled as given: its spaces are part of it.
+    let subject = args
+        .subject_regex
+        .map(|pattern| not_blank("--subject-regex", pattern))
+        .transpose()?
+        .map(|pattern| {
+            regex::RegexBuilder::new(&pattern)
+                .size_limit(1 << 20)
+                .build()
+                // The pattern is not repeated.
+                .map_err(|_| {
+                    PurviewError::message(
+                        "--subject-regex is not a regular expression this tool can use",
+                    )
+                })
+        })
+        .transpose()?;
+    let filters = Filters {
+        since: args.since,
+        until: args.until,
+        subject,
+        class_prefix: optional("--class", args.class)?.map(|class| class.to_lowercase()),
+        senders: addresses("--sender", args.sender)?,
+        exclude_senders: addresses("--exclude-sender", args.exclude_sender)?,
+        workload: optional("--workload", args.workload)?.map(|workload| workload.to_lowercase()),
+    };
+    let max_unique = args.max_unique.unwrap_or(DEFAULT_MAX_UNIQUE);
+    if max_unique == 0 {
+        return Err(PurviewError::message("--max-unique must be above zero"));
+    }
+    let json = output.format == crate::output::OutputFormat::Json;
+    if args.jsonl && json {
+        // A failure must print where the output mode says, so the two are
+        // never combined.
+        return Err(PurviewError::message(
+            "--jsonl and --json (or PURVIEW_JSON) ask for different output; give one",
+        ));
+    }
+    if args.force_buffer && !json {
+        return Err(PurviewError::message(
+            "--force-buffer goes with --json, which writes one document",
+        ));
+    }
+    let dir = configuration_dir(env)?;
+    let stored = load_config(env, &dir)?;
+    let limits = crate::report::ReportLimits::from_config(&stored.extra)?;
+    let request = commands::parse::ItemsRequest {
+        zip: args.zip,
+        filters,
+        all_rows: args.all_rows,
+        max_unique,
+        json,
+        force_buffer: args.force_buffer,
+    };
+    let produced = commands::parse::items(env, output, &request, limits)?;
     Ok(Outcome {
         exit_code: produced.exit_code,
         stdout_value: produced.document,

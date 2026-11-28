@@ -3,6 +3,7 @@
 
 pub mod csvread;
 pub mod estimate;
+pub mod items;
 pub mod summary;
 pub mod volume;
 
@@ -36,21 +37,38 @@ impl Kind {
         }
     }
 
-    fn of(names: &[String]) -> Self {
+    pub(crate) fn of(names: &[String]) -> Self {
         let base = |name: &String| name.rsplit('/').next().unwrap_or(name).to_owned();
         let bases: Vec<String> = names.iter().map(base).collect();
-        if bases.iter().any(|name| name.starts_with("Statistics-")) {
+        if bases
+            .iter()
+            .any(|name| name.starts_with("Statistics-") && is_csv(name))
+        {
             return Self::Estimate;
         }
-        let items = regex::Regex::new(r"^Items_\d+_.*\.csv$").expect("a valid pattern");
-        let package = regex::Regex::new(r"^Items\..*\.zip$").expect("a valid pattern");
-        if bases.iter().any(|name| items.is_match(name))
+        let package = regex::Regex::new(r"^Items\..*\.(?i:zip)$").expect("a valid pattern");
+        if bases.iter().any(|name| items_file_number(name).is_some())
             && !bases.iter().any(|name| package.is_match(name))
         {
             return Self::ItemReport;
         }
         Self::Other
     }
+}
+
+/// Whether a file name ends in `.csv`, ignoring ASCII case only.
+fn is_csv(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() > 4 && bytes[bytes.len() - 4..].eq_ignore_ascii_case(b".csv")
+}
+
+/// The `N` of an `Items_N_*.csv` file name, as written: ASCII digits only,
+/// and `.csv` in any ASCII case. The one rule for which files are an item
+/// report's, shared by `Kind` and the item reader.
+pub(crate) fn items_file_number(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix("Items_")?;
+    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    (digits > 0 && rest[digits..].starts_with('_') && is_csv(name)).then(|| &rest[..digits])
 }
 
 /// The limits for reading report files, from `config.json`'s `limits`.
@@ -296,6 +314,21 @@ mod tests {
             Kind::of(&names(&["Items_0_2026.csv", "Locations-1.csv"])),
             Kind::ItemReport
         );
+        assert_eq!(Kind::of(&names(&["Items_0_2026.CSV"])), Kind::ItemReport);
+        // Only a Statistics CSV makes an estimate; Unicode look-alikes of
+        // digits or of `.csv` are not item files.
+        assert_eq!(
+            Kind::of(&names(&["Items_0_2026.csv", "Statistics-notes.txt"])),
+            Kind::ItemReport
+        );
+        assert_eq!(Kind::of(&names(&["Items_0_x.c\u{17f}v"])), Kind::Other);
+        assert_eq!(Kind::of(&names(&["Items_\u{662}_x.csv"])), Kind::Other);
+        assert_eq!(items_file_number("Items_007_x.CSV"), Some("007"));
+        assert_eq!(
+            Kind::of(&names(&["Items_0_2026.csv", "Items.1.001.x.ZIP"])),
+            Kind::Other
+        );
+        assert_eq!(items_file_number("Items__x.csv"), None);
         assert_eq!(
             Kind::of(&names(&["Items_0_2026.csv", "Items.1.001.x.zip"])),
             Kind::Other

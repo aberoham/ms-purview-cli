@@ -772,6 +772,37 @@ estimate, `Items_N_*.csv` without an `Items.*.zip` sibling means an item report.
   `key`, `keyKind`, `class`, `date`, `sender`, `senderDomain`, `recipientCount`, `title`,
   `conversationType`, `workload`, `copies`, `locations`, `hasAttachment`, `immutableId` and
   `internetMessageId`.
+
+  Settled in PR 3.1:
+  - `locations` is the number of distinct `Location ID` values among the item's copies; the
+    ids themselves are not written. An `--all-rows` record has `locationId` in place of
+    `copies` and `locations`.
+  - `date` is RFC 3339 in UTC, with any fraction of a second kept, or `null` when `Date` is empty or cannot be read; `title` is
+    `Subject/Title`, else `Conversation name`; `senderDomain` is the part after `@` of the
+    address (the text inside `<…>` of `Name <addr>`), lowercased, and `null` for a Teams
+    thread id (`19:…`).
+  - Unique items are written by `date`, items without one last, then by `key`; `--all-rows`
+    keeps file order, the `Items_N` files by `N` as a number.
+  - `--sender` may be repeated (a row must match one), as may `--exclude-sender`; both, and
+    `--class` and `--workload`, ignore case. A sender flag is read as a row's sender is, so
+    `Name <addr>` as the output shows it matches `addr`. A date filter leaves out rows with no readable
+    `Date`.
+  - `--jsonl` names the default; with `--json` or `PURVIEW_JSON` it is refused, so that a
+    failure is printed in the shape the output mode gives it. `--force-buffer` without
+    `--json` is refused. Without `--force-buffer`, `--json` stops the pass at the 10,001st
+    unique item. `--max-unique` does not apply to `--all-rows`.
+  - `--subject-regex` is compiled as given, spaces included, with a 1 MiB size limit, and
+    matched against `Subject/Title` and `Conversation name` trimmed; an empty field is
+    absent, so it matches no pattern.
+  - Items are aggregated by key kind and key, so that an Internet message ID and an
+    Immutable ID with the same text stay two items.
+  - An `Items_N_*.csv` name has ASCII digits for `N` and `.csv` in any ASCII case; `Kind`
+    and the reader share that rule, and a zip is an estimate only with a
+    `Statistics-*.csv`.
+  - The stderr summary has counts and column names only: rows, files, rows matched, unique
+    items, those keyed by hash, rows with an unreadable `Date`, and missing columns.
+  - `--wrap-untrusted` wraps `title`, `key` and `senderDomain` too (with `sender`, `class`
+    and `internetMessageId`, already wrapped).
 - `parse profile <zip> [filters] [--top N] [--bucket day|week|month] [--merge-local-part]`
 
 Filters: `--since`, `--until` (on `Date`, both inclusive, UTC), `--subject-regex RE` (on
@@ -1346,9 +1377,12 @@ about 37 rows per estimated item, and about 12.6 rows per unique item (Observed,
 report).
 
 - **Key:** `Internet message ID` if it is not empty, else `Immutable ID`, else a SHA-256 of
-  `Item class|Date|Sender|Subject/Title|Conversation name`. Hash keys are counted and
-  reported.
-- **Aggregation:** `HashMap<Box<str>, UniqueAgg>`. Each `UniqueAgg` holds the slim fields of
+  `Item class`, `Date`, `Sender`, `Subject/Title` and `Conversation name`. Hash keys are
+  counted and reported. Settled in PR 3.1: the hash is over the five fields, trimmed, as a
+  compact JSON array of strings (an empty field as `""`), so that a `|` or any other text
+  inside a field cannot make two items one; the key is the hash in lowercase hex.
+- **Aggregation:** `HashMap<(KeyKind, Box<str>), UniqueAgg>` (keyed by kind and key, settled in
+  PR 3.1). Each `UniqueAgg` holds the slim fields of
   the first row, a copy count, and a sorted `Vec<u32>` of interned `Location ID` indexes,
   deduplicated at the end. `parse items` writes its JSONL after the pass. Memory grows with
   the number of unique items, roughly 1 KB each (Assumption). `--max-unique` (default
@@ -2445,12 +2479,12 @@ pub struct LocationRow { pub location: String, pub location_id: Option<String>, 
 pub struct FailedLocation { pub location: String, pub sub_type: String, pub message: String }
 pub enum Collection { Complete, Incomplete { failed: usize }, Unchecked }
 pub struct SummaryFile { pub groups: Vec<Vec<Vec<String>>>, pub values: BTreeMap<String, String> }
-pub struct SlimItem { pub class: String, pub date: Option<DateTime<Utc>>, pub sender: Option<String>,
+pub struct SlimItem { pub class: Option<String>, pub date: Option<DateTime<Utc>>, pub sender: Option<String>,
                       pub title: Option<String>, pub conversation_type: Option<String>, pub recipient_count: Option<u32>,
                       pub workload: Option<String>, pub has_attachment: Option<bool>,
                       pub internet_message_id: Option<String>, pub immutable_id: Option<String>,
                       pub target_path: Option<String> }
-pub struct UniqueAgg { pub first: SlimItem, pub copies: u32, pub locations: Vec<u32> }
+pub struct UniqueAgg { pub first: SlimItem, pub kind: KeyKind, pub copies: u64, locations: Vec<u32>, distinct: usize }
 pub enum KeyKind { InternetMessageId, ImmutableId, Hash }
 pub struct ExportJoinRow { pub part: String, pub entry: String, pub row: SlimItem }
 pub fn normalise_target_path(p: &str) -> Option<(String /* part */, String /* entry */)>;
@@ -3046,8 +3080,10 @@ If PR 2.6 cannot be completed, v0.2.0 ships without `case close`.
 - Scope: `items.rs`, the dedup aggregation, filters, `parse items` with `--all-rows` and
   `--max-unique`.
 - Tests: items units; a 200,000-row generated file in under 10 s (ignored by default).
-- Acceptance: on the maintainer's private large report, unique counts match the earlier
-  Python analysis. Checked locally and reported; nothing is committed.
+- Acceptance: on the item reports of the PR 2.4 and PR 2.5 live checks, unique counts,
+  copies and distinct locations match an independent Python count. Checked locally and
+  reported; nothing is committed. (Changed in PR 3.1: the large report and the earlier
+  Python analysis the plan named were not kept.)
 
 **PR 3.2: Profile.**
 - Scope: `profile.rs`, `parse profile`, `identity` config, `report --profile`,

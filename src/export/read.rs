@@ -310,35 +310,14 @@ fn fill(
     }
 }
 
-/// One JSON Lines record, prepared as every JSON document is: URLs
-/// redacted, `--wrap-untrusted` applied, secrets redacted as values. A
-/// record whose bytes still match a secret is replaced by its prepared
-/// entry and part names and an error, so the line count still matches the
-/// items. `false` when that happened.
 fn write_line(env: &mut Env, marker: Option<&str>, record: Value) -> Result<bool> {
-    let mut value = crate::trace::redact_urls(&record, &env.redactor);
-    if let Some(id) = marker {
-        crate::output::wrap_untrusted(&mut value, id);
-    }
-    let safe = env.redactor.redact_value(&value);
-    let mut bytes = serde_json::to_vec(&safe)?;
-    let mut written = true;
-    if env.redactor.recognises_bytes(&bytes) {
-        written = false;
-        bytes = serde_json::to_vec(&json!({
-            "entry": safe["entry"],
-            "part": safe["part"],
-            "error": "redactionFailed",
-            "errorDetail": "the record held a secret that could not be removed, so it is not printed",
-        }))?;
-        if env.redactor.recognises_bytes(&bytes) {
-            bytes = serde_json::to_vec(&json!({"error": "redactionFailed"}))?;
-        }
-    }
-    bytes.push(b'\n');
-    // `cli` reports a failed stdout itself, with its own prefix.
-    env.stdout.write_all(&bytes)?;
-    Ok(written)
+    crate::output::write_json_line(
+        &mut env.stdout,
+        &env.redactor,
+        marker,
+        record,
+        &["entry", "part"],
+    )
 }
 
 fn summary(log: &mut dyn Write, tally: &Tally) {

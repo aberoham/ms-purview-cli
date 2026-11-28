@@ -299,6 +299,10 @@ pub enum PurviewError {
     #[error("{0}")]
     NotAReportZip(String),
 
+    /// `parse items` met more unique items than `--max-unique` allows.
+    #[error("the report holds more unique items than --max-unique allows; raise --max-unique or narrow the filters")]
+    TooManyUnique(usize),
+
     #[error("could not {action} the credential lock file {path}: {source}")]
     CredentialLockFailed {
         action: &'static str,
@@ -453,6 +457,7 @@ impl PurviewError {
             Self::HostileZip(_) => ("HostileZip", 0),
             Self::RecordTooLarge { .. } => ("RecordTooLarge", 0),
             Self::NotAReportZip(_) => ("NotAReportZip", 0),
+            Self::TooManyUnique(_) => ("TooManyUnique", 0),
             Self::WriteRefused => ("WriteRefused", 0),
             Self::ReadOnlySession(_) => ("ReadOnlySession", 0),
             Self::WriteOutcomeUnknown { .. } => ("WriteOutcomeUnknown", 0),

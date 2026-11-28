@@ -1,9 +1,9 @@
-//! `purview parse locations|failures|summary <zip>` (`docs/SPEC.md`
+//! `purview parse locations|failures|summary|items <zip>` (`docs/SPEC.md`
 //! section 3.5): local, no sign-in. The zip is read through the limits of
 //! `report::ReportLimits`, which `cli` takes from `config.json`.
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::json;
 
@@ -12,6 +12,7 @@ use crate::env::Env;
 use crate::error::{PurviewError, Result};
 use crate::output::{sanitize, write_rows, OutputFormat, OutputOptions};
 use crate::report::estimate::{by_hits, FailedLocation, LocationRow};
+use crate::report::items::{self, Dedup, Filters, Tally};
 use crate::report::{ReportFiles, ReportLimits};
 
 pub const LOCATION_COLUMNS: &[&str] = &["LOCATION", "SUBTYPE", "COUNT", "SIZE", "STATUS"];
@@ -264,4 +265,196 @@ fn summary(env: &mut Env, output: &OutputOptions, files: &ReportFiles) -> Result
     }
     write_rows(&mut env.stdout, output, SUMMARY_COLUMNS, &table)?;
     Ok(Produced::success(None))
+}
+
+/// `--json` holds every record in memory; above this many it is refused
+/// unless `--force-buffer` is given.
+pub const JSON_MAX_RECORDS: usize = 10_000;
+
+/// The checked arguments of `parse items`.
+#[derive(Debug, Clone)]
+pub struct ItemsRequest {
+    pub zip: PathBuf,
+    pub filters: Filters,
+    pub all_rows: bool,
+    pub max_unique: usize,
+    /// One document rather than JSON Lines.
+    pub json: bool,
+    pub force_buffer: bool,
+}
+
+/// `parse items`: JSON Lines on stdout (after the pass, or as each row is
+/// read with `--all-rows`), or one document with `--json`, and a summary
+/// on stderr. Exit 4 when a record could not be printed.
+pub fn items(
+    env: &mut Env,
+    output: &OutputOptions,
+    request: &ItemsRequest,
+    limits: ReportLimits,
+) -> Result<Produced> {
+    let marker = if output.wrap_untrusted && !request.json {
+        let id = crate::output::untrusted_id()?;
+        let _ = writeln!(env.stderr, "{}", crate::output::untrusted_notice(&id));
+        Some(id)
+    } else {
+        None
+    };
+    let too_many = || {
+        PurviewError::message(format!(
+            "--json holds every record in memory and stops at {JSON_MAX_RECORDS}; use JSON \
+             Lines (the default, or --jsonl), or add --force-buffer"
+        ))
+    };
+    let mut buffered: Vec<serde_json::Value> = Vec::new();
+    let mut unprinted = 0usize;
+    let mut written = 0usize;
+    let mut dedup = Dedup::new(request.max_unique);
+    let read = {
+        let stdout = &mut env.stdout;
+        let redactor = env.redactor.clone();
+        items::read(&request.zip, limits, &request.filters, |row| {
+            if !request.all_rows {
+                dedup.add(row)?;
+                // A document past the limit is certain to be refused: stop
+                // now rather than hold the rest.
+                if request.json && !request.force_buffer && dedup.len() > JSON_MAX_RECORDS {
+                    return Err(too_many());
+                }
+                return Ok(());
+            }
+            if request.json {
+                if buffered.len() == JSON_MAX_RECORDS && !request.force_buffer {
+                    return Err(too_many());
+                }
+                buffered.push(row.record());
+                return Ok(());
+            }
+            written += 1;
+            if !crate::output::write_json_line(
+                stdout,
+                &redactor,
+                marker.as_deref(),
+                row.record(),
+                &["key"],
+            )? {
+                unprinted += 1;
+            }
+            Ok(())
+        })
+    };
+    // The path is the user's own argument and is not repeated. A failed
+    // stdout under --all-rows keeps its own error, for cli to report.
+    let tally = read.map_err(|error| match error {
+        PurviewError::Io(io) if !env.stdout.has_failed() => {
+            PurviewError::message(format!("the zip given cannot be read: {}", io.kind()))
+        }
+        other => other,
+    })?;
+    let unique = (dedup.len(), dedup.hash_keys());
+    if !request.all_rows {
+        let found = dedup.finish();
+        if request.json && found.len() > JSON_MAX_RECORDS && !request.force_buffer {
+            return Err(too_many());
+        }
+        for (key, agg) in &found {
+            let record = items::unique_record(key, agg);
+            if request.json {
+                buffered.push(record);
+                continue;
+            }
+            written += 1;
+            if !crate::output::write_json_line(
+                &mut env.stdout,
+                &env.redactor,
+                marker.as_deref(),
+                record,
+                &["key"],
+            )? {
+                unprinted += 1;
+            }
+        }
+    }
+    items_summary(
+        &mut env.stderr,
+        &tally,
+        request.all_rows.then_some(written),
+        unique,
+    );
+    if unprinted > 0 {
+        let _ = writeln!(
+            env.stderr,
+            "warning: {unprinted} records held a secret that could not be removed, and were \
+             written as their key and an error"
+        );
+    }
+    let exit_code = if unprinted > 0 { 4 } else { 0 };
+    if request.json {
+        let count = buffered.len();
+        let document = output.untrusted_json_value(
+            serde_json::Value::Array(buffered),
+            count,
+            &env.redactor,
+        )?;
+        return Ok(Produced {
+            exit_code,
+            document: Some(document),
+        });
+    }
+    Ok(Produced {
+        exit_code,
+        document: None,
+    })
+}
+
+/// The stderr summary of `parse items`: counts and column names only, never
+/// a field's text. `rows_written` is set under `--all-rows`.
+/// `unique` is the unique items and those keyed by hash.
+fn items_summary(
+    log: &mut dyn Write,
+    tally: &Tally,
+    rows_written: Option<usize>,
+    unique: (usize, usize),
+) {
+    let plural =
+        |count: u64, word: &str| format!("{count} {word}{}", if count == 1 { "" } else { "s" });
+    let what = match rows_written {
+        Some(_) => format!("{} written", plural(tally.matched, "row")),
+        None => format!(
+            "{} ({} keyed by a hash of their fields)",
+            plural(unique.0 as u64, "unique item"),
+            unique.1
+        ),
+    };
+    let _ = writeln!(
+        log,
+        "parse items: {} read from {}, {} matched the filters; {what}",
+        plural(tally.rows, "row"),
+        plural(tally.files as u64, "Items file"),
+        tally.matched,
+    );
+    if !tally.missing_columns.is_empty() {
+        let names: Vec<&str> = tally.missing_columns.iter().copied().collect();
+        let _ = writeln!(
+            log,
+            "warning: columns missing from the report's Items files: {}",
+            names.join(", ")
+        );
+    }
+    if tally.hash_rows > 0 {
+        let _ = writeln!(
+            log,
+            "warning: {} had neither an Internet message ID nor an Immutable ID and were \
+             keyed by a hash of their class, date, sender, subject and conversation name; \
+             copies of one item may then count as different items",
+            plural(tally.hash_rows, "matched row")
+        );
+    }
+    if tally.unreadable_dates > 0 {
+        let _ = writeln!(
+            log,
+            "warning: {} had a Date that could not be read; their date is null, and a date \
+             filter leaves them out",
+            plural(tally.unreadable_dates, "row")
+        );
+    }
 }

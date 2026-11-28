@@ -199,7 +199,10 @@ static VML_STYLE: LazyLock<Regex> = LazyLock::new(|| {
 /// as `[text]`, and a bracket run on to a URL hides its host from the
 /// redaction after. The link's target is never shown.
 static LINK_TAG: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)<a(?:\s[^>]*)?>|</a\s*>").expect("a valid pattern"));
+    // A quoted attribute value may hold `>`.
+    LazyLock::new(|| {
+        Regex::new(r#"(?i)<a(?:\s(?:[^>"']|"[^"]*"|'[^']*')*)?>|</a\s*>"#).expect("a valid pattern")
+    });
 
 /// A horizontal rule, which `html2text` 0.17 drops; it is kept as `---`.
 static HR: LazyLock<Regex> =
@@ -337,6 +340,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(text, "See https://portal.contoso.example and the portal.");
+        // `>` inside a quoted attribute does not end the tag.
+        let text = html_to_text(
+            "<p><a title=\"Score > target\" href=\"https://portal.contoso.example/a>b?x=1\">\
+             Report</a> <a title='a > b' href=x>Two</a></p>",
+        )
+        .unwrap();
+        assert_eq!(text, "Report Two");
     }
 
     #[test]

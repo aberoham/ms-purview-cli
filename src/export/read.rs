@@ -239,9 +239,14 @@ fn cut_body(text: &str, max: usize) -> String {
             .rev()
             .find(|(_, c)| c.is_whitespace())
             .map_or(0, |(at, c)| at + c.len_utf8());
+        // From the URL's scheme, so that text joined before it stays.
         let word = cut[start..].to_ascii_lowercase();
-        if word.contains("http://") || word.contains("https://") {
-            cut.truncate(start);
+        if let Some(at) = ["http://", "https://"]
+            .iter()
+            .filter_map(|scheme| word.find(scheme))
+            .min()
+        {
+            cut.truncate(start + at);
         }
     }
     cut

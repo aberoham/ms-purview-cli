@@ -49,8 +49,23 @@ def address(mailbox):
 
 
 def recipients(listed):
-    """An extract-msg header string split at each `;` outside quotes."""
-    return re.split(r';(?=(?:[^"]*"[^"]*")*[^"]*$)', listed or "")
+    """An extract-msg header string split at each `;` outside quotes, where
+    a backslash escapes the next character."""
+    parts, current, quoted, escaped = [], [], False, False
+    for char in listed or "":
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == '"':
+            quoted = not quoted
+        elif char == ";" and not quoted:
+            parts.append("".join(current))
+            current = []
+            continue
+        current.append(char)
+    parts.append("".join(current))
+    return parts
 
 
 def addresses_in(listed):

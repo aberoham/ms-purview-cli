@@ -53,11 +53,12 @@ fn an_html_only_note_reads_with_its_headers_and_html_body() {
 #[test]
 fn a_message_sent_on_behalf_is_from_the_mailbox_shown_and_sent_by_the_delegate() {
     // A delegate (`PidTagSender*`) sending for another mailbox
-    // (`PidTagSentRepresenting*`), with only the display address type
-    // for the mailbox shown.
+    // (`PidTagSentRepresenting*`), which has only its email address
+    // (0x0065), no SMTP address property.
     let message = html_note()
+        .without(0x5D02)
         .with(0x0042, P::Unicode("Robin Example".into()))
-        .with(0x5D02, P::Unicode("robin@contoso.example".into()))
+        .with(0x0065, P::Unicode("robin@contoso.example".into()))
         .with(0x0C1A, P::Unicode("Dana Example".into()))
         .with(0x5D01, P::Unicode("dana@contoso.example".into()));
     let item = parse_msg(&message.build()).unwrap();
@@ -402,7 +403,7 @@ async fn a_text_body_that_is_one_url_is_redacted_once_and_stays_under_the_cap() 
     let harness = Harness::new().await;
     let url = "https://portal.contoso.example/a?downloadType=textsecret";
     let whole = Message::note("Whole").with(BODY, P::Unicode(url.into()));
-    let cut = Message::note("Cut").with(BODY, P::Unicode(format!("Read {url}")));
+    let cut = Message::note("Cut").with(BODY, P::Unicode(format!("Read ID:{url}")));
     let path = write_zip(
         &harness,
         "Items.1.001.export.zip",
@@ -428,9 +429,29 @@ async fn a_text_body_that_is_one_url_is_redacted_once_and_stays_under_the_cap() 
         let first = records[0]["body"].as_str().unwrap();
         assert_eq!(first, "https://portal.contoso.example/a?REDACTED");
         let second = records[1]["body"].as_str().unwrap();
-        assert_eq!(second, "Read ", "{second}");
+        assert_eq!(second, "Read ID:", "{second}");
         assert!(second.chars().count() <= 45);
     }
+}
+
+#[tokio::test]
+async fn a_record_of_a_message_sent_on_behalf_keeps_from_and_sender_apart() {
+    let harness = Harness::new().await;
+    let message = html_note()
+        .with(0x0042, P::Unicode("Robin Example".into()))
+        .with(0x5D02, P::Unicode("robin@contoso.example".into()))
+        .with(0x0C1A, P::Unicode("Dana Example".into()))
+        .with(0x5D01, P::Unicode("dana@contoso.example".into()));
+    let path = write_zip(
+        &harness,
+        "Items.1.001.export.zip",
+        items_zip(&[("Exchange/Items/a.msg", message.build())]),
+    );
+    let run = harness.run(&["export", "read", &path]).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
+    let record = &lines(&run)[0];
+    assert_eq!(record["from"]["address"], "robin@contoso.example");
+    assert_eq!(record["sender"]["address"], "dana@contoso.example");
 }
 
 #[tokio::test]

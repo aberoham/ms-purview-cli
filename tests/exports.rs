@@ -1035,3 +1035,25 @@ async fn a_direct_estimate_never_downloads_an_items_part() {
     assert_eq!(downloads.len(), 1);
     assert!(downloads[0].url.query().unwrap().contains("part=report"));
 }
+
+#[tokio::test]
+async fn an_empty_file_name_is_no_candidate() {
+    // An item report whose one entry has an empty name: reported by
+    // position, and the collection has no file to come from.
+    let setup = Setup::new().await;
+    let mut record = setup.succeeded();
+    record["action"] = json!("exportReport");
+    record["exportFileMetadata"] = json!([{"fileName": "", "size": 10}]);
+    setup.get(&operation_path(), record).await;
+    let run = setup.check().await;
+    assert_eq!(run.json()["results"]["collection"], "unchecked");
+    let stderr = run.stderr();
+    assert!(
+        stderr.contains("file 1 of the operation cannot be downloaded: it has no fileName"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("lists no file that can hold its evidence"),
+        "{stderr}"
+    );
+}

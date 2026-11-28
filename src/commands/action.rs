@@ -665,7 +665,7 @@ pub fn evidence_files(record: &OperationRecord) -> Option<(EvidenceOf, Vec<Strin
         .iter()
         .filter_map(|file| file.file_name.clone())
     {
-        if !evidence_keep(&action).allows(&name) || names.contains(&name) {
+        if name.is_empty() || !evidence_keep(&action).allows(&name) || names.contains(&name) {
             continue;
         }
         names.push(name);

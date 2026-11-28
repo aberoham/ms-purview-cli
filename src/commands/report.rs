@@ -16,7 +16,7 @@ use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 
 use super::action::{
-    active_operations, check_search, resume, started_since, ActionRun, Active, Checked, Sent,
+    active_operations, check_search, resume_check, started_since, ActionRun, Active, Checked, Sent,
     EXPORT_ACTIONS,
 };
 use crate::error::{PurviewError, Result};
@@ -26,12 +26,12 @@ use crate::model::requests::{
     ExportReportRequest, ResponsiveLocations, SearchHits, TeamsConversations,
 };
 use crate::model::valid::{CaseKey, SearchKey, SearchRef};
-use crate::model::wire::{Action, OperationDetail, OperationRecord, OperationStatus, Source};
+use crate::model::wire::{Action, OperationRecord, OperationStatus, Source};
 use crate::naming::{Naming, Values};
 use crate::poll::Timing;
 use crate::report::estimate::Collection;
-use crate::report::volume::{grouped, size_text, VolumeLimits};
-use crate::report::{EvidenceOf, ReportFiles, ReportLimits};
+use crate::report::volume::{grouped, size_text, VolumeLimits, VolumeUse};
+use crate::report::{EvidenceOf, ReportLimits};
 use crate::routes::{CaseId, OperationId, Query, ReadRoute, SearchId, WriteRoute};
 use crate::safety::{
     After, Applied, Blocked, PlanInput, Planned, Preflight, Reconciled, WriteCommand, WritePlan,
@@ -197,14 +197,23 @@ pub(crate) async fn latest_estimate(
         .await
     {
         Ok(value) => value,
+        // An answer with no operation in it.
+        Err(PurviewError::GraphBodyNotObject { status }) => {
+            return Ok(unknown(
+                None,
+                format!("Graph's answer (HTTP {status}) holds no operation"),
+            ))
+        }
         Err(error) => {
-            let (code, status) = error.metadata();
-            if status == 0 {
+            // Only Graph's own answer is a basis; a sign-in that could not
+            // be refreshed, or no answer, is the command's error.
+            let Some(status) = error.graph_status() else {
                 return Err(error.context(format!(
                     "reading the latest estimate of search {}",
                     search.id
                 )));
-            }
+            };
+            let (code, _) = error.metadata();
             return Ok(unknown(
                 None,
                 if status == 404 {
@@ -224,8 +233,8 @@ pub(crate) async fn latest_estimate(
         .as_deref()
         .and_then(OperationId::parse)
         .map(|id| id.to_string());
-    let detail = match (record.action.as_deref(), record.detail()) {
-        (Some("estimateStatistics"), Some(OperationDetail::Estimate(detail))) => detail,
+    let detail = match (record.action.as_deref(), record.estimate_detail()) {
+        (Some("estimateStatistics"), Some(detail)) => detail,
         _ => {
             return Ok(unknown(
                 operation,
@@ -463,8 +472,8 @@ impl WriteCommand for Report {
         !self.flags.no_download && !self.flags.no_wait
     }
 
-    fn reads_volume(&self) -> bool {
-        true
+    fn volume_use(&self) -> VolumeUse {
+        VolumeUse::ExportSize
     }
 
     fn reads_teams_context(&self) -> bool {
@@ -707,6 +716,7 @@ impl WriteCommand for Report {
             action: "exportReport",
             evidence_of: EvidenceOf::Report,
             list_hint: "--action report --resolve",
+            check_only: true,
             no_wait: self.flags.no_wait,
             no_download: self.flags.no_download,
             timing: self.flags.timing,
@@ -722,7 +732,7 @@ impl WriteCommand for Report {
                     "collection": Collection::Unchecked.as_str(),
                     "displayName": shown.display_name,
                     "teamsContext": shown.teams_context,
-                    "resume": resume(after, case, &operation),
+                    "resume": resume_check(after, case, &operation),
                 })))
             }
             Sent::Finished(finished) => finished,
@@ -745,7 +755,10 @@ impl WriteCommand for Report {
                     .as_ref()
                     .and_then(|files| files.locations.as_ref())
                     .map(|locations| locations.rows.len()),
-                "failedLocations": finished.evidence.as_ref().map(ReportFiles::failed_locations),
+                "failedLocations": finished
+                    .evidence
+                    .as_ref()
+                    .map(|files| files.failed_locations_of(EvidenceOf::Report)),
                 "files": finished.files,
             }),
             reasons: finished.reasons,

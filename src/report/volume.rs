@@ -51,6 +51,15 @@ impl VolumeLimits {
     /// default; any other value of the wrong type is an error, which names
     /// the key and never repeats the value.
     pub fn from_config(extra: &BTreeMap<String, Value>) -> Result<Self> {
+        Self::read(extra, VolumeUse::All)
+    }
+
+    /// Reads the keys `used` needs, under the rules of `from_config`; the
+    /// others keep their defaults and are not checked.
+    pub fn read(extra: &BTreeMap<String, Value>, used: VolumeUse) -> Result<Self> {
+        if used == VolumeUse::None {
+            return Ok(Self::default());
+        }
         let volume = match extra.get("volume") {
             None | Some(Value::Null) => return Ok(Self::default()),
             Some(Value::Object(volume)) => volume,
@@ -82,6 +91,12 @@ impl VolumeLimits {
                     )
                 })?,
         };
+        if used == VolumeUse::ExportSize {
+            return Ok(Self {
+                max_export_size,
+                ..Self::default()
+            });
+        }
         Ok(Self {
             warn_hits: count("warn_hits", DEFAULT_WARN_HITS)?,
             warn_hits_per_location: count(
@@ -91,6 +106,17 @@ impl VolumeLimits {
             max_export_size,
         })
     }
+}
+
+/// Which `volume` keys a write command reads, so that a bad value stops
+/// only the commands that use it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeUse {
+    None,
+    /// `max_export_size` only: `report`.
+    ExportSize,
+    /// Every key: `estimate`.
+    All,
 }
 
 /// One limit that the estimate passed.

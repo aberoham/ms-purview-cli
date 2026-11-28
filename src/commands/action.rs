@@ -326,6 +326,11 @@ pub struct ActionRun {
     pub evidence_of: EvidenceOf,
     /// The command that lists the operation, after the case id.
     pub list_hint: &'static str,
+    /// Whether a stopped run resumes with `operation get --check`, which
+    /// fetches only the evidence file, never `download`: the operation the
+    /// `Location` header names is not checked until the wait ends, and an
+    /// export's other files are item content.
+    pub check_only: bool,
     pub no_wait: bool,
     pub no_download: bool,
     pub timing: Timing,
@@ -360,6 +365,16 @@ pub struct Finished {
 }
 
 impl ActionRun {
+    /// How a stopped run resumes; `waiting` while the operation may still
+    /// run.
+    fn resume_kind(&self, waiting: bool) -> Resume {
+        if self.check_only {
+            Resume::Check { wait: waiting }
+        } else {
+            Resume::WaitThenDownload
+        }
+    }
+
     fn hint(&self, case: CaseId) -> String {
         format!(
             "the {} may be running; 'purview operation list {case} {}' lists it",
@@ -440,7 +455,7 @@ impl ActionRun {
                     last,
                     waited,
                     false,
-                    Resume::WaitThenDownload,
+                    self.resume_kind(true),
                 )?))
             }
             PollEnd::Interrupted { last } => {
@@ -451,7 +466,7 @@ impl ActionRun {
                     last,
                     waited,
                     true,
-                    Resume::WaitThenDownload,
+                    self.resume_kind(true),
                 )?))
             }
         };
@@ -505,7 +520,7 @@ impl ActionRun {
                     Some(record),
                     waited,
                     true,
-                    Resume::WaitThenDownload,
+                    self.resume_kind(false),
                 )?));
             }
             reasons.extend(fetched.reasons);
@@ -611,4 +626,14 @@ pub fn resume(after: &After<'_>, case: CaseId, operation: &OperationId) -> Vec<S
         format!("purview --account={account} operation get {case} {operation} --wait"),
         format!("purview --account={account} download {case} {operation}"),
     ]
+}
+
+/// The command that carries on from a submitted report, as the signed-in
+/// account: the wait, then the collection check, which fetches only the
+/// evidence file whatever the operation turns out to be.
+pub fn resume_check(after: &After<'_>, case: CaseId, operation: &OperationId) -> Vec<String> {
+    let account = super::operation::shell_word(&after.session.account.email);
+    vec![format!(
+        "purview --account={account} operation get {case} {operation} --wait --check"
+    )]
 }

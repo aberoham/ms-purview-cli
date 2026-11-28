@@ -169,6 +169,16 @@ impl ReportFiles {
                 .map_or(0, |s| s.unusable_rows)
     }
 
+    /// The failed locations an action's evidence shows: both files for an
+    /// estimate, `Locations` alone for a report, which has no Statistics
+    /// file (Observed).
+    pub fn failed_locations_of(&self, action: EvidenceOf) -> Vec<FailedLocation> {
+        match action {
+            EvidenceOf::Estimate => self.failed_locations(),
+            EvidenceOf::Report => estimate::failed_locations(self.locations.as_ref(), None),
+        }
+    }
+
     /// The failed locations of both files.
     pub fn failed_locations(&self) -> Vec<FailedLocation> {
         estimate::failed_locations(
@@ -202,14 +212,18 @@ impl ReportFiles {
             EvidenceOf::Estimate => locations_usable && statistics_usable,
             EvidenceOf::Report => locations_usable,
         };
-        let ambiguous = self
-            .duplicates
-            .iter()
-            .any(|kind| matches!(*kind, "Locations" | "Statistics"));
-        if !usable || ambiguous || self.unusable_rows() > 0 {
+        let ambiguous = self.duplicates.iter().any(|kind| match action {
+            EvidenceOf::Estimate => matches!(*kind, "Locations" | "Statistics"),
+            EvidenceOf::Report => *kind == "Locations",
+        });
+        let unusable = match action {
+            EvidenceOf::Estimate => self.unusable_rows(),
+            EvidenceOf::Report => self.locations.as_ref().map_or(0, |l| l.unusable_rows),
+        };
+        if !usable || ambiguous || unusable > 0 {
             return Collection::Unchecked;
         }
-        match self.failed_locations().len() {
+        match self.failed_locations_of(action).len() {
             0 => Collection::Complete,
             failed => Collection::Incomplete { failed },
         }

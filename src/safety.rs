@@ -488,10 +488,10 @@ pub trait WriteCommand: Send {
         false
     }
 
-    /// Whether the command reads `volume` from `config.json`, so that a bad
-    /// setting there stops only the commands that use it.
-    fn reads_volume(&self) -> bool {
-        false
+    /// Which keys of `volume` in `config.json` the command reads, so that a
+    /// bad setting there stops only the commands that use it.
+    fn volume_use(&self) -> crate::report::volume::VolumeUse {
+        crate::report::volume::VolumeUse::None
     }
 
     /// Whether the command reads `defaults.teams_context`, so that a bad

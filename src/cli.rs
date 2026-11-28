@@ -2021,11 +2021,7 @@ async fn write_command(
         } else {
             crate::report::ReportLimits::from_config(&Default::default())?
         },
-        volume: if command.reads_volume() {
-            crate::report::volume::VolumeLimits::from_config(&stored.extra)?
-        } else {
-            crate::report::volume::VolumeLimits::default()
-        },
+        volume: crate::report::volume::VolumeLimits::read(&stored.extra, command.volume_use())?,
         teams_context: if command.reads_teams_context() {
             commands::report::teams_context_setting(&stored.extra)?
         } else {

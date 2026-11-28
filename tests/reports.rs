@@ -72,11 +72,27 @@ fn report_zip(failed: bool) -> Vec<u8> {
     buffer.into_inner()
 }
 
+/// A zip of the given entries.
+fn zip_of(entries: &[(&str, &str)]) -> Vec<u8> {
+    let mut buffer = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = zip::ZipWriter::new(&mut buffer);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, body) in entries {
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(body.as_bytes()).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+    buffer.into_inner()
+}
+
 /// The search's latest estimate: created after the fixture search's last
 /// change, with `size` bytes.
+/// It has no `@odata.type`, as observed.
 fn estimate(status: &str, size: Value) -> Value {
     json!({
-        "@odata.type": "#microsoft.graph.security.ediscoveryEstimateOperation",
         "id": ESTIMATE,
         "action": "estimateStatistics",
         "status": status,
@@ -200,7 +216,12 @@ impl Setup {
     /// A whole report: a small estimate, the 202, a succeeded operation
     /// and its zip.
     async fn ready(&mut self, failed: bool) {
-        self.zip_size = report_zip(failed).len();
+        self.ready_with(report_zip(failed)).await;
+    }
+
+    /// A whole report whose zip is `zip`.
+    async fn ready_with(&mut self, zip: Vec<u8>) {
+        self.zip_size = zip.len();
         self.preflight(
             self.search(),
             json!({"value": []}),
@@ -209,7 +230,6 @@ impl Setup {
         .await;
         self.accept().await;
         self.get(&operation_path(), self.succeeded()).await;
-        let zip = report_zip(failed);
         Mock::given(method("GET"))
             .and(path(FILE_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(zip))
@@ -696,7 +716,7 @@ async fn an_unclear_report_reads_each_candidate_for_its_true_action() {
 }
 
 #[tokio::test]
-async fn no_wait_submits_and_prints_the_commands_that_carry_on() {
+async fn no_wait_submits_and_resumes_with_the_check_never_download() {
     let mut setup = Setup::new().await;
     setup.ready(false).await;
     let run = setup.run(&["--json", "--yes", "--no-wait"]).await;
@@ -704,10 +724,14 @@ async fn no_wait_submits_and_prints_the_commands_that_carry_on() {
     let result = &run.json()["results"]["result"];
     assert_eq!(result["operationId"], OP);
     assert_eq!(result["collection"], "unchecked");
-    assert!(result["resume"][0]
+    // The operation the header named is not checked yet, so the resume
+    // fetches only the evidence file.
+    let resume = result["resume"].as_array().unwrap();
+    assert_eq!(resume.len(), 1, "{resume:?}");
+    assert!(resume[0]
         .as_str()
         .unwrap()
-        .ends_with(&format!("operation get {CASE} {OP} --wait")));
+        .ends_with(&format!("operation get {CASE} {OP} --wait --check")));
     assert!(setup.downloads().await.is_empty());
     assert!(!setup
         .graph_requests()
@@ -805,4 +829,211 @@ async fn the_size_limit_is_refused_ahead_of_a_possible_duplicate() {
     let run = setup.run(&["--json", "--yes", "--allow-concurrent"]).await;
     assert_eq!(run.json()["error"]["code"], "TooLarge");
     assert!(setup.posts().await.is_empty());
+}
+
+#[tokio::test]
+async fn the_wait_deadline_resumes_with_the_check_never_download() {
+    let setup = Setup::new().await;
+    setup
+        .preflight(
+            setup.search(),
+            json!({"value": []}),
+            estimate("succeeded", json!(GIB)),
+        )
+        .await;
+    setup.accept().await;
+    let mut running = setup.succeeded();
+    running["status"] = json!("running");
+    setup.get(&operation_path(), running).await;
+    let run = setup
+        .run(&["--json", "--yes", "--wait-timeout", "30s"])
+        .await;
+    assert_eq!(run.outcome.exit_code, 5, "{}", run.stdout());
+    let resume = run.json()["resume"].clone();
+    assert_eq!(resume.as_array().unwrap().len(), 1, "{resume}");
+    assert!(
+        resume[0].as_str().unwrap().ends_with("--wait --check"),
+        "{resume}"
+    );
+}
+
+#[tokio::test]
+async fn a_typed_latest_estimate_is_read_too() {
+    let mut setup = Setup::new().await;
+    setup.ready(false).await;
+    let mut typed = estimate("succeeded", json!(11 * GIB));
+    typed["@odata.type"] = json!("#microsoft.graph.security.ediscoveryEstimateOperation");
+    Mock::given(method("GET"))
+        .and(path(last_estimate_path()))
+        .respond_with(json_response(200, typed))
+        .with_priority(1)
+        .mount(&setup.harness.graph)
+        .await;
+    let run = setup.run(&["--json", "--yes"]).await;
+    assert_eq!(run.json()["error"]["code"], "TooLarge");
+}
+
+#[tokio::test]
+async fn an_answer_with_no_operation_is_unchecked_and_allow_large_still_sends() {
+    for answer in [ResponseTemplate::new(204), json_response(200, Value::Null)] {
+        let mut setup = Setup::new().await;
+        setup.ready(false).await;
+        Mock::given(method("GET"))
+            .and(path(last_estimate_path()))
+            .respond_with(answer)
+            .with_priority(1)
+            .mount(&setup.harness.graph)
+            .await;
+        let run = setup.run(&["--json", "--yes"]).await;
+        assert_eq!(
+            run.json()["error"]["code"],
+            "VolumeUnchecked",
+            "{}",
+            run.stdout()
+        );
+        assert!(run.json()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("holds no operation"));
+        let run = setup
+            .run(&[
+                "--json",
+                "--yes",
+                "--no-download",
+                "--allow-large",
+                "--reason",
+                "none yet",
+            ])
+            .await;
+        assert_eq!(run.outcome.exit_code, 0, "{}", run.stdout());
+        assert_eq!(setup.posts().await.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn an_estimate_that_grows_past_the_limit_after_the_plan_stops_the_send() {
+    let setup = Setup::new().await;
+    // Same estimate id: the plan reads 1 GiB, the read after approval 11.
+    Mock::given(method("GET"))
+        .and(path(last_estimate_path()))
+        .respond_with(json_response(200, estimate("succeeded", json!(GIB))))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&setup.harness.graph)
+        .await;
+    setup
+        .preflight(
+            setup.search(),
+            json!({"value": []}),
+            estimate("succeeded", json!(11 * GIB)),
+        )
+        .await;
+    setup.accept().await;
+    let run = setup.run(&["--json", "--yes"]).await;
+    assert_eq!(run.json()["error"]["code"], "TooLarge", "{}", run.stdout());
+    assert!(setup.posts().await.is_empty());
+}
+
+#[tokio::test]
+async fn a_zip_without_locations_is_unchecked_and_strict_exits_4() {
+    let mut setup = Setup::new().await;
+    setup
+        .ready_with(zip_of(&[(
+            "Items_0_2026-01-05_09-00-00.csv",
+            "\u{feff}Subject\r\nhello\r\n",
+        )]))
+        .await;
+    let run = setup.run(&["--json", "--yes"]).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stdout());
+    assert_eq!(run.json()["results"]["result"]["collection"], "unchecked");
+    assert!(
+        run.stderr().contains("warning: collection unchecked"),
+        "{}",
+        run.stderr()
+    );
+    let run = setup.run(&["--json", "--yes", "--strict"]).await;
+    assert_eq!(run.outcome.exit_code, 4, "{}", run.stdout());
+    assert_eq!(
+        run.json()["outcome"]["reasons"][0]["code"],
+        "EvidenceMissing"
+    );
+}
+
+#[tokio::test]
+async fn statistics_rows_do_not_change_a_report_s_collection() {
+    let mut setup = Setup::new().await;
+    let locations = format!(
+        "{LOCATIONS_HEADER}Exchange,Mailbox,alex@contoso.example,id-1,Mailbox,PrimaryMailBox,12,2048,Succeeded,,q\r\n"
+    );
+    setup
+        .ready_with(zip_of(&[
+            ("Items_0_2026-01-05_09-00-00.csv", "\u{feff}Subject\r\nhello\r\n"),
+            ("Locations-2026-01-05_09-00-00.csv", &locations),
+            (
+                "Statistics-2026-01-05_09-00-00.csv",
+                "\u{feff}DataSourceName,DataSourceType,Location,LocationType,LocationSubType,StatType,StatName,OriginalStatName,Value\r\nExchange,Mailbox,pat@fabrikam.example,Mailbox,SystemMailbox,Error,OperationCanceledException,x,0\r\n",
+            ),
+        ]))
+        .await;
+    let run = setup.run(&["--json", "--yes", "--strict"]).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stdout());
+    let result = &run.json()["results"]["result"];
+    assert_eq!(result["collection"], "complete");
+    assert_eq!(result["failedLocations"], json!([]));
+}
+
+#[tokio::test]
+async fn an_estimate_only_volume_setting_does_not_stop_a_report() {
+    let mut setup = Setup::new().await;
+    setup.ready(false).await;
+    set_config(
+        &setup.harness,
+        "volume",
+        json!({"warn_hits": "bad", "warn_hits_per_location": -1}),
+    );
+    let run = setup.run(&["--json", "--yes", "--no-download"]).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stdout());
+    // A bad max_export_size does.
+    set_config(&setup.harness, "volume", json!({"max_export_size": 10}));
+    let run = setup.run(&["--json", "--yes"]).await;
+    assert_eq!(run.outcome.exit_code, 1);
+    assert!(run.json()["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("volume.max_export_size"));
+}
+
+#[tokio::test]
+async fn a_refresh_the_identity_platform_refuses_is_a_sign_in_error_not_a_size_check() {
+    let mut setup = Setup::new().await;
+    setup.ready(false).await;
+    // Graph refuses the token on the estimate read, and the refresh that
+    // follows is refused with HTTP 400.
+    Mock::given(method("GET"))
+        .and(path(last_estimate_path()))
+        .respond_with(json_response(
+            401,
+            json!({"error": {"code": "InvalidAuthenticationToken"}}),
+        ))
+        .with_priority(1)
+        .mount(&setup.harness.graph)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(token_path("token")))
+        .respond_with(json_response(
+            400,
+            json!({"error": "invalid_grant", "error_description": "AADSTS70008: expired"}),
+        ))
+        .mount(&setup.harness.identity)
+        .await;
+    for args in [
+        vec!["--json", "--yes"],
+        vec!["--json", "--yes", "--allow-large", "--reason", "anyway"],
+    ] {
+        let run = setup.run(&args).await;
+        assert_eq!(run.outcome.exit_code, 1, "{args:?}");
+        let error = &run.json()["error"];
+        assert_eq!(error["code"], "invalid_grant", "{args:?}: {error}");
+        assert!(setup.posts().await.is_empty(), "{args:?}");
+    }
 }

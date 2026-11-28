@@ -24,7 +24,7 @@ use crate::model::valid::{CaseKey, SearchKey};
 use crate::model::wire::{OperationDetail, OperationRecord, OperationStatus};
 use crate::poll::Timing;
 use crate::report::estimate::{by_hits, Collection};
-use crate::report::volume::{Volume, VolumeLimits};
+use crate::report::volume::{Volume, VolumeLimits, VolumeUse};
 use crate::report::{EvidenceOf, ReportFiles, ReportLimits};
 use crate::routes::{CaseId, OperationId, SearchId, WriteRoute};
 use crate::safety::{
@@ -91,8 +91,8 @@ impl WriteCommand for Estimate {
         !self.flags.no_download && !self.flags.no_wait
     }
 
-    fn reads_volume(&self) -> bool {
-        true
+    fn volume_use(&self) -> VolumeUse {
+        VolumeUse::All
     }
 
     async fn plan(&mut self, preflight: &mut Preflight<'_>) -> Result<Planned> {
@@ -279,6 +279,7 @@ impl WriteCommand for Estimate {
             action: "estimateStatistics",
             evidence_of: EvidenceOf::Estimate,
             list_hint: "--action estimate",
+            check_only: false,
             no_wait: self.flags.no_wait,
             no_download: self.flags.no_download,
             timing: self.flags.timing,

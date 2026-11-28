@@ -457,9 +457,9 @@ impl GraphClient {
             if status.is_success() {
                 return match serde_json::from_slice::<Value>(&body) {
                     Ok(value @ Value::Object(_)) => Ok(value),
-                    _ => Err(PurviewError::message(
-                        "Microsoft Graph returned a response that is not a JSON object",
-                    )),
+                    _ => Err(PurviewError::GraphBodyNotObject {
+                        status: status.as_u16(),
+                    }),
                 };
             }
             if status == StatusCode::UNAUTHORIZED

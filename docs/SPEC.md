@@ -563,9 +563,10 @@ Settled in PR 3.2:
 - `--profile` adds `profile` to the result: `parse profile` on the zip read for the
   collection check, with no filter, `defaults.top`, month buckets and no local-part
   merging. `identity` and `defaults.top` are read before sign-in only under `--profile`,
-  which conflicts with `--no-download` and `--no-wait`. When no zip was read as the report,
-  or it cannot be profiled, `profile` is `null` and the run exits 4 with
-  `ProfileUnavailable`. `export create` has no `--profile`.
+  which conflicts with `--no-download` and `--no-wait`. When the files were downloaded but
+  none was read as the report zip, or that zip cannot be profiled, `profile` is `null` and
+  the run exits 4 with `ProfileUnavailable`. A failed download ends the run with exit 1, as
+  it does without `--profile`. `export create` has no `--profile`.
 - `result` is `{"operationId", "operationStatus", "collection", "displayName",
   "teamsContext", "estimateId", "locationsWithHits", "failedLocations", "files"}`;
   `locationsWithHits` is the number of Locations rows with a `Count` above zero, `null`
@@ -1864,7 +1865,8 @@ An object or value given as `null` means unset, as if it were missing; any other
 the wrong type is an error. `guard.specific_terms` and `guard.generic_terms` are lists of
 non-blank strings. `identity.internal_domains` is a list of domain names and
 `identity.domain_aliases` an object from domain name to domain name; a domain name is
-non-blank, has no `@`, space or control character, and is compared lowercased.
+trimmed, then non-blank with no `@`, space or control character, and is compared
+lowercased.
 `defaults.top` is a whole number above zero (settled in PR 3.2).
 
 Template variables:

@@ -48,10 +48,15 @@ def address(mailbox):
     return (mailbox or {}).get("address") or ""
 
 
+def recipients(listed):
+    """An extract-msg header string split at each `;` outside quotes."""
+    return re.split(r';(?=(?:[^"]*"[^"]*")*[^"]*$)', listed or "")
+
+
 def addresses_in(listed):
     """The addresses in an extract-msg header string, lower case."""
     return {
-        addr.lower() for _, addr in getaddresses((listed or "").split(";")) if "@" in addr
+        addr.lower() for _, addr in getaddresses(recipients(listed)) if "@" in addr
     }
 
 
@@ -60,7 +65,7 @@ def locals_in(listed):
     whose recipients are separated by `;`."""
     return {
         addr.split("@")[0].lower()
-        for _, addr in getaddresses((listed or "").split(";"))
+        for _, addr in getaddresses(recipients(listed))
         if "@" in addr
     }
 

@@ -224,6 +224,29 @@ fn mailbox(mailbox: &Mailbox) -> Value {
     json!({"name": mailbox.name, "address": mailbox.address})
 }
 
+/// The first `max` characters of `text`. A URL the cut falls inside is
+/// dropped: redacted again on output, a URL cut short, or its cut
+/// `?REDACTED`, could grow past `max` or read as a new query.
+fn cut_body(text: &str, max: usize) -> String {
+    let mut cut: String = text.chars().take(max).collect();
+    let mid_word = text[cut.len()..]
+        .chars()
+        .next()
+        .is_some_and(|next| !next.is_whitespace());
+    if mid_word {
+        let start = cut
+            .char_indices()
+            .rev()
+            .find(|(_, c)| c.is_whitespace())
+            .map_or(0, |(at, c)| at + c.len_utf8());
+        let word = cut[start..].to_ascii_lowercase();
+        if word.contains("http://") || word.contains("https://") {
+            cut.truncate(start);
+        }
+    }
+    cut
+}
+
 fn fill(
     record: &mut Map<String, Value>,
     item: &MsgItem,
@@ -241,10 +264,9 @@ fn fill(
         .text()
         .map(|text| crate::redact::urls_in_free_text(text, redactor));
     let (body, truncated) = match text.as_deref() {
-        Some(text) if text.chars().count() > max_body_chars => (
-            Some(text.chars().take(max_body_chars).collect::<String>()),
-            true,
-        ),
+        Some(text) if text.chars().count() > max_body_chars => {
+            (Some(cut_body(text, max_body_chars)), true)
+        }
         Some(text) => (Some(text.to_owned()), false),
         None => (None, false),
     };

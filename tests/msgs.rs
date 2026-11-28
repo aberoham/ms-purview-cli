@@ -363,6 +363,42 @@ async fn a_body_that_is_one_url_or_struck_through_or_cut_loses_every_query() {
 }
 
 #[tokio::test]
+async fn a_text_body_that_is_one_url_is_redacted_once_and_stays_under_the_cap() {
+    let harness = Harness::new().await;
+    let url = "https://portal.contoso.example/a?downloadType=textsecret";
+    let whole = Message::note("Whole").with(BODY, P::Unicode(url.into()));
+    let cut = Message::note("Cut").with(BODY, P::Unicode(format!("Read {url}")));
+    let path = write_zip(
+        &harness,
+        "Items.1.001.export.zip",
+        items_zip(&[
+            ("Exchange/Items/a.msg", whole.build()),
+            ("Exchange/Items/b.msg", cut.build()),
+        ]),
+    );
+    // 45 characters keep the first body whole and cut the second inside
+    // its redacted URL.
+    for json in [true, false] {
+        let mut argv = vec!["export", "read", &path, "--max-body-chars", "45"];
+        if json {
+            argv.push("--json");
+        }
+        let run = harness.run(&argv).await;
+        assert_eq!(run.outcome.exit_code, 0, "{}", run.stderr());
+        let records = if json {
+            run.json()["results"].as_array().unwrap().clone()
+        } else {
+            lines(&run)
+        };
+        let first = records[0]["body"].as_str().unwrap();
+        assert_eq!(first, "https://portal.contoso.example/a?REDACTED");
+        let second = records[1]["body"].as_str().unwrap();
+        assert_eq!(second, "Read ", "{second}");
+        assert!(second.chars().count() <= 45);
+    }
+}
+
+#[tokio::test]
 async fn an_unknown_class_never_reaches_stderr_and_is_wrapped_in_the_record() {
     let harness = Harness::new().await;
     let mut message = html_note();

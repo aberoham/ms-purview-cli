@@ -820,7 +820,9 @@ Settled in the first `.msg` reader PR (PR 5.1 with the body selection of PR 5.2)
   converted without combining strokes, which would hide a URL from the redaction. Every URL
   in a body, from HTML or text, keeps only scheme, host and path, as in other free text,
   before `--max-body-chars` cuts the body, so that a query neither survives as an OData
-  option of a body that is one URL alone nor takes the place of text under the cap.
+  option of a body that is one URL alone nor takes the place of text under the cap. A URL
+  that the cap falls inside is dropped, so that a URL cut short is not read as a new one. A
+  query already redacted (`?REDACTED`) is left as it is when the record is redacted again.
 - The container is refused as `cfbInvalid`, with a fixed `errorDetail`, when its header's
   FAT, DIFAT or mini FAT sector counts do not fit in the item, before `cfb` reads it; so is
   an item with a property stream that exists and cannot be read in full, and one whose

@@ -434,7 +434,11 @@ pub fn url(value: &::url::Url, redactor: &Redactor) -> String {
             path.clear().extend(&segments);
         }
     }
-    if let Some(query) = value.query() {
+    if value.query() == Some(REDACTED_QUERY_VALUE) {
+        // A query `urls_in_text` already redacted stays as it is, so that
+        // redacting twice changes nothing.
+        clean.set_query(Some(REDACTED_QUERY_VALUE));
+    } else if let Some(query) = value.query() {
         // Each pair is read raw as well as decoded: form decoding turns `+`
         // into a space, so a secret holding `+` would pass a check of the
         // decoded value alone.
@@ -503,6 +507,14 @@ pub fn urls_in_text(text: &str, redactor: &Redactor) -> String {
     if let Some(parsed) = single_url(text) {
         return url(&parsed, redactor);
     }
+    urls_in_free_text(text, redactor)
+}
+
+/// `text` with every URL as `urls_in_text` treats a URL in other text,
+/// even when `text` is one URL alone: scheme, host and path kept, any
+/// query or fragment `?REDACTED`. For text written by people, such as a
+/// message body, where no query is an OData option.
+pub fn urls_in_free_text(text: &str, redactor: &Redactor) -> String {
     let lower = text.to_ascii_lowercase();
     let mut output = String::with_capacity(text.len());
     let mut position = 0;
@@ -581,6 +593,14 @@ fn is_plain_key(key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_redacted_query_is_left_as_it_is() {
+        let redactor = Redactor::default();
+        let once = urls_in_free_text("https://portal.contoso.example/a?x=1", &redactor);
+        assert_eq!(once, "https://portal.contoso.example/a?REDACTED");
+        assert_eq!(urls_in_text(&once, &redactor), once);
+    }
+
     use std::sync::Mutex;
 
     use super::*;

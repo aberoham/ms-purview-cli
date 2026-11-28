@@ -788,6 +788,78 @@ a record with `error` set.
 The command refuses to run when stdout is a terminal, unless `--to-terminal` is given:
 bodies are colleagues' and outsiders' mail. Section 9 explains where the output should go.
 
+Settled in the first `.msg` reader PR (PR 5.1 with the body selection of PR 5.2):
+- The smallest form: `export read <items.zip>...` with `--max-entry-bytes`,
+  `--max-body-chars` and `--json`, local, with no sign-in and no configuration read. There
+  is no `--to-terminal`: a terminal stdout is always refused. The CSV join (`--report`,
+  `joined`, and `class`, `date`, `workload` and `conversationName` from the report), the
+  admission window and reorder buffer, `--jobs`, `--cut-quoted`, `--thread-dedup`,
+  `--body`, `--headers`, the filters and `--force-buffer` wait for later PRs; `--json` is
+  refused above 10,000 items.
+- A record has `entry`, `part`, `class`, `subject`, `conversationTopic`,
+  `internetMessageId`, `from`, `sender`, `to`, `cc`, `bcc` (each `{"name", "address"}`),
+  `sent`, `received`, `attachments` (`{"name", "size"}`), `body`, `bodySource`,
+  `bodyTruncated`, `error` and `errorDetail`; `class` is the `.msg`'s own. A record for an
+  item that could not be parsed (`entryTooLarge`, `entryUnreadable`, `cfbInvalid`) or
+  printed (`redactionFailed`) has only `entry`, `part`, `error` and `errorDetail`. An
+  entry that is not a `.msg` is skipped and counted. An entry over `--max-entry-bytes` is
+  `entryTooLarge`; one the zip cannot give is `entryUnreadable`.
+- `PidTagAttachSize` is absent from exported attachments (Observed), so an attachment's
+  size is the length of its data stream, `__substg1.0_37010102`, read from the container's
+  directory.
+- `from` and `sender` are Graph's pair: `from` is the mailbox the message is from as its
+  recipients see it (`PidTagSentRepresenting*`), `sender` the mailbox that sent it
+  (`PidTagSender*`); they differ when a delegate sent on another's behalf (Docs:
+  MS-OXOMSG). An item with no sent-representing properties is from its sender. On the
+  private export the two were the same on every item (Observed).
+- A sender with no SMTP address keeps its Exchange address (Observed: two of 31 items). A
+  recipient type has the `MAPI_SUBMITTED` flag of a resend masked off; a missing type is To.
+- Before conversion: `<head>`, `<style>` and `<script>` are removed with their content,
+  VML and Office rules only when they set `behavior`, and `<hr>` is kept as `---`. Office's
+  conditional comments need nothing: a hidden one is one HTML comment, which the parser
+  drops, and a downlevel-revealed one's markers are comments around text that is kept.
+  A link is its text alone: `html2text`'s rich decorator writes nothing around a link,
+  where the plain one writes `[text]` and the bracket runs on to a URL, hiding its host
+  from the redaction. The link's target is never shown. Conversion uses `html2text`'s raw mode, which gives each table cell its own line
+  and draws no borders, so a table is never wider or longer than its text; a huge span
+  stays cheap, and spans whose sum overflows panic inside `html2text`, which gives
+  `bodyDecode` (Derived from its source). The
+  width is 10,000 or more than the HTML's length, whichever is larger, so that no word is
+  broken across lines: the URL redaction that runs on the text afterwards then sees every
+  URL whole (Derived from `html2text` 0.17's source and tests). A converter that fails or
+  panics gives `bodyDecode` unless there is a plain-text body. Struck-through text is
+  converted without combining strokes, which would hide a URL from the redaction. Every URL
+  in a body, from HTML or text, keeps only scheme, host and path, as in other free text,
+  before `--max-body-chars` cuts the body, so that a query neither survives as an OData
+  option of a body that is one URL alone nor takes the place of text under the cap. A URL
+  that the cap falls inside is dropped, so that a URL cut short is not read as a new one. A
+  query already redacted (`?REDACTED`) is left as it is when the record is redacted again.
+- The container is refused as `cfbInvalid`, with a fixed `errorDetail`, when its header's
+  FAT, DIFAT or mini FAT sector counts do not fit in the item, before `cfb` reads it; so is
+  an item with a property stream that exists and cannot be read in full, and one whose
+  streams read add up to more than twice its size (streams sharing sectors).
+- An entry is `entryTooLarge`, without being read, when the size its zip declares passes
+  `--max-entry-bytes`, and also when reading it passes the limit; one refused for its
+  compression ratio, or unreadable for any other reason, is `entryUnreadable`.
+- The stderr summary counts items by class under fixed labels (the classes seen in exports,
+  else `other`), so no text from an item reaches stderr; `class` is wrapped by
+  `--wrap-untrusted`.
+- JSON Lines are prepared as every JSON document is: URLs redacted, `--wrap-untrusted` with
+  one marker for the run and the notice on stderr, secrets redacted as values.
+- `cfb` 0.16.0 (released 2026-10-31) and `html2text` 0.17.4 (released 2026-10-18).
+- The cross-check is `tests/scripts/msg-crosscheck.py`, run by hand. On the maintainer's
+  one private export of 31 items it agreed with `extract-msg` 0.55.0 on subject, sent time,
+  body and To for every item and on CC for the 18 with CC recipients (Observed). Of the 29
+  items with an SMTP sender, 25 agreed on the whole address; on 4, `from`
+  (`PidTagSentRepresentingSmtpAddress`, the same as `PidTagSenderSmtpAddress` there) had
+  the same local part in another domain than the address `extract-msg` gives from the
+  From header, which shows it only as the display name (Observed): `from` is the
+  mailbox's own SMTP address, not always the address the message was sent as. Senders are
+  compared whole and that case is counted apart; recipients are compared as sets of
+  address local parts. A field empty in one reader never agrees with a
+  filled one, and a field empty in both is counted apart.
+  The `msg-crosscheck` CI job waits for PR 5.3.
+
 #### `purview inventory cases` (read; phase 6)
 
 Flags: `--older-than DUR`, `--status S`, `--holds-only`, `--concurrency N` (default 4,
@@ -1357,6 +1429,7 @@ An entry over the cap gets
  "conversationName":null,"immutableId":"…","internetMessageId":"<…@contoso.example>",
  "subject":"Orders API cut-over",
  "from":{"name":"Alex Example","address":"alex@contoso.example"},
+ "sender":{"name":"Alex Example","address":"alex@contoso.example"},
  "to":[{"name":"Sam Example","address":"sam@contoso.example"}],"cc":[],
  "sent":"2025-03-02T09:13:58Z","received":"2025-03-02T09:14:00Z",
  "attachments":[{"name":"plan.xlsx","size":48211}],
@@ -1379,7 +1452,8 @@ from the `.msg`. `error` is one of `cfbInvalid`, `noBody`, `bodyDecode`, `entryT
      the property id. `TTTT` is the type: `001F` is a UTF-16LE string, `001E` an 8-bit
      string, `0102` binary.
    - Fixed-size properties live in `__properties_version1.0`. Its header is 32 bytes for the
-     top-level message, 24 for an embedded message or attachment and 8 for a recipient. Each
+     top-level message, 24 for an embedded message, and 8 for an attachment or a recipient
+     (Docs: MS-OXMSG 2.4.1; Observed: attachment sizes read only with 8). Each
      entry is 16 bytes, and type `0040` is a FILETIME.
    - Recipients and attachments are the storages `__recip_version1.0_#XXXXXXXX` and
      `__attach_version1.0_#XXXXXXXX`.
@@ -1389,9 +1463,11 @@ from the `.msg`. `error` is one of `cfbInvalid`, `noBody`, `bodyDecode`, `entryT
      `PidTagConversationTopic` 0x0070, `PidTagInternetMessageId` 0x1035,
      `PidTagTransportMessageHeaders` 0x007D, `PidTagClientSubmitTime` 0x0039,
      `PidTagMessageDeliveryTime` 0x0E06, `PidTagInternetCodepage` 0x3FDE.
-   - **Sender:** `PidTagSenderName` 0x0C1A, then `PidTagSenderSmtpAddress` 0x5D01,
-     `PidTagSenderEmailAddress` 0x0C1F, `PidTagSentRepresentingSmtpAddress` 0x5D02, in that
-     order of preference.
+   - **From:** `PidTagSentRepresentingName` 0x0042, then
+     `PidTagSentRepresentingSmtpAddress` 0x5D02 or `PidTagSentRepresentingEmailAddress`
+     0x0065; the sender when the item has none of them.
+   - **Sender:** `PidTagSenderName` 0x0C1A, then `PidTagSenderSmtpAddress` 0x5D01 or
+     `PidTagSenderEmailAddress` 0x0C1F.
    - **Body:** `PidTagBody` 0x1000, `PidTagHtml` 0x1013, `PidTagRtfCompressed` 0x1009.
    - **Recipients:** `PidTagRecipientType` 0x0C15, `PidTagDisplayName` 0x3001,
      `PidTagSmtpAddress` 0x39FE, then `PidTagEmailAddress` 0x3003.
@@ -1408,19 +1484,19 @@ from the `.msg`. `error` is one of `cfbInvalid`, `noBody`, `bodyDecode`, `entryT
    it. A contributor is expected to have Python with `uv`. The script is a `uv` script with
    `extract-msg` pinned that reads the same inputs and writes the fields the comparison
    needs. In the observed run, `extract-msg` read every item except the Teams system
-   messages, all from the zip in memory (Observed). CI compares the two readers on synthetic
-   fixtures, and a maintainer compares them on a private export, reporting only counts.
+   messages, all from the zip in memory (Observed). From PR 5.3, CI compares the two readers
+   on synthetic fixtures; until then, and on a private export, a maintainer compares them by
+   hand, reporting only counts.
 
 **Body selection.**
 1. `PidTagHtml`: a binary value is decoded with `PidTagInternetCodepage` through
    `encoding_rs` (default UTF-8); a string value is UTF-16LE. The text is then cleaned:
-   - remove `<head>`, `<style>`, `<script>` and Office conditional comments
-     (`<!--[if …]>…<![endif]-->`);
+   - remove `<head>`, `<style>` and `<script>`; Office conditional comments
+     (`<!--[if …]>…<![endif]-->`) are HTML comments, which the parser drops;
    - remove leftover style text matching `v\:* {behavior:…}`, as the VML (Vector Markup
      Language) text naive tag-stripping leaves behind (Observed). The similar `o\:*`,
      `w\:*` and `.shape` rules are removed too (Assumption: same origin);
-   - convert with `html2text` at a fixed very large width, so nothing wraps. The width is
-     chosen in PR 5.2 after checking how the pinned version treats width;
+   - convert with `html2text` at a width larger than the HTML, so nothing wraps;
    - set `bodySource: "html"`.
 2. Else `PidTagBody`, with `bodySource: "text"`.
 3. Else `PidTagRtfCompressed` only: `error: "noBody"`, `errorDetail: "compressed RTF only"`.

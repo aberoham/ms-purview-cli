@@ -558,6 +558,15 @@ Settled in PR 2.4:
   limit applies again.
 - The answer must be 202, and the operation the `Location` header names must be an
   `exportReport` operation with export detail before any file is fetched.
+
+Settled in PR 3.2:
+- `--profile` adds `profile` to the result: `parse profile` on the zip read for the
+  collection check, with no filter, `defaults.top`, month buckets and no local-part
+  merging. `identity` and `defaults.top` are read before sign-in only under `--profile`,
+  which conflicts with `--no-download` and `--no-wait`. When the files were downloaded but
+  none was read as the report zip, or that zip cannot be profiled, `profile` is `null` and
+  the run exits 4 with `ProfileUnavailable`. A failed download ends the run with exit 1, as
+  it does without `--profile`. `export create` has no `--profile`.
 - `result` is `{"operationId", "operationStatus", "collection", "displayName",
   "teamsContext", "estimateId", "locationsWithHits", "failedLocations", "files"}`;
   `locationsWithHits` is the number of Locations rows with a `Count` above zero, `null`
@@ -804,6 +813,40 @@ estimate, `Items_N_*.csv` without an `Items.*.zip` sibling means an item report.
   - `--wrap-untrusted` wraps `title`, `key` and `senderDomain` too (with `sender`, `class`
     and `internetMessageId`, already wrapped).
 - `parse profile <zip> [filters] [--top N] [--bucket day|week|month] [--merge-local-part]`
+
+  Settled in PR 3.2:
+  - It prints one document, as the other `parse` commands do, and is not a JSONL command
+    (section 3.3): `--json` gives `{"results": <profile>, "count": 1}`, and the table has
+    `SECTION`, `NAME` and `COUNT`, with names cut at 80 characters.
+  - Every count is of unique items, keyed and filtered as for `parse items`, with its
+    `--max-unique` and its stderr summary.
+  - The profile has `items`, `hashKeyed`, `copies` (`rows`, `mean`, `max`), `classes` and
+    `workloads` (every value, `null` for an empty field), `senders` (`distinct`,
+    `teamsThread`, `addressLists`, `none`, and `top`: `sender`, `items`, `addresses`),
+    `senderDomains` (`distinct`, `top`), `teamsConversations` (`items`, `distinct`,
+    `unnamed`, and `top` by `conversationName`), `histogram` (`bucket`, `undated`, and
+    `buckets` of `start` and `items`, by start date) and `options`. The other lists are by
+    count, most first, then by name.
+  - `--top` cuts the sender, domain and conversation lists. It defaults to `defaults.top`,
+    else 20, and zero is refused; `defaults.top` is read only when `--top` is absent.
+  - `--bucket` defaults to `month`. A week is an ISO 8601 week from Monday, in UTC. A bucket
+    is named by its first day, `YYYY-MM-DD`, and only buckets with items are listed.
+  - A sender is read as `parse items` reads it: lowercased, `Name <addr>` as `addr`. A Teams
+    thread id and a list of addresses separated by `;` (Teams file items; Observed) are
+    counted apart, never as a person or a domain, and `parse items` gives a list
+    `senderDomain: null` too. A sender with no `@` is counted by its text, with no domain.
+  - A Teams item is one whose `Item class` starts with `IPM.SkypeTeams.`, in any ASCII
+    case, because `Workload` is `Exchange` for Teams messages too (Observed). Teams items
+    are counted by `Conversation name`; those without one are `unnamed`.
+  - `identity.domain_aliases` maps the domain after `@` first, in one step: a target that is
+    itself mapped elsewhere is refused. `identity.internal_domains` are mapped through the
+    aliases too. `--merge-local-part` then counts every address in an internal domain by its
+    local part alone, and is refused when no internal domain is set. A merged sender is
+    shown as the address, after aliasing, that most of its items came under (the first by
+    name on a tie), with `addresses`, the number of distinct addresses merged. Domains are
+    never merged.
+  - `--wrap-untrusted` wraps `conversationName` too, with `sender`, `senderDomain` and
+    `class`.
 
 Filters: `--since`, `--until` (on `Date`, both inclusive, UTC), `--subject-regex RE` (on
 `Subject/Title` or `Conversation name`), `--class PREFIX`, `--sender ADDR`,
@@ -1401,7 +1444,9 @@ report).
 
 Senders are lowercased. The forms `addr` and `Name <addr>` are accepted. A Teams thread id
 (`19:…@thread.v2`) counts as "Teams thread" and never as a person (Observed: `Sender` is
-sometimes a thread id). Domains are mapped through `identity.domain_aliases`.
+sometimes a thread id). A `Sender` holding a list of addresses separated by `;`, cut at 255
+characters, counts as an address list and never as a person (Observed on Teams file items,
+`IPM.File.TeamsConversation`). Domains are mapped through `identity.domain_aliases`.
 `--merge-local-part` merges local parts only within `identity.internal_domains`. The same
 person was seen under an old and a new domain (Observed); merging across outside domains
 would join unrelated people.
@@ -1818,7 +1863,11 @@ repository on purpose. Every command that writes a file prints its full path.
 
 An object or value given as `null` means unset, as if it were missing; any other value of
 the wrong type is an error. `guard.specific_terms` and `guard.generic_terms` are lists of
-non-blank strings.
+non-blank strings. `identity.internal_domains` is a list of domain names and
+`identity.domain_aliases` an object from domain name to domain name; a domain name is
+trimmed, then non-blank with no `@`, space or control character, and is compared
+lowercased.
+`defaults.top` is a whole number above zero (settled in PR 3.2).
 
 Template variables:
 

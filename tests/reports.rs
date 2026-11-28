@@ -1706,3 +1706,123 @@ async fn locations_with_hits_leaves_out_rows_with_no_hits_and_is_unknown_without
         run.stdout()
     );
 }
+
+#[tokio::test]
+async fn profile_adds_the_report_s_profile_to_the_result_with_the_identity_settings() {
+    let mut setup = Setup::new().await;
+    setup.ready(false).await;
+    set_config(
+        &setup.harness,
+        "identity",
+        json!({"domain_aliases": {"contoso.example": "fabrikam.example"}}),
+    );
+    set_config(&setup.harness, "defaults", json!({"top": 3}));
+    let run = setup.run(&["--json", "--yes", "--profile"]).await;
+    assert_eq!(
+        run.outcome.exit_code,
+        0,
+        "{} {}",
+        run.stdout(),
+        run.stderr()
+    );
+    let profile = &run.json()["results"]["result"]["profile"];
+    assert_eq!(profile["items"], 1, "{profile}");
+    assert_eq!(
+        profile["senders"]["top"][0]["sender"],
+        "alex@fabrikam.example"
+    );
+    assert_eq!(
+        profile["options"],
+        json!({"top": 3, "bucket": "month", "mergeLocalPart": false})
+    );
+    assert!(
+        run.stderr()
+            .contains("profile: 1 row read from 1 Items file"),
+        "{}",
+        run.stderr()
+    );
+    // Without --profile, the result has none and the settings are unread.
+    set_config(&setup.harness, "identity", json!([]));
+    let run = setup.run(&["--json", "--yes"]).await;
+    assert_eq!(run.outcome.exit_code, 0, "{}", run.stdout());
+    assert!(run.json()["results"]["result"].get("profile").is_none());
+}
+
+#[tokio::test]
+async fn a_profile_that_cannot_be_made_is_null_and_exits_4() {
+    let mut setup = Setup::new().await;
+    // A report zip with Locations, so the collection is checked, but no
+    // Items file to profile.
+    setup
+        .ready_with(zip_of(&[(
+            "Locations-2026-01-05_09-00-00.csv",
+            &format!(
+                "{LOCATIONS_HEADER}Exchange,Mailbox,alex@contoso.example,id-1,Mailbox,PrimaryMailBox,1,1,Succeeded,,q\r\n"
+            ),
+        )]))
+        .await;
+    let run = setup.run(&["--json", "--yes", "--profile"]).await;
+    assert_eq!(run.outcome.exit_code, 4, "{}", run.stdout());
+    let document = run.json();
+    assert_eq!(document["results"]["result"]["collection"], "complete");
+    assert_eq!(
+        document["results"]["result"].get("profile"),
+        Some(&Value::Null)
+    );
+    assert_eq!(
+        document["outcome"]["reasons"][0]["code"],
+        "ProfileUnavailable"
+    );
+    let message = document["outcome"]["reasons"][0]["message"]
+        .as_str()
+        .unwrap();
+    assert!(message.contains("NotAReportZip"), "{message}");
+    // A zip that is not read as the report gives the same reason.
+    let mut setup = Setup::new().await;
+    setup
+        .ready_with(zip_of(&[("notes.txt", "not a report")]))
+        .await;
+    let run = setup.run(&["--json", "--yes", "--profile"]).await;
+    assert_eq!(run.outcome.exit_code, 4, "{}", run.stdout());
+    assert_eq!(
+        run.json()["outcome"]["reasons"][0]["code"],
+        "ProfileUnavailable"
+    );
+}
+
+#[tokio::test]
+async fn profile_needs_the_download_and_good_settings_before_any_request() {
+    let mut setup = Setup::new().await;
+    setup.ready(false).await;
+    for flag in ["--no-download", "--no-wait"] {
+        let run = setup.run(&["--json", "--yes", "--profile", flag]).await;
+        assert_eq!(run.outcome.exit_code, 1, "{flag}");
+        assert_eq!(run.json()["error"]["code"], "CommandFailed", "{flag}");
+    }
+    set_config(
+        &setup.harness,
+        "identity",
+        json!({"internal_domains": "secret.example"}),
+    );
+    let run = setup.run(&["--json", "--yes", "--profile"]).await;
+    assert_eq!(run.outcome.exit_code, 1);
+    let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
+    assert!(message.contains("identity.internal_domains"), "{message}");
+    assert!(!message.contains("secret"), "{message}");
+    assert!(setup.graph_requests().await.is_empty());
+    // With no account signed in, the setting is still the error.
+    let harness = Harness::new().await;
+    let dir = harness.config_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::to_vec(&json!({"identity": {"domain_aliases": []}})).unwrap(),
+    )
+    .unwrap();
+    let run = harness
+        .run(&["--json", "report", CASE, SEARCH, "--yes", "--profile"])
+        .await;
+    assert_eq!(run.outcome.exit_code, 1, "{}", run.stdout());
+    let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
+    assert!(message.contains("identity.domain_aliases"), "{message}");
+}

@@ -350,6 +350,8 @@ pub struct Finished {
     pub operation: OperationId,
     pub record: OperationRecord,
     pub evidence: Option<ReportFiles>,
+    /// Where the evidence file was written, when one was read.
+    pub evidence_path: Option<PathBuf>,
     /// Why the collection is unchecked, when it is for want of evidence.
     pub evidence_note: Option<String>,
     /// Each file with its path, size, SHA-256 and download status.
@@ -486,6 +488,7 @@ impl ActionRun {
         let mut reasons: Vec<Value> = Vec::new();
         let mut files: Vec<Value> = Vec::new();
         let mut evidence: Option<ReportFiles> = None;
+        let mut evidence_path: Option<PathBuf> = None;
         let mut evidence_note: Option<String> = None;
         if self.no_download {
             reasons.extend(incomplete_reason(&record));
@@ -545,6 +548,7 @@ impl ActionRun {
                     match ReportFiles::read_for(&done.path, limits, self.evidence_of) {
                         Ok(read) if read.has_evidence_for(self.evidence_of) => {
                             evidence = Some(read);
+                            evidence_path = Some(done.path.clone());
                             // A note about an earlier file no longer
                             // explains the collection.
                             evidence_note = None;
@@ -589,6 +593,7 @@ impl ActionRun {
             operation,
             record,
             evidence,
+            evidence_path,
             evidence_note,
             files,
             reasons,

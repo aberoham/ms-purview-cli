@@ -115,6 +115,8 @@ pub const UNTRUSTED_KEYS: &[&str] = &[
     "title",
     "key",
     "senderDomain",
+    // `parse profile`: the names of Teams chats and channels.
+    "conversationName",
 ];
 
 /// Wraps every non-empty string under a key in `UNTRUSTED_KEYS`, at any

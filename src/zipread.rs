@@ -901,6 +901,30 @@ mod tests {
     }
 
     #[test]
+    fn a_copied_locator_that_names_another_record_is_checked_on_its_own() {
+        // As the copy test, but the copy's locator names another offset:
+        // it does not reuse the first record's count.
+        let file = zip64_with(44, 0);
+        let mut bytes = std::fs::read(file.path()).unwrap();
+        let tail = bytes[bytes.len() - 42..].to_vec();
+        let at = bytes.len() - 2;
+        bytes[at..].copy_from_slice(&(tail.len() as u16).to_le_bytes());
+        let mut copy = tail.clone();
+        let named = u64::from_le_bytes(copy[8..16].try_into().unwrap()) + 1;
+        copy[8..16].copy_from_slice(&named.to_le_bytes());
+        let copy_len = copy.len();
+        copy[copy_len - 2..].copy_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&copy);
+        std::fs::write(file.path(), &bytes).unwrap();
+        let mut handle = File::open(file.path()).unwrap();
+        let len = handle.metadata().unwrap().len();
+        assert_eq!(
+            zip_end(&mut handle, len).unwrap_err().metadata().0,
+            "HostileZip"
+        );
+    }
+
+    #[test]
     fn bounded_reads_and_seeks_as_if_the_file_ended_there() {
         use std::io::{Seek, SeekFrom};
         let file = tempfile::NamedTempFile::new().unwrap();

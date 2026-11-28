@@ -1379,7 +1379,8 @@ from the `.msg`. `error` is one of `cfbInvalid`, `noBody`, `bodyDecode`, `entryT
      the property id. `TTTT` is the type: `001F` is a UTF-16LE string, `001E` an 8-bit
      string, `0102` binary.
    - Fixed-size properties live in `__properties_version1.0`. Its header is 32 bytes for the
-     top-level message, 24 for an embedded message or attachment and 8 for a recipient. Each
+     top-level message, 24 for an embedded message, and 8 for an attachment or a recipient
+     (Docs: MS-OXMSG 2.4.1; Observed: attachment sizes read only with 8). Each
      entry is 16 bytes, and type `0040` is a FILETIME.
    - Recipients and attachments are the storages `__recip_version1.0_#XXXXXXXX` and
      `__attach_version1.0_#XXXXXXXX`.

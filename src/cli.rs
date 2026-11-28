@@ -1117,6 +1117,49 @@ Examples:
   purview export create <case> <search> --yes --no-wait --json"
     )]
     Create(ExportCreateArgs),
+    #[command(
+        about = "Read the messages in an export's items zips on this computer, as JSON Lines",
+        long_about = "\
+Read each .msg in one or more Items.*.zip parts that 'purview download' or \
+'export create' wrote, with no sign-in: sender, recipients, subject, dates, \
+class, attachment names and sizes, and the body. The body is the HTML body \
+converted to text when there is one, else the plain-text body; an item with \
+only a compressed RTF body, or none, gets error noBody. Each zip is read in \
+memory through limits on entries and sizes, and nothing is extracted.
+
+Writes one JSON record per item (JSON Lines), or one document with --json, \
+and a summary to stderr. Bodies are colleagues' and outside senders' mail, \
+so the command refuses to write to a terminal: redirect standard output to \
+a file in the data directory. Exits 4 when any item has an error.",
+        after_help = "\
+Examples:
+  purview export read <items.zip> > items.jsonl
+  purview export read <items.zip> --max-body-chars 20000 > items.jsonl
+  purview export read <items.zip> --json --wrap-untrusted > items.json"
+    )]
+    Read(ExportReadArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct ExportReadArgs {
+    #[arg(
+        value_name = "ITEMS_ZIP",
+        required = true,
+        help = "An export's Items.*.zip part"
+    )]
+    zips: Vec<PathBuf>,
+    #[arg(
+        long,
+        value_name = "SIZE",
+        help = "Largest .msg to read, such as 64MiB (default); a larger one gets error entryTooLarge"
+    )]
+    max_entry_bytes: Option<String>,
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Longest body, in characters (default 200000); a longer one is cut and bodyTruncated set"
+    )]
+    max_body_chars: Option<usize>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1850,6 +1893,9 @@ async fn run(
             write_command(env, output, globals, &mut command).await
         }
         Command::Kql(query) => kql(env, output, query),
+        Command::Export(ExportArgs {
+            command: ExportCommand::Read(args),
+        }) => export_read(env, output, args),
         Command::Parse(parse) => parse_zip(env, output, parse.command),
         Command::Version => version(env, output),
     }
@@ -1903,6 +1949,39 @@ fn parse_zip(env: &mut Env, output: &OutputOptions, command: ParseCommand) -> Re
     let stored = load_config(env, &dir)?;
     let limits = crate::report::ReportLimits::from_config(&stored.extra)?;
     let produced = commands::parse::run(env, output, &zip, limits, what)?;
+    Ok(Outcome {
+        exit_code: produced.exit_code,
+        stdout_value: produced.document,
+    })
+}
+
+/// `purview export read`: local, no sign-in and no configuration read.
+fn export_read(env: &mut Env, output: &OutputOptions, args: ExportReadArgs) -> Result<Outcome> {
+    use crate::export::read::{ReadRequest, DEFAULT_MAX_BODY_CHARS, DEFAULT_MAX_ENTRY_BYTES};
+    if args.zips.iter().any(|zip| zip.as_os_str().is_empty()) {
+        return Err(PurviewError::message(
+            "<ITEMS_ZIP> was given an empty value",
+        ));
+    }
+    let max_entry_bytes = match args.max_entry_bytes {
+        None => DEFAULT_MAX_ENTRY_BYTES,
+        Some(text) => crate::download::parse_size(&not_blank("--max-entry-bytes", text)?)
+            .filter(|size| *size > 0)
+            .ok_or_else(|| {
+                PurviewError::message("--max-entry-bytes must be a size above zero, such as 64MiB")
+            })?,
+    };
+    let max_body_chars = args.max_body_chars.unwrap_or(DEFAULT_MAX_BODY_CHARS);
+    if max_body_chars == 0 {
+        return Err(PurviewError::message("--max-body-chars must be above zero"));
+    }
+    let request = ReadRequest {
+        zips: args.zips,
+        max_entry_bytes,
+        max_body_chars,
+        json: output.format == crate::output::OutputFormat::Json,
+    };
+    let produced = crate::export::read::run(env, output, &request)?;
     Ok(Outcome {
         exit_code: produced.exit_code,
         stdout_value: produced.document,
